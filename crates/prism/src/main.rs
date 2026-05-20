@@ -677,29 +677,30 @@ fn breadcrumb(msg: &str) {
 ///
 /// Requires DRM master — run from a free VT (Ctrl+Alt+F3). Ctrl-C to exit.
 ///
-/// Diagnostic env vars (set before `prism run`):
-///   PRISM_RENDER_HZ=N    render at N Hz (default: 60). Use low values
-///                         (e.g. 1) to debug GPU/scanout interaction.
-///   PRISM_MAX_FRAMES=N   exit after N frames presented (default: unlimited).
-///                         Use small values (e.g. 5) when testing on a TTY
-///                         so the process self-terminates even if rendering
-///                         hangs the GPU.
+/// Rendering is vblank-driven: each DRM VBlank event triggers the next
+/// present. Bootstrap is one explicit present before entering the loop;
+/// after that the kernel's vblank cadence (the display's refresh rate) sets
+/// the pace. This eliminates the half-rate pinning of the previous
+/// timer-driven model (timer + frame_pending gate skipped every other
+/// fire), and naturally drops frames if rendering can't keep up.
 ///
-/// Breadcrumbs are appended to /tmp/prism.crumbs with fsync per line, so
-/// they survive a system lockup.
+/// Diagnostic env vars (set before `prism run`):
+///   PRISM_MAX_FRAMES=N      exit after N frames presented (default: unlimited).
+///                            Use small values (e.g. 5) when testing on a TTY
+///                            so the process self-terminates if rendering hangs.
+///   PRISM_WATCHDOG_SECS=N   spawn a sleeper thread that SIGKILLs our PID
+///                            after N seconds (default 10, 0 to disable).
+///
+/// Breadcrumbs are appended to ./prism.crumbs (override with $PRISM_CRUMBS)
+/// with fsync per line, so they survive a system lockup.
 fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> Result<()> {
     use calloop::EventLoop;
     use calloop::signals::{Signal, Signals};
-    use calloop::timer::{TimeoutAction, Timer};
     use prism_drm::{OutputContext, OutputSetup};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
 
-    let render_hz: f32 = std::env::var("PRISM_RENDER_HZ")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60.0);
     let max_frames: Option<u32> = std::env::var("PRISM_MAX_FRAMES")
         .ok()
         .and_then(|s| s.parse().ok());
@@ -712,9 +713,8 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
-    let frame_interval = Duration::from_secs_f32(1.0 / render_hz);
     breadcrumb(&format!(
-        "startup: render_hz={render_hz}, max_frames={max_frames:?}, interval={frame_interval:?}, watchdog={watchdog_secs}s"
+        "startup: vblank-driven, max_frames={max_frames:?}, watchdog={watchdog_secs}s"
     ));
     if watchdog_secs > 0 {
         let secs = watchdog_secs;
@@ -781,17 +781,48 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     tracing::info!("WAYLAND_DISPLAY={socket}");
     tracing::info!("scanout target: {output_name_for_log} {}×{}", extent.width, extent.height);
 
-    // Drain DRM vblank / page-flip-complete events. CRITICAL: without this,
-    // event::true page_flips accumulate in the kernel until ENOMEM at 60Hz.
+    // Shared shutdown flag, set by signal handlers AND by the vblank handler
+    // once max_frames has been hit. Defined here so both can reference it.
+    let running = Arc::new(AtomicBool::new(true));
+    let frame_counter = Arc::new(AtomicU32::new(0));
+
+    // DRM vblank handler: marks the previous flip done AND triggers the
+    // next render. This is the heartbeat of vblank-driven pacing — present
+    // → wait for vblank → present again. Bootstrapped below with one
+    // explicit present that does the mode-set commit, after which every
+    // subsequent frame is kicked off by a vblank from the prior flip.
+    let running_for_vblank = running.clone();
+    let frame_counter_for_vblank = frame_counter.clone();
+    let max_frames_copy = max_frames;
     event_loop
         .handle()
-        .insert_source(notifiers.drm, |event, _metadata, state| {
+        .insert_source(notifiers.drm, move |event, _metadata, state| {
             use smithay::backend::drm::DrmEvent;
             match event {
-                DrmEvent::VBlank(crtc) => {
-                    breadcrumb(&format!("VBlank event for {crtc:?}"));
+                DrmEvent::VBlank(_crtc) => {
                     if let Some(output) = state.output.as_mut() {
                         output.mark_vblank();
+                    }
+                    let n = frame_counter_for_vblank.fetch_add(1, Ordering::SeqCst) + 1;
+                    breadcrumb(&format!("vblank → render frame #{n}"));
+                    match present_one_frame(state, gradient_view) {
+                        Ok(true) => breadcrumb(&format!("frame #{n}: submitted")),
+                        Ok(false) => {
+                            // Should be rare with vblank-driven scheduling
+                            // (we only render after a vblank cleared the gate)
+                            // but possible if vblanks fire back-to-back.
+                            breadcrumb(&format!("frame #{n}: skipped (still pending)"));
+                        }
+                        Err(e) => {
+                            breadcrumb(&format!("frame #{n}: ERROR {e:#}"));
+                            tracing::warn!("present failed: {e:#}");
+                        }
+                    }
+                    if let Some(max) = max_frames_copy {
+                        if n >= max {
+                            breadcrumb(&format!("frame #{n}: max_frames reached, exit"));
+                            running_for_vblank.store(false, Ordering::SeqCst);
+                        }
                     }
                 }
                 DrmEvent::Error(e) => {
@@ -828,7 +859,6 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         .map_err(|e| anyhow!("insert session notifier: {e}"))?;
 
     // SIGINT / SIGTERM → clean shutdown.
-    let running = Arc::new(AtomicBool::new(true));
     {
         let running = running.clone();
         let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM])
@@ -842,38 +872,19 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             .map_err(|e| anyhow!("insert signals source: {e}"))?;
     }
 
-    // Render timer. Vblank-driven pacing is still to come; for now we run
-    // a simple periodic timer with a configurable rate. The `frame_pending`
-    // gate inside OutputContext::present absorbs ticks that arrive while a
-    // flip is still in flight.
-    let timer = Timer::from_duration(frame_interval);
-    let frame_counter = Arc::new(AtomicU32::new(0));
-    let running_for_timer = running.clone();
-    let max_frames_copy = max_frames;
-    event_loop
-        .handle()
-        .insert_source(timer, move |_now, _, state| {
-            let n = frame_counter.fetch_add(1, Ordering::SeqCst) + 1;
-            breadcrumb(&format!("tick #{n}: enter present_one_frame"));
-            match present_one_frame(state, gradient_view) {
-                Ok(true) => breadcrumb(&format!("tick #{n}: present submitted")),
-                Ok(false) => breadcrumb(&format!("tick #{n}: skipped (flip pending)")),
-                Err(e) => {
-                    breadcrumb(&format!("tick #{n}: ERROR {e:#}"));
-                    tracing::warn!("present failed: {e:#}");
-                }
-            }
-            if let Some(max) = max_frames_copy {
-                if n >= max {
-                    breadcrumb(&format!("tick #{n}: max_frames reached, signalling exit"));
-                    running_for_timer.store(false, Ordering::SeqCst);
-                    return TimeoutAction::Drop;
-                }
-            }
-            TimeoutAction::ToDuration(frame_interval)
-        })
-        .map_err(|e| anyhow!("insert render timer: {e}"))?;
-    breadcrumb("render timer inserted");
+    // Bootstrap: render frame #1 explicitly so the kernel has a vblank to
+    // schedule. From here on, the DRM vblank handler triggers each next
+    // present — true vblank-driven pacing at the panel's refresh rate.
+    let n0 = frame_counter.fetch_add(1, Ordering::SeqCst) + 1;
+    breadcrumb(&format!("bootstrap → render frame #{n0}"));
+    match present_one_frame(&mut state, gradient_view) {
+        Ok(true) => breadcrumb(&format!("frame #{n0}: submitted (mode-set commit)")),
+        Ok(false) => breadcrumb(&format!("frame #{n0}: skipped (unexpected at bootstrap)")),
+        Err(e) => {
+            breadcrumb(&format!("frame #{n0}: ERROR {e:#}"));
+            return Err(e).context("bootstrap present");
+        }
+    }
 
     breadcrumb("entering dispatch loop");
     while running.load(Ordering::SeqCst) {
