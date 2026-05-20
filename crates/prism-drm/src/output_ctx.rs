@@ -4,16 +4,19 @@
 //! This is the closest prism comes to "an output." It bundles:
 //!   - The libseat session that holds DRM master.
 //!   - The smithay `DrmDevice` + `DrmSurface` for this output.
-//!   - The GBM allocator + the BO backing the scanout image.
-//!   - The Vulkan `ImportedImage` view of that BO + the DRM framebuffer handle.
+//!   - The GBM allocator + TWO BOs (double-buffered) backing the scanout images.
+//!   - The Vulkan `ImportedImage` view of each BO + DRM framebuffer handles.
 //!   - The renderer instance (per-output because its pipelines bake in the
 //!     scanout format and the per-output `EncodeConfig`).
 //!
-//! Lifetime contract: BO + GBM + ImportedImage + DRM device must all outlive
-//! the surface; the surface must outlive any frame queued against it. We keep
-//! everything as fields of this struct so drop order does the right thing
-//! (Rust drops fields in declaration order: surface → image → BO → GBM → drm
-//! → session).
+//! Double-buffering rationale: the AMD display engine reads continuously from
+//! whatever BO is currently being scanned out. If we render directly into that
+//! same BO every frame (single-buffered), the 3D engine writes and the display
+//! engine reads contend through implicit synchronization, which on
+//! amdgpu+RADV can fully wedge the system at 60Hz (system-wide kernel hang,
+//! even input layer stops responding). With two BOs the render targets the
+//! *back* buffer while the display reads the *front*; page_flip swaps them
+//! at vblank.
 
 use std::sync::Arc;
 
@@ -27,21 +30,17 @@ use smithay::backend::session::libseat::LibSeatSessionNotifier;
 use smithay::reexports::drm::control::framebuffer;
 use smithay::utils::{Rectangle, Transform};
 
-/// Bundle of calloop event sources the caller MUST insert into its loop.
-/// Failure to drain either source causes a hard system lockup:
-///   - `drm`: page-flip event ENOMEM cascade after ~140 frames.
-///   - `session`: VT-switch blocked because we never ack libseat's pause,
-///     and SIGINT delivery blocks too because the desktop session is
-///     stuck waiting for us. Hands typing Ctrl+Alt+Fn do nothing.
-pub struct OutputNotifiers {
-    pub drm: DrmDeviceNotifier,
-    pub session: LibSeatSessionNotifier,
-}
-
 use crate::{
     GbmDevice, ScanoutDepth, SeatSession, add_framebuffer_for_bo, pick_by_name,
     pick_first_connected, set_connector_max_bpc,
 };
+
+/// Bundle of calloop event sources the caller MUST insert into its loop.
+/// Failure to drain either source causes a hard system lockup.
+pub struct OutputNotifiers {
+    pub drm: DrmDeviceNotifier,
+    pub session: LibSeatSessionNotifier,
+}
 
 /// Builder-style input to `OutputContext::new`.
 pub struct OutputSetup<'a> {
@@ -59,17 +58,31 @@ pub struct OutputSetup<'a> {
     pub encode_config: &'a EncodeConfig,
 }
 
+/// One BO + Vulkan view + DRM framebuffer handle. Two of these live in
+/// `OutputContext` for double buffering. Field order matters for Drop:
+/// image (Vulkan) → BO (GBM); the FB is a kernel-side handle freed by the
+/// DRM device drop, no Rust-side cleanup needed here.
+struct ScanoutBuffer {
+    image: ImportedImage,
+    _bo: gbm::BufferObject<()>,
+    fb: framebuffer::Handle,
+}
+
 /// All the per-output state. Drop releases scanout cleanly.
 pub struct OutputContext {
-    // Field order matters: surface → image → BO → renderer → GBM → drm → session.
+    // Field order matters: surface → scanout buffers → renderer → GBM → drm → session.
     pub surface: DrmSurface,
-    pub fb: framebuffer::Handle,
-    pub scanout_image: ImportedImage,
+    /// Two-element ring; `back_index` selects which one to render into next.
+    /// On first present we render `buffers[0]` and mode-set to it.
+    buffers: [ScanoutBuffer; 2],
+    /// Which buffer is currently the *back* (safe to render into). After a
+    /// successful page-flip the kernel will switch at next vblank; we wait
+    /// for `mark_vblank()` to advance this index so we never render into
+    /// the buffer the display is actively reading.
+    back_index: usize,
     pub renderer: Renderer,
-    /// GBM BO backing the scanout image. Kept alive so the FB handle stays valid.
-    _bo: gbm::BufferObject<()>,
     _gbm: GbmDevice,
-    /// DRM device — kept alive so the surface, FB, and BOs remain valid.
+    /// DRM device — kept alive so the surface, FBs, and BOs remain valid.
     pub drm: DrmDevice,
     /// libseat session — last out, so the DRM fd stays open through the others' drops.
     pub session: SeatSession,
@@ -82,16 +95,13 @@ pub struct OutputContext {
     mode_set_done: bool,
     /// True between submitting a page-flip and receiving its vblank event.
     /// Submitting another flip while one is pending causes the kernel to
-    /// reject with ENOMEM as its event-allocation pool fills; on a 60Hz
-    /// timer that's ~3000 errors/minute which locks up the system. Don't
-    /// re-enter present() until `mark_vblank()` has been called.
+    /// reject with ENOMEM. Don't re-enter present() until `mark_vblank()`.
     frame_pending: bool,
 }
 
 impl OutputContext {
     /// Bring up the integrated output. Returns `(context, OutputNotifiers)`.
-    /// Both notifiers MUST be inserted into the caller's calloop event loop
-    /// or the system will hang in different ways (see `OutputNotifiers`).
+    /// Both notifiers MUST be inserted into the caller's calloop event loop.
     pub fn new(
         device: Arc<prism_renderer::Device>,
         setup: OutputSetup<'_>,
@@ -138,28 +148,13 @@ impl OutputContext {
             width: w as u32,
             height: h as u32,
         };
-        let (bo, dmabuf) = gbm
-            .allocate_scanout(
-                extent.width,
-                extent.height,
-                setup.depth.drm_fourcc(),
-                &[DrmModifier::Linear],
-            )
-            .with_context(|| {
-                format!(
-                    "GBM allocate scanout {}×{} {:?}",
-                    extent.width,
-                    extent.height,
-                    setup.depth.drm_fourcc()
-                )
-            })?;
-        let scanout_image = ImportedImage::import(
-            device.clone(),
-            &dmabuf,
-            setup.vk_format,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT,
-        )?;
-        let fb = add_framebuffer_for_bo(&drm, &bo)?;
+
+        // Two scanout buffers (double-buffered).
+        let buffer_a =
+            alloc_scanout_buffer(&device, &drm, &gbm, &setup, extent, "buffer A")?;
+        let buffer_b =
+            alloc_scanout_buffer(&device, &drm, &gbm, &setup, extent, "buffer B")?;
+        let buffers = [buffer_a, buffer_b];
 
         let renderer = Renderer::new(
             device.clone(),
@@ -173,10 +168,9 @@ impl OutputContext {
                 session,
                 drm,
                 _gbm: gbm,
-                _bo: bo,
-                scanout_image,
+                buffers,
+                back_index: 0,
                 renderer,
-                fb,
                 surface,
                 extent,
                 connector_name: pick.connector_name,
@@ -190,10 +184,16 @@ impl OutputContext {
         ))
     }
 
-    /// Clear the `frame_pending` flag. Call this when the DRM notifier
-    /// surfaces a VBlank event for this output's CRTC.
+    /// Clear the `frame_pending` flag AND advance the back-buffer index.
+    /// Call this when the DRM notifier surfaces a VBlank event for our CRTC.
+    ///
+    /// At this point the just-flipped buffer is being scanned out; the OTHER
+    /// buffer is no longer in use by the display and is safe to render into.
     pub fn mark_vblank(&mut self) {
         self.frame_pending = false;
+        // The buffer we just flipped TO is now front. Toggle so back_index
+        // points at the *other* one (the new back).
+        self.back_index = 1 - self.back_index;
     }
 
     /// True if a flip is in flight (`present` will be a no-op).
@@ -202,16 +202,11 @@ impl OutputContext {
     }
 
     /// Render the supplied `elements` (with the supplied encode parameters)
-    /// into the scanout image and submit it for display.
+    /// into the *back* scanout image and submit it for display.
     ///
     /// Returns `Ok(false)` (no-op) if a previous flip is still pending —
     /// the caller should wait for the next VBlank event before retrying.
     /// Returns `Ok(true)` if a frame was submitted.
-    ///
-    /// The first call does a full atomic `commit` (mode-set). Subsequent
-    /// calls do `page_flip` (buffer swap). Both request a vblank event from
-    /// the kernel; the caller MUST drain them by feeding the DrmDeviceNotifier
-    /// into calloop and routing VBlank back to `mark_vblank()`.
     pub fn present(
         &mut self,
         elements: &[ElementDraw],
@@ -221,8 +216,9 @@ impl OutputContext {
             return Ok(false);
         }
 
+        let back = &self.buffers[self.back_index];
         self.renderer.render_frame(
-            self.scanout_image.image(),
+            back.image.image(),
             self.extent,
             elements,
             encode_push,
@@ -242,7 +238,7 @@ impl OutputContext {
                 transform: Transform::Normal,
                 alpha: 1.0,
                 damage_clips: None,
-                fb: self.fb,
+                fb: back.fb,
                 fence: None,
             }),
         }];
@@ -260,6 +256,44 @@ impl OutputContext {
         self.frame_pending = true;
         Ok(true)
     }
+}
+
+fn alloc_scanout_buffer(
+    device: &Arc<prism_renderer::Device>,
+    drm: &DrmDevice,
+    gbm: &GbmDevice,
+    setup: &OutputSetup<'_>,
+    extent: vk::Extent2D,
+    label: &str,
+) -> Result<ScanoutBuffer> {
+    let (bo, dmabuf) = gbm
+        .allocate_scanout(
+            extent.width,
+            extent.height,
+            setup.depth.drm_fourcc(),
+            &[DrmModifier::Linear],
+        )
+        .with_context(|| {
+            format!(
+                "GBM allocate {} {}×{} {:?}",
+                label,
+                extent.width,
+                extent.height,
+                setup.depth.drm_fourcc()
+            )
+        })?;
+    let image = ImportedImage::import(
+        device.clone(),
+        &dmabuf,
+        setup.vk_format,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT,
+    )?;
+    let fb = add_framebuffer_for_bo(drm, &bo)?;
+    Ok(ScanoutBuffer {
+        image,
+        _bo: bo,
+        fb,
+    })
 }
 
 impl Drop for OutputContext {
