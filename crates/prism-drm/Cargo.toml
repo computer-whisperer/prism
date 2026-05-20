@@ -13,6 +13,7 @@ drm-fourcc.workspace = true
 gbm.workspace = true
 prism-frame.workspace = true
 prism-renderer.workspace = true
+rustix.workspace = true
 smithay.workspace = true
 smithay-drm-extras.workspace = true
 thiserror.workspace = true
