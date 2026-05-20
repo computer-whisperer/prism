@@ -14,13 +14,14 @@ fn main() -> Result<()> {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let output_name = args.get(1).map(String::as_str);
     match args.first().map(String::as_str) {
         None => run_headless_smoke_tests(),
-        Some("scanout") => run_scanout_smoke_test(),
-        Some("gradient") => run_gradient_scanout(),
+        Some("scanout") => run_scanout_smoke_test(output_name),
+        Some("gradient") => run_gradient_scanout(output_name),
         Some("wayland") => run_wayland_server(),
         Some(other) => Err(anyhow!(
-            "unknown subcommand {other:?}; expected: (no args) | scanout | gradient | wayland"
+            "unknown subcommand {other:?}; expected: (no args) | scanout [output] | gradient [output] | wayland"
         )),
     }
 }
@@ -607,7 +608,7 @@ fn pick_memory(
 /// the scanout image is rendered through the two-pass decode→encode pipeline
 /// using a horizontal-gradient texture. Visual verification: a smoothly
 /// gamma-correct gradient (black on the left → white on the right).
-fn run_gradient_scanout() -> Result<()> {
+fn run_gradient_scanout(output_name: Option<&str>) -> Result<()> {
     use prism_drm::scanout;
     use prism_renderer::{DecodePush, ElementDraw, EncodePush, Renderer, vk};
     use smithay::backend::drm::{DrmDevice, PlaneConfig, PlaneState};
@@ -635,7 +636,10 @@ fn run_gradient_scanout() -> Result<()> {
     }
     let drm_fd = session.open_drm(drm_path)?;
     let (mut drm, _drm_notifier) = DrmDevice::new(drm_fd, false)?;
-    let pick = scanout::pick_first_connected(&drm)?;
+    let pick = match output_name {
+        Some(name) => scanout::pick_by_name(&drm, name)?,
+        None => scanout::pick_first_connected(&drm)?,
+    };
     tracing::info!(
         "scanout target: {} mode={}x{}@{}Hz",
         pick.connector_name,
@@ -707,7 +711,7 @@ fn run_gradient_scanout() -> Result<()> {
 /// (or simpler, after switching to a fresh VT with Ctrl+Alt+F3:
 ///   `./target/debug/prism scanout`, no sudo needed if you're in the `seat`
 ///    or `video` group and seatd/logind is running.)
-fn run_scanout_smoke_test() -> Result<()> {
+fn run_scanout_smoke_test(output_name: Option<&str>) -> Result<()> {
     use prism_drm::scanout;
     use prism_renderer::{ImportedImage, OneshotPool, oneshot};
     use smithay::backend::drm::{DrmDevice, PlaneConfig, PlaneState};
@@ -743,8 +747,11 @@ fn run_scanout_smoke_test() -> Result<()> {
         .with_context(|| format!("DrmDevice::new({drm_path})"))?;
     tracing::info!("DRM atomic={} dev_id={:?}", drm.is_atomic(), drm.device_id());
 
-    // Pick the first connected output.
-    let pick = scanout::pick_first_connected(&drm)?;
+    // Pick a connected output: by name if specified, else the first one.
+    let pick = match output_name {
+        Some(name) => scanout::pick_by_name(&drm, name)?,
+        None => scanout::pick_first_connected(&drm)?,
+    };
     tracing::info!(
         "scanout target: {} mode={}x{}@{}Hz crtc={:?}",
         pick.connector_name,
