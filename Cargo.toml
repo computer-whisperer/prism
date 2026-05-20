@@ -37,6 +37,8 @@ bitflags = "2.11.1"
 bytemuck = { version = "1.20", features = ["derive"] }
 calloop = { version = "0.14.4", features = ["executor", "signals"] }
 calloop-wayland-source = "0.4.1"
+drm-fourcc = "2.2.0"
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 glam = "0.30"
 gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
 libc = "0.2"

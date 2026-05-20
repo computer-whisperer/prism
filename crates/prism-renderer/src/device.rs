@@ -52,21 +52,28 @@ pub struct PhysicalDeviceInfo {
 /// A logical Vulkan device + the queue we use for graphics work. Owns the
 /// lifetime; dropping waits for idle, then destroys.
 pub struct Device {
-    /// Kept to keep the parent instance alive while the device exists.
-    _instance: Arc<Instance>,
+    /// Kept to keep the parent instance alive while the device exists, and
+    /// to give callers access to the raw instance handle without re-plumbing
+    /// it everywhere.
+    pub instance: Arc<Instance>,
     pub physical: PhysicalDeviceInfo,
     pub raw: ash::Device,
     pub graphics_queue: vk::Queue,
 }
 
 impl Device {
+    /// Access the raw `ash::Instance` for building extension loaders.
+    pub fn instance_raw(&self) -> &ash::Instance {
+        self.instance.raw()
+    }
+
     /// Open a Vulkan logical device.
     ///
     /// Selection priority:
     ///   1. Physical device whose DRM node matches `prefer_drm_node` (major/minor).
     ///   2. Discrete GPU.
     ///   3. First device that meets the required-extension bar.
-    pub fn new(instance: Arc<Instance>, prefer_drm_node: Option<DrmDevId>) -> Result<Self> {
+    pub fn new(instance: Arc<Instance>, prefer_drm_node: Option<DrmDevId>) -> Result<Arc<Self>> {
         let physicals = unsafe { instance.raw().enumerate_physical_devices() }
             .vk_ctx("enumerate_physical_devices")?;
         if physicals.is_empty() {
@@ -134,12 +141,12 @@ impl Device {
 
         let graphics_queue = unsafe { raw.get_device_queue(info.graphics_queue_family, 0) };
 
-        Ok(Self {
-            _instance: instance,
+        Ok(Arc::new(Self {
+            instance,
             physical: info,
             raw,
             graphics_queue,
-        })
+        }))
     }
 }
 

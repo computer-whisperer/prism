@@ -8,4 +8,5 @@ description = "Renderer-independent frame description: Element, FrameDescription
 
 [dependencies]
 bitflags.workspace = true
+drm-fourcc.workspace = true
 smithay.workspace = true

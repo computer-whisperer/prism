@@ -9,6 +9,8 @@ description = "KMS frontend: DrmCompositor-equivalent + per-output scanout buffe
 [dependencies]
 anyhow.workspace = true
 calloop.workspace = true
+drm-fourcc.workspace = true
+gbm.workspace = true
 prism-frame.workspace = true
 prism-renderer.workspace = true
 smithay.workspace = true

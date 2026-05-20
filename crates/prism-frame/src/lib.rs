@@ -14,14 +14,20 @@
 //! the design rationale.
 
 pub mod color;
+pub mod dmabuf;
 pub mod element;
 pub mod handle;
 pub mod output;
 
 pub use color::{ColorDescription, GammaExponent, MasteringInfo, Primaries, TransferFunction};
+pub use dmabuf::{Dmabuf, DmabufPlane};
 pub use element::{Element, ElementId, ElementSource, ShaderUniform};
 pub use handle::{ShaderHandle, TextureHandle};
 pub use output::{OutputId, OutputState};
+
+// Re-export fourcc types so downstream crates needn't depend on drm-fourcc
+// directly to construct/inspect `Dmabuf`s.
+pub use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 
 // Re-export smithay geometry types so non-frame crates can use them through
 // `prism_frame` without taking a direct smithay dependency for layout
