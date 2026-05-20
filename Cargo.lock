@@ -696,6 +696,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "calloop",
+ "libc",
  "prism-config",
  "prism-drm",
  "prism-frame",

@@ -634,21 +634,85 @@ fn pick_memory(
     Err(anyhow!("no memory type matches {:?}", required))
 }
 
+/// Append a one-line breadcrumb to `/tmp/prism.crumbs` and `fsync`. Used in
+/// `prism run` to leave a trail across a TTY-test session that survives the
+/// system locking up — tracing-via-stderr can't reach the user's eyes once
+/// we own DRM master (the text console can't refresh), and any in-flight
+/// stdio is lost when the kernel wedges.
+fn breadcrumb(msg: &str) {
+    use std::io::Write;
+    let line = format!(
+        "{:.3}: {msg}\n",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/prism.crumbs")
+    {
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.sync_all();
+    }
+}
+
 /// End-to-end integrated mode: wayland server + DRM scanout + per-frame
-/// render in one event loop. Single process. Renders the gradient at 60Hz
-/// (timer-driven; vblank-driven pacing is a separate commit). Wayland clients
-/// can connect — their surfaces are tracked but not yet rendered (that's
-/// commit 3 of #49).
+/// render in one event loop. Single process. Wayland clients can connect —
+/// their surfaces are tracked but not yet rendered.
 ///
 /// Requires DRM master — run from a free VT (Ctrl+Alt+F3). Ctrl-C to exit.
+///
+/// Diagnostic env vars (set before `prism run`):
+///   PRISM_RENDER_HZ=N    render at N Hz (default: 60). Use low values
+///                         (e.g. 1) to debug GPU/scanout interaction.
+///   PRISM_MAX_FRAMES=N   exit after N frames presented (default: unlimited).
+///                         Use small values (e.g. 5) when testing on a TTY
+///                         so the process self-terminates even if rendering
+///                         hangs the GPU.
+///
+/// Breadcrumbs are appended to /tmp/prism.crumbs with fsync per line, so
+/// they survive a system lockup.
 fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> Result<()> {
     use calloop::EventLoop;
     use calloop::signals::{Signal, Signals};
     use calloop::timer::{TimeoutAction, Timer};
     use prism_drm::{OutputContext, OutputSetup};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
+
+    let render_hz: f32 = std::env::var("PRISM_RENDER_HZ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60.0);
+    let max_frames: Option<u32> = std::env::var("PRISM_MAX_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    // Hard self-kill watchdog. Spawns a sleeper thread that SIGKILLs our
+    // own PID after N seconds — uncatchable, runs in a separate thread so
+    // it fires even if our main thread is stuck on queue_wait_idle waiting
+    // for a hung GPU. Default 10s so a misbehaving TTY test still recovers
+    // before the kernel locks up. Set to 0 to disable.
+    let watchdog_secs: u64 = std::env::var("PRISM_WATCHDOG_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let frame_interval = Duration::from_secs_f32(1.0 / render_hz);
+    breadcrumb(&format!(
+        "startup: render_hz={render_hz}, max_frames={max_frames:?}, interval={frame_interval:?}, watchdog={watchdog_secs}s"
+    ));
+    if watchdog_secs > 0 {
+        let secs = watchdog_secs;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            breadcrumb(&format!("WATCHDOG: {secs}s elapsed, SIGKILL self"));
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+        });
+    }
 
     tracing::info!("prism — integrated mode (wayland + scanout)");
 
@@ -662,6 +726,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         }),
     )?;
     tracing::info!("Vulkan device: {}", device.physical.name);
+    breadcrumb("vulkan device up");
 
     // Output bringup (DRM master, scanout BO, renderer).
     let encode_config = prism_renderer::EncodeConfig::default_srgb();
@@ -678,11 +743,16 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     )?;
     let extent = output.extent;
     let output_name_for_log = output.connector_name.clone();
+    breadcrumb(&format!(
+        "output bringup ok: {} {}x{}",
+        output_name_for_log, extent.width, extent.height
+    ));
 
     // Wayland display + PrismState; attach the output.
     let display = prism_protocols::new_display()?;
     let mut state = prism_protocols::PrismState::new(&display, device.clone());
     state.attach_output(output);
+    breadcrumb("wayland state up, output attached");
 
     // Demo content: the same gradient as `prism gradient`. Owned outside the
     // PrismState because GradientTexture is binary-local. The texture view
@@ -705,12 +775,16 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         .insert_source(notifiers.drm, |event, _metadata, state| {
             use smithay::backend::drm::DrmEvent;
             match event {
-                DrmEvent::VBlank(_crtc) => {
+                DrmEvent::VBlank(crtc) => {
+                    breadcrumb(&format!("VBlank event for {crtc:?}"));
                     if let Some(output) = state.output.as_mut() {
                         output.mark_vblank();
                     }
                 }
-                DrmEvent::Error(e) => tracing::warn!("DRM event error: {e:#}"),
+                DrmEvent::Error(e) => {
+                    breadcrumb(&format!("DRM event ERROR: {e:#}"));
+                    tracing::warn!("DRM event error: {e:#}");
+                }
             }
         })
         .map_err(|e| anyhow!("insert drm notifier: {e}"))?;
@@ -726,11 +800,13 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             use smithay::backend::session::Event as SessionEvent;
             match event {
                 SessionEvent::PauseSession => {
+                    breadcrumb("session PAUSE");
                     tracing::info!("libseat session paused (likely VT switch away)");
                     // TODO: properly suspend rendering / release DRM resources;
                     // for now we just let subsequent DRM ops fail and log.
                 }
                 SessionEvent::ActivateSession => {
+                    breadcrumb("session ACTIVATE");
                     tracing::info!("libseat session activated");
                     // TODO: re-acquire DRM resources after a previous pause.
                 }
@@ -753,20 +829,40 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             .map_err(|e| anyhow!("insert signals source: {e}"))?;
     }
 
-    // Render timer @ ~60Hz. Replaces vblank-driven pacing for commit 1;
-    // commit 2 will swap this for `DrmDeviceNotifier` vblank events.
-    let frame_interval = Duration::from_micros(16_667);
+    // Render timer. Vblank-driven pacing is still to come; for now we run
+    // a simple periodic timer with a configurable rate. The `frame_pending`
+    // gate inside OutputContext::present absorbs ticks that arrive while a
+    // flip is still in flight.
     let timer = Timer::from_duration(frame_interval);
+    let frame_counter = Arc::new(AtomicU32::new(0));
+    let running_for_timer = running.clone();
+    let max_frames_copy = max_frames;
     event_loop
         .handle()
         .insert_source(timer, move |_now, _, state| {
-            if let Err(e) = present_one_frame(state, gradient_view) {
-                tracing::warn!("present failed: {e:#}");
+            let n = frame_counter.fetch_add(1, Ordering::SeqCst) + 1;
+            breadcrumb(&format!("tick #{n}: enter present_one_frame"));
+            match present_one_frame(state, gradient_view) {
+                Ok(true) => breadcrumb(&format!("tick #{n}: present submitted")),
+                Ok(false) => breadcrumb(&format!("tick #{n}: skipped (flip pending)")),
+                Err(e) => {
+                    breadcrumb(&format!("tick #{n}: ERROR {e:#}"));
+                    tracing::warn!("present failed: {e:#}");
+                }
+            }
+            if let Some(max) = max_frames_copy {
+                if n >= max {
+                    breadcrumb(&format!("tick #{n}: max_frames reached, signalling exit"));
+                    running_for_timer.store(false, Ordering::SeqCst);
+                    return TimeoutAction::Drop;
+                }
             }
             TimeoutAction::ToDuration(frame_interval)
         })
         .map_err(|e| anyhow!("insert render timer: {e}"))?;
+    breadcrumb("render timer inserted");
 
+    breadcrumb("entering dispatch loop");
     while running.load(Ordering::SeqCst) {
         event_loop
             .dispatch(Some(Duration::from_millis(100)), &mut state)
@@ -777,6 +873,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             .context("flush_clients")?;
     }
 
+    breadcrumb("dispatch loop exited cleanly");
     tracing::info!("integrated loop stopped");
     Ok(())
 }
