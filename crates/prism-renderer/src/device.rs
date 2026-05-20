@@ -31,7 +31,7 @@ const OPTIONAL_DEVICE_EXTS: &[&CStr] = &[physical_device_drm::NAME, external_mem
 
 /// DRM device-id (major, minor) for matching a Vulkan physical device to a
 /// DRM node opened separately. Populated via `VK_EXT_physical_device_drm`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DrmDevId {
     pub major: i64,
     pub minor: i64,

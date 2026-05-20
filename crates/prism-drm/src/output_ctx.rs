@@ -1,62 +1,39 @@
-//! Per-output runtime state — the integrated thing that owns "this display
-//! is currently scanning out, here are all the resources holding it together."
+//! Per-output runtime state — one per active connector.
 //!
-//! This is the closest prism comes to "an output." It bundles:
-//!   - The libseat session that holds DRM master.
-//!   - The smithay `DrmDevice` + `DrmSurface` for this output.
-//!   - The GBM allocator + TWO BOs (double-buffered) backing the scanout images.
-//!   - The Vulkan `ImportedImage` view of each BO + DRM framebuffer handles.
-//!   - The renderer instance (per-output because its pipelines bake in the
-//!     scanout format and the per-output `EncodeConfig`).
+//! Owns the per-connector scanout pipeline: the DrmSurface (CRTC + mode +
+//! connector), the double-buffered scanout BOs (front/back + Vulkan
+//! `ImportedImage` view + DRM framebuffer handle for each), and the
+//! per-output `Renderer` (one per output because its encode pipeline bakes
+//! in the per-output `EncodeConfig`).
 //!
-//! Double-buffering rationale: the AMD display engine reads continuously from
-//! whatever BO is currently being scanned out. If we render directly into that
-//! same BO every frame (single-buffered), the 3D engine writes and the display
-//! engine reads contend through implicit synchronization, which on
-//! amdgpu+RADV can fully wedge the system at 60Hz (system-wide kernel hang,
-//! even input layer stops responding). With two BOs the render targets the
-//! *back* buffer while the display reads the *front*; page_flip swaps them
-//! at vblank.
+//! Does NOT own: the libseat session (per-process, see [`crate::SeatSession`])
+//! or the DRM device + GBM (per-card, see [`crate::DrmCardContext`]). Multiple
+//! `OutputContext`s on the same card share their card context.
+//!
+//! Double-buffering rationale: the AMD display engine reads continuously
+//! from whatever BO is currently being scanned out. If we render directly
+//! into that same BO every frame (single-buffered), the 3D engine writes
+//! and the display engine reads contend through implicit synchronization,
+//! which on amdgpu+RADV can fully wedge the system at 60Hz (system-wide
+//! kernel hang, even input layer stops responding). With two BOs the render
+//! targets the *back* buffer while the display reads the *front*; page_flip
+//! swaps them at vblank.
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use drm_fourcc::DrmModifier;
 use prism_renderer::{
-    ElementDraw, EncodeConfig, EncodePush, ImportedImage, Renderer, vk,
+    Device, DrmDevId, ElementDraw, EncodePush, ImportedImage, Renderer, vk,
 };
-use smithay::backend::drm::{DrmDevice, DrmDeviceNotifier, DrmSurface, PlaneConfig, PlaneState};
-use smithay::backend::session::libseat::LibSeatSessionNotifier;
-use smithay::reexports::drm::control::framebuffer;
+use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneState};
+use smithay::reexports::drm::control::{connector, crtc, framebuffer};
 use smithay::utils::{Rectangle, Transform};
 
 use crate::{
-    GbmDevice, ScanoutDepth, SeatSession, add_framebuffer_for_bo, pick_by_name,
-    pick_first_connected, set_connector_max_bpc,
+    DrmCardContext, OutputConfig, OutputPick, add_framebuffer_for_bo,
+    set_connector_max_bpc,
 };
-
-/// Bundle of calloop event sources the caller MUST insert into its loop.
-/// Failure to drain either source causes a hard system lockup.
-pub struct OutputNotifiers {
-    pub drm: DrmDeviceNotifier,
-    pub session: LibSeatSessionNotifier,
-}
-
-/// Builder-style input to `OutputContext::new`.
-pub struct OutputSetup<'a> {
-    /// Path to the DRM primary node (e.g. `/dev/dri/card0`).
-    pub drm_path: &'a str,
-    /// Optional connector name. `None` → first connected.
-    pub output_name: Option<&'a str>,
-    /// Scanout depth + matching Vulkan format.
-    pub depth: ScanoutDepth,
-    /// Vulkan format that matches `depth.drm_fourcc()` byte layout.
-    pub vk_format: vk::Format,
-    /// Intermediate fp16 / fp32 format for the renderer.
-    pub intermediate_format: vk::Format,
-    /// Per-output encode shader composition.
-    pub encode_config: &'a EncodeConfig,
-}
 
 /// One BO + Vulkan view + DRM framebuffer handle. Two of these live in
 /// `OutputContext` for double buffering. Field order matters for Drop:
@@ -68,9 +45,13 @@ struct ScanoutBuffer {
     fb: framebuffer::Handle,
 }
 
-/// All the per-output state. Drop releases scanout cleanly.
+/// The per-output state. Drop releases scanout cleanly.
+///
+/// Construction (`OutputContext::new`) takes a pre-opened [`DrmCardContext`]
+/// (borrowed for construction only), the [`Arc<Device>`] for the GPU that
+/// will render frames for this output, a pre-resolved [`OutputPick`]
+/// (connector + crtc + mode + connector_name), and the static [`OutputConfig`].
 pub struct OutputContext {
-    // Field order matters: surface → scanout buffers → renderer → GBM → drm → session.
     pub surface: DrmSurface,
     /// Two-element ring; `back_index` selects which one to render into next.
     /// On first present we render `buffers[0]` and mode-set to it.
@@ -81,15 +62,23 @@ pub struct OutputContext {
     /// the buffer the display is actively reading.
     back_index: usize,
     pub renderer: Renderer,
-    _gbm: GbmDevice,
-    /// DRM device — kept alive so the surface, FBs, and BOs remain valid.
-    pub drm: DrmDevice,
-    /// libseat session — last out, so the DRM fd stays open through the others' drops.
-    pub session: SeatSession,
     /// Width × height in pixels.
     pub extent: vk::Extent2D,
     /// Connector name for logging.
     pub connector_name: String,
+    /// Connector handle (for routing / config queries).
+    pub connector: connector::Handle,
+    /// CRTC bound to this output. The vblank event from `DrmDeviceNotifier`
+    /// carries the CRTC handle; the main loop uses this to route to the
+    /// right OutputContext on a multi-output card.
+    pub crtc: crtc::Handle,
+    /// DrmDevId of the GPU whose `Device` this output's renderer was built
+    /// from. The render path uses this to look up the correct per-GPU
+    /// texture import (or per-GPU shm upload) when sampling client surfaces.
+    pub gpu_id: DrmDevId,
+    /// The static config used at construction. Held so HDR / calibration
+    /// reconfig later can read what we currently have.
+    pub config: OutputConfig,
     /// Set on first present to switch from `commit` (mode-set) to `page_flip`
     /// (just-swap-fb) for subsequent frames.
     mode_set_done: bool,
@@ -100,88 +89,89 @@ pub struct OutputContext {
 }
 
 impl OutputContext {
-    /// Bring up the integrated output. Returns `(context, OutputNotifiers)`.
-    /// Both notifiers MUST be inserted into the caller's calloop event loop.
+    /// Bring up an output on the given card+GPU with the given connector pick
+    /// and static config. Allocates the scanout buffers + builds the renderer.
+    ///
+    /// The card is borrowed mutably for construction only (smithay's
+    /// `DrmDevice::create_surface` takes `&mut`); once allocated, the
+    /// OutputContext doesn't reference the card directly (DrmSurface keeps
+    /// its own internal handle to the device fd).
     pub fn new(
-        device: Arc<prism_renderer::Device>,
-        setup: OutputSetup<'_>,
-    ) -> Result<(Self, OutputNotifiers)> {
-        let (mut session, session_notifier) = SeatSession::new()?;
-        if !session.is_active() {
-            return Err(anyhow!(
-                "libseat session not active — must be run from a foreground VT"
-            ));
-        }
-        let drm_fd = session.open_drm(setup.drm_path)?;
-        let (mut drm, drm_notifier) = smithay::backend::drm::DrmDevice::new(drm_fd, false)
-            .with_context(|| format!("DrmDevice::new({})", setup.drm_path))?;
+        card: &mut DrmCardContext,
+        device: Arc<Device>,
+        pick: OutputPick,
+        config: &OutputConfig,
+    ) -> Result<Self> {
+        let gpu_id = device
+            .physical
+            .drm_primary
+            .or(device.physical.drm_render)
+            .ok_or_else(|| {
+                anyhow::anyhow!("renderer Device has no DRM node id; cannot build OutputContext")
+            })?;
 
-        let pick = match setup.output_name {
-            Some(name) => pick_by_name(&drm, name)?,
-            None => pick_first_connected(&drm)?,
-        };
         tracing::info!(
-            "output bringup: {} mode={}x{}@{}Hz crtc={:?} depth={:?}",
+            "output bringup: {} mode={}x{}@{}Hz crtc={:?} depth={:?} gpu={}:{}",
             pick.connector_name,
             pick.mode.size().0,
             pick.mode.size().1,
             pick.mode.vrefresh(),
             pick.crtc,
-            setup.depth,
+            config.depth,
+            gpu_id.major,
+            gpu_id.minor,
         );
 
-        match set_connector_max_bpc(&drm, pick.connector, setup.depth.max_bpc()) {
-            Ok(true) => tracing::info!("connector max bpc set to {}", setup.depth.max_bpc()),
+        match set_connector_max_bpc(&card.drm, pick.connector, config.depth.max_bpc()) {
+            Ok(true) => tracing::info!("connector max bpc set to {}", config.depth.max_bpc()),
             Ok(false) => tracing::warn!(
                 "connector doesn't expose 'max bpc'; link depth driver-controlled"
             ),
             Err(e) => tracing::warn!("set max bpc failed: {e:#}"),
         }
 
-        let surface = drm
+        tracing::info!(connector = %pick.connector_name, "OutputContext::new step: create_surface");
+        let surface = card
+            .drm
             .create_surface(pick.crtc, pick.mode, &[pick.connector])
             .with_context(|| format!("create_surface on {:?}", pick.crtc))?;
 
-        let gbm = GbmDevice::from_device_fd(drm.device_fd().device_fd())?;
         let (w, h) = pick.mode.size();
         let extent = vk::Extent2D {
             width: w as u32,
             height: h as u32,
         };
 
-        // Two scanout buffers (double-buffered).
-        let buffer_a =
-            alloc_scanout_buffer(&device, &drm, &gbm, &setup, extent, "buffer A")?;
-        let buffer_b =
-            alloc_scanout_buffer(&device, &drm, &gbm, &setup, extent, "buffer B")?;
+        // Two scanout buffers (double-buffered). See module doc.
+        tracing::info!(connector = %pick.connector_name, "OutputContext::new step: alloc buffer A");
+        let buffer_a = alloc_scanout_buffer(&device, card, config, extent, "buffer A")?;
+        tracing::info!(connector = %pick.connector_name, "OutputContext::new step: alloc buffer B");
+        let buffer_b = alloc_scanout_buffer(&device, card, config, extent, "buffer B")?;
         let buffers = [buffer_a, buffer_b];
 
+        tracing::info!(connector = %pick.connector_name, "OutputContext::new step: Renderer::new");
         let renderer = Renderer::new(
             device.clone(),
-            setup.vk_format,
-            setup.intermediate_format,
-            setup.encode_config,
+            config.vk_format,
+            config.intermediate_format,
+            &config.encode_config,
         )?;
+        tracing::info!(connector = %pick.connector_name, "OutputContext::new step: done");
 
-        Ok((
-            Self {
-                session,
-                drm,
-                _gbm: gbm,
-                buffers,
-                back_index: 0,
-                renderer,
-                surface,
-                extent,
-                connector_name: pick.connector_name,
-                mode_set_done: false,
-                frame_pending: false,
-            },
-            OutputNotifiers {
-                drm: drm_notifier,
-                session: session_notifier,
-            },
-        ))
+        Ok(Self {
+            surface,
+            buffers,
+            back_index: 0,
+            renderer,
+            extent,
+            connector_name: pick.connector_name,
+            connector: pick.connector,
+            crtc: pick.crtc,
+            gpu_id,
+            config: config.clone(),
+            mode_set_done: false,
+            frame_pending: false,
+        })
     }
 
     /// Clear the `frame_pending` flag AND advance the back-buffer index.
@@ -255,18 +245,18 @@ impl OutputContext {
 }
 
 fn alloc_scanout_buffer(
-    device: &Arc<prism_renderer::Device>,
-    drm: &DrmDevice,
-    gbm: &GbmDevice,
-    setup: &OutputSetup<'_>,
+    device: &Arc<Device>,
+    card: &DrmCardContext,
+    config: &OutputConfig,
     extent: vk::Extent2D,
     label: &str,
 ) -> Result<ScanoutBuffer> {
-    let (bo, dmabuf) = gbm
+    let (bo, dmabuf) = card
+        .gbm
         .allocate_scanout(
             extent.width,
             extent.height,
-            setup.depth.drm_fourcc(),
+            config.depth.drm_fourcc(),
             &[DrmModifier::Linear],
         )
         .with_context(|| {
@@ -275,16 +265,16 @@ fn alloc_scanout_buffer(
                 label,
                 extent.width,
                 extent.height,
-                setup.depth.drm_fourcc()
+                config.depth.drm_fourcc()
             )
         })?;
     let image = ImportedImage::import(
         device.clone(),
         &dmabuf,
-        setup.vk_format,
+        config.vk_format,
         vk::ImageUsageFlags::COLOR_ATTACHMENT,
     )?;
-    let fb = add_framebuffer_for_bo(drm, &bo)?;
+    let fb = add_framebuffer_for_bo(&card.drm, &bo)?;
     Ok(ScanoutBuffer {
         image,
         _bo: bo,
@@ -295,8 +285,21 @@ fn alloc_scanout_buffer(
 impl Drop for OutputContext {
     fn drop(&mut self) {
         // Best-effort scanout clear so the desktop session reclaims a known
-        // state. Ignoring the EINVAL we observed earlier — already documented
-        // as a follow-up.
-        let _ = self.surface.clear();
+        // state. May still fail with EINVAL (smithay's clear_state quirk)
+        // or EACCES if libseat released master before us — but the latter
+        // is a Drop-order bug; complain loudly so it gets fixed.
+        let t0 = std::time::Instant::now();
+        match self.surface.clear() {
+            Ok(()) => tracing::debug!(
+                connector = %self.connector_name,
+                "OutputContext drop: surface.clear() OK in {}ms",
+                t0.elapsed().as_millis()
+            ),
+            Err(e) => tracing::warn!(
+                connector = %self.connector_name,
+                "OutputContext drop: surface.clear() failed in {}ms: {e}",
+                t0.elapsed().as_millis()
+            ),
+        }
     }
 }

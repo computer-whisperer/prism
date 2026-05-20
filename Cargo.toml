@@ -9,6 +9,7 @@ members = [
     "crates/prism-layout",
     "crates/prism-protocols",
     "crates/prism-renderer",
+    "crates/prism-shmtest",
 ]
 
 [workspace.package]

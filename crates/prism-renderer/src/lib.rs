@@ -12,6 +12,7 @@ pub mod intermediate;
 pub mod oneshot;
 pub mod pipeline;
 pub mod renderer;
+pub mod upload;
 
 pub use device::{Device, DrmDevId, PhysicalDeviceInfo};
 pub use dmabuf::ImportedImage;
@@ -23,6 +24,7 @@ pub use oneshot::OneshotPool;
 pub use pipeline::decode::{DecodePipeline, DecodePush};
 pub use pipeline::encode::{EncodePipeline, EncodePush};
 pub use renderer::{ElementDraw, Renderer};
+pub use upload::ShmTexture;
 
 // Re-export ash::vk so binary / glue crates don't need a direct ash dep.
 pub use ash::vk;

@@ -90,29 +90,7 @@ where
     F: Fn(&str) -> bool,
 {
     let resources = drm.resource_handles().context("resource_handles")?;
-
-    // Build the set of CRTCs currently bound to *other* connectors (a prior
-    // desktop session usually leaves these bound to its assignments). Reusing
-    // one would require atomically disabling the other connector's CRTC in
-    // the same commit, which we don't do — the kernel rejects the test
-    // commit with "Atomic Test failed for crtc X". So treat them as occupied.
-    let mut occupied_crtcs: Vec<crtc::Handle> = Vec::new();
-    for &c in resources.connectors() {
-        let info = drm.get_connector(c, false).ok();
-        let Some(info) = info else { continue };
-        if info.state() != connector::State::Connected {
-            continue;
-        }
-        let Some(enc_h) = info.current_encoder() else {
-            continue;
-        };
-        let Ok(enc) = drm.get_encoder(enc_h) else {
-            continue;
-        };
-        if let Some(crtc_h) = enc.crtc() {
-            occupied_crtcs.push(crtc_h);
-        }
-    }
+    let occupied_by_other = collect_other_session_crtcs(drm, &resources);
 
     for &conn_h in resources.connectors() {
         let info = drm
@@ -125,51 +103,157 @@ where
         if !matches(&name) {
             continue;
         }
-        let mode = info
-            .modes()
-            .iter()
-            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-            .or_else(|| info.modes().first())
-            .copied();
-        let Some(mode) = mode else {
+        let Some(mode) = preferred_mode(&info) else {
+            continue;
+        };
+        let pick = match resolve_pick(drm, &resources, conn_h, &info, &name, mode, &occupied_by_other, &[]) {
+            Ok(p) => p,
+            Err(e) => return Err(e),
+        };
+        return Ok(pick);
+    }
+    Err(anyhow!("no connected connector with a usable mode + CRTC"))
+}
+
+/// Pick every connected connector with a usable mode + free CRTC.
+///
+/// Each successful pick reserves its CRTC against subsequent picks in the
+/// same call, so two of our outputs can't accidentally collide on the same
+/// CRTC. Connectors that can't be assigned (no free CRTC, no preferred
+/// mode, etc.) are skipped with a warning rather than aborting the whole
+/// bringup — useful on hardware with more connectors than CRTCs (DP MST
+/// splitters etc.) where partial bringup is the right answer.
+///
+/// Returns the picks in connector-order. Empty result is success-with-zero-
+/// outputs (caller may treat that as an error of its own).
+pub fn pick_all_connected(drm: &DrmDevice) -> Result<Vec<OutputPick>> {
+    let resources = drm.resource_handles().context("resource_handles")?;
+    let occupied_by_other = collect_other_session_crtcs(drm, &resources);
+
+    let mut picks: Vec<OutputPick> = Vec::new();
+    for &conn_h in resources.connectors() {
+        let info = match drm.get_connector(conn_h, false) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!("get_connector {conn_h:?} failed: {e:#}; skipping");
+                continue;
+            }
+        };
+        if info.state() != connector::State::Connected {
+            continue;
+        }
+        let name = format!("{:?}-{}", info.interface(), info.interface_id());
+        let Some(mode) = preferred_mode(&info) else {
+            tracing::warn!("{name}: no usable mode; skipping");
             continue;
         };
 
-        // Allowed: our connector's own current CRTC (if any), plus any free
-        // CRTC. Reject CRTCs bound to *other* connectors.
-        let own_crtc: Option<crtc::Handle> = info
-            .current_encoder()
-            .and_then(|enc_h| drm.get_encoder(enc_h).ok())
-            .and_then(|enc| enc.crtc());
-
-        let mut chosen_crtc: Option<crtc::Handle> = None;
-        'pick: for &enc_h in info.encoders() {
-            let enc = drm
-                .get_encoder(enc_h)
-                .with_context(|| format!("get_encoder {enc_h:?}"))?;
-            for candidate in resources.filter_crtcs(enc.possible_crtcs()) {
-                let occupied_by_other = occupied_crtcs.contains(&candidate)
-                    && Some(candidate) != own_crtc;
-                if !occupied_by_other {
-                    chosen_crtc = Some(candidate);
-                    break 'pick;
-                }
+        let used_by_us: Vec<crtc::Handle> = picks.iter().map(|p| p.crtc).collect();
+        match resolve_pick(
+            drm,
+            &resources,
+            conn_h,
+            &info,
+            &name,
+            mode,
+            &occupied_by_other,
+            &used_by_us,
+        ) {
+            Ok(p) => {
+                tracing::info!(
+                    "{name}: assigned crtc {:?} mode={}x{}@{}Hz",
+                    p.crtc,
+                    p.mode.size().0,
+                    p.mode.size().1,
+                    p.mode.vrefresh()
+                );
+                picks.push(p);
+            }
+            Err(e) => {
+                tracing::warn!("{name}: cannot bring up: {e:#}; skipping");
             }
         }
-        let Some(crtc_h) = chosen_crtc else {
-            return Err(anyhow!(
-                "no free CRTC available for {name} (all compatible CRTCs are bound to other connectors)"
-            ));
-        };
-
-        return Ok(OutputPick {
-            connector: conn_h,
-            mode,
-            crtc: crtc_h,
-            connector_name: name,
-        });
     }
-    Err(anyhow!("no connected connector with a usable mode + CRTC"))
+    Ok(picks)
+}
+
+/// CRTCs currently bound to *other* sessions' connectors (a prior desktop
+/// session usually leaves these bound to its assignments). Reusing one
+/// would require atomically disabling the other connector's CRTC in the
+/// same commit, which we don't do — the kernel rejects the test commit
+/// with "Atomic Test failed for crtc X".
+fn collect_other_session_crtcs(
+    drm: &DrmDevice,
+    resources: &smithay::reexports::drm::control::ResourceHandles,
+) -> Vec<crtc::Handle> {
+    let mut out = Vec::new();
+    for &c in resources.connectors() {
+        let Ok(info) = drm.get_connector(c, false) else { continue };
+        if info.state() != connector::State::Connected {
+            continue;
+        }
+        let Some(enc_h) = info.current_encoder() else { continue };
+        let Ok(enc) = drm.get_encoder(enc_h) else { continue };
+        if let Some(crtc_h) = enc.crtc() {
+            out.push(crtc_h);
+        }
+    }
+    out
+}
+
+fn preferred_mode(info: &connector::Info) -> Option<Mode> {
+    info.modes()
+        .iter()
+        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+        .or_else(|| info.modes().first())
+        .copied()
+}
+
+/// Find a free CRTC for this connector, building an `OutputPick`.
+///
+/// `occupied_by_other` are CRTCs we treat as off-limits because another
+/// session owns them; `also_excluded` are CRTCs we've already picked in
+/// the current bringup pass (multi-output uses this to avoid collisions).
+/// A CRTC currently bound to *this* connector by another session is
+/// still acceptable (we'll grab master and rebind it).
+fn resolve_pick(
+    drm: &DrmDevice,
+    resources: &smithay::reexports::drm::control::ResourceHandles,
+    conn_h: connector::Handle,
+    info: &connector::Info,
+    name: &str,
+    mode: Mode,
+    occupied_by_other: &[crtc::Handle],
+    also_excluded: &[crtc::Handle],
+) -> Result<OutputPick> {
+    let own_crtc: Option<crtc::Handle> = info
+        .current_encoder()
+        .and_then(|enc_h| drm.get_encoder(enc_h).ok())
+        .and_then(|enc| enc.crtc());
+
+    for &enc_h in info.encoders() {
+        let enc = drm
+            .get_encoder(enc_h)
+            .with_context(|| format!("get_encoder {enc_h:?}"))?;
+        for candidate in resources.filter_crtcs(enc.possible_crtcs()) {
+            if also_excluded.contains(&candidate) {
+                continue;
+            }
+            let blocked_by_other =
+                occupied_by_other.contains(&candidate) && Some(candidate) != own_crtc;
+            if !blocked_by_other {
+                return Ok(OutputPick {
+                    connector: conn_h,
+                    mode,
+                    crtc: candidate,
+                    connector_name: name.to_string(),
+                });
+            }
+        }
+    }
+    Err(anyhow!(
+        "no free CRTC available for {name} (all compatible CRTCs are bound to other connectors or already picked in this pass)"
+    ))
 }
 
 /// Add a framebuffer for a GBM BO. The BO must have a non-INVALID modifier

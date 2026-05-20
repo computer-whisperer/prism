@@ -11,3 +11,9 @@ Cargo.lock.bak
 
 # OS
 .DS_Store
+
+# Test-run artifacts from scripts/tty-test.sh
+prism.log
+prism.crumbs
+prism-client.log
+tty-test.log

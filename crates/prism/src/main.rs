@@ -13,10 +13,21 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // Capture panic messages to the (fsync'd) breadcrumb file so we can
+    // still see them after a hard process exit that loses stderr buffer
+    // contents — happens during TTY runs where stderr goes to a file the
+    // script can't flush on our behalf.
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = format!("PANIC: {info}");
+        breadcrumb(&msg);
+        default_panic(info);
+    }));
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let output_name = args.get(1).map(String::as_str);
     let depth_arg = args.get(2).map(String::as_str);
-    match args.first().map(String::as_str) {
+    let result: Result<()> = match args.first().map(String::as_str) {
         None => run_headless_smoke_tests(),
         Some("scanout") => run_scanout_smoke_test(output_name),
         Some("gradient") => run_gradient_scanout(output_name, parse_depth(depth_arg)?),
@@ -25,7 +36,13 @@ fn main() -> Result<()> {
         Some(other) => Err(anyhow!(
             "unknown subcommand {other:?}; expected: (no args) | scanout [output] | gradient [output] [8|10] | wayland | run [output] [8|10]"
         )),
+    };
+    if let Err(e) = &result {
+        // Mirror the error into the breadcrumb file so it survives a TTY
+        // run where stderr buffering may eat the standard anyhow display.
+        breadcrumb(&format!("EXIT ERROR: {e:#}"));
     }
+    result
 }
 
 fn parse_depth(arg: Option<&str>) -> Result<prism_drm::ScanoutDepth> {
@@ -74,7 +91,16 @@ fn run_wayland_server() -> Result<()> {
     tracing::info!("Vulkan device for dmabuf import: {}", device.physical.name);
 
     let display = prism_protocols::new_display()?;
-    let mut state = prism_protocols::PrismState::new(&display, device);
+    // Wayland-only mode: no DRM session, one GPU available for dmabuf import
+    // validation. Key the gpu map by drm_primary (or drm_render fallback).
+    let mut gpus = std::collections::HashMap::new();
+    let key = device
+        .physical
+        .drm_primary
+        .or(device.physical.drm_render)
+        .ok_or_else(|| anyhow!("Vulkan device has no DRM node id; cannot index"))?;
+    gpus.insert(key, device);
+    let mut state = prism_protocols::PrismState::new(&display, None, gpus);
 
     let mut event_loop: EventLoop<'static, prism_protocols::PrismState> =
         EventLoop::try_new().context("calloop EventLoop::try_new")?;
@@ -697,12 +723,18 @@ fn breadcrumb(msg: &str) {
 fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> Result<()> {
     use calloop::EventLoop;
     use calloop::signals::{Signal, Signals};
-    use prism_drm::{OutputContext, OutputSetup};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
 
     let max_frames: Option<u32> = std::env::var("PRISM_MAX_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    // Wall-clock shutdown trigger. Cleaner than `max_frames` for
+    // multi-output (frame counter rate scales with output count). When set,
+    // a thread flips `running` to false after N seconds, the main dispatch
+    // loop notices and exits cleanly.
+    let max_runtime_secs: Option<u64> = std::env::var("PRISM_MAX_RUNTIME_SECS")
         .ok()
         .and_then(|s| s.parse().ok());
     // Hard self-kill watchdog. Spawns a sleeper thread that SIGKILLs our
@@ -715,7 +747,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
     breadcrumb(&format!(
-        "startup: vblank-driven, max_frames={max_frames:?}, watchdog={watchdog_secs}s"
+        "startup: vblank-driven, max_frames={max_frames:?}, max_runtime={max_runtime_secs:?}s, watchdog={watchdog_secs}s"
     ));
     if watchdog_secs > 0 {
         let secs = watchdog_secs;
@@ -730,109 +762,251 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
 
     tracing::info!("prism — integrated mode (wayland + scanout)");
 
-    // Vulkan.
+    // ── Vulkan instance (devices opened later, one per card) ──────────────
     let instance = prism_renderer::Instance::new()?;
-    let device = prism_renderer::Device::new(
-        instance.clone(),
-        Some(prism_renderer::DrmDevId {
-            major: 226,
-            minor: 129,
-        }),
-    )?;
-    tracing::info!("Vulkan device: {}", device.physical.name);
-    breadcrumb("vulkan device up");
+    breadcrumb("vulkan instance up");
 
-    // Output bringup (DRM master, scanout BO, renderer).
-    let encode_config = prism_renderer::EncodeConfig::default_srgb();
-    let (output, notifiers) = OutputContext::new(
-        device.clone(),
-        OutputSetup {
-            drm_path: "/dev/dri/card0",
-            output_name,
-            depth,
-            vk_format: vk_format_for_depth(depth),
-            intermediate_format: prism_renderer::DEFAULT_INTERMEDIATE_FORMAT,
-            encode_config: &encode_config,
-        },
-    )?;
-    let extent = output.extent;
-    let output_name_for_log = output.connector_name.clone();
-    breadcrumb(&format!(
-        "output bringup ok: {} {}x{}",
-        output_name_for_log, extent.width, extent.height
-    ));
+    // ── DRM session ────────────────────────────────────────────────────────
+    let (mut session, session_notifier) = prism_drm::SeatSession::new()?;
+    if !session.is_active() {
+        return Err(anyhow!(
+            "libseat session not active — must be run from a foreground VT"
+        ));
+    }
 
-    // Wayland display + PrismState; attach the output.
+    // ── Open every card we want to drive ───────────────────────────────────
+    // CARDS env var overrides the hard-coded list (comma-separated paths,
+    // e.g. CARDS=/dev/dri/card1). Default: both cards on this hardware.
+    let card_paths: Vec<String> = match std::env::var("CARDS").ok() {
+        Some(s) => s.split(',').map(|p| p.trim().to_string()).collect(),
+        None => vec!["/dev/dri/card0".into(), "/dev/dri/card1".into()],
+    };
+    let mut cards: Vec<prism_drm::DrmCardContext> = Vec::new();
+    let mut drm_notifiers: Vec<smithay::backend::drm::DrmDeviceNotifier> = Vec::new();
+    for path in &card_paths {
+        match prism_drm::DrmCardContext::open(&mut session, path) {
+            Ok((card, notifier)) => {
+                breadcrumb(&format!(
+                    "card opened: {} (drm {}:{})",
+                    card.path, card.drm_dev_id.major, card.drm_dev_id.minor
+                ));
+                cards.push(card);
+                drm_notifiers.push(notifier);
+            }
+            Err(e) => {
+                tracing::warn!("skipping card {path}: {e:#}");
+                breadcrumb(&format!("card open FAILED: {path}: {e:#}"));
+            }
+        }
+    }
+    if cards.is_empty() {
+        return Err(anyhow!("no DRM cards could be opened"));
+    }
+
+    // ── Build a Vulkan device per opened card ──────────────────────────────
+    // Match Vulkan physical devices to DRM cards via DrmDevId. If a card
+    // has no matching Vulkan device (driver mismatch), skip that card's
+    // outputs but keep the rest of the bringup.
+    let mut gpus: std::collections::HashMap<
+        prism_renderer::DrmDevId,
+        Arc<prism_renderer::Device>,
+    > = std::collections::HashMap::new();
+    for card in &cards {
+        match prism_renderer::Device::new(instance.clone(), Some(card.drm_dev_id)) {
+            Ok(device) => {
+                tracing::info!(
+                    "GPU for card {} ({}:{}): {}",
+                    card.path,
+                    card.drm_dev_id.major,
+                    card.drm_dev_id.minor,
+                    device.physical.name
+                );
+                gpus.insert(card.drm_dev_id, device);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "no Vulkan device matches card {} ({}:{}): {e:#}",
+                    card.path,
+                    card.drm_dev_id.major,
+                    card.drm_dev_id.minor
+                );
+            }
+        }
+    }
+    if gpus.is_empty() {
+        return Err(anyhow!("no Vulkan devices matched any opened card"));
+    }
+    breadcrumb(&format!("vulkan devices: {} GPU(s)", gpus.len()));
+
+    // For now every output uses the same OutputConfig (same depth, same
+    // encode chain). Per-output config (from EDID + user config) is the
+    // job of #59.x-later; today we let depth come from the CLI to keep
+    // existing test flows working.
+    let output_config = prism_drm::OutputConfig {
+        depth,
+        vk_format: vk_format_for_depth(depth),
+        intermediate_format: prism_renderer::DEFAULT_INTERMEDIATE_FORMAT,
+        encode_config: prism_renderer::EncodeConfig::default_srgb(),
+    };
+
+    // ── Pick connectors + bring up OutputContexts on every card ────────────
+    // If OUTPUT specifies a connector name, search every card for it and
+    // bring up only that one. Otherwise pick_all_connected on each card.
+    let mut outputs: Vec<prism_drm::OutputContext> = Vec::new();
+    for card in &mut cards {
+        breadcrumb(&format!("bringup loop: entering card {}", card.path));
+        let Some(device) = gpus.get(&card.drm_dev_id).cloned() else {
+            tracing::warn!(
+                "card {} has no GPU; skipping all its outputs",
+                card.path
+            );
+            breadcrumb(&format!(
+                "bringup loop: {} has no matching GPU, skipping",
+                card.path
+            ));
+            continue;
+        };
+        breadcrumb(&format!("bringup loop: {} picking connectors", card.path));
+        let picks: Vec<prism_drm::OutputPick> = match output_name {
+            Some(name) => match prism_drm::pick_by_name(&card.drm, name) {
+                Ok(p) => vec![p],
+                Err(_) => Vec::new(), // OUTPUT might be on a different card
+            },
+            None => prism_drm::pick_all_connected(&card.drm).unwrap_or_default(),
+        };
+        breadcrumb(&format!(
+            "bringup loop: {} got {} pick(s)",
+            card.path,
+            picks.len()
+        ));
+        for pick in picks {
+            let name = pick.connector_name.clone();
+            breadcrumb(&format!("bringup loop: building OutputContext for {name}"));
+            match prism_drm::OutputContext::new(card, device.clone(), pick, &output_config) {
+                Ok(output) => {
+                    breadcrumb(&format!(
+                        "output bringup ok: {} {}x{} on {}",
+                        name, output.extent.width, output.extent.height, card.path
+                    ));
+                    outputs.push(output);
+                }
+                Err(e) => {
+                    breadcrumb(&format!("output bringup FAILED for {name}: {e:#}"));
+                    tracing::warn!("output bringup failed for {name}: {e:#}");
+                }
+            }
+        }
+        breadcrumb(&format!("bringup loop: finished card {}", card.path));
+    }
+    breadcrumb(&format!("bringup loop: all cards done, {} outputs total", outputs.len()));
+    if outputs.is_empty() {
+        return Err(anyhow!("no outputs successfully brought up across any card"));
+    }
+
+    // ── Wayland display + PrismState ───────────────────────────────────────
     let display = prism_protocols::new_display()?;
-    let mut state = prism_protocols::PrismState::new(&display, device.clone());
-    state.attach_output(output);
-    breadcrumb("wayland state up, output attached");
-
-    // Demo content: the same gradient as `prism gradient`. Owned outside the
-    // PrismState because GradientTexture is binary-local. The texture view
-    // gets handed to the render callback via a closure.
-    let gradient_texture = build_gradient_texture(device.clone(), 1024)?;
-    let gradient_view = gradient_texture.view;
-    let _hold_texture = gradient_texture; // keep alive
+    let mut state = prism_protocols::PrismState::new(&display, Some(session), gpus);
+    for card in cards {
+        state.attach_card(card);
+    }
+    for output in outputs {
+        state.attach_output(output);
+    }
+    breadcrumb(&format!(
+        "wayland state up; {} card(s) + {} output(s) attached",
+        state.cards.len(),
+        state.outputs.len()
+    ));
 
     // Event loop + sources.
     let mut event_loop: EventLoop<'static, prism_protocols::PrismState> =
         EventLoop::try_new().context("EventLoop::try_new")?;
     let socket = prism_protocols::insert_wayland_sources(&event_loop.handle(), display)?;
     tracing::info!("WAYLAND_DISPLAY={socket}");
-    tracing::info!("scanout target: {output_name_for_log} {}×{}", extent.width, extent.height);
+    for output in state.outputs.values() {
+        tracing::info!(
+            "scanout target: {} {}×{} (crtc {:?})",
+            output.connector_name, output.extent.width, output.extent.height, output.crtc
+        );
+    }
 
     // Shared shutdown flag, set by signal handlers AND by the vblank handler
     // once max_frames has been hit. Defined here so both can reference it.
     let running = Arc::new(AtomicBool::new(true));
     let frame_counter = Arc::new(AtomicU32::new(0));
 
-    // DRM vblank handler: marks the previous flip done AND triggers the
-    // next render. This is the heartbeat of vblank-driven pacing — present
-    // → wait for vblank → present again. Bootstrapped below with one
-    // explicit present that does the mode-set commit, after which every
-    // subsequent frame is kicked off by a vblank from the prior flip.
-    let running_for_vblank = running.clone();
-    let frame_counter_for_vblank = frame_counter.clone();
+    // Wall-clock shutdown timer (if PRISM_MAX_RUNTIME_SECS is set). Flips
+    // `running` to false after N seconds. Cleaner than frame-count caps
+    // for multi-output, where total frames-per-second scales with the
+    // number of outputs.
+    if let Some(secs) = max_runtime_secs {
+        let running = running.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            breadcrumb(&format!("MAX_RUNTIME: {secs}s elapsed, requesting clean exit"));
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    // DRM vblank handler — one per card (each card's DrmDeviceNotifier
+    // fires only for its own CRTCs). Marks the just-flipped output's
+    // page-flip done AND triggers its next render. This is the heartbeat
+    // of vblank-driven pacing — present → wait for vblank → present again.
+    // Bootstrapped below with one explicit present per output that does
+    // the mode-set commit; every subsequent frame is kicked off by a
+    // vblank from the prior flip.
     let max_frames_copy = max_frames;
-    event_loop
-        .handle()
-        .insert_source(notifiers.drm, move |event, _metadata, state| {
-            use smithay::backend::drm::DrmEvent;
-            match event {
-                DrmEvent::VBlank(_crtc) => {
-                    if let Some(output) = state.output.as_mut() {
+    for drm_notifier in drm_notifiers.drain(..) {
+        let running_for_vblank = running.clone();
+        let frame_counter_for_vblank = frame_counter.clone();
+        event_loop
+            .handle()
+            .insert_source(drm_notifier, move |event, _metadata, state| {
+                use smithay::backend::drm::DrmEvent;
+                match event {
+                    DrmEvent::VBlank(crtc) => {
+                        let Some(output) = state.output_for_crtc(crtc) else {
+                            breadcrumb(&format!("vblank for unknown crtc {crtc:?}"));
+                            return;
+                        };
                         output.mark_vblank();
+                        let n = frame_counter_for_vblank.fetch_add(1, Ordering::SeqCst) + 1;
+                        let t0 = std::time::Instant::now();
+                        let result = present_for_crtc(state, crtc);
+                        let dt_us = t0.elapsed().as_micros();
+                        match result {
+                            Ok(true) => breadcrumb(&format!(
+                                "frame #{n}: vblank({crtc:?}) → present submitted in {dt_us}µs"
+                            )),
+                            Ok(false) => {
+                                breadcrumb(&format!(
+                                    "frame #{n}: skipped after {dt_us}µs (still pending)"
+                                ));
+                            }
+                            Err(e) => {
+                                breadcrumb(&format!(
+                                    "frame #{n}: ERROR after {dt_us}µs: {e:#}"
+                                ));
+                                tracing::warn!("present failed: {e:#}");
+                            }
+                        }
+                        if let Some(max) = max_frames_copy {
+                            if n >= max {
+                                breadcrumb(&format!(
+                                    "frame #{n}: max_frames reached, exit"
+                                ));
+                                running_for_vblank.store(false, Ordering::SeqCst);
+                            }
+                        }
                     }
-                    let n = frame_counter_for_vblank.fetch_add(1, Ordering::SeqCst) + 1;
-                    breadcrumb(&format!("vblank → render frame #{n}"));
-                    match present_one_frame(state, gradient_view) {
-                        Ok(true) => breadcrumb(&format!("frame #{n}: submitted")),
-                        Ok(false) => {
-                            // Should be rare with vblank-driven scheduling
-                            // (we only render after a vblank cleared the gate)
-                            // but possible if vblanks fire back-to-back.
-                            breadcrumb(&format!("frame #{n}: skipped (still pending)"));
-                        }
-                        Err(e) => {
-                            breadcrumb(&format!("frame #{n}: ERROR {e:#}"));
-                            tracing::warn!("present failed: {e:#}");
-                        }
-                    }
-                    if let Some(max) = max_frames_copy {
-                        if n >= max {
-                            breadcrumb(&format!("frame #{n}: max_frames reached, exit"));
-                            running_for_vblank.store(false, Ordering::SeqCst);
-                        }
+                    DrmEvent::Error(e) => {
+                        breadcrumb(&format!("DRM event ERROR: {e:#}"));
+                        tracing::warn!("DRM event error: {e:#}");
                     }
                 }
-                DrmEvent::Error(e) => {
-                    breadcrumb(&format!("DRM event ERROR: {e:#}"));
-                    tracing::warn!("DRM event error: {e:#}");
-                }
-            }
-        })
-        .map_err(|e| anyhow!("insert drm notifier: {e}"))?;
+            })
+            .map_err(|e| anyhow!("insert drm notifier: {e}"))?;
+    }
 
     // Drain libseat session events. CRITICAL: without this, logind can't
     // request a VT switch (we never ack the "pause" message), which blocks
@@ -841,7 +1015,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     // own dispatch path; we just need process_events to run.
     event_loop
         .handle()
-        .insert_source(notifiers.session, |event, _, _state| {
+        .insert_source(session_notifier, |event, _, _state| {
             use smithay::backend::session::Event as SessionEvent;
             match event {
                 SessionEvent::PauseSession => {
@@ -873,17 +1047,25 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             .map_err(|e| anyhow!("insert signals source: {e}"))?;
     }
 
-    // Bootstrap: render frame #1 explicitly so the kernel has a vblank to
-    // schedule. From here on, the DRM vblank handler triggers each next
-    // present — true vblank-driven pacing at the panel's refresh rate.
-    let n0 = frame_counter.fetch_add(1, Ordering::SeqCst) + 1;
-    breadcrumb(&format!("bootstrap → render frame #{n0}"));
-    match present_one_frame(&mut state, gradient_view) {
-        Ok(true) => breadcrumb(&format!("frame #{n0}: submitted (mode-set commit)")),
-        Ok(false) => breadcrumb(&format!("frame #{n0}: skipped (unexpected at bootstrap)")),
-        Err(e) => {
-            breadcrumb(&format!("frame #{n0}: ERROR {e:#}"));
-            return Err(e).context("bootstrap present");
+    // Bootstrap: render frame #1 on every attached output explicitly so
+    // the kernel has a vblank to schedule. From here on, each output's
+    // DRM vblank handler triggers its next present — true vblank-driven
+    // pacing at the panel's refresh rate. Before any client connects, the
+    // element list is empty: scanout shows a black frame, but the page-flip
+    // cycle is up and running so a later commit lands in the next vblank.
+    let bootstrap_crtcs: Vec<_> = state.outputs.values().map(|o| o.crtc).collect();
+    for crtc in bootstrap_crtcs {
+        let n0 = frame_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        breadcrumb(&format!("bootstrap({crtc:?}) → render frame #{n0}"));
+        match present_for_crtc(&mut state, crtc) {
+            Ok(true) => breadcrumb(&format!("frame #{n0}: submitted (mode-set commit)")),
+            Ok(false) => {
+                breadcrumb(&format!("frame #{n0}: skipped (unexpected at bootstrap)"))
+            }
+            Err(e) => {
+                breadcrumb(&format!("frame #{n0}: ERROR {e:#}"));
+                return Err(e).context("bootstrap present");
+            }
         }
     }
 
@@ -900,29 +1082,161 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
 
     breadcrumb("dispatch loop exited cleanly");
     tracing::info!("integrated loop stopped");
+
+    // Explicit, instrumented teardown.
+    //
+    // Order matters. The libseat-grant (DRM master) is held by
+    // `LibSeatSessionImpl`, which is owned by `LibSeatSessionNotifier`
+    // (inside event_loop). The `SeatSession` we stash in PrismState is
+    // just a `Weak<LibSeatSessionImpl>` — dropping PrismState does NOT
+    // release master. Master release happens when the libseat notifier
+    // source inside event_loop drops.
+    //
+    // Same shape for DrmDevice: `DrmDeviceNotifier` holds an
+    // `Arc<DrmDeviceInternal>`. `DrmDevice::Drop` (which tries its own
+    // `clear_state`) only fires when the LAST Arc is gone — which means
+    // after both PrismState's `DrmCardContext` AND event_loop's notifier
+    // both drop.
+    //
+    // Therefore: drop PrismState FIRST while master is still held by
+    // event_loop's libseat notifier — gives `OutputContext::Drop` a
+    // chance to `surface.clear()` successfully. Then drop event_loop;
+    // calloop drops sources in insertion order (drm_notifier first,
+    // session_notifier second), so DrmDevice::Drop fires (its own
+    // clear_state succeeds) BEFORE the libseat seat closes.
+    breadcrumb(&format!(
+        "shutdown: outputs={} cards={} gpus={} dmabuf_textures={}",
+        state.outputs.len(),
+        state.cards.len(),
+        state.gpus.len(),
+        state.dmabuf_textures.len()
+    ));
+    let t_start = std::time::Instant::now();
+
+    // Take + drop outputs one at a time so we can attribute hangs to a
+    // specific OutputContext (surface.clear, Renderer Drop, scanout buffer
+    // Drop with imported image + GBM BO).
+    let outputs = std::mem::take(&mut state.outputs);
+    breadcrumb(&format!("shutdown: dropping {} outputs", outputs.len()));
+    for (id, output) in outputs {
+        let t = std::time::Instant::now();
+        let crtc = output.crtc;
+        drop(output);
+        breadcrumb(&format!(
+            "shutdown: dropped output {id} (crtc {crtc:?}) in {}ms",
+            t.elapsed().as_millis()
+        ));
+    }
+
+    let t = std::time::Instant::now();
+    state.dmabuf_textures.clear();
+    breadcrumb(&format!(
+        "shutdown: cleared dmabuf_textures in {}ms",
+        t.elapsed().as_millis()
+    ));
+
+    let t = std::time::Instant::now();
+    let cards = std::mem::take(&mut state.cards);
+    let n_cards = cards.len();
+    drop(cards);
+    breadcrumb(&format!(
+        "shutdown: dropped {n_cards} cards in {}ms",
+        t.elapsed().as_millis()
+    ));
+
+    let t = std::time::Instant::now();
+    let gpus = std::mem::take(&mut state.gpus);
+    let n_gpus = gpus.len();
+    drop(gpus);
+    breadcrumb(&format!(
+        "shutdown: dropped {n_gpus} gpus in {}ms",
+        t.elapsed().as_millis()
+    ));
+
+    let t = std::time::Instant::now();
+    drop(state);
+    breadcrumb(&format!(
+        "shutdown: dropped remaining state in {}ms (state total {}ms)",
+        t.elapsed().as_millis(),
+        t_start.elapsed().as_millis()
+    ));
+
+    let t = std::time::Instant::now();
+    drop(event_loop);
+    breadcrumb(&format!(
+        "shutdown: dropped event_loop in {}ms",
+        t.elapsed().as_millis()
+    ));
+    breadcrumb(&format!(
+        "shutdown: returning from run_integrated (total {}ms)",
+        t_start.elapsed().as_millis()
+    ));
     Ok(())
 }
 
-/// One frame: build the element list (gradient only for now), present.
+/// Present one frame on a specific output (identified by CRTC handle).
+/// Walks currently-mapped xdg toplevels, builds the element list from
+/// their cached `SurfaceTexture`s, calls `OutputContext::present` on the
+/// matching output.
+///
 /// Returns true if a flip was submitted, false if skipped (previous flip
-/// still pending). The render timer fires unconditionally; this provides
-/// the backpressure.
-fn present_one_frame(
+/// still pending), Err if the output isn't found or presenting failed.
+///
+/// Layout (provisional, until #59.5): every output sees every surface;
+/// first mapped toplevel covers the whole output.
+fn present_for_crtc(
     state: &mut prism_protocols::PrismState,
-    gradient_view: prism_renderer::vk::ImageView,
+    crtc: smithay::reexports::drm::control::crtc::Handle,
 ) -> Result<bool> {
     use prism_renderer::{DecodePush, ElementDraw, EncodePush};
+    use smithay::wayland::compositor::with_states;
 
-    let Some(output) = state.output.as_mut() else {
-        return Err(anyhow!("no output attached"));
-    };
+    // Find the output for this CRTC and capture its GPU id — we need it
+    // to pick the right per-GPU texture import below. (We re-borrow the
+    // output mutably at present() time.)
+    let output_gpu_id = state
+        .output_for_crtc(crtc)
+        .ok_or_else(|| anyhow!("no output bound to crtc {crtc:?}"))?
+        .gpu_id;
 
-    let element = ElementDraw {
-        texture_view: gradient_view,
-        push: DecodePush::identity_srgb([-1.0, -1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
-    };
+    // Snapshot the toplevel surface handles so we can drop the borrow on
+    // state.xdg_shell before mutably borrowing state.outputs for present().
+    let surfaces: Vec<_> = state
+        .xdg_shell
+        .toplevel_surfaces()
+        .iter()
+        .map(|t| t.wl_surface().clone())
+        .collect();
+
+    let mut elements: Vec<ElementDraw> = Vec::new();
+    for surface in &surfaces {
+        let view_opt = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<prism_protocols::SurfaceTexSlot>()
+                .and_then(|s| s.0.lock().unwrap().as_ref()
+                    .and_then(|t| t.view_for(output_gpu_id)))
+        });
+        if let Some(view) = view_opt {
+            elements.push(ElementDraw {
+                texture_view: view,
+                push: DecodePush::identity_srgb(
+                    [-1.0, -1.0, 1.0, 1.0],
+                    [0.0, 0.0, 1.0, 1.0],
+                ),
+            });
+            // Trivial layout: only the first mapped toplevel goes through.
+            break;
+        }
+        // view_for can still return None if a per-GPU dmabuf import failed
+        // on this GPU; in that case we silently skip this surface here.
+    }
+
     let encode_push = EncodePush::sdr_identity();
-    output.present(&[element], &encode_push)
+    let output = state
+        .output_for_crtc(crtc)
+        .ok_or_else(|| anyhow!("no output bound to crtc {crtc:?}"))?;
+    output.present(&elements, &encode_push)
 }
 
 /// Same TTY-required mode-set as `scanout`, but instead of `vkCmdClearColorImage`

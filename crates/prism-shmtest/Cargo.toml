@@ -1,0 +1,18 @@
+[package]
+name = "prism-shmtest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tiny wayland xdg-shell shm client used to exercise prism end-to-end on TTY"
+
+[[bin]]
+name = "prism-shmtest"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true
+memmap2 = "0.9"
+rustix = { version = "1.0", features = ["fs", "mm"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }

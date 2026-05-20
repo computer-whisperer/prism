@@ -1,20 +1,29 @@
 //! KMS frontend.
 //!
-//! Owns per-GPU `DrmDevice`, per-output `DrmSurface`, scanout buffer pool.
-//! Builds atomic commits combining renderer scanout output + color/HDR
-//! connector properties.
+//! Three-layer ownership:
+//!
+//!   - [`SeatSession`] — one per process. libseat grant.
+//!   - [`DrmCardContext`] — one per `/dev/dri/cardN` driven. DrmDevice + GBM.
+//!   - [`OutputContext`] — one per active connector. DrmSurface + scanout
+//!     BOs + per-output Renderer.
+//!
+//! Static per-output configuration (depth, formats, encode-shader chain,
+//! and — future — color description, calibration, tone-map) lives in
+//! [`OutputConfig`].
 
+pub mod card;
 pub mod enumerate;
 pub mod gbm_dev;
 pub mod output_ctx;
 pub mod scanout;
 pub mod session;
 
+pub use card::{DrmCardContext, OutputConfig};
 pub use enumerate::{ConnectorSummary, DeviceSummary, DrmFd, open_for_enumeration, summarize};
 pub use gbm_dev::GbmDevice;
-pub use output_ctx::{OutputContext, OutputNotifiers, OutputSetup};
+pub use output_ctx::OutputContext;
 pub use scanout::{
-    OutputPick, ScanoutDepth, add_framebuffer_for_bo, find_property, pick_by_name,
-    pick_first_connected, set_connector_max_bpc,
+    OutputPick, ScanoutDepth, add_framebuffer_for_bo, find_property, pick_all_connected,
+    pick_by_name, pick_first_connected, set_connector_max_bpc,
 };
 pub use session::SeatSession;
