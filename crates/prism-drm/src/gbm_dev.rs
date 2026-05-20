@@ -3,9 +3,8 @@
 //! GBM is the standard way on Linux to allocate buffers that both a GPU and
 //! the display controller can use. The flow is:
 //!
-//!   1. Open a DRM fd (render node is fine for non-scanout; primary node
-//!      needed for actual scanout — but the BO itself doesn't care, only the
-//!      eventual `addfb2` does).
+//!   1. Open a DRM fd (render node is fine for headless tests; primary node
+//!      needed for actual scanout — `addfb2` requires DRM master).
 //!   2. Build a `gbm::Device` on top of that fd.
 //!   3. Allocate a `BufferObject` with `SCANOUT|RENDERING` usage and the set
 //!      of DRM format modifiers we're willing to accept. GBM picks the best
@@ -13,47 +12,49 @@
 //!   4. Export the BO as a dmabuf (per plane), package into `prism_frame::Dmabuf`.
 //!   5. Renderer imports the dmabuf as a `VkImage`.
 //!
-//! For the first-pass tracer we ask for `LINEAR` only — keeps the layout
-//! trivially CPU-mappable for verification.
+//! Critical: GEM handles are PER-FD. When the same BO is to be used both for
+//! Vulkan import (via dmabuf, fd-agnostic) AND for `addfb2` (via GEM handle,
+//! fd-specific), the GBM device and the DRM master device MUST share the
+//! same fd, or `addfb2` will return ENOENT looking up an unknown handle.
+//! Use `from_device_fd` with the same `DeviceFd` the `DrmDevice` holds.
 
-use std::fs::{File, OpenOptions};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::fs::OpenOptions;
+use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use drm_fourcc::{DrmFourcc, DrmModifier};
 use gbm::{BufferObject, BufferObjectFlags};
 use prism_frame::{Dmabuf, DmabufPlane};
+use smithay::utils::DeviceFd;
 
-/// A DRM fd owned for GBM use. `gbm::Device` requires `AsFd`.
-pub struct GbmFd(File);
+/// GBM device wrapper. The inner fd is a `DeviceFd` (Arc<OwnedFd>) so it can
+/// be shared with a smithay `DrmDevice` — GEM handles are per-fd, so anything
+/// that wants to addfb2 from this BO has to be on the same fd.
+pub struct GbmDevice {
+    inner: gbm::Device<DeviceFd>,
+}
 
-impl GbmFd {
-    /// Open a DRM node (primary or render) for GBM. Does NOT acquire master.
+impl GbmDevice {
+    /// Open a DRM node by path and use it for GBM. For headless tracer use
+    /// (render node, no master needed). Cannot be used for actual scanout
+    /// because the fd isn't shared with anything that holds DRM master.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        Ok(Self(file))
+            .with_context(|| format!("opening {} for GBM", path.display()))?;
+        let owned: OwnedFd = file.into();
+        Self::from_device_fd(DeviceFd::from(owned))
     }
-}
 
-impl AsFd for GbmFd {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
-    }
-}
-
-/// GBM device wrapper. Holds the DRM fd alive for the device's lifetime.
-pub struct GbmDevice {
-    inner: gbm::Device<GbmFd>,
-}
-
-impl GbmDevice {
-    pub fn new(fd: GbmFd) -> Result<Self> {
+    /// Build a GBM device on an existing `DeviceFd`. Use this when the same
+    /// fd must back both a `DrmDevice` (for atomic commits / addfb2) and GBM
+    /// (for BO allocation) — the underlying `OwnedFd` is ref-counted, so both
+    /// owners keep it alive.
+    pub fn from_device_fd(fd: DeviceFd) -> Result<Self> {
         let inner = gbm::Device::new(fd).context("gbm::Device::new")?;
         Ok(Self { inner })
     }

@@ -103,9 +103,8 @@ fn tracer_clear(device: Arc<prism_renderer::Device>) -> Result<()> {
     let width: u32 = 256;
     let height: u32 = 16;
 
-    let gbm_fd = prism_drm::GbmFd::open("/dev/dri/renderD129")
+    let gbm = prism_drm::GbmDevice::open("/dev/dri/renderD129")
         .context("open /dev/dri/renderD129 for GBM")?;
-    let gbm = prism_drm::GbmDevice::new(gbm_fd)?;
     tracing::info!("GBM backend: {}", gbm.backend_name());
 
     let (bo, dmabuf) = gbm
@@ -234,10 +233,11 @@ fn run_scanout_smoke_test() -> Result<()> {
         surface.current_mode().size(),
     );
 
-    // GBM on the same DRM path. Allocating BOs doesn't need DRM master, so a
-    // plain second open() works regardless of which fd holds master. We keep
-    // the master fd (inside `drm`) alive for the FB-creation + commit calls.
-    let gbm = prism_drm::GbmDevice::new(prism_drm::GbmFd::open(drm_path)?)?;
+    // GBM and DrmDevice MUST share the same fd: GEM handles are per-fd, so
+    // BOs allocated through GBM on a different fd would be invisible to the
+    // addfb2 ioctl called through the master fd (ENOENT). Pull the master
+    // fd back out of the DrmDevice's DrmDeviceFd to share it.
+    let gbm = prism_drm::GbmDevice::from_device_fd(drm.device_fd().device_fd())?;
     tracing::info!("GBM backend: {}", gbm.backend_name());
 
     let (w, h) = pick.mode.size();
