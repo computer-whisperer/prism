@@ -42,6 +42,7 @@ gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 glam = "0.30"
 gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
 libc = "0.2"
+rspirv = "0.13"
 rustix = { version = "1.0.7", features = ["fs"] }
 thiserror = "2.0"
 tracing = { version = "0.1.44", features = ["max_level_trace", "release_max_level_debug"] }

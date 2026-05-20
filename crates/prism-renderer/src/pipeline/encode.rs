@@ -1,66 +1,23 @@
 //! Output encode pipeline.
 //!
-//! Full-screen triangle. Samples the fp16 intermediate, applies per-output
-//! calibration matrix + transfer encode, writes to the scanout image.
+//! Full-screen triangle. Samples the fp16/fp32 intermediate, applies per-output
+//! calibration + transfer encode (+ any other configured effects), writes to
+//! the scanout image. The fragment shader is *synthesized at construction*
+//! from an `EncodeConfig` — see `encode_synth` for the SPIR-V emission.
 
 use std::sync::Arc;
 
 use ash::vk;
-use bytemuck::{Pod, Zeroable};
 
 use crate::device::Device;
+use crate::encode_synth::{EncodeConfig, PUSH_CONSTANTS_SIZE, synthesize_fragment_shader};
 use crate::error::{Result, VkResultExt};
 
 use super::shader_module;
 
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/encode.vert.spv"));
-const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/encode.frag.spv"));
 
-/// Output transfer enum. Matches the GLSL `output_transfer` int in
-/// `shaders/encode.frag`.
-#[derive(Clone, Copy, Debug)]
-#[repr(i32)]
-pub enum OutputTransfer {
-    /// fp16 / 32-bit float scanout — no encoding, just scale to [0,1].
-    /// Not used yet; HDR-fp16-scanout is its own task.
-    Linear = 0,
-    /// sRGB OETF for SDR XRGB8888 / XBGR8888 scanout.
-    Srgb = 1,
-    /// PQ OETF for HDR A2RGB10 / fp16-PQ scanout. Plumbed but not wired
-    /// to a real HDR scanout BO yet.
-    Pq = 2,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
-pub struct EncodePush {
-    pub cal_matrix: [f32; 16],   // mat4
-    pub sdr_white_nits: f32,
-    pub target_peak_nits: f32,
-    pub output_transfer: i32,
-    pub _pad: i32,
-}
-
-impl EncodePush {
-    pub fn sdr_identity() -> Self {
-        Self {
-            cal_matrix: mat4_identity(),
-            sdr_white_nits: 80.0,
-            target_peak_nits: 80.0,
-            output_transfer: OutputTransfer::Srgb as i32,
-            _pad: 0,
-        }
-    }
-}
-
-fn mat4_identity() -> [f32; 16] {
-    [
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        0.0, 0.0, 0.0, 1.0,
-    ]
-}
+pub use crate::encode_synth::EncodePushSynth as EncodePush;
 
 pub struct EncodePipeline {
     device: Arc<Device>,
@@ -74,7 +31,11 @@ pub struct EncodePipeline {
 const POOL_MAX_SETS: u32 = 8;
 
 impl EncodePipeline {
-    pub fn new(device: Arc<Device>, scanout_format: vk::Format) -> Result<Self> {
+    pub fn new(
+        device: Arc<Device>,
+        scanout_format: vk::Format,
+        encode_config: &EncodeConfig,
+    ) -> Result<Self> {
         let bindings = [vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -88,7 +49,7 @@ impl EncodePipeline {
         let push_range = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(std::mem::size_of::<EncodePush>() as u32)];
+            .size(PUSH_CONSTANTS_SIZE)];
         let set_layouts = [descriptor_set_layout];
         let pl_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
@@ -116,8 +77,14 @@ impl EncodePipeline {
         let descriptor_pool = unsafe { device.raw.create_descriptor_pool(&pool_info, None) }
             .vk_ctx("create_descriptor_pool (encode)")?;
 
+        // Vertex shader stays statically compiled from GLSL — full-screen
+        // triangle, no per-output variation.
         let vert = shader_module(&device, VERT_SPV)?;
-        let frag = shader_module(&device, FRAG_SPV)?;
+
+        // Fragment shader is synthesized from the EncodeConfig.
+        let frag_spv_words = synthesize_fragment_shader(encode_config)?;
+        let frag = create_shader_from_words(&device, &frag_spv_words)?;
+
         let pipeline =
             build_encode_pipeline(&device, pipeline_layout, vert, frag, scanout_format)?;
         unsafe {
@@ -183,6 +150,15 @@ impl Drop for EncodePipeline {
                 .destroy_descriptor_pool(self.descriptor_pool, None);
         }
     }
+}
+
+/// Build a `VkShaderModule` directly from u32 SPIR-V words (synthesized,
+/// not loaded from disk). The byte-based path in `super::shader_module`
+/// requires byte alignment; this version skips that and uses the words
+/// directly.
+fn create_shader_from_words(device: &Device, words: &[u32]) -> Result<vk::ShaderModule> {
+    let info = vk::ShaderModuleCreateInfo::default().code(words);
+    unsafe { device.raw.create_shader_module(&info, None) }.vk_ctx("create_shader_module (synth)")
 }
 
 fn build_encode_pipeline(

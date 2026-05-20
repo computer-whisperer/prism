@@ -11,11 +11,12 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// encode.frag is synthesized at runtime via rspirv (see encode_synth/).
+// Only the static-GLSL shaders are listed here.
 const SHADERS: &[(&str, &str)] = &[
     ("decode.vert", "vert"),
     ("decode.frag", "frag"),
     ("encode.vert", "vert"),
-    ("encode.frag", "frag"),
 ];
 
 fn main() {

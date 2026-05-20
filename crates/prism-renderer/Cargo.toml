@@ -14,6 +14,7 @@ glam.workspace = true
 gpu-allocator.workspace = true
 libc.workspace = true
 prism-frame.workspace = true
+rspirv.workspace = true
 smithay.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

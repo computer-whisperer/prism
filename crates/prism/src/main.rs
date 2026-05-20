@@ -352,11 +352,14 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     // back to [0,1] and sRGB-encodes.
     let texture = build_gradient_texture(device.clone(), width)?;
 
-    // Headless self-test uses the renderer's default fp32 intermediate.
+    // Headless self-test uses the renderer's default fp32 intermediate + the
+    // default-SDR encode config (identity calibration + sRGB OETF).
+    let encode_config = prism_renderer::EncodeConfig::default_srgb();
     let mut renderer = Renderer::new(
         device.clone(),
         vk::Format::B8G8R8A8_UNORM,
         prism_renderer::DEFAULT_INTERMEDIATE_FORMAT,
+        &encode_config,
     )?;
 
     // Single element covering the whole output.
@@ -711,12 +714,15 @@ fn run_gradient_scanout(
     );
 
     let texture = build_gradient_texture(device.clone(), 1024)?;
-    // TTY gradient also uses the fp32 default; if we add per-output config
-    // later, this would come from the output's config.
+    // TTY gradient: fp32 intermediate + standard SDR encode. Per-output
+    // EncodeConfig (FIR filter for the QD-OLED, calibration LUT per panel)
+    // will come from the config layer once it exists.
+    let encode_config = prism_renderer::EncodeConfig::default_srgb();
     let mut renderer = Renderer::new(
         device.clone(),
         vk_format,
         prism_renderer::DEFAULT_INTERMEDIATE_FORMAT,
+        &encode_config,
     )?;
 
     let element = ElementDraw {

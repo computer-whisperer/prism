@@ -11,6 +11,7 @@ use ash::vk;
 
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
+use crate::encode_synth::EncodeConfig;
 use crate::intermediate::{Intermediate, create_view};
 use crate::pipeline::decode::{DecodePipeline, DecodePush};
 use crate::pipeline::encode::{EncodePipeline, EncodePush};
@@ -45,9 +46,10 @@ impl Renderer {
         device: Arc<Device>,
         scanout_format: vk::Format,
         intermediate_format: vk::Format,
+        encode_config: &EncodeConfig,
     ) -> Result<Self> {
         let decode = DecodePipeline::new(device.clone(), intermediate_format)?;
-        let encode = EncodePipeline::new(device.clone(), scanout_format)?;
+        let encode = EncodePipeline::new(device.clone(), scanout_format, encode_config)?;
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(device.physical.graphics_queue_family)
