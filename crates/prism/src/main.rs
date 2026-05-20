@@ -15,14 +15,35 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let output_name = args.get(1).map(String::as_str);
+    let depth_arg = args.get(2).map(String::as_str);
     match args.first().map(String::as_str) {
         None => run_headless_smoke_tests(),
         Some("scanout") => run_scanout_smoke_test(output_name),
-        Some("gradient") => run_gradient_scanout(output_name),
+        Some("gradient") => run_gradient_scanout(output_name, parse_depth(depth_arg)?),
         Some("wayland") => run_wayland_server(),
         Some(other) => Err(anyhow!(
-            "unknown subcommand {other:?}; expected: (no args) | scanout [output] | gradient [output] | wayland"
+            "unknown subcommand {other:?}; expected: (no args) | scanout [output] | gradient [output] [8|10] | wayland"
         )),
+    }
+}
+
+fn parse_depth(arg: Option<&str>) -> Result<prism_drm::ScanoutDepth> {
+    match arg {
+        None | Some("10") => Ok(prism_drm::ScanoutDepth::Bpc10),
+        Some("8") => Ok(prism_drm::ScanoutDepth::Bpc8),
+        Some(other) => Err(anyhow!("unknown depth {other:?}; expected 8 or 10")),
+    }
+}
+
+fn vk_format_for_depth(depth: prism_drm::ScanoutDepth) -> prism_renderer::vk::Format {
+    use prism_drm::ScanoutDepth::*;
+    use prism_renderer::vk;
+    match depth {
+        Bpc8 => vk::Format::B8G8R8A8_UNORM,
+        // DRM XR30 layout: 32-bit word with X(2) | R(10) | G(10) | B(10),
+        // X in the high bits. Vulkan A2R10G10B10_UNORM_PACK32 uses the
+        // exact same component ordering inside the 32-bit word.
+        Bpc10 => vk::Format::A2R10G10B10_UNORM_PACK32,
     }
 }
 
@@ -608,14 +629,17 @@ fn pick_memory(
 /// the scanout image is rendered through the two-pass decode→encode pipeline
 /// using a horizontal-gradient texture. Visual verification: a smoothly
 /// gamma-correct gradient (black on the left → white on the right).
-fn run_gradient_scanout(output_name: Option<&str>) -> Result<()> {
+fn run_gradient_scanout(
+    output_name: Option<&str>,
+    depth: prism_drm::ScanoutDepth,
+) -> Result<()> {
     use prism_drm::scanout;
     use prism_renderer::{DecodePush, ElementDraw, EncodePush, Renderer, vk};
     use smithay::backend::drm::{DrmDevice, PlaneConfig, PlaneState};
     use smithay::utils::{Rectangle, Transform};
     use std::time::Duration;
 
-    tracing::info!("prism — TTY gradient scanout (renderer pipeline)");
+    tracing::info!("prism — TTY gradient scanout (renderer pipeline), depth={depth:?}");
 
     let instance = prism_renderer::Instance::new()?;
     let device = prism_renderer::Device::new(
@@ -647,24 +671,42 @@ fn run_gradient_scanout(output_name: Option<&str>) -> Result<()> {
         pick.mode.size().1,
         pick.mode.vrefresh(),
     );
+
+    // Tell the connector to run the link at the depth we're scanning out.
+    // Without this, a 10-bit framebuffer gets dithered down to 8 bits at
+    // scanout — better than 8-bit-with-banding but still throws information
+    // away. Most amdgpu connectors expose `max bpc` for DP and HDMI.
+    match prism_drm::set_connector_max_bpc(&drm, pick.connector, depth.max_bpc()) {
+        Ok(true) => tracing::info!("connector max bpc set to {}", depth.max_bpc()),
+        Ok(false) => tracing::warn!(
+            "connector doesn't expose `max bpc` property; scanout depth may be \
+             driver-controlled (typically 8)"
+        ),
+        Err(e) => tracing::warn!("set max bpc failed: {e:#}"),
+    }
+
     let surface = drm.create_surface(pick.crtc, pick.mode, &[pick.connector])?;
     let gbm = prism_drm::GbmDevice::from_device_fd(drm.device_fd().device_fd())?;
 
     let (w, h) = pick.mode.size();
     let w = w as u32;
     let h = h as u32;
-    let (bo, dmabuf) =
-        gbm.allocate_scanout(w, h, DrmFourcc::Xrgb8888, &[DrmModifier::Linear])?;
+    let fourcc = depth.drm_fourcc();
+    let vk_format = vk_format_for_depth(depth);
+    let (bo, dmabuf) = gbm.allocate_scanout(w, h, fourcc, &[DrmModifier::Linear])?;
     let scanout_image = prism_renderer::ImportedImage::import(
         device.clone(),
         &dmabuf,
-        vk::Format::B8G8R8A8_UNORM,
+        vk_format,
         vk::ImageUsageFlags::COLOR_ATTACHMENT,
     )?;
-    tracing::info!("scanout BO ready: {w}x{h} XRGB8888 LINEAR");
+    tracing::info!(
+        "scanout BO ready: {w}x{h} {:?} LINEAR (Vulkan {:?})",
+        fourcc, vk_format
+    );
 
     let texture = build_gradient_texture(device.clone(), 1024)?;
-    let mut renderer = Renderer::new(device.clone(), vk::Format::B8G8R8A8_UNORM)?;
+    let mut renderer = Renderer::new(device.clone(), vk_format)?;
 
     let element = ElementDraw {
         texture_view: texture.view,

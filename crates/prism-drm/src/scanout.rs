@@ -2,12 +2,48 @@
 //! from a GBM BO, and producing the `PlaneState` for an atomic commit.
 
 use anyhow::{Context, Result, anyhow};
+use drm_fourcc::DrmFourcc;
 use gbm::BufferObject;
 use smithay::backend::drm::DrmDevice;
 use smithay::reexports::drm::buffer::PlanarBuffer;
 use smithay::reexports::drm::control::{
-    Device as ControlDevice, FbCmd2Flags, Mode, ModeTypeFlags, connector, crtc, framebuffer,
+    Device as ControlDevice, FbCmd2Flags, Mode, ModeTypeFlags, ResourceHandle, connector, crtc,
+    framebuffer, property,
 };
+
+/// Bit depth + format selection for a scanout BO. Picks the matching DRM
+/// fourcc and the Vulkan format that interprets the same memory layout.
+///
+/// `Bpc8` → DRM `XR24` ↔ Vulkan `B8G8R8A8_UNORM`. Standard SDR scanout.
+/// `Bpc10` → DRM `XR30` ↔ Vulkan `A2R10G10B10_UNORM_PACK32`. Higher
+///   precision; required for HDR and for SDR-without-banding on smooth
+///   gradients. Pair with `max_bpc=10` on the connector to actually push
+///   10 bits over the wire (else driver dithers down).
+///
+/// Choice is per-output; some displays don't support 10-bit links (cheap
+/// 1080p panels). Negotiation belongs in the per-output config layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanoutDepth {
+    Bpc8,
+    Bpc10,
+}
+
+impl ScanoutDepth {
+    pub fn drm_fourcc(self) -> DrmFourcc {
+        match self {
+            Self::Bpc8 => DrmFourcc::Xrgb8888,
+            Self::Bpc10 => DrmFourcc::Xrgb2101010,
+        }
+    }
+
+    /// The `max bpc` value to push to the connector for this depth.
+    pub fn max_bpc(self) -> u64 {
+        match self {
+            Self::Bpc8 => 8,
+            Self::Bpc10 => 10,
+        }
+    }
+}
 
 /// One connected output's wiring choices for the tracer.
 #[derive(Debug)]
@@ -149,4 +185,45 @@ where
         .add_planar_framebuffer(bo, FbCmd2Flags::MODIFIERS)
         .context("add_planar_framebuffer")?;
     Ok(fb)
+}
+
+/// Find a named property on a resource by walking its property list.
+/// Returns `None` if no such property exists on this object.
+pub fn find_property<H: ResourceHandle>(
+    drm: &DrmDevice,
+    handle: H,
+    name: &str,
+) -> Result<Option<property::Handle>> {
+    let props = drm.get_properties(handle).context("get_properties")?;
+    for (&prop_h, _) in &props {
+        let info = drm.get_property(prop_h).context("get_property")?;
+        if info.name().to_string_lossy() == name {
+            return Ok(Some(prop_h));
+        }
+    }
+    Ok(None)
+}
+
+/// Set `max bpc` on a connector via the legacy property API.
+///
+/// `max bpc` controls the bit depth used on the physical link to the
+/// display. Default is usually 8; setting it to 10 lets us send full
+/// 10-bit scanout (paired with an A2R10G10B10 framebuffer). Without this
+/// the driver dithers our 10-bit framebuffer down to 8 bits on the wire.
+///
+/// Returns `Ok(false)` if the property isn't exposed on this connector
+/// (some drivers omit it for HDMI/DP variants); the caller can treat
+/// that as "use whatever depth the link defaulted to". Returns `Ok(true)`
+/// on a successful set.
+pub fn set_connector_max_bpc(
+    drm: &DrmDevice,
+    connector: connector::Handle,
+    value: u64,
+) -> Result<bool> {
+    let Some(prop) = find_property(drm, connector, "max bpc")? else {
+        return Ok(false);
+    };
+    drm.set_property(connector, prop, value)
+        .with_context(|| format!("set_property max_bpc={value}"))?;
+    Ok(true)
 }
