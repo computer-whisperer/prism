@@ -42,4 +42,32 @@ impl Dmabuf {
             modifier: self.modifier,
         }
     }
+
+    /// Build a `Dmabuf` from smithay's allocator type by dup-ing the plane
+    /// fds. The source `Dmabuf` keeps its own references; ours are
+    /// independent and live as long as this struct does.
+    pub fn from_smithay(src: &smithay::backend::allocator::dmabuf::Dmabuf) -> std::io::Result<Self> {
+        use smithay::backend::allocator::Buffer;
+        let size = Buffer::size(src);
+        let format = Buffer::format(src);
+        let planes: Result<Vec<DmabufPlane>, std::io::Error> = src
+            .handles()
+            .zip(src.offsets())
+            .zip(src.strides())
+            .map(|((fd, offset), stride)| {
+                Ok(DmabufPlane {
+                    fd: fd.try_clone_to_owned()?,
+                    offset,
+                    stride,
+                })
+            })
+            .collect();
+        Ok(Self {
+            width: size.w as u32,
+            height: size.h as u32,
+            format: format.code,
+            modifier: format.modifier,
+            planes: planes?,
+        })
+    }
 }

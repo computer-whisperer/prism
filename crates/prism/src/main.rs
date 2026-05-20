@@ -36,8 +36,21 @@ fn run_wayland_server() -> Result<()> {
 
     tracing::info!("prism compositor — wayland server scaffolding");
 
+    // Bring up Vulkan so the dmabuf handler can do real imports. Pick the
+    // device that drives DP-4 (Vega 20) so client buffers and our scanout
+    // path end up on the same GPU.
+    let instance = prism_renderer::Instance::new()?;
+    let device = prism_renderer::Device::new(
+        instance.clone(),
+        Some(prism_renderer::DrmDevId {
+            major: 226,
+            minor: 129,
+        }),
+    )?;
+    tracing::info!("Vulkan device for dmabuf import: {}", device.physical.name);
+
     let display = prism_protocols::new_display()?;
-    let mut state = prism_protocols::PrismState::new(&display);
+    let mut state = prism_protocols::PrismState::new(&display, device);
 
     let mut event_loop: EventLoop<'static, prism_protocols::PrismState> =
         EventLoop::try_new().context("calloop EventLoop::try_new")?;
@@ -139,7 +152,11 @@ fn run_headless_smoke_tests() -> Result<()> {
     }
 
     // GBM allocate + Vulkan import + clear-to-magenta + readback.
-    tracer_clear(device).context("GBM→Vulkan tracer")?;
+    tracer_clear(device.clone()).context("GBM→Vulkan tracer")?;
+
+    // Same code path the wayland dmabuf protocol handler uses, exercised
+    // without needing a real client to play along.
+    tracer_dmabuf_protocol(device).context("dmabuf protocol-handler import path")?;
 
     Ok(())
 }
@@ -218,6 +235,56 @@ fn tracer_clear(device: Arc<prism_renderer::Device>) -> Result<()> {
             probe.0, probe.1, probe.2
         ));
     }
+    Ok(())
+}
+
+/// Exercise the same import path that `prism-protocols::DmabufHandler::dmabuf_imported`
+/// runs, but synthesize the smithay::Dmabuf locally so we don't depend on a
+/// real client. Validates that:
+///   - smithay::Dmabuf → prism_frame::Dmabuf fd-dup conversion works
+///   - ImportedImage::import succeeds with vk::ImageUsageFlags::SAMPLED
+///     (vs the TRANSFER_DST usage the tracer_clear path uses)
+fn tracer_dmabuf_protocol(device: Arc<prism_renderer::Device>) -> Result<()> {
+    use smithay::backend::allocator::dmabuf::{Dmabuf as SmithayDmabuf, DmabufFlags};
+
+    let width: u32 = 256;
+    let height: u32 = 16;
+
+    let gbm = prism_drm::GbmDevice::open("/dev/dri/renderD129")?;
+    let (bo, _our_dmabuf) =
+        gbm.allocate_scanout(width, height, DrmFourcc::Xrgb8888, &[DrmModifier::Linear])?;
+
+    // Build a smithay::Dmabuf from the GBM BO, mirroring what
+    // smithay::backend::allocator::gbm::GbmAllocator does internally — that
+    // way the input to ImportedImage::import matches the shape the wayland
+    // handler will hand us at runtime.
+    let plane_fd = bo
+        .fd_for_plane(0)
+        .map_err(|_| anyhow!("gbm_bo_get_fd_for_plane(0) returned -1"))?;
+    let mut builder = SmithayDmabuf::builder(
+        (width as i32, height as i32),
+        DrmFourcc::Xrgb8888,
+        DrmModifier::Linear,
+        DmabufFlags::empty(),
+    );
+    if !builder.add_plane(plane_fd, 0, bo.offset(0), bo.stride_for_plane(0)) {
+        return Err(anyhow!("DmabufBuilder::add_plane returned false"));
+    }
+    let smithay_dmabuf: SmithayDmabuf = builder
+        .build()
+        .ok_or_else(|| anyhow!("DmabufBuilder::build returned None"))?;
+
+    // Convert + import — same call shape as the wayland handler.
+    let prism_dmabuf = prism_frame::Dmabuf::from_smithay(&smithay_dmabuf)
+        .context("Dmabuf::from_smithay")?;
+    let _image = prism_renderer::ImportedImage::import(
+        device,
+        &prism_dmabuf,
+        vk::Format::B8G8R8A8_UNORM,
+        vk::ImageUsageFlags::SAMPLED,
+    )
+    .context("ImportedImage::import (SAMPLED, mirroring wayland handler)")?;
+    tracing::info!("✓ dmabuf-handler import path verified (SAMPLED VkImage)");
     Ok(())
 }
 
