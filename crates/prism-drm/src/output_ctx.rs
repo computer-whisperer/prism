@@ -23,8 +23,20 @@ use prism_renderer::{
     ElementDraw, EncodeConfig, EncodePush, ImportedImage, Renderer, vk,
 };
 use smithay::backend::drm::{DrmDevice, DrmDeviceNotifier, DrmSurface, PlaneConfig, PlaneState};
+use smithay::backend::session::libseat::LibSeatSessionNotifier;
 use smithay::reexports::drm::control::framebuffer;
 use smithay::utils::{Rectangle, Transform};
+
+/// Bundle of calloop event sources the caller MUST insert into its loop.
+/// Failure to drain either source causes a hard system lockup:
+///   - `drm`: page-flip event ENOMEM cascade after ~140 frames.
+///   - `session`: VT-switch blocked because we never ack libseat's pause,
+///     and SIGINT delivery blocks too because the desktop session is
+///     stuck waiting for us. Hands typing Ctrl+Alt+Fn do nothing.
+pub struct OutputNotifiers {
+    pub drm: DrmDeviceNotifier,
+    pub session: LibSeatSessionNotifier,
+}
 
 use crate::{
     GbmDevice, ScanoutDepth, SeatSession, add_framebuffer_for_bo, pick_by_name,
@@ -77,15 +89,14 @@ pub struct OutputContext {
 }
 
 impl OutputContext {
-    /// Bring up the integrated output. Returns `(context, drm_notifier)` — the
-    /// caller MUST insert the notifier into a calloop event loop and route
-    /// VBlank events back to `mark_vblank()`. Failure to drain notifier events
-    /// causes a kernel-side event-allocation cascade that locks the system.
+    /// Bring up the integrated output. Returns `(context, OutputNotifiers)`.
+    /// Both notifiers MUST be inserted into the caller's calloop event loop
+    /// or the system will hang in different ways (see `OutputNotifiers`).
     pub fn new(
         device: Arc<prism_renderer::Device>,
         setup: OutputSetup<'_>,
-    ) -> Result<(Self, DrmDeviceNotifier)> {
-        let mut session = SeatSession::new()?;
+    ) -> Result<(Self, OutputNotifiers)> {
+        let (mut session, session_notifier) = SeatSession::new()?;
         if !session.is_active() {
             return Err(anyhow!(
                 "libseat session not active — must be run from a foreground VT"
@@ -172,7 +183,10 @@ impl OutputContext {
                 mode_set_done: false,
                 frame_pending: false,
             },
-            drm_notifier,
+            OutputNotifiers {
+                drm: drm_notifier,
+                session: session_notifier,
+            },
         ))
     }
 

@@ -20,16 +20,23 @@ use smithay::backend::session::Session;
 use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
 use smithay::utils::DeviceFd;
 
-/// libseat-backed session. Owns the session handle; dropping releases it.
+/// libseat-backed session. The companion [`LibSeatSessionNotifier`] returned
+/// from `new()` MUST be inserted into a calloop event loop. Without it,
+/// libseat can't process logind's "release the devices" messages during a
+/// VT switch — the kernel waits for our ack, the VT switch hangs, and
+/// the user can't escape (Ctrl+Alt+Fn does nothing, SIGINT delivery is
+/// blocked too because the desktop session is stuck on the switch).
 pub struct SeatSession {
     session: LibSeatSession,
-    /// Held so the seat-fd stays open. Smithay needs us to keep this around
-    /// even if we never poll it.
-    _notifier: LibSeatSessionNotifier,
 }
 
 impl SeatSession {
-    pub fn new() -> Result<Self> {
+    /// Open a libseat session. Returns `(SeatSession, notifier)` — the
+    /// caller MUST insert `notifier` into the calloop event loop. The
+    /// callback typically logs the `SessionEvent` (Pause / Activate) but
+    /// doesn't need to do more — libseat acknowledges the pause inside
+    /// its own dispatch path.
+    pub fn new() -> Result<(Self, LibSeatSessionNotifier)> {
         let (session, notifier) =
             LibSeatSession::new().context("LibSeatSession::new (is logind/seatd running?)")?;
         tracing::info!(
@@ -37,10 +44,7 @@ impl SeatSession {
             session.seat(),
             session.is_active(),
         );
-        Ok(Self {
-            session,
-            _notifier: notifier,
-        })
+        Ok((Self { session }, notifier))
     }
 
     pub fn seat(&self) -> String {

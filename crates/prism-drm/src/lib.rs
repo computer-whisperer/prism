@@ -12,7 +12,7 @@ pub mod session;
 
 pub use enumerate::{ConnectorSummary, DeviceSummary, DrmFd, open_for_enumeration, summarize};
 pub use gbm_dev::GbmDevice;
-pub use output_ctx::{OutputContext, OutputSetup};
+pub use output_ctx::{OutputContext, OutputNotifiers, OutputSetup};
 pub use scanout::{
     OutputPick, ScanoutDepth, add_framebuffer_for_bo, find_property, pick_by_name,
     pick_first_connected, set_connector_max_bpc,

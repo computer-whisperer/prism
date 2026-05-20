@@ -665,7 +665,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
 
     // Output bringup (DRM master, scanout BO, renderer).
     let encode_config = prism_renderer::EncodeConfig::default_srgb();
-    let (output, drm_notifier) = OutputContext::new(
+    let (output, notifiers) = OutputContext::new(
         device.clone(),
         OutputSetup {
             drm_path: "/dev/dri/card0",
@@ -699,11 +699,10 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     tracing::info!("scanout target: {output_name_for_log} {}×{}", extent.width, extent.height);
 
     // Drain DRM vblank / page-flip-complete events. CRITICAL: without this,
-    // event::true page_flips accumulate in the kernel until ENOMEM, which
-    // locks up at 60Hz (#49a debrief).
+    // event::true page_flips accumulate in the kernel until ENOMEM at 60Hz.
     event_loop
         .handle()
-        .insert_source(drm_notifier, |event, _metadata, state| {
+        .insert_source(notifiers.drm, |event, _metadata, state| {
             use smithay::backend::drm::DrmEvent;
             match event {
                 DrmEvent::VBlank(_crtc) => {
@@ -715,6 +714,29 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             }
         })
         .map_err(|e| anyhow!("insert drm notifier: {e}"))?;
+
+    // Drain libseat session events. CRITICAL: without this, logind can't
+    // request a VT switch (we never ack the "pause" message), which blocks
+    // Ctrl+Alt+Fn AND blocks SIGINT delivery to us via the desktop session.
+    // The callback can be a near-no-op — libseat acks the pause inside its
+    // own dispatch path; we just need process_events to run.
+    event_loop
+        .handle()
+        .insert_source(notifiers.session, |event, _, _state| {
+            use smithay::backend::session::Event as SessionEvent;
+            match event {
+                SessionEvent::PauseSession => {
+                    tracing::info!("libseat session paused (likely VT switch away)");
+                    // TODO: properly suspend rendering / release DRM resources;
+                    // for now we just let subsequent DRM ops fail and log.
+                }
+                SessionEvent::ActivateSession => {
+                    tracing::info!("libseat session activated");
+                    // TODO: re-acquire DRM resources after a previous pause.
+                }
+            }
+        })
+        .map_err(|e| anyhow!("insert session notifier: {e}"))?;
 
     // SIGINT / SIGTERM → clean shutdown.
     let running = Arc::new(AtomicBool::new(true));
@@ -808,7 +830,12 @@ fn run_gradient_scanout(
     tracing::info!("Vulkan device: {}", device.physical.name);
 
     let drm_path = "/dev/dri/card0";
-    let mut session = prism_drm::SeatSession::new()?;
+    // One-shot subcommand: we hold the session + DRM only briefly (5s).
+    // VT-switch and SIGINT may be blocked during that window because we
+    // don't drain the libseat notifier (`_session_notifier`) — acceptable
+    // for the diagnostic subcommands. Integrated `prism run` properly
+    // drains both notifiers.
+    let (mut session, _session_notifier) = prism_drm::SeatSession::new()?;
     if !session.is_active() {
         return Err(anyhow!(
             "libseat session not active. Switch to a free VT and rerun."
@@ -941,7 +968,12 @@ fn run_scanout_smoke_test(output_name: Option<&str>) -> Result<()> {
     tracing::info!("Vulkan device: {}", device.physical.name);
 
     // libseat session → DRM master.
-    let mut session = prism_drm::SeatSession::new()?;
+    // One-shot subcommand: we hold the session + DRM only briefly (5s).
+    // VT-switch and SIGINT may be blocked during that window because we
+    // don't drain the libseat notifier (`_session_notifier`) — acceptable
+    // for the diagnostic subcommands. Integrated `prism run` properly
+    // drains both notifiers.
+    let (mut session, _session_notifier) = prism_drm::SeatSession::new()?;
     if !session.is_active() {
         return Err(anyhow!(
             "libseat session not active. Switch to a free VT (Ctrl+Alt+F3) and rerun."
