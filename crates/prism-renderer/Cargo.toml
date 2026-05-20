@@ -1,0 +1,19 @@
+[package]
+name = "prism-renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Vulkan (ash) renderer: per-GPU instance, decode/composite/postprocess pipeline, HDR-native"
+
+[dependencies]
+anyhow.workspace = true
+ash.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+gpu-allocator.workspace = true
+libc.workspace = true
+prism-frame.workspace = true
+smithay.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

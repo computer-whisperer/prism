@@ -1,0 +1,15 @@
+[package]
+name = "prism-protocols"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wayland protocol wiring (smithay handlers, dispatch to layout/input/renderer)"
+
+[dependencies]
+anyhow.workspace = true
+calloop.workspace = true
+prism-frame.workspace = true
+prism-renderer.workspace = true
+smithay.workspace = true
+tracing.workspace = true

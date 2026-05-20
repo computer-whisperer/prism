@@ -1,0 +1,11 @@
+[package]
+name = "prism-frame"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Renderer-independent frame description: Element, FrameDescription, ColorDescription, opaque handles"
+
+[dependencies]
+bitflags.workspace = true
+smithay.workspace = true

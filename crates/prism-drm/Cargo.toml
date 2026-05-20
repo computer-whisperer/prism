@@ -1,0 +1,17 @@
+[package]
+name = "prism-drm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "KMS frontend: DrmCompositor-equivalent + per-output scanout buffer management"
+
+[dependencies]
+anyhow.workspace = true
+calloop.workspace = true
+prism-frame.workspace = true
+prism-renderer.workspace = true
+smithay.workspace = true
+smithay-drm-extras.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

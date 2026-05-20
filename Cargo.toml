@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/prism",
+    "crates/prism-config",
+    "crates/prism-drm",
+    "crates/prism-frame",
+    "crates/prism-input",
+    "crates/prism-layout",
+    "crates/prism-protocols",
+    "crates/prism-renderer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+description = "Vulkan-native, HDR-native Wayland compositor"
+repository = "https://github.com/christianbrickhouse/prism"
+authors = ["Christian Brickhouse"]
+
+[workspace.dependencies]
+# in-tree
+prism-config = { path = "crates/prism-config" }
+prism-drm = { path = "crates/prism-drm" }
+prism-frame = { path = "crates/prism-frame" }
+prism-input = { path = "crates/prism-input" }
+prism-layout = { path = "crates/prism-layout" }
+prism-protocols = { path = "crates/prism-protocols" }
+prism-renderer = { path = "crates/prism-renderer" }
+
+# external
+anyhow = "1.0.102"
+ash = { version = "0.38", features = ["loaded"] }
+bitflags = "2.11.1"
+bytemuck = { version = "1.20", features = ["derive"] }
+calloop = { version = "0.14.4", features = ["executor", "signals"] }
+calloop-wayland-source = "0.4.1"
+glam = "0.30"
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+libc = "0.2"
+thiserror = "2.0"
+tracing = { version = "0.1.44", features = ["max_level_trace", "release_max_level_debug"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# smithay: pinned to the same revision niri uses (known-good for the protocol/drm/utils
+# pieces we depend on). Migrate to crates.io once a release catches up to what we use.
+[workspace.dependencies.smithay]
+git = "https://github.com/Smithay/smithay.git"
+rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+default-features = false
+features = [
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
+    "wayland_frontend",
+    "use_system_lib",
+]
+
+[workspace.dependencies.smithay-drm-extras]
+git = "https://github.com/Smithay/smithay.git"
+rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+
+[profile.dev]
+opt-level = 1
+debug = "limited"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+debug = "limited"
+lto = "thin"

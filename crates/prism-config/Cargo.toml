@@ -1,0 +1,11 @@
+[package]
+name = "prism-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Config schema (KDL-based, ported from niri-config)"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
