@@ -11,7 +11,7 @@ use ash::vk;
 
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
-use crate::intermediate::{INTERMEDIATE_FORMAT, Intermediate, create_view};
+use crate::intermediate::{Intermediate, create_view};
 use crate::pipeline::decode::{DecodePipeline, DecodePush};
 use crate::pipeline::encode::{EncodePipeline, EncodePush};
 
@@ -33,12 +33,20 @@ pub struct Renderer {
     /// Scanout format the encode pipeline was built for. Recreating the
     /// pipeline for a new format isn't free; assert callers keep this stable.
     scanout_format: vk::Format,
+    /// fp32 / fp16 / etc. — picked at Renderer-instance construction, which
+    /// today maps 1:1 to per-output (one Renderer per scanout target).
+    /// When multi-output lands this will move into per-output state.
+    intermediate_format: vk::Format,
     command_pool: vk::CommandPool,
 }
 
 impl Renderer {
-    pub fn new(device: Arc<Device>, scanout_format: vk::Format) -> Result<Self> {
-        let decode = DecodePipeline::new(device.clone(), INTERMEDIATE_FORMAT)?;
+    pub fn new(
+        device: Arc<Device>,
+        scanout_format: vk::Format,
+        intermediate_format: vk::Format,
+    ) -> Result<Self> {
+        let decode = DecodePipeline::new(device.clone(), intermediate_format)?;
         let encode = EncodePipeline::new(device.clone(), scanout_format)?;
 
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -56,6 +64,7 @@ impl Renderer {
             encode,
             intermediate: None,
             scanout_format,
+            intermediate_format,
             command_pool,
         })
     }
@@ -64,17 +73,25 @@ impl Renderer {
         self.scanout_format
     }
 
-    /// Ensure we have an intermediate image of the right size. Recreates
-    /// on mismatch.
+    pub fn intermediate_format(&self) -> vk::Format {
+        self.intermediate_format
+    }
+
+    /// Ensure we have an intermediate image of the right size + format.
+    /// Recreates on mismatch.
     fn ensure_intermediate(&mut self, extent: vk::Extent2D) -> Result<()> {
-        if self
-            .intermediate
-            .as_ref()
-            .is_some_and(|i| i.extent.width == extent.width && i.extent.height == extent.height)
-        {
+        if self.intermediate.as_ref().is_some_and(|i| {
+            i.extent.width == extent.width
+                && i.extent.height == extent.height
+                && i.format == self.intermediate_format
+        }) {
             return Ok(());
         }
-        self.intermediate = Some(Intermediate::new(self.device.clone(), extent)?);
+        self.intermediate = Some(Intermediate::new(
+            self.device.clone(),
+            extent,
+            self.intermediate_format,
+        )?);
         Ok(())
     }
 

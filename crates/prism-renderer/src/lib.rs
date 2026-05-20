@@ -16,7 +16,7 @@ pub use device::{Device, DrmDevId, PhysicalDeviceInfo};
 pub use dmabuf::ImportedImage;
 pub use error::{RendererError, Result};
 pub use instance::Instance;
-pub use intermediate::{INTERMEDIATE_FORMAT, Intermediate, create_view};
+pub use intermediate::{DEFAULT_INTERMEDIATE_FORMAT, Intermediate, create_view};
 pub use oneshot::OneshotPool;
 pub use pipeline::decode::{DecodePipeline, DecodePush};
 pub use pipeline::encode::{EncodePipeline, EncodePush, OutputTransfer};

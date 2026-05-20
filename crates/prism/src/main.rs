@@ -352,7 +352,12 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     // back to [0,1] and sRGB-encodes.
     let texture = build_gradient_texture(device.clone(), width)?;
 
-    let mut renderer = Renderer::new(device.clone(), vk::Format::B8G8R8A8_UNORM)?;
+    // Headless self-test uses the renderer's default fp32 intermediate.
+    let mut renderer = Renderer::new(
+        device.clone(),
+        vk::Format::B8G8R8A8_UNORM,
+        prism_renderer::DEFAULT_INTERMEDIATE_FORMAT,
+    )?;
 
     // Single element covering the whole output.
     let element = ElementDraw {
@@ -706,7 +711,13 @@ fn run_gradient_scanout(
     );
 
     let texture = build_gradient_texture(device.clone(), 1024)?;
-    let mut renderer = Renderer::new(device.clone(), vk_format)?;
+    // TTY gradient also uses the fp32 default; if we add per-output config
+    // later, this would come from the output's config.
+    let mut renderer = Renderer::new(
+        device.clone(),
+        vk_format,
+        prism_renderer::DEFAULT_INTERMEDIATE_FORMAT,
+    )?;
 
     let element = ElementDraw {
         texture_view: texture.view,

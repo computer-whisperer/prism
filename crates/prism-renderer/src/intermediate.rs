@@ -11,7 +11,17 @@ use ash::vk;
 use crate::device::Device;
 use crate::error::{RendererError, Result, VkResultExt};
 
-pub const INTERMEDIATE_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+/// Default intermediate format: fp32 BT.2020 absolute-nits linear.
+///
+/// fp32 gives ~7 decimal digits of mantissa and infinite headroom for
+/// accumulating semi-transparent layers, calibration matrices that compress
+/// dynamic range, and steep-slope encode math (PQ near peak luminance).
+///
+/// Cost on our hardware is negligible: at 4K@60 a write+read pair burns
+/// ~16 GB/s per output — single-digit % of either GPU's memory bandwidth.
+/// fp16 stays available for outputs where measurement shows no difference
+/// or where VRAM pressure becomes the binding constraint.
+pub const DEFAULT_INTERMEDIATE_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
 
 pub struct Intermediate {
     device: Arc<Device>,
@@ -19,13 +29,14 @@ pub struct Intermediate {
     pub view: vk::ImageView,
     pub memory: vk::DeviceMemory,
     pub extent: vk::Extent2D,
+    pub format: vk::Format,
 }
 
 impl Intermediate {
-    pub fn new(device: Arc<Device>, extent: vk::Extent2D) -> Result<Self> {
+    pub fn new(device: Arc<Device>, extent: vk::Extent2D, format: vk::Format) -> Result<Self> {
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(INTERMEDIATE_FORMAT)
+            .format(format)
             .extent(vk::Extent3D {
                 width: extent.width,
                 height: extent.height,
@@ -51,7 +62,7 @@ impl Intermediate {
         unsafe { device.raw.bind_image_memory(image, memory, 0) }
             .vk_ctx("bind_image_memory (intermediate)")?;
 
-        let view = create_view(&device, image, INTERMEDIATE_FORMAT)?;
+        let view = create_view(&device, image, format)?;
 
         Ok(Self {
             device,
@@ -59,6 +70,7 @@ impl Intermediate {
             view,
             memory,
             extent,
+            format,
         })
     }
 }
