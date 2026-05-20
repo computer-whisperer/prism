@@ -22,7 +22,7 @@ use drm_fourcc::DrmModifier;
 use prism_renderer::{
     ElementDraw, EncodeConfig, EncodePush, ImportedImage, Renderer, vk,
 };
-use smithay::backend::drm::{DrmDevice, DrmSurface, PlaneConfig, PlaneState};
+use smithay::backend::drm::{DrmDevice, DrmDeviceNotifier, DrmSurface, PlaneConfig, PlaneState};
 use smithay::reexports::drm::control::framebuffer;
 use smithay::utils::{Rectangle, Transform};
 
@@ -68,10 +68,23 @@ pub struct OutputContext {
     /// Set on first present to switch from `commit` (mode-set) to `page_flip`
     /// (just-swap-fb) for subsequent frames.
     mode_set_done: bool,
+    /// True between submitting a page-flip and receiving its vblank event.
+    /// Submitting another flip while one is pending causes the kernel to
+    /// reject with ENOMEM as its event-allocation pool fills; on a 60Hz
+    /// timer that's ~3000 errors/minute which locks up the system. Don't
+    /// re-enter present() until `mark_vblank()` has been called.
+    frame_pending: bool,
 }
 
 impl OutputContext {
-    pub fn new(device: Arc<prism_renderer::Device>, setup: OutputSetup<'_>) -> Result<Self> {
+    /// Bring up the integrated output. Returns `(context, drm_notifier)` — the
+    /// caller MUST insert the notifier into a calloop event loop and route
+    /// VBlank events back to `mark_vblank()`. Failure to drain notifier events
+    /// causes a kernel-side event-allocation cascade that locks the system.
+    pub fn new(
+        device: Arc<prism_renderer::Device>,
+        setup: OutputSetup<'_>,
+    ) -> Result<(Self, DrmDeviceNotifier)> {
         let mut session = SeatSession::new()?;
         if !session.is_active() {
             return Err(anyhow!(
@@ -79,7 +92,7 @@ impl OutputContext {
             ));
         }
         let drm_fd = session.open_drm(setup.drm_path)?;
-        let (mut drm, _notifier) = smithay::backend::drm::DrmDevice::new(drm_fd, false)
+        let (mut drm, drm_notifier) = smithay::backend::drm::DrmDevice::new(drm_fd, false)
             .with_context(|| format!("DrmDevice::new({})", setup.drm_path))?;
 
         let pick = match setup.output_name {
@@ -144,28 +157,56 @@ impl OutputContext {
             setup.encode_config,
         )?;
 
-        Ok(Self {
-            session,
-            drm,
-            _gbm: gbm,
-            _bo: bo,
-            scanout_image,
-            renderer,
-            fb,
-            surface,
-            extent,
-            connector_name: pick.connector_name,
-            mode_set_done: false,
-        })
+        Ok((
+            Self {
+                session,
+                drm,
+                _gbm: gbm,
+                _bo: bo,
+                scanout_image,
+                renderer,
+                fb,
+                surface,
+                extent,
+                connector_name: pick.connector_name,
+                mode_set_done: false,
+                frame_pending: false,
+            },
+            drm_notifier,
+        ))
+    }
+
+    /// Clear the `frame_pending` flag. Call this when the DRM notifier
+    /// surfaces a VBlank event for this output's CRTC.
+    pub fn mark_vblank(&mut self) {
+        self.frame_pending = false;
+    }
+
+    /// True if a flip is in flight (`present` will be a no-op).
+    pub fn is_frame_pending(&self) -> bool {
+        self.frame_pending
     }
 
     /// Render the supplied `elements` (with the supplied encode parameters)
     /// into the scanout image and submit it for display.
     ///
+    /// Returns `Ok(false)` (no-op) if a previous flip is still pending —
+    /// the caller should wait for the next VBlank event before retrying.
+    /// Returns `Ok(true)` if a frame was submitted.
+    ///
     /// The first call does a full atomic `commit` (mode-set). Subsequent
-    /// calls do `page_flip` (buffer swap without mode change). Both request
-    /// a vblank event from the kernel; we don't drain those yet (#49 follow-up).
-    pub fn present(&mut self, elements: &[ElementDraw], encode_push: &EncodePush) -> Result<()> {
+    /// calls do `page_flip` (buffer swap). Both request a vblank event from
+    /// the kernel; the caller MUST drain them by feeding the DrmDeviceNotifier
+    /// into calloop and routing VBlank back to `mark_vblank()`.
+    pub fn present(
+        &mut self,
+        elements: &[ElementDraw],
+        encode_push: &EncodePush,
+    ) -> Result<bool> {
+        if self.frame_pending {
+            return Ok(false);
+        }
+
         self.renderer.render_frame(
             self.scanout_image.image(),
             self.extent,
@@ -202,7 +243,8 @@ impl OutputContext {
                 .page_flip(plane_state.iter().cloned(), true)
                 .context("DrmSurface::page_flip")?;
         }
-        Ok(())
+        self.frame_pending = true;
+        Ok(true)
     }
 }
 

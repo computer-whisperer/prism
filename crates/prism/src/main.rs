@@ -665,7 +665,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
 
     // Output bringup (DRM master, scanout BO, renderer).
     let encode_config = prism_renderer::EncodeConfig::default_srgb();
-    let output = OutputContext::new(
+    let (output, drm_notifier) = OutputContext::new(
         device.clone(),
         OutputSetup {
             drm_path: "/dev/dri/card0",
@@ -697,6 +697,24 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     let socket = prism_protocols::insert_wayland_sources(&event_loop.handle(), display)?;
     tracing::info!("WAYLAND_DISPLAY={socket}");
     tracing::info!("scanout target: {output_name_for_log} {}×{}", extent.width, extent.height);
+
+    // Drain DRM vblank / page-flip-complete events. CRITICAL: without this,
+    // event::true page_flips accumulate in the kernel until ENOMEM, which
+    // locks up at 60Hz (#49a debrief).
+    event_loop
+        .handle()
+        .insert_source(drm_notifier, |event, _metadata, state| {
+            use smithay::backend::drm::DrmEvent;
+            match event {
+                DrmEvent::VBlank(_crtc) => {
+                    if let Some(output) = state.output.as_mut() {
+                        output.mark_vblank();
+                    }
+                }
+                DrmEvent::Error(e) => tracing::warn!("DRM event error: {e:#}"),
+            }
+        })
+        .map_err(|e| anyhow!("insert drm notifier: {e}"))?;
 
     // SIGINT / SIGTERM → clean shutdown.
     let running = Arc::new(AtomicBool::new(true));
@@ -742,10 +760,13 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
 }
 
 /// One frame: build the element list (gradient only for now), present.
+/// Returns true if a flip was submitted, false if skipped (previous flip
+/// still pending). The render timer fires unconditionally; this provides
+/// the backpressure.
 fn present_one_frame(
     state: &mut prism_protocols::PrismState,
     gradient_view: prism_renderer::vk::ImageView,
-) -> Result<()> {
+) -> Result<bool> {
     use prism_renderer::{DecodePush, ElementDraw, EncodePush};
 
     let Some(output) = state.output.as_mut() else {
