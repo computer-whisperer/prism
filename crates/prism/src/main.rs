@@ -634,13 +634,26 @@ fn pick_memory(
     Err(anyhow!("no memory type matches {:?}", required))
 }
 
-/// Append a one-line breadcrumb to `/tmp/prism.crumbs` and `fsync`. Used in
+/// Append a one-line breadcrumb to the crumbs file and `fsync`. Used in
 /// `prism run` to leave a trail across a TTY-test session that survives the
 /// system locking up — tracing-via-stderr can't reach the user's eyes once
 /// we own DRM master (the text console can't refresh), and any in-flight
 /// stdio is lost when the kernel wedges.
+///
+/// Path: `$PRISM_CRUMBS` if set, otherwise `./prism.crumbs` (relative to
+/// the cwd at process start). NOT `/tmp` — that's tmpfs on most distros
+/// and gets wiped at the reboot we're specifically trying to debug.
 fn breadcrumb(msg: &str) {
     use std::io::Write;
+    use std::sync::OnceLock;
+    static CRUMBS_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let path = CRUMBS_PATH.get_or_init(|| {
+        if let Ok(p) = std::env::var("PRISM_CRUMBS") {
+            std::path::PathBuf::from(p)
+        } else {
+            std::path::PathBuf::from("prism.crumbs")
+        }
+    });
     let line = format!(
         "{:.3}: {msg}\n",
         std::time::SystemTime::now()
@@ -651,7 +664,7 @@ fn breadcrumb(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/prism.crumbs")
+        .open(path)
     {
         let _ = f.write_all(line.as_bytes());
         let _ = f.sync_all();
