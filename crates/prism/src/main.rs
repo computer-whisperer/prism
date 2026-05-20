@@ -37,5 +37,41 @@ fn main() -> Result<()> {
         );
     }
 
+    // Smoke test: enumerate DRM connectors on both cards.
+    for path in ["/dev/dri/card0", "/dev/dri/card1"] {
+        match prism_drm::open_for_enumeration(path) {
+            Ok(dev) => {
+                let summary = prism_drm::summarize(&dev)?;
+                tracing::info!(
+                    "{path}: {} connectors, {} CRTCs, {} planes",
+                    summary.connectors.len(),
+                    summary.crtcs.len(),
+                    summary.planes.len(),
+                );
+                for c in &summary.connectors {
+                    let mode_str = c
+                        .preferred_mode()
+                        .map(|m| {
+                            format!(
+                                "{}x{}@{}Hz",
+                                m.size().0,
+                                m.size().1,
+                                m.vrefresh()
+                            )
+                        })
+                        .unwrap_or_else(|| "<no mode>".to_string());
+                    tracing::info!(
+                        "  {} {:?} {} modes, preferred {}",
+                        c.name(),
+                        c.state,
+                        c.modes.len(),
+                        mode_str,
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("could not open {path}: {e:#}"),
+        }
+    }
+
     Ok(())
 }
