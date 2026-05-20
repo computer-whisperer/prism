@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+bytemuck.workspace = true
 calloop.workspace = true
 prism-config.workspace = true
 prism-drm.workspace = true

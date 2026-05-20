@@ -7,13 +7,20 @@ pub mod device;
 pub mod dmabuf;
 pub mod error;
 pub mod instance;
+pub mod intermediate;
 pub mod oneshot;
+pub mod pipeline;
+pub mod renderer;
 
 pub use device::{Device, DrmDevId, PhysicalDeviceInfo};
 pub use dmabuf::ImportedImage;
 pub use error::{RendererError, Result};
 pub use instance::Instance;
+pub use intermediate::{INTERMEDIATE_FORMAT, Intermediate, create_view};
 pub use oneshot::OneshotPool;
+pub use pipeline::decode::{DecodePipeline, DecodePush};
+pub use pipeline::encode::{EncodePipeline, EncodePush, OutputTransfer};
+pub use renderer::{ElementDraw, Renderer};
 
 // Re-export ash::vk so binary / glue crates don't need a direct ash dep.
 pub use ash::vk;

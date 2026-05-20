@@ -17,9 +17,10 @@ fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         None => run_headless_smoke_tests(),
         Some("scanout") => run_scanout_smoke_test(),
+        Some("gradient") => run_gradient_scanout(),
         Some("wayland") => run_wayland_server(),
         Some(other) => Err(anyhow!(
-            "unknown subcommand {other:?}; expected: (no args) | scanout | wayland"
+            "unknown subcommand {other:?}; expected: (no args) | scanout | gradient | wayland"
         )),
     }
 }
@@ -156,7 +157,11 @@ fn run_headless_smoke_tests() -> Result<()> {
 
     // Same code path the wayland dmabuf protocol handler uses, exercised
     // without needing a real client to play along.
-    tracer_dmabuf_protocol(device).context("dmabuf protocol-handler import path")?;
+    tracer_dmabuf_protocol(device.clone()).context("dmabuf protocol-handler import path")?;
+
+    // Full decode→encode pipeline rendering a linear gradient through the
+    // intermediate, sRGB-encoded into a GBM BO we can map+inspect.
+    tracer_render_gradient(device).context("render pipeline gradient test")?;
 
     Ok(())
 }
@@ -285,6 +290,411 @@ fn tracer_dmabuf_protocol(device: Arc<prism_renderer::Device>) -> Result<()> {
     )
     .context("ImportedImage::import (SAMPLED, mirroring wayland handler)")?;
     tracing::info!("✓ dmabuf-handler import path verified (SAMPLED VkImage)");
+    Ok(())
+}
+
+/// End-to-end pipeline check: build a small linear gradient texture, run it
+/// through decode→intermediate→encode (sRGB OETF), readback the BGRA bytes,
+/// validate at anchor points. Catches:
+///   - shader compile / SPIR-V loading regressions
+///   - descriptor / pipeline layout mismatches
+///   - dynamic-rendering attachment setup mistakes
+///   - sRGB OETF math (compare to known curve values)
+fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
+    use prism_renderer::{
+        DecodePush, ElementDraw, EncodePush, ImportedImage, Renderer, vk,
+    };
+
+    let width: u32 = 256;
+    let height: u32 = 1;
+
+    // Scanout target: a GBM XRGB8888 LINEAR BO we can map for readback.
+    let gbm = prism_drm::GbmDevice::open("/dev/dri/renderD129")?;
+    let (bo, dmabuf) = gbm.allocate_scanout(
+        width,
+        height,
+        DrmFourcc::Xrgb8888,
+        &[DrmModifier::Linear],
+    )?;
+    let scanout = ImportedImage::import(
+        device.clone(),
+        &dmabuf,
+        vk::Format::B8G8R8A8_UNORM,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT,
+    )?;
+
+    // Source texture: 256×1 linear horizontal gradient, RGBA16_SFLOAT. Each
+    // pixel = (x/255, x/255, x/255, 1.0). When fed through identity decode
+    // (transfer=Linear) the intermediate holds linear values in [0,1] *
+    // sdr_white_nits. The encode pass (Srgb, sdr_white_nits=80) normalizes
+    // back to [0,1] and sRGB-encodes.
+    let texture = build_gradient_texture(device.clone(), width)?;
+
+    let mut renderer = Renderer::new(device.clone(), vk::Format::B8G8R8A8_UNORM)?;
+
+    // Single element covering the whole output.
+    let element = ElementDraw {
+        texture_view: texture.view,
+        push: DecodePush::identity_srgb(
+            [-1.0, -1.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ),
+    };
+    let encode_push = EncodePush::sdr_identity();
+
+    renderer.render_frame(
+        scanout.image(),
+        vk::Extent2D { width, height },
+        &[element],
+        &encode_push,
+    )?;
+
+    // Read back via GBM map and check anchor points.
+    bo.map(0, 0, width, 1, |mapped| {
+        let stride = mapped.stride() as usize;
+        let row = &mapped.buffer()[..stride];
+        // Pixel at x=0 should be ~0 (sRGB-encoded 0.0 → 0.0).
+        let p0 = bgra(row, 0);
+        // Pixel at x=255 should be ~255 (sRGB-encoded 1.0 → 1.0).
+        let p255 = bgra(row, 255);
+        // Mid pixel: linear 127/255 ≈ 0.498. sRGB OETF ≈ 0.738. So encoded byte ≈ 188.
+        let pmid = bgra(row, 127);
+        tracing::info!(
+            "gradient readback: x=0 BGRA={:?}  x=127 BGRA={:?}  x=255 BGRA={:?}",
+            p0, pmid, p255
+        );
+        // Quick sanity bounds (allow small AMD sRGB-OETF rounding).
+        let ok = p0.0 <= 4
+            && p255.0 >= 250
+            && (180..=196).contains(&pmid.0)
+            && (180..=196).contains(&pmid.1)
+            && (180..=196).contains(&pmid.2);
+        if ok {
+            tracing::info!("✓ render pipeline gradient verified (sRGB OETF anchor-points match)");
+            Ok(())
+        } else {
+            Err(anyhow!("gradient anchor-point mismatch"))
+        }
+    })
+    .context("gbm map for gradient readback")??;
+
+    Ok(())
+}
+
+fn bgra(row: &[u8], x: usize) -> (u8, u8, u8, u8) {
+    let off = x * 4;
+    (row[off], row[off + 1], row[off + 2], row[off + 3])
+}
+
+/// Create a 256×1 RGBA16_SFLOAT texture pre-filled with a horizontal linear
+/// gradient. Owns its own VkImage + memory; caller drops to free.
+struct GradientTexture {
+    device: Arc<prism_renderer::Device>,
+    image: prism_renderer::vk::Image,
+    memory: prism_renderer::vk::DeviceMemory,
+    view: prism_renderer::vk::ImageView,
+}
+
+impl Drop for GradientTexture {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.raw.device_wait_idle();
+            self.device.raw.destroy_image_view(self.view, None);
+            self.device.raw.destroy_image(self.image, None);
+            self.device.raw.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Minimal f32 → IEEE-754 half-precision bit pattern. Sufficient for the
+/// non-negative finite values the test uses; doesn't handle subnormals or
+/// rounding modes carefully.
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 31) & 0x1) as u16;
+    let exp_f32 = ((bits >> 23) & 0xff) as i32;
+    let mantissa_f32 = bits & 0x007f_ffff;
+    if exp_f32 == 0 {
+        return sign << 15; // ±0
+    }
+    let exp_f16 = exp_f32 - 127 + 15;
+    if exp_f16 <= 0 {
+        return sign << 15; // underflow → zero (no subnormals)
+    }
+    if exp_f16 >= 31 {
+        return (sign << 15) | (0x1f << 10); // ±inf
+    }
+    let mantissa_f16 = (mantissa_f32 >> 13) as u16;
+    (sign << 15) | ((exp_f16 as u16) << 10) | mantissa_f16
+}
+
+fn build_gradient_texture(
+    device: Arc<prism_renderer::Device>,
+    width: u32,
+) -> Result<GradientTexture> {
+    use prism_renderer::vk;
+    let height = 1;
+
+    // Generate the data: 256 fp16 RGBA values, linear ramp 0..1.
+    let pixels: Vec<u16> = (0..width)
+        .flat_map(|x| {
+            let v = x as f32 / (width - 1) as f32;
+            let h = f32_to_f16_bits(v);
+            let one = f32_to_f16_bits(1.0);
+            [h, h, h, one]
+        })
+        .collect();
+    let bytes: &[u8] = bytemuck::cast_slice(&pixels);
+
+    // Staging buffer: HOST_VISIBLE, large enough for the upload.
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(bytes.len() as u64)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let staging = unsafe { device.raw.create_buffer(&buffer_info, None) }?;
+    let req = unsafe { device.raw.get_buffer_memory_requirements(staging) };
+    let mem_type = pick_memory(&device, req.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?;
+    let alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(req.size)
+        .memory_type_index(mem_type);
+    let staging_mem = unsafe { device.raw.allocate_memory(&alloc, None) }?;
+    unsafe { device.raw.bind_buffer_memory(staging, staging_mem, 0) }?;
+    unsafe {
+        let dst = device.raw.map_memory(staging_mem, 0, req.size, vk::MemoryMapFlags::empty())?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+        device.raw.unmap_memory(staging_mem);
+    }
+
+    // Texture image: OPTIMAL, SAMPLED + TRANSFER_DST.
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(vk::Format::R16G16B16A16_SFLOAT)
+        .extent(vk::Extent3D { width, height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let image = unsafe { device.raw.create_image(&image_info, None) }?;
+    let req = unsafe { device.raw.get_image_memory_requirements(image) };
+    let mem_type =
+        pick_memory(&device, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+    let alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(req.size)
+        .memory_type_index(mem_type);
+    let memory = unsafe { device.raw.allocate_memory(&alloc, None) }?;
+    unsafe { device.raw.bind_image_memory(image, memory, 0) }?;
+
+    // Upload: one-shot command buffer: transition → copy → transition.
+    let pool_info = vk::CommandPoolCreateInfo::default()
+        .queue_family_index(device.physical.graphics_queue_family)
+        .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+    let pool = unsafe { device.raw.create_command_pool(&pool_info, None) }?;
+    let cb_info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    let cb = unsafe { device.raw.allocate_command_buffers(&cb_info) }?[0];
+    let begin = vk::CommandBufferBeginInfo::default()
+        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    unsafe { device.raw.begin_command_buffer(cb, &begin) }?;
+
+    let to_xfer = [vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+        .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })];
+    unsafe {
+        device.raw.cmd_pipeline_barrier2(
+            cb,
+            &vk::DependencyInfo::default().image_memory_barriers(&to_xfer),
+        );
+    }
+    let region = [vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+        .image_extent(vk::Extent3D { width, height, depth: 1 })];
+    unsafe {
+        device.raw.cmd_copy_buffer_to_image(
+            cb,
+            staging,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &region,
+        );
+    }
+    let to_sampled = [vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })];
+    unsafe {
+        device.raw.cmd_pipeline_barrier2(
+            cb,
+            &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
+        );
+        device.raw.end_command_buffer(cb)?;
+    }
+    let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+    let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cbs)];
+    unsafe {
+        device
+            .raw
+            .queue_submit2(device.graphics_queue, &submit, vk::Fence::null())?;
+        device.raw.queue_wait_idle(device.graphics_queue)?;
+        device.raw.destroy_command_pool(pool, None);
+        device.raw.destroy_buffer(staging, None);
+        device.raw.free_memory(staging_mem, None);
+    }
+
+    let view = prism_renderer::create_view(&device, image, vk::Format::R16G16B16A16_SFLOAT)?;
+    Ok(GradientTexture { device, image, memory, view })
+}
+
+fn pick_memory(
+    device: &prism_renderer::Device,
+    type_bits: u32,
+    required: prism_renderer::vk::MemoryPropertyFlags,
+) -> Result<u32> {
+    let props = unsafe {
+        device
+            .instance_raw()
+            .get_physical_device_memory_properties(device.physical.raw)
+    };
+    for i in 0..props.memory_type_count {
+        let mt = props.memory_types[i as usize];
+        if (type_bits & (1 << i)) != 0 && mt.property_flags.contains(required) {
+            return Ok(i);
+        }
+    }
+    Err(anyhow!("no memory type matches {:?}", required))
+}
+
+/// Same TTY-required mode-set as `scanout`, but instead of `vkCmdClearColorImage`
+/// the scanout image is rendered through the two-pass decode→encode pipeline
+/// using a horizontal-gradient texture. Visual verification: a smoothly
+/// gamma-correct gradient (black on the left → white on the right).
+fn run_gradient_scanout() -> Result<()> {
+    use prism_drm::scanout;
+    use prism_renderer::{DecodePush, ElementDraw, EncodePush, Renderer, vk};
+    use smithay::backend::drm::{DrmDevice, PlaneConfig, PlaneState};
+    use smithay::utils::{Rectangle, Transform};
+    use std::time::Duration;
+
+    tracing::info!("prism — TTY gradient scanout (renderer pipeline)");
+
+    let instance = prism_renderer::Instance::new()?;
+    let device = prism_renderer::Device::new(
+        instance.clone(),
+        Some(prism_renderer::DrmDevId {
+            major: 226,
+            minor: 129,
+        }),
+    )?;
+    tracing::info!("Vulkan device: {}", device.physical.name);
+
+    let drm_path = "/dev/dri/card0";
+    let mut session = prism_drm::SeatSession::new()?;
+    if !session.is_active() {
+        return Err(anyhow!(
+            "libseat session not active. Switch to a free VT and rerun."
+        ));
+    }
+    let drm_fd = session.open_drm(drm_path)?;
+    let (mut drm, _drm_notifier) = DrmDevice::new(drm_fd, false)?;
+    let pick = scanout::pick_first_connected(&drm)?;
+    tracing::info!(
+        "scanout target: {} mode={}x{}@{}Hz",
+        pick.connector_name,
+        pick.mode.size().0,
+        pick.mode.size().1,
+        pick.mode.vrefresh(),
+    );
+    let surface = drm.create_surface(pick.crtc, pick.mode, &[pick.connector])?;
+    let gbm = prism_drm::GbmDevice::from_device_fd(drm.device_fd().device_fd())?;
+
+    let (w, h) = pick.mode.size();
+    let w = w as u32;
+    let h = h as u32;
+    let (bo, dmabuf) =
+        gbm.allocate_scanout(w, h, DrmFourcc::Xrgb8888, &[DrmModifier::Linear])?;
+    let scanout_image = prism_renderer::ImportedImage::import(
+        device.clone(),
+        &dmabuf,
+        vk::Format::B8G8R8A8_UNORM,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT,
+    )?;
+    tracing::info!("scanout BO ready: {w}x{h} XRGB8888 LINEAR");
+
+    let texture = build_gradient_texture(device.clone(), 1024)?;
+    let mut renderer = Renderer::new(device.clone(), vk::Format::B8G8R8A8_UNORM)?;
+
+    let element = ElementDraw {
+        texture_view: texture.view,
+        push: DecodePush::identity_srgb([-1.0, -1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
+    };
+    let encode_push = EncodePush::sdr_identity();
+    renderer.render_frame(
+        scanout_image.image(),
+        vk::Extent2D { width: w, height: h },
+        &[element],
+        &encode_push,
+    )?;
+    tracing::info!("rendered gradient via decode→encode pipeline");
+
+    let fb = scanout::add_framebuffer_for_bo(&drm, &bo)?;
+    let src = Rectangle::from_size((w as i32, h as i32).into()).to_f64();
+    let dst = Rectangle::from_size((w as i32, h as i32).into());
+    let plane_state = [PlaneState {
+        handle: surface.plane(),
+        config: Some(PlaneConfig {
+            src,
+            dst,
+            transform: Transform::Normal,
+            alpha: 1.0,
+            damage_clips: None,
+            fb,
+            fence: None,
+        }),
+    }];
+    surface.commit(plane_state.iter().cloned(), true)?;
+    tracing::info!("committed; holding 5s");
+    std::thread::sleep(Duration::from_secs(5));
+    surface.clear()?;
+    tracing::info!("released");
     Ok(())
 }
 

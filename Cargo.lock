@@ -694,6 +694,7 @@ name = "prism"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "calloop",
  "prism-config",
  "prism-drm",

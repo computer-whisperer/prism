@@ -1,0 +1,91 @@
+// Per-element decode pass: fragment shader.
+//
+// Pipeline stage 1 of 2. Inputs one element's texture (any transfer/primaries).
+// Outputs BT.2020 linear absolute nits into the fp16 intermediate.
+//
+// Transfer enum (matches prism_frame::TransferFunction):
+//   0 = Linear (no-op, assume input is already linear-light)
+//   1 = sRGB EOTF
+//   2 = PQ (SMPTE ST 2084) EOTF
+//   3 = HLG (BT.2100) — TODO not implemented yet
+//   4 = BT.1886 — TODO not implemented yet
+//   5 = Gamma  — TODO not implemented yet
+//
+// For now we support Linear + sRGB; PQ/HLG/BT.1886/Gamma will be added as
+// soon as we have client buffers in those formats to test against.
+
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D u_texture;
+
+layout(push_constant) uniform Push {
+    vec4 dst_rect_clip;
+    vec4 src_rect_uv;
+    mat4 decode_matrix;
+    float sdr_white_nits;
+    int transfer;
+    int _pad0;
+    int _pad1;
+} push;
+
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 out_color;
+
+// sRGB inverse EOTF (encoded → linear), per IEC 61966-2-1.
+float srgb_eotf_component(float c) {
+    return c <= 0.04045
+        ? c / 12.92
+        : pow((c + 0.055) / 1.055, 2.4);
+}
+vec3 srgb_eotf(vec3 c) {
+    return vec3(srgb_eotf_component(c.r),
+                srgb_eotf_component(c.g),
+                srgb_eotf_component(c.b));
+}
+
+// PQ inverse EOTF (encoded V in [0,1] → linear Y in [0,1] scaled to 10000 nits).
+// SMPTE ST 2084. TODO: implement and unit-test against anchor points
+// (V=0.5 ≈ 92.25 nits; V=1.0 = 10000 nits).
+vec3 pq_eotf(vec3 v) {
+    const float m1 = 0.1593017578125;     // 2610/16384
+    const float m2 = 78.84375;            // 2523/4096 * 128
+    const float c1 = 0.8359375;           // 3424/4096
+    const float c2 = 18.8515625;          // 2413/4096 * 32
+    const float c3 = 18.6875;             // 2392/4096 * 32
+    vec3 vm = pow(max(v, vec3(0.0)), vec3(1.0 / m2));
+    vec3 num = max(vm - c1, vec3(0.0));
+    vec3 den = c2 - c3 * vm;
+    vec3 y = pow(num / den, vec3(1.0 / m1));
+    return y * 10000.0;
+}
+
+void main() {
+    vec4 sampled = texture(u_texture, v_uv);
+
+    // Decode transfer → linear-light. Linear path leaves alpha-unmultiplied
+    // values where they are.
+    vec3 linear;
+    if (push.transfer == 1) {
+        linear = srgb_eotf(sampled.rgb);
+    } else if (push.transfer == 2) {
+        linear = pq_eotf(sampled.rgb);
+    } else {
+        // Linear (or unhandled transfer → identity for now).
+        linear = sampled.rgb;
+    }
+
+    // Scale into absolute-nits domain. For PQ the EOTF already produced
+    // absolute nits; everything else interprets the source's 1.0 as
+    // `sdr_white_nits`.
+    if (push.transfer != 2) {
+        linear *= push.sdr_white_nits;
+    }
+
+    // Primaries → BT.2020. mat4 storage; the 3×3 lives in the upper-left.
+    mat3 m = mat3(push.decode_matrix);
+    vec3 bt2020 = m * linear;
+
+    // Output to fp16 intermediate. Alpha is passed through unchanged so
+    // standard pre-multiplied blending composes correctly in linear space.
+    out_color = vec4(bt2020 * sampled.a, sampled.a);
+}
