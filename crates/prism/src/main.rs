@@ -17,10 +17,64 @@ fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         None => run_headless_smoke_tests(),
         Some("scanout") => run_scanout_smoke_test(),
+        Some("wayland") => run_wayland_server(),
         Some(other) => Err(anyhow!(
-            "unknown subcommand {other:?}; expected: (no args) | scanout"
+            "unknown subcommand {other:?}; expected: (no args) | scanout | wayland"
         )),
     }
+}
+
+/// Bring up a Wayland server socket and dispatch protocol messages forever.
+/// Clients can connect via `WAYLAND_DISPLAY=wayland-N`. No rendering yet —
+/// surface lifecycle / configure / commit are logged, buffers are dropped.
+fn run_wayland_server() -> Result<()> {
+    use calloop::EventLoop;
+    use calloop::signals::{Signal, Signals};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    tracing::info!("prism compositor — wayland server scaffolding");
+
+    let display = prism_protocols::new_display()?;
+    let mut state = prism_protocols::PrismState::new(&display);
+
+    let mut event_loop: EventLoop<'static, prism_protocols::PrismState> =
+        EventLoop::try_new().context("calloop EventLoop::try_new")?;
+
+    let socket = prism_protocols::insert_wayland_sources(&event_loop.handle(), display)?;
+    tracing::info!(
+        "WAYLAND_DISPLAY={socket}  — try: `WAYLAND_DISPLAY={socket} foot` (or weston-terminal)"
+    );
+    tracing::info!("Ctrl-C to exit");
+
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let running = running.clone();
+        let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM])
+            .context("Signals::new(SIGINT|SIGTERM)")?;
+        event_loop
+            .handle()
+            .insert_source(signals, move |evt, _, _state| {
+                tracing::info!(signal = ?evt.signal(), "signal received, shutting down");
+                running.store(false, Ordering::SeqCst);
+            })
+            .map_err(|e| anyhow!("insert signals source: {e}"))?;
+    }
+
+    while running.load(Ordering::SeqCst) {
+        event_loop
+            .dispatch(Some(Duration::from_millis(100)), &mut state)
+            .context("event_loop.dispatch")?;
+        // Flush replies queued during this turn.
+        state
+            .display_handle
+            .flush_clients()
+            .context("flush_clients")?;
+    }
+
+    tracing::info!("wayland server stopped");
+    Ok(())
 }
 
 /// Default invocation: probe Vulkan + DRM + GBM↔Vulkan round-trip. All steps
