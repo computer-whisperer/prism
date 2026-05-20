@@ -373,12 +373,13 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     };
     let encode_push = EncodePush::sdr_identity();
 
-    renderer.render_frame(
-        scanout.image(),
-        vk::Extent2D { width, height },
-        &[element],
-        &encode_push,
-    )?;
+    renderer.render_frame(&scanout, &[element], &encode_push)?;
+    // Headless readback wants to map the scanout BO; the GPU work above
+    // was submitted with a fence we don't wait on, so make sure it's done
+    // before we map. device_wait_idle is fine here (one-shot test).
+    unsafe {
+        let _ = device.raw.device_wait_idle();
+    }
 
     // Read back via GBM map and check anchor points.
     bo.map(0, 0, width, 1, |mapped| {
@@ -1026,12 +1027,11 @@ fn run_gradient_scanout(
         push: DecodePush::identity_srgb([-1.0, -1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
     };
     let encode_push = EncodePush::sdr_identity();
-    renderer.render_frame(
-        scanout_image.image(),
-        vk::Extent2D { width: w, height: h },
-        &[element],
-        &encode_push,
-    )?;
+    renderer.render_frame(&scanout_image, &[element], &encode_push)?;
+    // One-shot TTY test: page-flip below needs the render to be done.
+    unsafe {
+        let _ = device.raw.device_wait_idle();
+    }
     tracing::info!("rendered gradient via decode→encode pipeline");
 
     let fb = scanout::add_framebuffer_for_bo(&drm, &bo)?;

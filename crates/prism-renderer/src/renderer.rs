@@ -1,20 +1,33 @@
-//! Top-level renderer: orchestrates the two-pass decode→encode pipeline for
-//! a single frame, targeting a caller-provided scanout image.
+//! Top-level renderer: orchestrates the two-pass decode→encode pipeline.
 //!
-//! Scope today: single output, single element type (texture), SDR sRGB
-//! encode. Multi-output and richer element types (solid color, custom
-//! shader) follow in #49 + later tasks.
+//! Architecture: N frame slots in flight (default 2, matching double-buffered
+//! scanout). Each slot owns a persistent command buffer + a fence. Per-frame:
+//! wait for the slot's fence (gates resource reuse), reset the command buffer,
+//! record the new frame's commands, submit signalling the fence. No
+//! `queue_wait_idle`. No descriptor pool — push descriptors at draw time.
+//!
+//! The CPU can prepare frame N+1 while the GPU executes frame N; only stalls
+//! if the GPU falls more than N frames behind. For our gradient at ~7 ms GPU
+//! time on a 16.67 ms vblank budget there's plenty of slack, but real
+//! workloads (full client compositing) need this overlap.
 
 use std::sync::Arc;
 
 use ash::vk;
 
 use crate::device::Device;
-use crate::error::{Result, VkResultExt};
+use crate::dmabuf::ImportedImage;
 use crate::encode_synth::EncodeConfig;
-use crate::intermediate::{Intermediate, create_view};
+use crate::error::{Result, VkResultExt};
+use crate::intermediate::Intermediate;
 use crate::pipeline::decode::{DecodePipeline, DecodePush};
 use crate::pipeline::encode::{EncodePipeline, EncodePush};
+
+/// Number of frames the renderer keeps in flight. Matches the scanout BO
+/// count in `prism-drm::OutputContext`; the kernel only ever has one flip
+/// pending and one currently scanning out, so two frames-worth of GPU
+/// resources is the right size.
+pub const FRAMES_IN_FLIGHT: usize = 2;
 
 /// One element to draw in the decode pass.
 pub struct ElementDraw {
@@ -23,22 +36,28 @@ pub struct ElementDraw {
     pub push: DecodePush,
 }
 
-/// Top-level renderer. Owns the two pipelines + a transient command pool.
-/// `render_frame` is synchronous (waits for the queue to go idle) — fine
-/// for the tracer demo; #49 will introduce real frame pacing + sync2 sems.
+/// Per-frame-in-flight resources. Owned by the renderer.
+struct FrameSlot {
+    cmd_buffer: vk::CommandBuffer,
+    /// Signalled by the queue submission for this slot's frame. We wait on
+    /// it at the start of the *next* time we use this slot, to ensure the
+    /// GPU is done with the previous frame's resources (including the
+    /// intermediate image, the scanout image's previous content, etc.).
+    /// Created in the signalled state so the first wait is a no-op.
+    fence: vk::Fence,
+}
+
 pub struct Renderer {
     device: Arc<Device>,
     decode: DecodePipeline,
     encode: EncodePipeline,
     intermediate: Option<Intermediate>,
-    /// Scanout format the encode pipeline was built for. Recreating the
-    /// pipeline for a new format isn't free; assert callers keep this stable.
     scanout_format: vk::Format,
-    /// fp32 / fp16 / etc. — picked at Renderer-instance construction, which
-    /// today maps 1:1 to per-output (one Renderer per scanout target).
-    /// When multi-output lands this will move into per-output state.
     intermediate_format: vk::Format,
     command_pool: vk::CommandPool,
+    slots: [FrameSlot; FRAMES_IN_FLIGHT],
+    /// Index into `slots` for the *next* frame.
+    next_slot: usize,
 }
 
 impl Renderer {
@@ -53,12 +72,33 @@ impl Renderer {
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(device.physical.graphics_queue_family)
-            .flags(
-                vk::CommandPoolCreateFlags::TRANSIENT
-                    | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-            );
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let command_pool = unsafe { device.raw.create_command_pool(&pool_info, None) }
             .vk_ctx("create_command_pool (renderer)")?;
+
+        // Allocate all N command buffers in one call.
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(FRAMES_IN_FLIGHT as u32);
+        let cbs = unsafe { device.raw.allocate_command_buffers(&alloc_info) }
+            .vk_ctx("allocate_command_buffers (renderer slots)")?;
+
+        // One fence per slot, signalled at creation so the first wait is a no-op.
+        let fence_info =
+            vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        let mut slots = Vec::with_capacity(FRAMES_IN_FLIGHT);
+        for cb in cbs {
+            let fence = unsafe { device.raw.create_fence(&fence_info, None) }
+                .vk_ctx("create_fence (renderer slot)")?;
+            slots.push(FrameSlot {
+                cmd_buffer: cb,
+                fence,
+            });
+        }
+        let slots: [FrameSlot; FRAMES_IN_FLIGHT] = slots
+            .try_into()
+            .map_err(|_| crate::error::RendererError::MissingFeature("FrameSlot collect"))?;
 
         Ok(Self {
             device,
@@ -68,6 +108,8 @@ impl Renderer {
             scanout_format,
             intermediate_format,
             command_pool,
+            slots,
+            next_slot: 0,
         })
     }
 
@@ -79,8 +121,6 @@ impl Renderer {
         self.intermediate_format
     }
 
-    /// Ensure we have an intermediate image of the right size + format.
-    /// Recreates on mismatch.
     fn ensure_intermediate(&mut self, extent: vk::Extent2D) -> Result<()> {
         if self.intermediate.as_ref().is_some_and(|i| {
             i.extent.width == extent.width
@@ -97,62 +137,64 @@ impl Renderer {
         Ok(())
     }
 
-    /// Render one frame.
+    /// Render one frame into `scanout` (which must match `scanout_format`).
     ///
-    /// Arguments:
-    /// - `scanout_image`: the destination image (matching `scanout_format`,
-    ///   `extent`, and must be in UNDEFINED layout — we transition it).
-    /// - `extent`: scanout size in pixels.
-    /// - `elements`: per-element draws (decode pass). Empty list is valid;
-    ///   you'll get whatever was cleared into the intermediate.
-    /// - `encode_push`: per-output encode parameters (CTM, transfer, etc.).
-    ///
-    /// Leaves the scanout image in `PRESENT_SRC_KHR` (suitable for KMS
-    /// scanout) on success. Waits for queue idle before returning.
+    /// Waits on the next slot's fence (gates against the GPU still using its
+    /// resources from N frames ago), records into its command buffer, submits
+    /// signalling the fence. Does NOT wait for the GPU to finish — that's
+    /// what frames-in-flight gives us. Caller should sequence the page-flip
+    /// after this; the page-flip waits implicitly because Vulkan-emitted
+    /// images get a sync-fd that the KMS path respects via dmabuf fences.
+    /// (For now we still rely on implicit sync; explicit dmabuf fence
+    /// integration is a follow-up.)
     pub fn render_frame(
         &mut self,
-        scanout_image: vk::Image,
-        extent: vk::Extent2D,
+        scanout: &ImportedImage,
         elements: &[ElementDraw],
         encode_push: &EncodePush,
     ) -> Result<()> {
+        let extent = scanout.extent();
         self.ensure_intermediate(extent)?;
         let intermediate = self.intermediate.as_ref().unwrap();
 
-        // Encode pass needs a descriptor set bound to the intermediate.
-        // Both pools are reset at the start so we don't leak sets across frames.
-        self.decode.reset_pool()?;
-        self.encode.reset_pool()?;
-        let encode_set = self.encode.allocate_descriptor_set(intermediate.view)?;
+        let slot_idx = self.next_slot;
+        let slot = &self.slots[slot_idx];
 
-        // Decode descriptor sets — one per element.
-        let mut decode_sets = Vec::with_capacity(elements.len());
-        for el in elements {
-            decode_sets.push(self.decode.allocate_descriptor_set(el.texture_view)?);
+        // Wait for this slot's previous use to finish. With N=2 frames in
+        // flight and a 60Hz vblank cadence, this is essentially free —
+        // the GPU has had ~16ms+ to drain.
+        unsafe {
+            self.device
+                .raw
+                .wait_for_fences(&[slot.fence], true, u64::MAX)
         }
+        .vk_ctx("wait_for_fences (slot)")?;
+        unsafe { self.device.raw.reset_fences(&[slot.fence]) }
+            .vk_ctx("reset_fences (slot)")?;
 
-        // Build a scanout image view for the dynamic-rendering attachment.
-        let scanout_view = create_view(&self.device, scanout_image, self.scanout_format)?;
+        let cb = slot.cmd_buffer;
+        unsafe {
+            self.device
+                .raw
+                .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
+        }
+        .vk_ctx("reset_command_buffer (slot)")?;
 
-        let cb = self.alloc_cmd_buffer()?;
-        let begin = vk::CommandBufferBeginInfo::default()
+        let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { self.device.raw.begin_command_buffer(cb, &begin) }
+        unsafe { self.device.raw.begin_command_buffer(cb, &begin_info) }
             .vk_ctx("begin_command_buffer (renderer)")?;
 
         // ── Decode pass ────────────────────────────────────────────────────
-        // Intermediate: UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
-        let pre_intermediate = [
-            barrier_image(
-                intermediate.image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags2::TOP_OF_PIPE,
-                vk::AccessFlags2::empty(),
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            ),
-        ];
+        let pre_intermediate = [barrier_image(
+            intermediate.image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags2::TOP_OF_PIPE,
+            vk::AccessFlags2::empty(),
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        )];
         unsafe {
             self.device.raw.cmd_pipeline_barrier2(
                 cb,
@@ -172,7 +214,7 @@ impl Renderer {
             })];
         let render_info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
+                offset: vk::Offset2D::default(),
                 extent,
             })
             .layer_count(1)
@@ -199,14 +241,18 @@ impl Renderer {
                 .raw
                 .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.decode.pipeline);
 
-            for (el, set) in elements.iter().zip(decode_sets.iter()) {
-                self.device.raw.cmd_bind_descriptor_sets(
+            for el in elements {
+                let image_info = [vk::DescriptorImageInfo::default()
+                    .sampler(self.decode.sampler)
+                    .image_view(el.texture_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let writes = [self.decode.write_texture_binding(&image_info)];
+                self.decode.push_loader.cmd_push_descriptor_set(
                     cb,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.decode.pipeline_layout,
                     0,
-                    &[*set],
-                    &[],
+                    &writes,
                 );
                 self.device.raw.cmd_push_constants(
                     cb,
@@ -215,36 +261,33 @@ impl Renderer {
                     0,
                     bytemuck::bytes_of(&el.push),
                 );
-                // 4 vertices, triangle-strip → 1 quad.
                 self.device.raw.cmd_draw(cb, 4, 1, 0, 0);
             }
 
             self.device.raw.cmd_end_rendering(cb);
         }
 
-        // ── Barrier: intermediate becomes the encode-pass input ────────────
-        // COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
-        let mid_barrier = [barrier_image(
-            intermediate.image,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-        )];
-
-        // Also bring the scanout image up: UNDEFINED → COLOR_ATTACHMENT_OPTIMAL.
-        let pre_scanout = barrier_image(
-            scanout_image,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::PipelineStageFlags2::TOP_OF_PIPE,
-            vk::AccessFlags2::empty(),
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        );
-        let mid_barriers = [mid_barrier[0], pre_scanout];
+        // ── Barrier: intermediate → SHADER_READ; scanout → COLOR_ATTACHMENT ─
+        let mid_barriers = [
+            barrier_image(
+                intermediate.image,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+            ),
+            barrier_image(
+                scanout.image(),
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                vk::AccessFlags2::empty(),
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            ),
+        ];
         unsafe {
             self.device.raw.cmd_pipeline_barrier2(
                 cb,
@@ -254,13 +297,13 @@ impl Renderer {
 
         // ── Encode pass ───────────────────────────────────────────────────
         let encode_color_attach = [vk::RenderingAttachmentInfo::default()
-            .image_view(scanout_view)
+            .image_view(scanout.view())
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::DONT_CARE)
             .store_op(vk::AttachmentStoreOp::STORE)];
         let encode_render_info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
+                offset: vk::Offset2D::default(),
                 extent,
             })
             .layer_count(1)
@@ -284,13 +327,18 @@ impl Renderer {
             self.device
                 .raw
                 .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.encode.pipeline);
-            self.device.raw.cmd_bind_descriptor_sets(
+
+            let image_info = [vk::DescriptorImageInfo::default()
+                .sampler(self.encode.sampler)
+                .image_view(intermediate.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let writes = [self.encode.write_intermediate_binding(&image_info)];
+            self.encode.push_loader.cmd_push_descriptor_set(
                 cb,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.encode.pipeline_layout,
                 0,
-                &[encode_set],
-                &[],
+                &writes,
             );
             self.device.raw.cmd_push_constants(
                 cb,
@@ -303,12 +351,9 @@ impl Renderer {
             self.device.raw.cmd_end_rendering(cb);
         }
 
-        // ── Final: scanout → GENERAL for the KMS handoff ───────────────────
-        // PRESENT_SRC_KHR would require VK_KHR_swapchain (we don't use it —
-        // KMS reads the dmabuf directly). GENERAL is the correct non-swapchain
-        // layout when handing a Vulkan-written image to a non-Vulkan consumer.
+        // ── Final: scanout → GENERAL for KMS handoff ──────────────────────
         let final_barrier = [barrier_image(
-            scanout_image,
+            scanout.image(),
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::ImageLayout::GENERAL,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
@@ -330,34 +375,25 @@ impl Renderer {
         unsafe {
             self.device
                 .raw
-                .queue_submit2(self.device.graphics_queue, &submit, vk::Fence::null())
+                .queue_submit2(self.device.graphics_queue, &submit, slot.fence)
         }
         .vk_ctx("queue_submit2 (renderer)")?;
-        unsafe { self.device.raw.queue_wait_idle(self.device.graphics_queue) }
-            .vk_ctx("queue_wait_idle (renderer)")?;
 
-        unsafe {
-            self.device.raw.free_command_buffers(self.command_pool, &[cb]);
-            self.device.raw.destroy_image_view(scanout_view, None);
-        }
+        // Advance to the next slot. No GPU wait — the next call to
+        // render_frame will wait on its slot's fence as needed.
+        self.next_slot = (slot_idx + 1) % FRAMES_IN_FLIGHT;
         Ok(())
-    }
-
-    fn alloc_cmd_buffer(&self) -> Result<vk::CommandBuffer> {
-        let info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cbs = unsafe { self.device.raw.allocate_command_buffers(&info) }
-            .vk_ctx("allocate_command_buffers (renderer)")?;
-        Ok(cbs[0])
     }
 }
 
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
+            // Drain all outstanding work before tearing down the pool / fences.
             let _ = self.device.raw.device_wait_idle();
+            for slot in &self.slots {
+                self.device.raw.destroy_fence(slot.fence, None);
+            }
             self.device.raw.destroy_command_pool(self.command_pool, None);
         }
     }

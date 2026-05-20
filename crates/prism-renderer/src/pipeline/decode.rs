@@ -1,8 +1,11 @@
 //! Per-element decode pipeline.
 //!
-//! Draws a single element as a 4-vertex triangle-strip quad onto the fp16
+//! Draws a single element as a 4-vertex triangle-strip quad onto the fp16/fp32
 //! intermediate. Fragment shader applies the input transfer + primaries
 //! conversion, writes BT.2020 linear absolute nits.
+//!
+//! Uses VK_KHR_push_descriptor — bindings are pushed at command-record time,
+//! no descriptor pool, no per-frame allocate/free.
 
 use std::sync::Arc;
 
@@ -56,34 +59,33 @@ fn mat4_identity() -> [f32; 16] {
     ]
 }
 
-/// Owns the decode pipeline + its descriptor set layout, sampler, and pool.
-/// One per-renderer (not per-output) — the same pipeline draws onto whichever
-/// intermediate image we're targeting (via dynamic rendering).
+/// Owns the decode pipeline + its descriptor set layout + sampler. No pool
+/// because we push descriptors at draw time.
 pub struct DecodePipeline {
     device: Arc<Device>,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
     pub pipeline_layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
     pub sampler: vk::Sampler,
-    pub descriptor_pool: vk::DescriptorPool,
+    pub push_loader: ash::khr::push_descriptor::Device,
 }
-
-const POOL_MAX_SETS: u32 = 64;
 
 impl DecodePipeline {
     pub fn new(device: Arc<Device>, intermediate_format: vk::Format) -> Result<Self> {
-        // Descriptor set layout: one combined image-sampler at binding 0.
+        // Descriptor set layout — combined image-sampler at binding 0. The
+        // PUSH_DESCRIPTOR_KHR flag is what lets us bypass the pool.
         let bindings = [vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
-        let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let dsl_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(&bindings)
+            .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
         let descriptor_set_layout =
             unsafe { device.raw.create_descriptor_set_layout(&dsl_info, None) }
                 .vk_ctx("create_descriptor_set_layout (decode)")?;
 
-        // Pipeline layout: that DSL + push constants.
         let push_range = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
@@ -95,8 +97,6 @@ impl DecodePipeline {
         let pipeline_layout = unsafe { device.raw.create_pipeline_layout(&pl_info, None) }
             .vk_ctx("create_pipeline_layout (decode)")?;
 
-        // Linear sampler. NEAREST for the gradient test would be fine too; LINEAR
-        // is what real surface textures will want for fractional scaling.
         let sampler_info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
@@ -106,19 +106,6 @@ impl DecodePipeline {
             .mipmap_mode(vk::SamplerMipmapMode::NEAREST);
         let sampler = unsafe { device.raw.create_sampler(&sampler_info, None) }
             .vk_ctx("create_sampler (decode)")?;
-
-        // Descriptor pool sized for the max elements we expect per-frame.
-        // The smoke test only uses 1; the real compositor will need more.
-        // TODO: dynamic sizing once we know real-world element counts.
-        let pool_size = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(POOL_MAX_SETS)];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(POOL_MAX_SETS)
-            .pool_sizes(&pool_size)
-            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
-        let descriptor_pool = unsafe { device.raw.create_descriptor_pool(&pool_info, None) }
-            .vk_ctx("create_descriptor_pool (decode)")?;
 
         let vert = shader_module(&device, VERT_SPV)?;
         let frag = shader_module(&device, FRAG_SPV)?;
@@ -131,11 +118,13 @@ impl DecodePipeline {
             intermediate_format,
         )?;
 
-        // Shader modules can be destroyed once the pipeline is built.
         unsafe {
             device.raw.destroy_shader_module(vert, None);
             device.raw.destroy_shader_module(frag, None);
         }
+
+        let push_loader =
+            ash::khr::push_descriptor::Device::new(device.instance_raw(), &device.raw);
 
         Ok(Self {
             device,
@@ -143,44 +132,21 @@ impl DecodePipeline {
             pipeline_layout,
             pipeline,
             sampler,
-            descriptor_pool,
+            push_loader,
         })
     }
 
-    /// Allocate + write a descriptor set bound to the given image view. The
-    /// caller is responsible for freeing via `vkFreeDescriptorSets` or
-    /// resetting the pool between frames.
-    pub fn allocate_descriptor_set(&self, image_view: vk::ImageView) -> Result<vk::DescriptorSet> {
-        let layouts = [self.descriptor_set_layout];
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&layouts);
-        let sets = unsafe { self.device.raw.allocate_descriptor_sets(&alloc_info) }
-            .vk_ctx("allocate_descriptor_sets (decode)")?;
-        let set = sets[0];
-
-        let image_info = [vk::DescriptorImageInfo::default()
-            .sampler(self.sampler)
-            .image_view(image_view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let write = [vk::WriteDescriptorSet::default()
-            .dst_set(set)
+    /// Build the `WriteDescriptorSet` to push for a texture binding.
+    /// Caller writes via `cmd_push_descriptor_set`. Useful as a helper
+    /// to keep the per-draw recording terse.
+    pub fn write_texture_binding<'a>(
+        &self,
+        image_info: &'a [vk::DescriptorImageInfo; 1],
+    ) -> vk::WriteDescriptorSet<'a> {
+        vk::WriteDescriptorSet::default()
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&image_info)];
-        unsafe { self.device.raw.update_descriptor_sets(&write, &[]) };
-        Ok(set)
-    }
-
-    /// Reset the descriptor pool (frees all sets allocated from it). Call
-    /// between frames or after every render cycle.
-    pub fn reset_pool(&self) -> Result<()> {
-        unsafe {
-            self.device
-                .raw
-                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
-        }
-        .vk_ctx("reset_descriptor_pool (decode)")
+            .image_info(image_info)
     }
 }
 
@@ -196,9 +162,6 @@ impl Drop for DecodePipeline {
                 .raw
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device.raw.destroy_sampler(self.sampler, None);
-            self.device
-                .raw
-                .destroy_descriptor_pool(self.descriptor_pool, None);
         }
     }
 }
@@ -238,7 +201,6 @@ fn build_decode_pipeline(
     let ms = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
-    // Pre-multiplied alpha blend: src + dst * (1 - src_alpha).
     let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(true)
         .src_color_blend_factor(vk::BlendFactor::ONE)
@@ -254,7 +216,6 @@ fn build_decode_pipeline(
     let dyn_state =
         vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-    // Dynamic rendering: declare the color attachment format directly.
     let color_formats = [color_format];
     let mut dynamic_info =
         vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&color_formats);

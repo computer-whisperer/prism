@@ -4,7 +4,7 @@ use std::sync::Arc;
 use ash::ext::{
     external_memory_dma_buf, external_memory_host, image_drm_format_modifier, physical_device_drm,
 };
-use ash::khr::{external_memory_fd, external_semaphore_fd, image_format_list};
+use ash::khr::{external_memory_fd, external_semaphore_fd, image_format_list, push_descriptor};
 use ash::vk;
 use tracing::{debug, info, warn};
 
@@ -20,6 +20,10 @@ const REQUIRED_DEVICE_EXTS: &[&CStr] = &[
     external_memory_dma_buf::NAME,
     image_format_list::NAME,
     external_semaphore_fd::NAME,
+    // Lets us bind descriptors at command-record time without allocating
+    // from a pool — no per-frame allocate/free churn. RADV + recent NVidia
+    // + Intel all support this; failure here means an unusably old GPU.
+    push_descriptor::NAME,
 ];
 
 /// Optional extensions. Enabled if available; absence is logged but not fatal.

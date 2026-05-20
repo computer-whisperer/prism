@@ -25,10 +25,8 @@ pub struct EncodePipeline {
     pub pipeline_layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
     pub sampler: vk::Sampler,
-    pub descriptor_pool: vk::DescriptorPool,
+    pub push_loader: ash::khr::push_descriptor::Device,
 }
-
-const POOL_MAX_SETS: u32 = 8;
 
 impl EncodePipeline {
     pub fn new(
@@ -41,7 +39,9 @@ impl EncodePipeline {
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
-        let dsl_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let dsl_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(&bindings)
+            .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
         let descriptor_set_layout =
             unsafe { device.raw.create_descriptor_set_layout(&dsl_info, None) }
                 .vk_ctx("create_descriptor_set_layout (encode)")?;
@@ -67,16 +67,6 @@ impl EncodePipeline {
         let sampler = unsafe { device.raw.create_sampler(&sampler_info, None) }
             .vk_ctx("create_sampler (encode)")?;
 
-        let pool_size = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(POOL_MAX_SETS)];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(POOL_MAX_SETS)
-            .pool_sizes(&pool_size)
-            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
-        let descriptor_pool = unsafe { device.raw.create_descriptor_pool(&pool_info, None) }
-            .vk_ctx("create_descriptor_pool (encode)")?;
-
         // Vertex shader stays statically compiled from GLSL — full-screen
         // triangle, no per-output variation.
         let vert = shader_module(&device, VERT_SPV)?;
@@ -92,44 +82,29 @@ impl EncodePipeline {
             device.raw.destroy_shader_module(frag, None);
         }
 
+        let push_loader =
+            ash::khr::push_descriptor::Device::new(device.instance_raw(), &device.raw);
+
         Ok(Self {
             device,
             descriptor_set_layout,
             pipeline_layout,
             pipeline,
             sampler,
-            descriptor_pool,
+            push_loader,
         })
     }
 
-    pub fn allocate_descriptor_set(&self, image_view: vk::ImageView) -> Result<vk::DescriptorSet> {
-        let layouts = [self.descriptor_set_layout];
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&layouts);
-        let sets = unsafe { self.device.raw.allocate_descriptor_sets(&alloc_info) }
-            .vk_ctx("allocate_descriptor_sets (encode)")?;
-        let set = sets[0];
-        let image_info = [vk::DescriptorImageInfo::default()
-            .sampler(self.sampler)
-            .image_view(image_view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let write = [vk::WriteDescriptorSet::default()
-            .dst_set(set)
+    /// Build the `WriteDescriptorSet` for the intermediate-image binding.
+    /// Caller pushes via `cmd_push_descriptor_set` at record time.
+    pub fn write_intermediate_binding<'a>(
+        &self,
+        image_info: &'a [vk::DescriptorImageInfo; 1],
+    ) -> vk::WriteDescriptorSet<'a> {
+        vk::WriteDescriptorSet::default()
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&image_info)];
-        unsafe { self.device.raw.update_descriptor_sets(&write, &[]) };
-        Ok(set)
-    }
-
-    pub fn reset_pool(&self) -> Result<()> {
-        unsafe {
-            self.device
-                .raw
-                .reset_descriptor_pool(self.descriptor_pool, vk::DescriptorPoolResetFlags::empty())
-        }
-        .vk_ctx("reset_descriptor_pool (encode)")
+            .image_info(image_info)
     }
 }
 
@@ -145,9 +120,6 @@ impl Drop for EncodePipeline {
                 .raw
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device.raw.destroy_sampler(self.sampler, None);
-            self.device
-                .raw
-                .destroy_descriptor_pool(self.descriptor_pool, None);
         }
     }
 }

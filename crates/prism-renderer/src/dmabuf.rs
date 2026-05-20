@@ -29,6 +29,7 @@ use crate::error::{RendererError, Result, VkResultExt};
 pub struct ImportedImage {
     device: Arc<Device>,
     image: vk::Image,
+    view: vk::ImageView,
     memory: vk::DeviceMemory,
     extent: vk::Extent2D,
     format: vk::Format,
@@ -37,6 +38,9 @@ pub struct ImportedImage {
 impl ImportedImage {
     pub fn image(&self) -> vk::Image {
         self.image
+    }
+    pub fn view(&self) -> vk::ImageView {
+        self.view
     }
     pub fn extent(&self) -> vk::Extent2D {
         self.extent
@@ -131,9 +135,24 @@ impl ImportedImage {
             u64::from(dmabuf.modifier),
         );
 
+        // Cache the image view here so the renderer doesn't re-create one
+        // per frame. The view's lifetime is tied to the image's, so owning
+        // it here is the natural place.
+        let view = match crate::intermediate::create_view(&device, image, vk_format) {
+            Ok(v) => v,
+            Err(e) => {
+                unsafe {
+                    device.raw.free_memory(memory, None);
+                    device.raw.destroy_image(image, None);
+                }
+                return Err(e);
+            }
+        };
+
         Ok(Self {
             device,
             image,
+            view,
             memory,
             extent: vk::Extent2D {
                 width: dmabuf.width,
@@ -147,6 +166,7 @@ impl ImportedImage {
 impl Drop for ImportedImage {
     fn drop(&mut self) {
         unsafe {
+            self.device.raw.destroy_image_view(self.view, None);
             self.device.raw.destroy_image(self.image, None);
             self.device.raw.free_memory(self.memory, None);
         }

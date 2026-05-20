@@ -217,12 +217,8 @@ impl OutputContext {
         }
 
         let back = &self.buffers[self.back_index];
-        self.renderer.render_frame(
-            back.image.image(),
-            self.extent,
-            elements,
-            encode_push,
-        )?;
+        self.renderer
+            .render_frame(&back.image, elements, encode_push)?;
 
         let src = Rectangle::from_size(
             (self.extent.width as i32, self.extent.height as i32).into(),
