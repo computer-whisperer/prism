@@ -57,6 +57,11 @@ pub struct PrismState {
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: DmabufGlobal,
     pub renderer_device: Arc<prism_renderer::Device>,
+    /// Active scanout output, if any. Headless usage (`prism wayland`) leaves
+    /// this `None`; integrated usage (`prism run`) holds it for the lifetime
+    /// of the loop. Multi-output expansion will turn this into a `Vec` keyed
+    /// by some output id.
+    pub output: Option<prism_drm::OutputContext>,
 }
 
 impl PrismState {
@@ -97,7 +102,17 @@ impl PrismState {
             dmabuf_state,
             dmabuf_global,
             renderer_device,
+            output: None,
         }
+    }
+
+    /// Move the supplied scanout output into this state. Returns the previous
+    /// output, if any (today: always `None`; multi-output support comes later).
+    pub fn attach_output(
+        &mut self,
+        output: prism_drm::OutputContext,
+    ) -> Option<prism_drm::OutputContext> {
+        self.output.replace(output)
     }
 }
 

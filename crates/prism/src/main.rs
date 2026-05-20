@@ -21,8 +21,9 @@ fn main() -> Result<()> {
         Some("scanout") => run_scanout_smoke_test(output_name),
         Some("gradient") => run_gradient_scanout(output_name, parse_depth(depth_arg)?),
         Some("wayland") => run_wayland_server(),
+        Some("run") => run_integrated(output_name, parse_depth(depth_arg)?),
         Some(other) => Err(anyhow!(
-            "unknown subcommand {other:?}; expected: (no args) | scanout [output] | gradient [output] [8|10] | wayland"
+            "unknown subcommand {other:?}; expected: (no args) | scanout [output] | gradient [output] [8|10] | wayland | run [output] [8|10]"
         )),
     }
 }
@@ -631,6 +632,132 @@ fn pick_memory(
         }
     }
     Err(anyhow!("no memory type matches {:?}", required))
+}
+
+/// End-to-end integrated mode: wayland server + DRM scanout + per-frame
+/// render in one event loop. Single process. Renders the gradient at 60Hz
+/// (timer-driven; vblank-driven pacing is a separate commit). Wayland clients
+/// can connect — their surfaces are tracked but not yet rendered (that's
+/// commit 3 of #49).
+///
+/// Requires DRM master — run from a free VT (Ctrl+Alt+F3). Ctrl-C to exit.
+fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> Result<()> {
+    use calloop::EventLoop;
+    use calloop::signals::{Signal, Signals};
+    use calloop::timer::{TimeoutAction, Timer};
+    use prism_drm::{OutputContext, OutputSetup};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    tracing::info!("prism — integrated mode (wayland + scanout)");
+
+    // Vulkan.
+    let instance = prism_renderer::Instance::new()?;
+    let device = prism_renderer::Device::new(
+        instance.clone(),
+        Some(prism_renderer::DrmDevId {
+            major: 226,
+            minor: 129,
+        }),
+    )?;
+    tracing::info!("Vulkan device: {}", device.physical.name);
+
+    // Output bringup (DRM master, scanout BO, renderer).
+    let encode_config = prism_renderer::EncodeConfig::default_srgb();
+    let output = OutputContext::new(
+        device.clone(),
+        OutputSetup {
+            drm_path: "/dev/dri/card0",
+            output_name,
+            depth,
+            vk_format: vk_format_for_depth(depth),
+            intermediate_format: prism_renderer::DEFAULT_INTERMEDIATE_FORMAT,
+            encode_config: &encode_config,
+        },
+    )?;
+    let extent = output.extent;
+    let output_name_for_log = output.connector_name.clone();
+
+    // Wayland display + PrismState; attach the output.
+    let display = prism_protocols::new_display()?;
+    let mut state = prism_protocols::PrismState::new(&display, device.clone());
+    state.attach_output(output);
+
+    // Demo content: the same gradient as `prism gradient`. Owned outside the
+    // PrismState because GradientTexture is binary-local. The texture view
+    // gets handed to the render callback via a closure.
+    let gradient_texture = build_gradient_texture(device.clone(), 1024)?;
+    let gradient_view = gradient_texture.view;
+    let _hold_texture = gradient_texture; // keep alive
+
+    // Event loop + sources.
+    let mut event_loop: EventLoop<'static, prism_protocols::PrismState> =
+        EventLoop::try_new().context("EventLoop::try_new")?;
+    let socket = prism_protocols::insert_wayland_sources(&event_loop.handle(), display)?;
+    tracing::info!("WAYLAND_DISPLAY={socket}");
+    tracing::info!("scanout target: {output_name_for_log} {}×{}", extent.width, extent.height);
+
+    // SIGINT / SIGTERM → clean shutdown.
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let running = running.clone();
+        let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM])
+            .context("Signals::new")?;
+        event_loop
+            .handle()
+            .insert_source(signals, move |evt, _, _state| {
+                tracing::info!(signal = ?evt.signal(), "shutting down");
+                running.store(false, Ordering::SeqCst);
+            })
+            .map_err(|e| anyhow!("insert signals source: {e}"))?;
+    }
+
+    // Render timer @ ~60Hz. Replaces vblank-driven pacing for commit 1;
+    // commit 2 will swap this for `DrmDeviceNotifier` vblank events.
+    let frame_interval = Duration::from_micros(16_667);
+    let timer = Timer::from_duration(frame_interval);
+    event_loop
+        .handle()
+        .insert_source(timer, move |_now, _, state| {
+            if let Err(e) = present_one_frame(state, gradient_view) {
+                tracing::warn!("present failed: {e:#}");
+            }
+            TimeoutAction::ToDuration(frame_interval)
+        })
+        .map_err(|e| anyhow!("insert render timer: {e}"))?;
+
+    while running.load(Ordering::SeqCst) {
+        event_loop
+            .dispatch(Some(Duration::from_millis(100)), &mut state)
+            .context("event_loop.dispatch")?;
+        state
+            .display_handle
+            .flush_clients()
+            .context("flush_clients")?;
+    }
+
+    tracing::info!("integrated loop stopped");
+    Ok(())
+}
+
+/// One frame: build the element list (gradient only for now), present.
+fn present_one_frame(
+    state: &mut prism_protocols::PrismState,
+    gradient_view: prism_renderer::vk::ImageView,
+) -> Result<()> {
+    use prism_renderer::{DecodePush, ElementDraw, EncodePush};
+
+    let Some(output) = state.output.as_mut() else {
+        return Err(anyhow!("no output attached"));
+    };
+
+    let element = ElementDraw {
+        texture_view: gradient_view,
+        push: DecodePush::identity_srgb([-1.0, -1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
+    };
+    let encode_push = EncodePush::sdr_identity();
+    output.present(&[element], &encode_push)
 }
 
 /// Same TTY-required mode-set as `scanout`, but instead of `vkCmdClearColorImage`

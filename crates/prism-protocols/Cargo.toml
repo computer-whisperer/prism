@@ -9,6 +9,7 @@ description = "Wayland protocol wiring (smithay handlers, dispatch to layout/inp
 [dependencies]
 anyhow.workspace = true
 calloop.workspace = true
+prism-drm.workspace = true
 prism-frame.workspace = true
 prism-renderer.workspace = true
 smithay.workspace = true
