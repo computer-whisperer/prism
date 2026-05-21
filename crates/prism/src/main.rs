@@ -408,7 +408,7 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     };
     let encode_push = EncodePush::sdr_identity();
 
-    renderer.render_frame(&scanout, &[element], &encode_push, None)?;
+    renderer.render_frame(&scanout, &[element], &encode_push)?;
     // Headless readback wants to map the scanout BO; the GPU work above
     // was submitted with a fence we don't wait on, so make sure it's done
     // before we map. device_wait_idle is fine here (one-shot test).
@@ -998,13 +998,6 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     // the mode-set commit; every subsequent frame is kicked off by a
     // vblank from the prior flip.
     let max_frames_copy = max_frames;
-    // Per-frame breadcrumbs fsync per line — useful while debugging
-    // bringup, but at 7 CRTCs × 60Hz that's 420 fsyncs/sec which
-    // serializes to ~22Hz per CRTC. Off by default; opt in with
-    // PRISM_FRAME_TRACE=1 when you need the trail.
-    let frame_trace = std::env::var("PRISM_FRAME_TRACE")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
     for drm_notifier in drm_notifiers.drain(..) {
         let running_for_vblank = running.clone();
         let frame_counter_for_vblank = frame_counter.clone();
@@ -1020,56 +1013,8 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                         };
                         output.mark_vblank();
                         let n = frame_counter_for_vblank.fetch_add(1, Ordering::SeqCst) + 1;
-                        // TEMP: crumb the first 30 vblanks per crtc to see
-                        // post-map vblanks. Remove once verified.
-                        static FIRST_VBLANKS: std::sync::OnceLock<
-                            std::sync::Mutex<std::collections::HashMap<String, u32>>,
-                        > = std::sync::OnceLock::new();
-                        let map = FIRST_VBLANKS.get_or_init(|| {
-                            std::sync::Mutex::new(std::collections::HashMap::new())
-                        });
-                        let crtc_key = format!("{crtc:?}");
-                        let mut g = map.lock().unwrap();
-                        let count = g.entry(crtc_key).or_insert(0u32);
-                        if *count < 30 {
-                            *count += 1;
-                            breadcrumb(&format!(
-                                "vblank #{} for crtc {:?} (call {})",
-                                *count, crtc, n
-                            ));
-                        }
-                        drop(g);
-                        let t0 = std::time::Instant::now();
-                        let result = present_for_crtc(state, crtc);
-                        let dt_us = t0.elapsed().as_micros();
-                        // Per-frame breadcrumbs fsync per line and cap our
-                        // event-loop throughput at ~150 ops/sec total —
-                        // 22Hz across 7 CRTCs instead of 60Hz each. Keep
-                        // them gated behind PRISM_FRAME_TRACE so debug
-                        // runs can still get the trail without crippling
-                        // steady-state perf. Errors and skips always log
-                        // (they're rare and useful).
-                        // TEMP: unconditionally crumb every present (cap 200)
-                        // to confirm presents continue post-map. Restore the
-                        // gated path once layout-render is verified.
-                        static PRESENT_CRUMB_COUNT: std::sync::atomic::AtomicUsize =
-                            std::sync::atomic::AtomicUsize::new(0);
-                        let pcc = PRESENT_CRUMB_COUNT
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if pcc < 200 {
-                            match &result {
-                                Ok(true) => breadcrumb(&format!(
-                                    "frame #{n}: OK_TRUE crtc {crtc:?} in {dt_us}µs"
-                                )),
-                                Ok(false) => breadcrumb(&format!(
-                                    "frame #{n}: OK_FALSE skipped {crtc:?} {dt_us}µs"
-                                )),
-                                Err(e) => breadcrumb(&format!(
-                                    "frame #{n}: ERROR {crtc:?} {dt_us}µs: {e:#}"
-                                )),
-                            }
-                        }
-                        if let Err(e) = &result {
+                        if let Err(e) = present_for_crtc(state, crtc) {
+                            breadcrumb(&format!("frame #{n}: ERROR {crtc:?}: {e:#}"));
                             tracing::warn!("present failed: {e:#}");
                         }
                         if let Some(max) = max_frames_copy {
@@ -1277,31 +1222,6 @@ fn present_for_crtc(
     use smithay::utils::{Logical, Rectangle};
     use smithay::wayland::compositor::with_states;
 
-    // TEMP: per-crtc enter crumb, capped at the first 30 invocations per
-    // crtc so we can trail through the layout walk for the first post-map
-    // present. Lets us figure out where the hang lives when it sits
-    // between vblank and the existing OK_TRUE crumb.
-    static ENTER_COUNT: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, u32>>,
-    > = std::sync::OnceLock::new();
-    let enter_map = ENTER_COUNT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let trace_this_call: bool = {
-        let mut g = enter_map.lock().unwrap();
-        let count = g.entry(format!("{crtc:?}")).or_insert(0);
-        if *count < 30 {
-            *count += 1;
-            true
-        } else {
-            false
-        }
-    };
-    let trace = |s: &str| {
-        if trace_this_call {
-            breadcrumb(&format!("pfc {crtc:?}: {s}"));
-        }
-    };
-    trace("entered");
-
     // Snapshot identity bits we'll need below without holding any borrow
     // into state.outputs (so we can re-borrow mutably at present()
     // time). `white_view` is the renderer's 1×1 white texel — every
@@ -1367,23 +1287,11 @@ fn present_for_crtc(
         texture_lookup: &texture_lookup,
     };
 
-    trace("about to render_workspaces");
-
     // Layout walk into a flat RenderEl vector. Monitor is borrowed
     // immutably for the duration of render_workspaces; dropped before
     // the present below mutably re-borrows state.outputs.
     let mut render_els: Vec<RenderEl> = Vec::new();
-    let mut diag_ws_count: usize = 0;
-    let mut diag_tile_counts: Vec<usize> = Vec::new();
     let monitor_found = if let Some(monitor) = state.layout.monitor_for_output(&smithay_output) {
-        diag_ws_count = monitor
-            .workspaces_with_render_geo()
-            .count();
-        diag_tile_counts = monitor
-            .workspaces_with_render_geo()
-            .map(|(ws, _)| ws.tiles().count())
-            .collect();
-        trace(&format!("monitor_found ws_count={diag_ws_count} tile_counts={diag_tile_counts:?}"));
         // focus_ring: this is the focused monitor's render — for
         // single-monitor configs it always is; multi-monitor focus
         // tracking lands when input dispatch does.
@@ -1393,8 +1301,6 @@ fn present_for_crtc(
         false
     };
 
-    trace(&format!("render_workspaces done n_render_els={}", render_els.len()));
-
     // Lower RenderEls (geometry + tint) → ElementDraws (texture + push
     // constants). One pass; SolidColor/Border elements bind the white
     // texel, Surface elements bind the per-surface view.
@@ -1403,18 +1309,16 @@ fn present_for_crtc(
         el.lower(white_view, &mut elements);
     }
 
-    trace(&format!("lowered n_draws={}", elements.len()));
-
-    // Log once per output the first present that actually carries tiles
-    // — answers "did this output's render walk see the layout's window?"
-    // without spamming the log on every frame.
+    // Once per output, the first present that actually carries tiles —
+    // a single tracing line we use as a regression sentinel for
+    // "did this output's render walk see the layout's window?".
     static FIRST_WITH_TILES: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashSet<String>>,
     > = std::sync::OnceLock::new();
-    let n_render_els = render_els.len();
-    let n_draws = elements.len();
-    let total_tiles: usize = diag_tile_counts.iter().sum();
-    if total_tiles > 0 {
+    let has_surface = render_els
+        .iter()
+        .any(|e| matches!(e, RenderEl::Surface(_)));
+    if has_surface {
         let seen =
             FIRST_WITH_TILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
         if seen.lock().unwrap().insert(output_id.clone()) {
@@ -1427,10 +1331,8 @@ fn present_for_crtc(
                 view_w = view_size.w,
                 view_h = view_size.h,
                 monitor_found,
-                diag_ws_count,
-                ?diag_tile_counts,
-                n_render_els,
-                n_draws,
+                n_render_els = render_els.len(),
+                n_draws = elements.len(),
                 ?first_surface,
                 "FIRST present with tiles for output"
             );
@@ -1438,35 +1340,12 @@ fn present_for_crtc(
     }
 
     let encode_push = EncodePush::sdr_identity();
-    // TEMP: bracket output.present() with crumbs for the first present that
-    // carries actual draws. If the hang shows up between BEFORE and AFTER,
-    // it lives in render_frame / page_flip. Inside render_frame, every
-    // stage emits its own crumb via the tracer closure too.
-    let crumb_present = total_tiles > 0;
-    if crumb_present {
-        breadcrumb(&format!(
-            "present(BEFORE) crtc {crtc:?} n_draws={n_draws} n_render_els={n_render_els}"
-        ));
-    }
-    let tracer_owned: Box<dyn Fn(&str)> = Box::new(move |s: &str| {
-        breadcrumb(&format!("{crtc:?}: {s}"));
-    });
     let presented = {
         let output = state
             .output_for_crtc(crtc)
             .ok_or_else(|| anyhow!("no output bound to crtc {crtc:?}"))?;
-        let tracer: Option<&dyn Fn(&str)> = if crumb_present {
-            Some(tracer_owned.as_ref())
-        } else {
-            None
-        };
-        output.present(&elements, &encode_push, tracer)?
+        output.present(&elements, &encode_push)?
     };
-    if crumb_present {
-        breadcrumb(&format!(
-            "present(AFTER) crtc {crtc:?} presented={presented}"
-        ));
-    }
 
     // Frame callbacks still want to iterate the toplevels mapped here.
     let surfaces: Vec<_> = state
@@ -1670,7 +1549,7 @@ fn run_gradient_scanout(
         push: DecodePush::identity_srgb([-1.0, -1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
     };
     let encode_push = EncodePush::sdr_identity();
-    renderer.render_frame(&scanout_image, &[element], &encode_push, None)?;
+    renderer.render_frame(&scanout_image, &[element], &encode_push)?;
     // One-shot TTY test: page-flip below needs the render to be done.
     unsafe {
         let _ = device.raw.device_wait_idle();

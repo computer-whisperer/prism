@@ -174,13 +174,7 @@ impl Renderer {
         scanout: &ImportedImage,
         elements: &[ElementDraw],
         encode_push: &EncodePush,
-        tracer: Option<&dyn Fn(&str)>,
     ) -> Result<()> {
-        let trace = |s: &str| {
-            if let Some(t) = tracer {
-                t(s);
-            }
-        };
         let extent = scanout.extent();
         self.ensure_intermediate(extent)?;
         let intermediate = self.intermediate.as_ref().unwrap();
@@ -191,14 +185,12 @@ impl Renderer {
         // Wait for this slot's previous use to finish. With N=2 frames in
         // flight and a 60Hz vblank cadence, this is essentially free —
         // the GPU has had ~16ms+ to drain.
-        trace(&format!("rf: wait_for_fences slot={slot_idx}"));
         unsafe {
             self.device
                 .raw
                 .wait_for_fences(&[slot.fence], true, u64::MAX)
         }
         .vk_ctx("wait_for_fences (slot)")?;
-        trace("rf: wait_for_fences done");
         unsafe { self.device.raw.reset_fences(&[slot.fence]) }
             .vk_ctx("reset_fences (slot)")?;
 
@@ -286,8 +278,7 @@ impl Renderer {
                 .raw
                 .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.decode.pipeline);
 
-            for (i, el) in elements.iter().enumerate() {
-                trace(&format!("rf: decode el#{i} push_descriptor view={:?}", el.texture_view));
+            for el in elements {
                 let image_info = [vk::DescriptorImageInfo::default()
                     .sampler(self.decode.sampler)
                     .image_view(el.texture_view)
@@ -308,7 +299,6 @@ impl Renderer {
                     bytemuck::bytes_of(&el.push),
                 );
                 self.device.raw.cmd_draw(cb, 4, 1, 0, 0);
-                trace(&format!("rf: decode el#{i} drawn"));
             }
 
             self.device.raw.cmd_end_rendering(cb);
@@ -416,18 +406,15 @@ impl Renderer {
         }
 
         unsafe { self.device.raw.end_command_buffer(cb) }.vk_ctx("end_command_buffer")?;
-        trace("rf: end_command_buffer");
 
         let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
-        trace("rf: queue_submit2 BEFORE");
         unsafe {
             self.device
                 .raw
                 .queue_submit2(self.device.graphics_queue, &submit, slot.fence)
         }
         .vk_ctx("queue_submit2 (renderer)")?;
-        trace("rf: queue_submit2 AFTER");
 
         // Advance to the next slot. No GPU wait — the next call to
         // render_frame will wait on its slot's fence as needed.
