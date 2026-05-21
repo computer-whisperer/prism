@@ -1353,61 +1353,32 @@ fn present_for_crtc(
         el.lower(white_view, &mut elements);
     }
 
-    // TEMP DIAGNOSTIC: log every output's first AND first-with-window
-    // present so we can see both the empty walk and the moment a tile
-    // actually emits. Remove once layout-driven render is verified.
-    static SEEN_ANY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    static SEEN_NONEMPTY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    // TEMP DIAGNOSTIC: log per (output, tile-count) so we see state
+    // transitions. Bootstrap presents see [0]; first present after
+    // map should see [1, 0] or similar. Remove once verified.
+    static SEEN_KEYS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     let n_render_els = render_els.len();
     let n_draws = elements.len();
-    let any = SEEN_ANY.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    let nonempty =
-        SEEN_NONEMPTY.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    if any.lock().unwrap().insert(output_id.clone()) {
-        tracing::info!(
-            output = %output_id,
-            view_w = view_size.w,
-            view_h = view_size.h,
-            monitor_found,
-            n_render_els,
-            n_draws,
-            diag_ws_count,
-            ?diag_tile_counts,
-            "first present for output"
-        );
-    }
-    // Also log every present where the monitor has tiles but render emitted
-    // nothing — fires once globally to surface the "tiles exist but walk
-    // produces 0 elements" gap.
-    static EMPTY_WITH_TILES: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
-        std::sync::OnceLock::new();
-    let total_tiles: usize = diag_tile_counts.iter().sum();
-    if total_tiles > 0 && n_render_els == 0 {
-        let flag = EMPTY_WITH_TILES.get_or_init(|| std::sync::atomic::AtomicBool::new(false));
-        if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::warn!(
-                output = %output_id,
-                view_w = view_size.w,
-                view_h = view_size.h,
-                diag_ws_count,
-                ?diag_tile_counts,
-                "present produced 0 render_els despite tiles in layout"
-            );
-        }
-    }
-    if n_render_els > 0 && nonempty.lock().unwrap().insert(output_id.clone()) {
+    let key = format!("{output_id}:{diag_ws_count}:{diag_tile_counts:?}:{n_render_els}");
+    let seen =
+        SEEN_KEYS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if seen.lock().unwrap().insert(key) {
         let first_surface = render_els.iter().find_map(|e| match e {
             RenderEl::Surface(s) => Some(s.dst_rect_clip),
             _ => None,
         });
         tracing::info!(
             output = %output_id,
+            view_w = view_size.w,
+            view_h = view_size.h,
+            monitor_found,
+            diag_ws_count,
+            ?diag_tile_counts,
             n_render_els,
             n_draws,
-            first_surface_clip = ?first_surface,
-            "first NON-EMPTY layout walk for output"
+            ?first_surface,
+            "present state transition"
         );
     }
 
