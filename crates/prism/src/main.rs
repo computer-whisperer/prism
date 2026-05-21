@@ -1020,20 +1020,18 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                         };
                         output.mark_vblank();
                         let n = frame_counter_for_vblank.fetch_add(1, Ordering::SeqCst) + 1;
-                        // TEMP: crumb the first 2 vblanks per crtc so we can
-                        // confirm vblanks ARE firing post-bootstrap. Remove
-                        // once layout-render is verified.
+                        // TEMP: crumb the first 30 vblanks per crtc to see
+                        // post-map vblanks. Remove once verified.
                         static FIRST_VBLANKS: std::sync::OnceLock<
-                            std::sync::Mutex<std::collections::HashMap<u64, u32>>,
+                            std::sync::Mutex<std::collections::HashMap<String, u32>>,
                         > = std::sync::OnceLock::new();
                         let map = FIRST_VBLANKS.get_or_init(|| {
                             std::sync::Mutex::new(std::collections::HashMap::new())
                         });
-                        let crtc_key = format!("{crtc:?}").len() as u64
-                            ^ (format!("{crtc:?}").as_bytes().iter().fold(0u64, |a, b| a.wrapping_add(*b as u64)));
+                        let crtc_key = format!("{crtc:?}");
                         let mut g = map.lock().unwrap();
                         let count = g.entry(crtc_key).or_insert(0u32);
-                        if *count < 2 {
+                        if *count < 30 {
                             *count += 1;
                             breadcrumb(&format!(
                                 "vblank #{} for crtc {:?} (call {})",
@@ -1374,22 +1372,28 @@ fn present_for_crtc(
         el.lower(white_view, &mut elements);
     }
 
-    // TEMP DIAGNOSTIC: log per (output, tile-count) so we see state
-    // transitions. Bootstrap presents see [0]; first present after
-    // map should see [1, 0] or similar. Remove once verified.
-    static SEEN_KEYS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
+    // TEMP DIAGNOSTIC: log the first 10 presents per output
+    // unconditionally — no dedup — so we definitively see post-map
+    // state. Remove once layout-driven render verified.
+    static PRESENT_COUNTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    > = std::sync::OnceLock::new();
     let n_render_els = render_els.len();
     let n_draws = elements.len();
-    let key = format!("{output_id}:{diag_ws_count}:{diag_tile_counts:?}:{n_render_els}");
-    let seen =
-        SEEN_KEYS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    if seen.lock().unwrap().insert(key) {
+    let counts =
+        PRESENT_COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = counts.lock().unwrap();
+    let c = g.entry(output_id.clone()).or_insert(0u32);
+    if *c < 10 {
+        *c += 1;
+        let n = *c;
+        drop(g);
         let first_surface = render_els.iter().find_map(|e| match e {
             RenderEl::Surface(s) => Some(s.dst_rect_clip),
             _ => None,
         });
         tracing::info!(
+            present_n = n,
             output = %output_id,
             view_w = view_size.w,
             view_h = view_size.h,
@@ -1399,7 +1403,7 @@ fn present_for_crtc(
             n_render_els,
             n_draws,
             ?first_surface,
-            "present state transition"
+            "present #{n} for output"
         );
     }
 
