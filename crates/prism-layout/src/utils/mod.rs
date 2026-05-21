@@ -148,3 +148,136 @@ pub fn with_toplevel_role<T>(
         f(&mut role)
     })
 }
+
+/// Like [`with_toplevel_role`] but also exposes the toplevel's most
+/// recently *acked* server-side state (a snapshot of the size/state
+/// we configured the client with). Ported from niri/src/utils.
+pub fn with_toplevel_role_and_current<T>(
+    toplevel: &smithay::wayland::shell::xdg::ToplevelSurface,
+    f: impl FnOnce(
+        &mut smithay::wayland::shell::xdg::XdgToplevelSurfaceRoleAttributes,
+        Option<&smithay::wayland::shell::xdg::ToplevelState>,
+    ) -> T,
+) -> T {
+    smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+        let mut role = states
+            .data_map
+            .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+            .unwrap()
+            .lock()
+            .unwrap();
+
+        let mut guard = states
+            .cached_state
+            .get::<smithay::wayland::shell::xdg::ToplevelCachedState>();
+        let current = guard.current().last_acked.as_ref().map(|c| &c.state);
+
+        f(&mut role, current)
+    })
+}
+
+/// Look up the most recent in-flight (not-yet-acked) configure for a
+/// toplevel. Used by the configure-throttling logic to decide whether
+/// a new configure would be a redundant duplicate. Ported from
+/// niri/src/utils.
+pub fn with_toplevel_last_uncommitted_configure<T>(
+    toplevel: &smithay::wayland::shell::xdg::ToplevelSurface,
+    f: impl FnOnce(Option<&smithay::wayland::shell::xdg::ToplevelConfigure>) -> T,
+) -> T {
+    smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+        let role = states
+            .data_map
+            .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+            .unwrap()
+            .lock()
+            .unwrap();
+
+        let mut guard = states
+            .cached_state
+            .get::<smithay::wayland::shell::xdg::ToplevelCachedState>();
+
+        if let Some(last_pending) = role.pending_configures().last() {
+            f(Some(last_pending))
+        } else if let Some(last_acked) = &role.last_acked {
+            let mut configure = Some(last_acked);
+            if let Some(committed) = &guard.current().last_acked {
+                if committed.serial.is_no_older_than(&last_acked.serial) {
+                    configure = None;
+                }
+            }
+            f(configure)
+        } else {
+            f(None)
+        }
+    })
+}
+
+/// Pump a surface's preferred output scale + transform out to the
+/// client via wl_surface enter/leave + the fractional-scale protocol.
+/// Ported verbatim from niri/src/utils.
+pub fn send_scale_transform(
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    data: &smithay::wayland::compositor::SurfaceData,
+    scale: smithay::output::Scale,
+    transform: smithay::utils::Transform,
+) {
+    smithay::wayland::compositor::send_surface_state(surface, data, scale.integer_scale(), transform);
+    smithay::wayland::fractional_scale::with_fractional_scale(data, |fractional| {
+        fractional.set_preferred_scale(scale.fractional_scale());
+    });
+}
+
+/// Configure the xdg-toplevel's "tiled" state hint based on the
+/// user's CSD preference. Niri also consults `KdeDecorationsModeState`
+/// (which lives in niri/src/handlers and isn't ported yet); prism's
+/// version pretends the client never bound the KDE decoration global,
+/// which is the correct behavior for clients that don't use it. When
+/// the handlers port lands, the KDE branch will reappear here.
+pub fn update_tiled_state(
+    toplevel: &smithay::wayland::shell::xdg::ToplevelSurface,
+    prefer_no_csd: bool,
+    force_tiled: Option<bool>,
+) {
+    use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+
+    let should_tile = || {
+        if let Some(mode) = toplevel.with_pending_state(|state| state.decoration_mode) {
+            mode == zxdg_toplevel_decoration_v1::Mode::ServerSide
+        } else {
+            // niri also peeks at KdeDecorationsModeState here; until
+            // the handlers port lands we treat the client as never
+            // having bound the KDE decoration global.
+            prefer_no_csd
+        }
+    };
+
+    let should_tile = force_tiled.unwrap_or_else(should_tile);
+
+    toplevel.with_pending_state(|state| {
+        if should_tile {
+            state.states.set(xdg_toplevel::State::TiledLeft);
+            state.states.set(xdg_toplevel::State::TiledRight);
+            state.states.set(xdg_toplevel::State::TiledTop);
+            state.states.set(xdg_toplevel::State::TiledBottom);
+        } else {
+            state.states.unset(xdg_toplevel::State::TiledLeft);
+            state.states.unset(xdg_toplevel::State::TiledRight);
+            state.states.unset(xdg_toplevel::State::TiledTop);
+            state.states.unset(xdg_toplevel::State::TiledBottom);
+        }
+    });
+}
+
+/// Fetch the OS-level (pid/uid/gid) credentials of the client that
+/// owns `surface`. Niri caches these on `ClientState`; until that's
+/// ported we return `None`, which downstream code treats as "client
+/// credentials are unknown" — disables a few window-rule
+/// process-matching predicates but is otherwise harmless.
+pub fn get_credentials_for_surface(
+    _surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+) -> Option<wayland_backend::server::Credentials> {
+    // TODO: re-introduce ClientState lookup once the handlers port
+    // lands; see niri/src/utils::get_credentials_for_surface.
+    None
+}
