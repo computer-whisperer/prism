@@ -31,6 +31,7 @@ use smithay::delegate_dmabuf;
 use smithay::delegate_output;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
+use smithay::delegate_viewporter;
 use smithay::delegate_xdg_shell;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
@@ -50,6 +51,7 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
@@ -99,6 +101,13 @@ pub struct PrismState {
     /// The single seat we advertise. Kept around so we can flip
     /// capabilities on later (when we add keyboard/pointer support).
     pub seat: Seat<PrismState>,
+    /// wp_viewporter global. mpv (with `--vo=gpu --gpu-context=wayland`)
+    /// hard-requires this to attach destination/source rects to each
+    /// surface. We accept the protocol but currently *ignore* the
+    /// destination rect at present time — surfaces still render
+    /// full-screen on the output they belong to. Honoring the viewport
+    /// state lands when we add per-surface dst-rect positioning.
+    pub viewporter: ViewporterState,
 
     /// Per-output smithay `Output`, keyed by the same `OutputId`
     /// (connector name) as `outputs`. Populated by [`advertise_output`];
@@ -194,6 +203,11 @@ impl PrismState {
         let mut seat_state = SeatState::<PrismState>::new();
         let seat = seat_state.new_wl_seat(&dh, "seat0");
 
+        // wp_viewporter — hard-required by mpv's wayland-egl path so it
+        // can set destination rects on its video surface. Smithay
+        // handles all the protocol bookkeeping; we just advertise.
+        let viewporter = ViewporterState::new::<PrismState>(&dh);
+
         Self {
             display_handle: dh,
             compositor,
@@ -204,6 +218,7 @@ impl PrismState {
             output_manager,
             seat_state,
             seat,
+            viewporter,
             session,
             cards: HashMap::new(),
             gpus,
@@ -371,6 +386,13 @@ impl SeatHandler for PrismState {
 }
 
 delegate_seat!(PrismState);
+
+// ─── wp_viewporter ──────────────────────────────────────────────────────────
+
+// No handler trait required — smithay stores per-surface viewport
+// state in SurfaceData::cached_state; we'd read it via with_states +
+// ViewportCachedState if/when we honor it in the render path.
+delegate_viewporter!(PrismState);
 
 // ─── wl_compositor ──────────────────────────────────────────────────────────
 
