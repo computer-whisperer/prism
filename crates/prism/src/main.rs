@@ -1344,20 +1344,19 @@ fn present_for_crtc(
         el.lower(white_view, &mut elements);
     }
 
-    // TEMP DIAGNOSTIC: log the first frame per output where the layout
-    // walk produces anything non-empty. Lets us see whether the bridge
-    // is firing at all without per-frame log spam. Remove once layout-
-    // driven render is verified visually.
-    static FIRST_NONEMPTY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    // TEMP DIAGNOSTIC: log every output's first AND first-with-window
+    // present so we can see both the empty walk and the moment a tile
+    // actually emits. Remove once layout-driven render is verified.
+    static SEEN_ANY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
-    let seen = FIRST_NONEMPTY.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    static SEEN_NONEMPTY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
     let n_render_els = render_els.len();
     let n_draws = elements.len();
-    if (n_render_els > 0 || n_draws > 0) && seen.lock().unwrap().insert(output_id.clone()) {
-        let first_surface = render_els.iter().find_map(|e| match e {
-            RenderEl::Surface(s) => Some(s.dst_rect_clip),
-            _ => None,
-        });
+    let any = SEEN_ANY.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let nonempty =
+        SEEN_NONEMPTY.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if any.lock().unwrap().insert(output_id.clone()) {
         tracing::info!(
             output = %output_id,
             view_w = view_size.w,
@@ -1365,17 +1364,21 @@ fn present_for_crtc(
             monitor_found,
             n_render_els,
             n_draws,
-            first_surface_clip = ?first_surface,
-            "first non-empty layout walk for output"
+            "first present for output"
         );
-    } else if !monitor_found {
-        // Less noisy variant: only log "no monitor" once per output.
-        static NO_MON_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-            std::sync::OnceLock::new();
-        let s = NO_MON_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-        if s.lock().unwrap().insert(output_id.clone()) {
-            tracing::info!(output = %output_id, "no monitor in layout for output");
-        }
+    }
+    if n_render_els > 0 && nonempty.lock().unwrap().insert(output_id.clone()) {
+        let first_surface = render_els.iter().find_map(|e| match e {
+            RenderEl::Surface(s) => Some(s.dst_rect_clip),
+            _ => None,
+        });
+        tracing::info!(
+            output = %output_id,
+            n_render_els,
+            n_draws,
+            first_surface_clip = ?first_surface,
+            "first NON-EMPTY layout walk for output"
+        );
     }
 
     let encode_push = EncodePush::sdr_identity();
