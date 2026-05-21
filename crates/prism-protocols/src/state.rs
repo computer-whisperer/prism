@@ -398,6 +398,20 @@ impl PrismState {
             // location assigned by layout_outputs once all outputs known
             None,
         );
+        // Attach the OutputName user data the layout uses to track
+        // outputs across disconnects (workspaces remember which
+        // output they originated on by name). Must happen before
+        // layout.add_output below — that path unwraps this user data.
+        // make/model/serial are None until EDID parsing lands;
+        // matching today is by connector name alone.
+        output
+            .user_data()
+            .insert_if_missing(|| prism_config::OutputName {
+                connector: ctx.connector_name.clone(),
+                make: None,
+                model: None,
+                serial: None,
+            });
         // Inform the layout. This creates a Monitor entry, splices in any
         // workspaces that named this output via `original_output`, and
         // (if this is the first output) hosts the no-output workspace
