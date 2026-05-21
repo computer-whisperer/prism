@@ -1,0 +1,24 @@
+[package]
+name = "prism-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Types and helpers for interfacing with the prism Wayland compositor."
+keywords = ["wayland"]
+categories = ["api-bindings", "os"]
+
+# Ported from niri-ipc (rev pinned in workspace smithay block); types kept in
+# lockstep with that vocabulary so prism-config's `From<prism_ipc::Action>`
+# conversions match niri's wire format. The only intentional rename so far is
+# the env var: NIRI_SOCKET → PRISM_SOCKET.
+
+[dependencies]
+clap = { workspace = true, optional = true }
+schemars = { version = "1.2.1", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+clap = ["dep:clap"]
+json-schema = ["dep:schemars"]

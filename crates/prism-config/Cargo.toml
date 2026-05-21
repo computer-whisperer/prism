@@ -6,6 +6,27 @@ rust-version.workspace = true
 license.workspace = true
 description = "Config schema (KDL-based, ported from niri-config)"
 
+# Ported wholesale from niri-config at the same revision as the workspace
+# smithay pin. Kept structurally identical so config files written for niri
+# parse here unchanged; prism-specific extensions (color management,
+# calibration matrices, …) get added as new keys without breaking entries.
+#
+# Only mechanical changes vs upstream:
+#   - `use niri_ipc::X` → `use prism_ipc::X` (same wire vocabulary)
+#   - `tracy_client::span!` stripped (no profiler integration yet)
+
 [dependencies]
 anyhow.workspace = true
+bitflags.workspace = true
+csscolorparser = "0.8.3"
+knuffel = "3.2.0"
+miette = { version = "5.10.0", features = ["fancy-no-backtrace"] }
+prism-ipc.workspace = true
+regex = "1.12.3"
+smithay = { workspace = true, features = ["backend_libinput"] }
 tracing.workspace = true
+
+[dev-dependencies]
+insta = "1.43.4"
+pretty_assertions = "1.4.1"
+diff = "0.1.13"
