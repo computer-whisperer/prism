@@ -144,11 +144,11 @@ Listed alongside the task that introduced them so we don't lose track.
 
 ### Wayland / protocol
 
-- **wl_output advertisement.** Not implemented yet. Without it, real clients (mpv, browsers) probe-fail and bail to the host compositor. Blocks "actually run a client through prism."
-- **wl_seat / input.** Not implemented. Same blocker class as wl_output — many clients want to know they have an input device.
+- **wl_seat input dispatch.** wl_seat is advertised (zero capabilities — makes mpv/browsers connect successfully) but no keyboard / pointer / touch capabilities are flagged. libinput wiring + capability-flipping when devices appear is the next step. Real focus tracking + per-output keyboard layout / repeat-rate config follow.
 - **linux-dmabuf-v1 v4 feedback (modifier-aware).** Current v3 advertises a hardcoded format list. v4 lets us advertise per-display preferred modifiers; the negotiation closes off direct-scanout with tiled modifiers (which we don't support yet, but will need to).
 - **Vulkan format-modifier capability query.** Right now we hardcode "we can import XRGB8888 + ARGB8888 LINEAR." Real querying via `VK_EXT_image_drm_format_modifier::vkGetPhysicalDeviceFormatProperties2` would advertise everything the GPU actually supports.
 - **Multi-planar dmabuf import**. `ImportedImage::import` rejects multi-plane sources. Needed for NV12 / P010 (video clients) but not for the tracer MVP.
+- **Optional protocols for video clients.** `wp_presentation_time` (accurate display-time feedback so mpv can A/V-sync), `wp_viewporter` (lets clients scale buffers to surface size — mpv uses for video↔window fit), `wp_fractional_scale_manager_v1` (HiDPI), `xdg-decoration-unstable-v1` (server vs client decoration negotiation), `zwp_idle_inhibit_manager_v1` (prevent screen lock during playback). All graceful-degrade — mpv works without them, just with slightly worse behavior. Add as we run into client-specific needs.
 
 ### DRM / KMS
 

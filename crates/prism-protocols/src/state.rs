@@ -29,8 +29,10 @@ use smithay::backend::allocator::dmabuf::Dmabuf as SmithayDmabuf;
 use smithay::delegate_compositor;
 use smithay::delegate_dmabuf;
 use smithay::delegate_output;
+use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_xdg_shell;
+use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use prism_frame::{DrmFourcc, DrmModifier};
 use smithay::reexports::wayland_server::Client;
@@ -88,6 +90,15 @@ pub struct PrismState {
     /// for the xdg-output manager; per-output `Output` instances live in
     /// `wl_outputs` and carry their own wl_output global IDs.
     pub output_manager: OutputManagerState,
+    /// wl_seat state for all advertised seats. We only have one ("seat0")
+    /// today and it's advertised with zero capabilities — enough to make
+    /// clients (mpv, browsers) that require *some* seat to be present
+    /// connect successfully. Real input dispatch (keyboard/pointer)
+    /// lands when we wire up libinput.
+    pub seat_state: SeatState<PrismState>,
+    /// The single seat we advertise. Kept around so we can flip
+    /// capabilities on later (when we add keyboard/pointer support).
+    pub seat: Seat<PrismState>,
 
     /// Per-output smithay `Output`, keyed by the same `OutputId`
     /// (connector name) as `outputs`. Populated by [`advertise_output`];
@@ -175,6 +186,14 @@ impl PrismState {
         // accounts for fractional scaling.
         let output_manager = OutputManagerState::new_with_xdg_output::<PrismState>(&dh);
 
+        // wl_seat advertised with zero capabilities. Many clients (mpv
+        // in particular) refuse to start without *some* wl_seat global;
+        // advertising one with no keyboard/pointer/touch makes them
+        // connect cleanly. Real input dispatch lands when libinput
+        // wiring does.
+        let mut seat_state = SeatState::<PrismState>::new();
+        let seat = seat_state.new_wl_seat(&dh, "seat0");
+
         Self {
             display_handle: dh,
             compositor,
@@ -183,6 +202,8 @@ impl PrismState {
             dmabuf_state,
             dmabuf_global,
             output_manager,
+            seat_state,
+            seat,
             session,
             cards: HashMap::new(),
             gpus,
@@ -325,13 +346,31 @@ impl OutputHandler for PrismState {
         _wl_output: smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
     ) {
         // Logged at info so the integration test can confirm clients
-        // see our wl_output advertisements. enter/leave bookkeeping
-        // (and most other handler hooks) come with #59.5.
+        // see our wl_output advertisements.
         tracing::info!(connector = %output.name(), "client bound wl_output");
     }
 }
 
 delegate_output!(PrismState);
+
+// ─── wl_seat ────────────────────────────────────────────────────────────────
+
+impl SeatHandler for PrismState {
+    // WlSurface is the focus carrier — smithay provides KeyboardTarget /
+    // PointerTarget / TouchTarget impls for it. No input dispatch yet,
+    // so these are mostly placeholders; the seat is advertised with
+    // zero capabilities and clients can bind but won't receive events.
+    type KeyboardFocus = WlSurface;
+    type PointerFocus = WlSurface;
+    type TouchFocus = WlSurface;
+
+    fn seat_state(&mut self) -> &mut SeatState<Self> {
+        &mut self.seat_state
+    }
+    // focus_changed / cursor_image / led_state_changed default to no-ops.
+}
+
+delegate_seat!(PrismState);
 
 // ─── wl_compositor ──────────────────────────────────────────────────────────
 

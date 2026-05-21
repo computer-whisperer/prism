@@ -1271,7 +1271,47 @@ fn present_for_crtc(
     let output = state
         .output_for_crtc(crtc)
         .ok_or_else(|| anyhow!("no output bound to crtc {crtc:?}"))?;
-    output.present(&elements, &encode_push)
+    let presented = output.present(&elements, &encode_push)?;
+
+    // Fire wl_callback.frame for every surface that's mapped to this
+    // output, but ONLY when we actually submitted a frame. If
+    // present() returned false (a flip is still in flight, our render
+    // was a no-op), the client's "next frame is on screen" callback
+    // hasn't happened yet — defer to the next vblank.
+    if presented {
+        let time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u32)
+            .unwrap_or(0);
+        for surface in &surfaces {
+            let belongs_here = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<prism_protocols::SurfacePlacementSlot>()
+                    .map(|p| {
+                        p.0.lock()
+                            .unwrap()
+                            .current_output
+                            .as_deref()
+                            == Some(output_id.as_str())
+                    })
+                    .unwrap_or(false)
+            });
+            if !belongs_here {
+                continue;
+            }
+            let callbacks: Vec<_> = with_states(surface, |states| {
+                let mut attrs =
+                    states.cached_state.get::<smithay::wayland::compositor::SurfaceAttributes>();
+                std::mem::take(&mut attrs.current().frame_callbacks)
+            });
+            for cb in callbacks {
+                cb.done(time_ms);
+            }
+        }
+    }
+
+    Ok(presented)
 }
 
 /// Same TTY-required mode-set as `scanout`, but instead of `vkCmdClearColorImage`
