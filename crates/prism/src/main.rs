@@ -1277,6 +1277,31 @@ fn present_for_crtc(
     use smithay::utils::{Logical, Rectangle};
     use smithay::wayland::compositor::with_states;
 
+    // TEMP: per-crtc enter crumb, capped at the first 30 invocations per
+    // crtc so we can trail through the layout walk for the first post-map
+    // present. Lets us figure out where the hang lives when it sits
+    // between vblank and the existing OK_TRUE crumb.
+    static ENTER_COUNT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    > = std::sync::OnceLock::new();
+    let enter_map = ENTER_COUNT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let trace_this_call: bool = {
+        let mut g = enter_map.lock().unwrap();
+        let count = g.entry(format!("{crtc:?}")).or_insert(0);
+        if *count < 30 {
+            *count += 1;
+            true
+        } else {
+            false
+        }
+    };
+    let trace = |s: &str| {
+        if trace_this_call {
+            breadcrumb(&format!("pfc {crtc:?}: {s}"));
+        }
+    };
+    trace("entered");
+
     // Snapshot identity bits we'll need below without holding any borrow
     // into state.outputs (so we can re-borrow mutably at present()
     // time). `white_view` is the renderer's 1×1 white texel — every
@@ -1344,6 +1369,8 @@ fn present_for_crtc(
         texture_lookup: &texture_lookup,
     };
 
+    trace("about to render_workspaces");
+
     // Layout walk into a flat RenderEl vector. Monitor is borrowed
     // immutably for the duration of render_workspaces; dropped before
     // the present below mutably re-borrows state.outputs.
@@ -1358,6 +1385,7 @@ fn present_for_crtc(
             .workspaces_with_render_geo()
             .map(|(ws, _)| ws.tiles().count())
             .collect();
+        trace(&format!("monitor_found ws_count={diag_ws_count} tile_counts={diag_tile_counts:?}"));
         // focus_ring: this is the focused monitor's render — for
         // single-monitor configs it always is; multi-monitor focus
         // tracking lands when input dispatch does.
@@ -1367,6 +1395,8 @@ fn present_for_crtc(
         false
     };
 
+    trace(&format!("render_workspaces done n_render_els={}", render_els.len()));
+
     // Lower RenderEls (geometry + tint) → ElementDraws (texture + push
     // constants). One pass; SolidColor/Border elements bind the white
     // texel, Surface elements bind the per-surface view.
@@ -1374,6 +1404,8 @@ fn present_for_crtc(
     for el in &render_els {
         el.lower(white_view, &mut elements);
     }
+
+    trace(&format!("lowered n_draws={}", elements.len()));
 
     // Log once per output the first present that actually carries tiles
     // — answers "did this output's render walk see the layout's window?"
