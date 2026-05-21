@@ -94,6 +94,18 @@ pub fn floor_logical_in_physical_max1(scale: f64, logical: f64) -> f64 {
     (logical * scale).max(1.).floor() / scale
 }
 
+/// Logical-space size of `output` (applying the output's transform).
+/// Niri's helper, ported verbatim from niri/src/utils.
+pub fn output_size(
+    output: &smithay::output::Output,
+) -> smithay::utils::Size<f64, smithay::utils::Logical> {
+    let output_scale = output.current_scale().fractional_scale();
+    let output_transform = output.current_transform();
+    let output_mode = output.current_mode().unwrap();
+    let logical_size = output_mode.size.to_f64().to_logical(output_scale);
+    output_transform.transform_size(logical_size)
+}
+
 /// "Baba is float" bob — tiny vertical offset based on wall time, used
 /// for the joke window-rule that makes windows bob up and down.
 /// Ported verbatim from niri/src/utils/mod.rs.

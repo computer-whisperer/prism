@@ -25,6 +25,7 @@ pub mod scrolling;
 pub mod shadow;
 pub mod tab_indicator;
 pub mod tile;
+pub mod workspace;
 
 pub use closing_window::ClosingWindow;
 pub use element::{
@@ -209,6 +210,11 @@ impl WorkspaceId {
 pub struct OutputId(pub String);
 
 impl OutputId {
+    pub fn new(output: &Output) -> Self {
+        let output_name = output.user_data().get::<OutputName>().unwrap();
+        Self(output_name.format_make_model_serial_or_connector())
+    }
+
     pub fn matches(&self, output: &Output) -> bool {
         let output_name = output.user_data().get::<OutputName>().unwrap();
         output_name.matches(&self.0)
