@@ -637,11 +637,42 @@ impl CompositorHandler for PrismState {
                             false,
                             ActivateWindow::Smart,
                         );
+                        let output_name = output.map(|o| o.name());
                         tracing::info!(
                             ?id,
-                            output = ?output.map(|o| o.name()),
+                            output = ?output_name,
                             "mapped xdg_toplevel into layout"
                         );
+
+                        // TEMP DIAGNOSTIC: dump the layout state per monitor
+                        // immediately after add_window. Tells us whether the
+                        // tile actually landed in a workspace anywhere. Uses
+                        // the SAME accessor the render walk does
+                        // (workspaces_with_render_geo) so we see exactly what
+                        // present_for_crtc sees.
+                        let monitor_dump: Vec<(String, usize, Vec<usize>)> = self
+                            .layout
+                            .monitors()
+                            .map(|mon| {
+                                let name = mon.output().name();
+                                let counts: Vec<usize> = mon
+                                    .workspaces_with_render_geo()
+                                    .map(|(ws, _)| ws.tiles().count())
+                                    .collect();
+                                let ws_count = counts.len();
+                                (name, ws_count, counts)
+                            })
+                            .collect();
+                        for (mon_name, ws_count, counts) in &monitor_dump {
+                            let total: usize = counts.iter().sum();
+                            tracing::info!(
+                                monitor = %mon_name,
+                                ws_count_visible = ws_count,
+                                ?counts,
+                                total_tiles = total,
+                                "post-add_window monitor state (via render-geo iter)"
+                            );
+                        }
                     }
                 }
             }
