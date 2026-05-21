@@ -29,6 +29,7 @@ use smithay::backend::allocator::dmabuf::Dmabuf as SmithayDmabuf;
 use smithay::delegate_compositor;
 use smithay::delegate_dmabuf;
 use smithay::delegate_output;
+use smithay::delegate_presentation;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_viewporter;
@@ -49,8 +50,11 @@ use smithay::wayland::compositor::{
     BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
     SurfaceAttributes, get_role, with_states,
 };
-use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
+use smithay::wayland::dmabuf::{
+    DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
+};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -108,6 +112,13 @@ pub struct PrismState {
     /// full-screen on the output they belong to. Honoring the viewport
     /// state lands when we add per-surface dst-rect positioning.
     pub viewporter: ViewporterState,
+    /// wp_presentation. Tells clients which clock we use for timestamps
+    /// (CLOCK_MONOTONIC) and lets them register per-frame feedback
+    /// callbacks that we fire with actual present time + refresh
+    /// interval + vblank sequence. Big quality win for video clients
+    /// (mpv): without it they fall back to wl_callback.frame timestamp
+    /// guesses and end up dropping frames pessimistically.
+    pub presentation: PresentationState,
 
     /// Per-output smithay `Output`, keyed by the same `OutputId`
     /// (connector name) as `outputs`. Populated by [`advertise_output`];
@@ -159,10 +170,22 @@ impl PrismState {
     ///   `gpus: {one GPU}` for dmabuf import validation. No scanout.
     /// - **truly headless** (tracer self-tests): `session: None`,
     ///   `gpus: {}`. dmabuf imports rejected.
+    /// Build a `PrismState`.
+    ///
+    /// `primary_gpu` is the GPU advertised to clients via
+    /// `linux-dmabuf-v1 v4`'s default [`DmabufFeedback`] as the
+    /// "main_device" — i.e. the render node EGL/Vulkan clients should
+    /// open. Pick the one whose outputs you expect to host the most
+    /// surfaces (Navi 21 on this hardware: 5 ancillary panels on
+    /// Vega 20 vs central + VR + OLED on Navi 21). `None` falls back
+    /// to dmabuf v3 (no feedback): clients can still send dmabufs but
+    /// have to guess which device to render on, which lands many of
+    /// them in software fallback.
     pub fn new(
         display: &Display<PrismState>,
         session: Option<prism_drm::SeatSession>,
         gpus: HashMap<DrmDevId, Arc<prism_renderer::Device>>,
+        primary_gpu: Option<DrmDevId>,
     ) -> Self {
         let dh = display.handle();
         let compositor = CompositorState::new::<PrismState>(&dh);
@@ -186,8 +209,44 @@ impl PrismState {
             },
         ];
         let mut dmabuf_state = DmabufState::new();
-        let dmabuf_global =
-            dmabuf_state.create_global::<PrismState>(&dh, supported_formats.iter().copied());
+        // dmabuf v4 + DmabufFeedback when we know the primary GPU's
+        // render node. Without that we'd fall back to v3 (no feedback),
+        // and clients like mpv that probe the dmabuf-feedback's
+        // main_device to pick a render node land in software EGL.
+        let dmabuf_global = match primary_gpu.and_then(|id| {
+            gpus.get(&id).map(|dev| (id, dev))
+        }) {
+            Some((id, device)) => {
+                // Prefer the render node for client rendering; fall
+                // back to the primary node if a render node isn't
+                // exposed (shouldn't happen on amdgpu but be defensive).
+                let node = device
+                    .physical
+                    .drm_render
+                    .or(device.physical.drm_primary)
+                    .unwrap_or(id);
+                let main_device = libc::makedev(node.major as u32, node.minor as u32);
+                let feedback = DmabufFeedbackBuilder::new(
+                    main_device,
+                    supported_formats.iter().copied(),
+                )
+                .build()
+                .expect("DmabufFeedbackBuilder::build");
+                tracing::info!(
+                    "dmabuf v4 advertised with main_device {}:{} ({} formats)",
+                    node.major,
+                    node.minor,
+                    supported_formats.len()
+                );
+                dmabuf_state.create_global_with_default_feedback::<PrismState>(&dh, &feedback)
+            }
+            None => {
+                tracing::warn!(
+                    "no primary GPU registered; falling back to dmabuf v3 — clients may end up in software EGL"
+                );
+                dmabuf_state.create_global::<PrismState>(&dh, supported_formats.iter().copied())
+            }
+        };
 
         // wl_output v4 + xdg-output-unstable-v1. Bundling both is the
         // standard smithay pattern; modern clients (mpv, browsers,
@@ -208,6 +267,14 @@ impl PrismState {
         // handles all the protocol bookkeeping; we just advertise.
         let viewporter = ViewporterState::new::<PrismState>(&dh);
 
+        // wp_presentation_time, advertising CLOCK_MONOTONIC. mpv (and
+        // any client doing precise A/V sync) needs this for proper
+        // pacing — otherwise it estimates display time from
+        // wl_callback.frame timestamps and ends up dropping frames
+        // pessimistically.
+        let presentation =
+            PresentationState::new::<PrismState>(&dh, libc::CLOCK_MONOTONIC as u32);
+
         Self {
             display_handle: dh,
             compositor,
@@ -219,6 +286,7 @@ impl PrismState {
             seat_state,
             seat,
             viewporter,
+            presentation,
             session,
             cards: HashMap::new(),
             gpus,
@@ -393,6 +461,10 @@ delegate_seat!(PrismState);
 // state in SurfaceData::cached_state; we'd read it via with_states +
 // ViewportCachedState if/when we honor it in the render path.
 delegate_viewporter!(PrismState);
+
+// ─── wp_presentation_time ───────────────────────────────────────────────────
+
+delegate_presentation!(PrismState);
 
 // ─── wl_compositor ──────────────────────────────────────────────────────────
 
@@ -648,7 +720,16 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
 
         match assignment {
             BufferAssignment::Removed => {
-                *slot.0.lock().unwrap() = None;
+                // If we were holding a dmabuf-backed buffer, release it
+                // so the client knows the BO is reusable. (For shm we
+                // already released after the byte copy at attach time;
+                // taking the slot is a no-op as far as the wl_buffer is
+                // concerned.)
+                let mut guard = slot.0.lock().unwrap();
+                if let Some(SurfaceTexture::Dmabuf { buffer, .. }) = guard.take() {
+                    buffer.release();
+                }
+                drop(guard);
                 // Surface is unmapping; leave its current output (if any).
                 let mut placement = placement_slot.0.lock().unwrap();
                 let old = placement.current_output.take();
@@ -721,10 +802,23 @@ fn build_surface_texture(
         if per_gpu.is_empty() {
             anyhow::bail!("dmabuf buffer has no imports on any GPU");
         }
-        *slot.0.lock().unwrap() = Some(SurfaceTexture::Dmabuf {
+        // Atomic swap: release the OLD buffer (if any) as we install the
+        // new one. Doing this on commit (rather than on present-done) is
+        // racy if we're still GPU-reading the BO — see SurfaceTexture
+        // doc — but works fine for video clients with a buffer pool ≥ 2,
+        // because the client keeps the next buffer free until release.
+        let mut guard = slot.0.lock().unwrap();
+        let previous = guard.replace(SurfaceTexture::Dmabuf {
             by_gpu: per_gpu.clone(),
+            buffer: buffer.clone(),
         });
-        // Don't release: client will overwrite the BO we're still sampling.
+        drop(guard);
+        if let Some(SurfaceTexture::Dmabuf { buffer: old, .. }) = previous {
+            // Different proxy → release sends the event; same proxy
+            // (re-committing the same buffer) is allowed but wasteful,
+            // release is a no-op in that case.
+            old.release();
+        }
         return Ok(());
     }
 

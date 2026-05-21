@@ -771,6 +771,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "calloop",
+ "libc",
  "prism-drm",
  "prism-frame",
  "prism-renderer",

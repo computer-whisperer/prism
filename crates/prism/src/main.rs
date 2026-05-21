@@ -100,7 +100,8 @@ fn run_wayland_server() -> Result<()> {
         .or(device.physical.drm_render)
         .ok_or_else(|| anyhow!("Vulkan device has no DRM node id; cannot index"))?;
     gpus.insert(key, device);
-    let mut state = prism_protocols::PrismState::new(&display, None, gpus);
+    // Single-GPU wayland mode → that's the primary.
+    let mut state = prism_protocols::PrismState::new(&display, None, gpus, Some(key));
 
     let mut event_loop: EventLoop<'static, prism_protocols::PrismState> =
         EventLoop::try_new().context("calloop EventLoop::try_new")?;
@@ -905,7 +906,27 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
 
     // ── Wayland display + PrismState ───────────────────────────────────────
     let display = prism_protocols::new_display()?;
-    let mut state = prism_protocols::PrismState::new(&display, Some(session), gpus);
+    // Pick the primary GPU for dmabuf-feedback's main_device:
+    // - PRISM_PRIMARY_GPU env var (format "major:minor", e.g. "226:1") overrides
+    // - Otherwise the highest-numbered DrmDevId, which on this hardware
+    //   (and most modern setups where the discrete GPU is added later)
+    //   resolves to Navi 21 (226:1). Documented in
+    //   memory/project_hardware_allocation as the bandwidth-critical primary.
+    let primary_gpu = std::env::var("PRISM_PRIMARY_GPU")
+        .ok()
+        .and_then(|s| {
+            let mut parts = s.splitn(2, ':');
+            let major = parts.next()?.parse::<i64>().ok()?;
+            let minor = parts.next()?.parse::<i64>().ok()?;
+            Some(prism_renderer::DrmDevId { major, minor })
+        })
+        .filter(|id| gpus.contains_key(id))
+        .or_else(|| gpus.keys().max_by_key(|id| (id.major, id.minor)).copied());
+    if let Some(id) = primary_gpu {
+        tracing::info!("primary GPU for dmabuf-feedback: {}:{}", id.major, id.minor);
+    }
+    let mut state =
+        prism_protocols::PrismState::new(&display, Some(session), gpus, primary_gpu);
     for card in cards {
         state.attach_card(card);
     }
@@ -964,6 +985,13 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     // the mode-set commit; every subsequent frame is kicked off by a
     // vblank from the prior flip.
     let max_frames_copy = max_frames;
+    // Per-frame breadcrumbs fsync per line — useful while debugging
+    // bringup, but at 7 CRTCs × 60Hz that's 420 fsyncs/sec which
+    // serializes to ~22Hz per CRTC. Off by default; opt in with
+    // PRISM_FRAME_TRACE=1 when you need the trail.
+    let frame_trace = std::env::var("PRISM_FRAME_TRACE")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
     for drm_notifier in drm_notifiers.drain(..) {
         let running_for_vblank = running.clone();
         let frame_counter_for_vblank = frame_counter.clone();
@@ -982,10 +1010,21 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                         let t0 = std::time::Instant::now();
                         let result = present_for_crtc(state, crtc);
                         let dt_us = t0.elapsed().as_micros();
+                        // Per-frame breadcrumbs fsync per line and cap our
+                        // event-loop throughput at ~150 ops/sec total —
+                        // 22Hz across 7 CRTCs instead of 60Hz each. Keep
+                        // them gated behind PRISM_FRAME_TRACE so debug
+                        // runs can still get the trail without crippling
+                        // steady-state perf. Errors and skips always log
+                        // (they're rare and useful).
                         match result {
-                            Ok(true) => breadcrumb(&format!(
-                                "frame #{n}: vblank({crtc:?}) → present submitted in {dt_us}µs"
-                            )),
+                            Ok(true) => {
+                                if frame_trace {
+                                    breadcrumb(&format!(
+                                        "frame #{n}: vblank({crtc:?}) → present submitted in {dt_us}µs"
+                                    ));
+                                }
+                            }
                             Ok(false) => {
                                 breadcrumb(&format!(
                                     "frame #{n}: skipped after {dt_us}µs (still pending)"
@@ -1268,21 +1307,37 @@ fn present_for_crtc(
     }
 
     let encode_push = EncodePush::sdr_identity();
-    let output = state
-        .output_for_crtc(crtc)
-        .ok_or_else(|| anyhow!("no output bound to crtc {crtc:?}"))?;
-    let presented = output.present(&elements, &encode_push)?;
+    let presented = {
+        let output = state
+            .output_for_crtc(crtc)
+            .ok_or_else(|| anyhow!("no output bound to crtc {crtc:?}"))?;
+        output.present(&elements, &encode_push)?
+    };
 
-    // Fire wl_callback.frame for every surface that's mapped to this
-    // output, but ONLY when we actually submitted a frame. If
-    // present() returned false (a flip is still in flight, our render
-    // was a no-op), the client's "next frame is on screen" callback
-    // hasn't happened yet — defer to the next vblank.
+    // Fire wl_callback.frame + wp_presentation_feedback for surfaces
+    // mapped to this output, but ONLY when we actually submitted a
+    // frame. If present() returned false (a flip still in flight, our
+    // render was a no-op), the "next frame is on screen" hasn't
+    // happened yet — defer the callbacks to the next vblank.
     if presented {
-        let time_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u32)
-            .unwrap_or(0);
+        let mono = clock_monotonic_now();
+        let time_ms = mono.as_millis() as u32;
+
+        // Look up the smithay Output handle + refresh once per crtc.
+        let (smithay_output, refresh) = {
+            let wl_out = state.wl_outputs.get(&output_id).cloned();
+            let refresh = state
+                .output_for_crtc(crtc)
+                .map(|o| {
+                    let hz = o.mode.vrefresh().max(1);
+                    smithay::wayland::presentation::Refresh::fixed(
+                        std::time::Duration::from_nanos(1_000_000_000 / hz as u64),
+                    )
+                })
+                .unwrap_or(smithay::wayland::presentation::Refresh::Unknown);
+            (wl_out, refresh)
+        };
+
         for surface in &surfaces {
             let belongs_here = with_states(surface, |states| {
                 states
@@ -1300,18 +1355,65 @@ fn present_for_crtc(
             if !belongs_here {
                 continue;
             }
-            let callbacks: Vec<_> = with_states(surface, |states| {
-                let mut attrs =
-                    states.cached_state.get::<smithay::wayland::compositor::SurfaceAttributes>();
-                std::mem::take(&mut attrs.current().frame_callbacks)
+            let (frame_cbs, presentation_cbs) = with_states(surface, |states| {
+                let frames = std::mem::take(
+                    &mut states
+                        .cached_state
+                        .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                        .current()
+                        .frame_callbacks,
+                );
+                let pres = std::mem::take(
+                    &mut states
+                        .cached_state
+                        .get::<smithay::wayland::presentation::PresentationFeedbackCachedState>()
+                        .current()
+                        .callbacks,
+                );
+                (frames, pres)
             });
-            for cb in callbacks {
+            for cb in frame_cbs {
                 cb.done(time_ms);
+            }
+            if let Some(out) = smithay_output.as_ref() {
+                use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+                for fb in presentation_cbs {
+                    fb.presented(
+                        out,
+                        mono,
+                        refresh,
+                        // We don't track a real vblank sequence yet.
+                        // mpv uses this for sanity / glitch detection;
+                        // a monotonically-increasing counter is fine.
+                        0,
+                        wp_presentation_feedback::Kind::Vsync,
+                    );
+                }
             }
         }
     }
 
     Ok(presented)
+}
+
+/// CLOCK_MONOTONIC right now as a `Duration` since the kernel's boot
+/// reference. Used for `wl_callback.frame` timestamps and
+/// `wp_presentation_feedback.presented` times — both want the same
+/// clock that `wp_presentation` advertises (CLOCK_MONOTONIC for us).
+fn clock_monotonic_now() -> std::time::Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: ts is a stack timespec we just zeroed; CLOCK_MONOTONIC
+    // is always supported on Linux; we check return for the off chance
+    // and fall back to zero (clients diff timestamps, so zero is fine
+    // as long as we're consistent).
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc != 0 {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
 /// Same TTY-required mode-set as `scanout`, but instead of `vkCmdClearColorImage`

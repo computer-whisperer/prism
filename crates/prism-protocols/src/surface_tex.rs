@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use prism_renderer::{DrmDevId, ImportedImage, ShmTexture, vk};
+use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 
 /// What the renderer samples from on a given commit.
 pub enum SurfaceTexture {
@@ -31,7 +32,20 @@ pub enum SurfaceTexture {
     Shm { by_gpu: HashMap<DrmDevId, ShmTexture> },
     /// VkImage backed by client-owned dmabuf (linux-dmabuf path), imported
     /// on every registered GPU. Lookup by GPU returns the matching import.
-    Dmabuf { by_gpu: HashMap<DrmDevId, Arc<ImportedImage>> },
+    ///
+    /// `buffer` is held so we can send `wl_buffer.release` when the
+    /// client commits a replacement buffer. Without that the client's
+    /// dmabuf pool fills up and it stalls / errors out (mpv exits with
+    /// "Error occurred on display fd" after ~4 unreleased commits).
+    /// The release happens at "replacement" time, not at present-done
+    /// time — so there's a small race where we may still be GPU-reading
+    /// the BO when the client starts writing it. Acceptable for video
+    /// (next frame masks any tearing); proper sync needs explicit
+    /// fences (linux-drm-syncobj-v1) and lands later.
+    Dmabuf {
+        by_gpu: HashMap<DrmDevId, Arc<ImportedImage>>,
+        buffer: WlBuffer,
+    },
 }
 
 impl SurfaceTexture {
@@ -42,7 +56,7 @@ impl SurfaceTexture {
     pub fn view_for(&self, gpu: DrmDevId) -> Option<vk::ImageView> {
         match self {
             Self::Shm { by_gpu } => by_gpu.get(&gpu).map(|t| t.view()),
-            Self::Dmabuf { by_gpu } => by_gpu.get(&gpu).map(|t| t.view()),
+            Self::Dmabuf { by_gpu, .. } => by_gpu.get(&gpu).map(|t| t.view()),
         }
     }
 
@@ -55,7 +69,7 @@ impl SurfaceTexture {
                 .next()
                 .map(|t| t.extent())
                 .unwrap_or_default(),
-            Self::Dmabuf { by_gpu } => by_gpu
+            Self::Dmabuf { by_gpu, .. } => by_gpu
                 .values()
                 .next()
                 .map(|i| i.extent())
