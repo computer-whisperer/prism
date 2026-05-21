@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::time::Duration;
 
 use prism_config::{Config, WindowRule};
-use prism_renderer::RenderEl;
+use prism_renderer::{RenderEl, SurfaceEl};
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::Window;
 use smithay::output::{self, Output};
@@ -567,14 +567,51 @@ impl LayoutElement for Mapped {
     fn render_normal(
         &self,
         location: Point<f64, Logical>,
-        scale: Scale<f64>,
-        alpha: f32,
+        _scale: Scale<f64>,
+        _alpha: f32,
         project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
         ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
-        // Surface-tree walk + SurfaceEl emission lands in step C2.
-        let _ = (location, scale, alpha, project, ctx, out);
+        // Root surface only — subsurface walk lands when we have a
+        // multi-surface client to test against (subsurface protocol is
+        // not yet exercised in the prism test harness). niri's path
+        // here is `surface_render_elements()` which recurses through
+        // the subsurface tree; we'll port that shape (without the
+        // GLES `Element` types) once we need it.
+        //
+        // _alpha is dropped: SurfaceEl's per-element opacity multiplier
+        // isn't plumbed through DecodePush yet. Opacity from window
+        // rules / close animation will land with that wiring.
+        let surface = self.toplevel().wl_surface();
+        let Some(view) = ctx.texture_for(surface) else {
+            // No GPU-side import yet (first frame before commit, or a
+            // failed dmabuf import on this output's GPU). Emit nothing
+            // and let the next frame retry.
+            return;
+        };
+
+        // The window's "geometry" is its logical content rect — for a
+        // toplevel with shadows it excludes the shadow inset; for plain
+        // toplevels it's just the surface size. Surface buffer can be
+        // larger; we sample the full buffer (UV [0,1]) and draw it at
+        // the geometry size for now. Honoring geometry-rect-vs-buffer
+        // (viewporter src rect) is a follow-on.
+        let geom_size = self.window.geometry().size.to_f64();
+        let dst = Rectangle::new(location, geom_size);
+        let dst_rect_clip = project(dst);
+
+        out.push(RenderEl::Surface(SurfaceEl {
+            texture_view: view,
+            dst_rect_clip,
+            src_rect_uv: [0.0, 0.0, 1.0, 1.0],
+            // Assume sRGB-encoded client buffer with 80-nit reference
+            // white. Per-surface colorspace negotiation
+            // (color-management-v1) lands separately; that's where
+            // wide-gamut and HDR clients will set this differently.
+            transfer: 1,
+            sdr_white_nits: 80.0,
+        }));
     }
 
     fn render_popups(
