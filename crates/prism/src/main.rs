@@ -1049,25 +1049,28 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                         // runs can still get the trail without crippling
                         // steady-state perf. Errors and skips always log
                         // (they're rare and useful).
-                        match result {
-                            Ok(true) => {
-                                if frame_trace {
-                                    breadcrumb(&format!(
-                                        "frame #{n}: vblank({crtc:?}) → present submitted in {dt_us}µs"
-                                    ));
-                                }
+                        // TEMP: unconditionally crumb every present (cap 200)
+                        // to confirm presents continue post-map. Restore the
+                        // gated path once layout-render is verified.
+                        static PRESENT_CRUMB_COUNT: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        let pcc = PRESENT_CRUMB_COUNT
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if pcc < 200 {
+                            match &result {
+                                Ok(true) => breadcrumb(&format!(
+                                    "frame #{n}: OK_TRUE crtc {crtc:?} in {dt_us}µs"
+                                )),
+                                Ok(false) => breadcrumb(&format!(
+                                    "frame #{n}: OK_FALSE skipped {crtc:?} {dt_us}µs"
+                                )),
+                                Err(e) => breadcrumb(&format!(
+                                    "frame #{n}: ERROR {crtc:?} {dt_us}µs: {e:#}"
+                                )),
                             }
-                            Ok(false) => {
-                                breadcrumb(&format!(
-                                    "frame #{n}: skipped after {dt_us}µs (still pending)"
-                                ));
-                            }
-                            Err(e) => {
-                                breadcrumb(&format!(
-                                    "frame #{n}: ERROR after {dt_us}µs: {e:#}"
-                                ));
-                                tracing::warn!("present failed: {e:#}");
-                            }
+                        }
+                        if let Err(e) = &result {
+                            tracing::warn!("present failed: {e:#}");
                         }
                         if let Some(max) = max_frames_copy {
                             if n >= max {
