@@ -21,6 +21,7 @@
 
 use std::os::fd::AsFd;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use drm_fourcc::DrmModifier;
@@ -29,6 +30,8 @@ use prism_renderer::{
 };
 use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneState};
 use smithay::reexports::drm::control::{Mode, connector, crtc, framebuffer};
+
+use crate::frame_clock::FrameClock;
 use smithay::utils::{Rectangle, Transform};
 
 use crate::{
@@ -90,6 +93,12 @@ pub struct OutputContext {
     /// Submitting another flip while one is pending causes the kernel to
     /// reject with ENOMEM. Don't re-enter present() until `mark_vblank()`.
     frame_pending: bool,
+    /// VRR-aware predictor for the next vblank. Updated on every vblank
+    /// with the actual presentation time the kernel reports; the redraw
+    /// pass reads `next_presentation_time()` to pick the
+    /// `target_presentation_time` it hands to clients via
+    /// `wp_presentation_feedback`.
+    pub frame_clock: FrameClock,
 }
 
 impl OutputContext {
@@ -162,6 +171,12 @@ impl OutputContext {
         )?;
         tracing::info!(connector = %pick.connector_name, "OutputContext::new step: done");
 
+        // FrameClock seed: refresh interval from the picked mode (vrefresh
+        // is Hz). VRR not yet plumbed through config, so off for now.
+        let vrefresh = pick.mode.vrefresh().max(1);
+        let refresh_interval = Duration::from_nanos(1_000_000_000 / u64::from(vrefresh));
+        let frame_clock = FrameClock::new(Some(refresh_interval), false);
+
         Ok(Self {
             surface,
             buffers,
@@ -176,19 +191,25 @@ impl OutputContext {
             config: config.clone(),
             mode_set_done: false,
             frame_pending: false,
+            frame_clock,
         })
     }
 
-    /// Clear the `frame_pending` flag AND advance the back-buffer index.
-    /// Call this when the DRM notifier surfaces a VBlank event for our CRTC.
+    /// Clear the `frame_pending` flag, advance the back-buffer index, and
+    /// feed the actual kernel-reported presentation time into the
+    /// `FrameClock` so the next render can predict the upcoming vblank.
+    /// Call this when the DRM notifier surfaces a VBlank event for our
+    /// CRTC.
     ///
-    /// At this point the just-flipped buffer is being scanned out; the OTHER
-    /// buffer is no longer in use by the display and is safe to render into.
-    pub fn mark_vblank(&mut self) {
+    /// At this point the just-flipped buffer is being scanned out; the
+    /// other buffer is no longer in use by the display and is safe to
+    /// render into.
+    pub fn mark_vblank(&mut self, presentation_time: Duration) {
         self.frame_pending = false;
         // The buffer we just flipped TO is now front. Toggle so back_index
         // points at the *other* one (the new back).
         self.back_index = 1 - self.back_index;
+        self.frame_clock.presented(presentation_time);
     }
 
     /// True if a flip is in flight (`present` will be a no-op).

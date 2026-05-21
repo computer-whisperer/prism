@@ -165,6 +165,13 @@ pub struct PrismState {
     pub dmabuf_textures:
         HashMap<ObjectId, HashMap<DrmDevId, Arc<prism_renderer::ImportedImage>>>,
 
+    /// Per-output redraw state machine + the `wl_callback.frame` /
+    /// `wp_presentation_feedback` stashed at submit time, waiting on
+    /// the next vblank to fire with the kernel-reported presentation
+    /// timestamp. Keyed by `OutputId` to match `outputs` / `wl_outputs`.
+    /// See [`crate::redraw`] for the state-machine shape.
+    pub output_redraw: HashMap<OutputId, crate::redraw::OutputRedrawState>,
+
     // ── DRM stack — declaration order = drop order = outer to inner ────────
     /// Active outputs across all cards. Each `OutputContext` Drop calls
     /// `surface.clear()`, which needs DRM master. Must drop before
@@ -327,6 +334,7 @@ impl PrismState {
             outputs: HashMap::new(),
             wl_outputs: HashMap::new(),
             dmabuf_textures: HashMap::new(),
+            output_redraw: HashMap::new(),
         }
     }
 

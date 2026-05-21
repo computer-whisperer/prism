@@ -990,33 +990,30 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         });
     }
 
-    // DRM vblank handler — one per card (each card's DrmDeviceNotifier
-    // fires only for its own CRTCs). Marks the just-flipped output's
-    // page-flip done AND triggers its next render. This is the heartbeat
-    // of vblank-driven pacing — present → wait for vblank → present again.
-    // Bootstrapped below with one explicit present per output that does
-    // the mode-set commit; every subsequent frame is kicked off by a
-    // vblank from the prior flip.
+    // DRM vblank handler — one per card. Strictly bookkeeping: fire the
+    // wp_presentation_feedback that was stashed at the matching submit
+    // (with the kernel-reported presentation time), advance the
+    // FrameClock, transition the redraw state machine, queue another
+    // redraw if needed. The actual render+page_flip happens later, in
+    // `redraw_queued_outputs` called from the main loop after dispatch.
+    // Keeping GPU work off the vblank thread is what lets wayland event
+    // servicing keep up at refresh rate.
     let max_frames_copy = max_frames;
     for drm_notifier in drm_notifiers.drain(..) {
         let running_for_vblank = running.clone();
         let frame_counter_for_vblank = frame_counter.clone();
         event_loop
             .handle()
-            .insert_source(drm_notifier, move |event, _metadata, state| {
+            .insert_source(drm_notifier, move |event, metadata, state| {
                 use smithay::backend::drm::DrmEvent;
                 match event {
                     DrmEvent::VBlank(crtc) => {
-                        let Some(output) = state.output_for_crtc(crtc) else {
-                            breadcrumb(&format!("vblank for unknown crtc {crtc:?}"));
-                            return;
-                        };
-                        output.mark_vblank();
+                        let presentation_time = metadata
+                            .as_ref()
+                            .map(|m| time_to_monotonic(m.time))
+                            .unwrap_or_else(clock_monotonic_now);
+                        on_vblank(state, crtc, presentation_time);
                         let n = frame_counter_for_vblank.fetch_add(1, Ordering::SeqCst) + 1;
-                        if let Err(e) = present_for_crtc(state, crtc) {
-                            breadcrumb(&format!("frame #{n}: ERROR {crtc:?}: {e:#}"));
-                            tracing::warn!("present failed: {e:#}");
-                        }
                         if let Some(max) = max_frames_copy {
                             if n >= max {
                                 breadcrumb(&format!(
@@ -1074,27 +1071,24 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             .map_err(|e| anyhow!("insert signals source: {e}"))?;
     }
 
-    // Bootstrap: render frame #1 on every attached output explicitly so
-    // the kernel has a vblank to schedule. From here on, each output's
-    // DRM vblank handler triggers its next present — true vblank-driven
-    // pacing at the panel's refresh rate. Before any client connects, the
-    // element list is empty: scanout shows a black frame, but the page-flip
-    // cycle is up and running so a later commit lands in the next vblank.
-    let bootstrap_crtcs: Vec<_> = state.outputs.values().map(|o| o.crtc).collect();
-    for crtc in bootstrap_crtcs {
-        let n0 = frame_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        breadcrumb(&format!("bootstrap({crtc:?}) → render frame #{n0}"));
-        match present_for_crtc(&mut state, crtc) {
-            Ok(true) => breadcrumb(&format!("frame #{n0}: submitted (mode-set commit)")),
-            Ok(false) => {
-                breadcrumb(&format!("frame #{n0}: skipped (unexpected at bootstrap)"))
-            }
-            Err(e) => {
-                breadcrumb(&format!("frame #{n0}: ERROR {e:#}"));
-                return Err(e).context("bootstrap present");
-            }
-        }
+    // Bootstrap: mark every attached output Queued so the very first
+    // redraw_queued_outputs pass below performs the mode-set commit and
+    // kicks off the vblank → on_vblank → queue_redraw → render cycle.
+    // Subsequent renders are paced by real vblanks (each output's
+    // FrameClock predicts the next presentation time on the fly).
+    let bootstrap_ids: Vec<_> = state.outputs.keys().cloned().collect();
+    for output_id in bootstrap_ids {
+        state
+            .output_redraw
+            .entry(output_id)
+            .or_default()
+            .queue_redraw();
     }
+    breadcrumb(&format!(
+        "bootstrap: {} output(s) queued",
+        state.output_redraw.len()
+    ));
+    redraw_queued_outputs(&mut state);
 
     breadcrumb("entering dispatch loop");
     while running.load(Ordering::SeqCst) {
@@ -1105,6 +1099,15 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             .display_handle
             .flush_clients()
             .context("flush_clients")?;
+        // Drain any outputs queued by this iteration (vblank handlers,
+        // commit handlers, etc.). One pass — if rendering itself sets
+        // more outputs Queued (it shouldn't), they'll drain on the next
+        // iteration.
+        redraw_queued_outputs(&mut state);
+        state
+            .display_handle
+            .flush_clients()
+            .context("flush_clients (after redraw)")?;
     }
 
     breadcrumb("dispatch loop exited cleanly");
@@ -1213,27 +1216,172 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
 /// emit `RenderEl`s with each tile projected to clip space, lower to
 /// `ElementDraw`s, and submit through the OutputContext. Replaces the
 /// pre-layout "first toplevel fills the framebuffer" bypass.
-fn present_for_crtc(
+/// Lightweight DRM-vblank handler. Bookkeeping only — no render, no
+/// page-flip. Called from the DrmEvent::VBlank dispatch path in the main
+/// loop. The actual render+page-flip for the next frame is performed by
+/// [`redraw_queued_outputs`] in the same loop iteration, *after*
+/// `event_loop.dispatch` returns, so wayland clients also get serviced
+/// in between.
+///
+/// Steps, in order:
+/// 1. Advance the output's `frame_clock` and back-buffer / `frame_pending`
+///    bookkeeping with the kernel-reported `presentation_time`.
+/// 2. Take the `PendingFeedback` we stashed at the matching submit and
+///    fire `wl_callback.frame` + `wp_presentation_feedback.presented`
+///    with the *actual* presentation time. This is what stops clients
+///    (mpv) from over-producing: the feedback signal goes out when the
+///    flip actually landed on screen, not when we queued it.
+/// 3. Transition the redraw state machine: `WaitingForVBlank { redraw_needed }`
+///    decides whether we re-queue or go idle. Today we always re-queue
+///    (matches the "render every vblank" behaviour we had before Stage B);
+///    Stage D will replace that with damage-driven scheduling.
+fn on_vblank(
     state: &mut prism_protocols::PrismState,
     crtc: smithay::reexports::drm::control::crtc::Handle,
-) -> Result<bool> {
+    presentation_time: Duration,
+) {
+    use prism_protocols::redraw::RedrawState;
+
+    // Resolve crtc → OutputId (small map; lookup is fine).
+    let Some(output_id) = state
+        .outputs
+        .iter()
+        .find(|(_, o)| o.crtc == crtc)
+        .map(|(id, _)| id.clone())
+    else {
+        breadcrumb(&format!("vblank for unknown crtc {crtc:?}"));
+        return;
+    };
+
+    // Step 1: per-output DRM bookkeeping (frame_pending, back_buffer
+    // toggle, frame_clock update).
+    if let Some(ctx) = state.outputs.get_mut(&output_id) {
+        ctx.mark_vblank(presentation_time);
+    }
+
+    // Step 2: take + fire stashed feedback. We split the take from the
+    // fire so the second part can hold immutable borrows into state for
+    // the smithay Output / refresh duration.
+    let pending = state
+        .output_redraw
+        .entry(output_id.clone())
+        .or_default()
+        .pending_feedback
+        .take();
+
+    if let Some(pending) = pending {
+        if let (Some(smithay_output), Some(ctx)) = (
+            state.wl_outputs.get(&output_id).cloned(),
+            state.outputs.get(&output_id),
+        ) {
+            let hz = ctx.mode.vrefresh().max(1);
+            let refresh = smithay::wayland::presentation::Refresh::fixed(Duration::from_nanos(
+                1_000_000_000 / hz as u64,
+            ));
+            let time_ms = presentation_time.as_millis() as u32;
+            for cb in pending.frame_cbs {
+                cb.done(time_ms);
+            }
+            use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+            for fb in pending.presentation_cbs {
+                fb.presented(
+                    &smithay_output,
+                    presentation_time,
+                    refresh,
+                    // We don't track a real vblank sequence yet; the kernel
+                    // gives us metadata.sequence but plumbing it through is
+                    // a separate change. Monotonic-zero is sane for mpv's
+                    // glitch-detection.
+                    0,
+                    wp_presentation_feedback::Kind::Vsync,
+                );
+            }
+        }
+    }
+
+    // Step 3: transition the state machine. Today: always re-queue, to
+    // preserve current "render every vblank" behaviour. Stage D will
+    // replace this unconditional re-queue with commit-driven
+    // `queue_redraw()` so idle outputs actually go idle.
+    let entry = state.output_redraw.entry(output_id).or_default();
+    let prev = std::mem::take(&mut entry.redraw);
+    entry.redraw = match prev {
+        RedrawState::WaitingForVBlank { redraw_needed: true } => RedrawState::Queued,
+        RedrawState::WaitingForVBlank { redraw_needed: false } => RedrawState::Idle,
+        other => other,
+    };
+    entry.queue_redraw();
+}
+
+/// Drain every output whose `redraw` state is `Queued`: build its render
+/// elements, render and submit the page-flip, stash the surfaces'
+/// `wl_callback.frame` and `wp_presentation_feedback` objects so the
+/// matching vblank handler can fire them with the actual presentation
+/// timestamp. Called once per main-loop iteration, after `dispatch`.
+fn redraw_queued_outputs(state: &mut prism_protocols::PrismState) {
+    use prism_protocols::redraw::RedrawState;
+
+    let to_render: Vec<_> = state
+        .output_redraw
+        .iter()
+        .filter_map(|(id, st)| matches!(st.redraw, RedrawState::Queued).then(|| id.clone()))
+        .collect();
+
+    for output_id in to_render {
+        match render_output_now(state, &output_id) {
+            Ok(Some(pending)) => {
+                let entry = state
+                    .output_redraw
+                    .entry(output_id)
+                    .or_default();
+                entry.pending_feedback = Some(pending);
+                entry.redraw = RedrawState::WaitingForVBlank {
+                    redraw_needed: false,
+                };
+            }
+            Ok(None) => {
+                // present() returned Ok(false) — flip still in flight.
+                // Shouldn't normally happen because we only enter Queued
+                // after a vblank cleared frame_pending, but defensive:
+                // leave Queued so the next pass retries.
+                tracing::debug!(output = %output_id, "render_output_now: flip still pending, retry next pass");
+            }
+            Err(e) => {
+                tracing::warn!("render_output_now({output_id}) failed: {e:#}");
+                breadcrumb(&format!("render_output_now({output_id}) ERROR: {e:#}"));
+                if let Some(entry) = state.output_redraw.get_mut(&output_id) {
+                    entry.redraw = RedrawState::Idle;
+                }
+            }
+        }
+    }
+}
+
+/// Render one output now and submit the page-flip. Returns the
+/// `PendingFeedback` to be stashed on the OutputRedrawState for the
+/// matching vblank handler to fire. Returns `Ok(None)` if the output's
+/// previous flip is still pending (caller will retry).
+fn render_output_now(
+    state: &mut prism_protocols::PrismState,
+    output_id: &str,
+) -> Result<Option<prism_protocols::PendingFeedback>> {
     use prism_layout::layout::RenderCtx;
+    use prism_protocols::PendingFeedback;
     use prism_renderer::{ElementDraw, EncodePush, RenderEl, vk};
     use smithay::utils::{Logical, Rectangle};
     use smithay::wayland::compositor::with_states;
 
-    // Snapshot identity bits we'll need below without holding any borrow
-    // into state.outputs (so we can re-borrow mutably at present()
-    // time). `white_view` is the renderer's 1×1 white texel — every
-    // SolidColor/Border element samples it at lower-time.
-    let (output_id, output_gpu_id, white_view) = {
+    // Snapshot identity bits without holding any borrow into
+    // state.outputs (we'll re-borrow mutably at present() time below).
+    let (output_gpu_id, white_view, target_time) = {
         let output = state
-            .output_for_crtc(crtc)
-            .ok_or_else(|| anyhow!("no output bound to crtc {crtc:?}"))?;
+            .outputs
+            .get(output_id)
+            .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
         (
-            output.connector_name.clone(),
             output.gpu_id,
             output.renderer.white_view(),
+            output.frame_clock.next_presentation_time(),
         )
     };
 
@@ -1241,7 +1389,7 @@ fn present_for_crtc(
     // Monitor. wl_outputs is populated by advertise_output().
     let smithay_output = state
         .wl_outputs
-        .get(&output_id)
+        .get(output_id)
         .cloned()
         .ok_or_else(|| anyhow!("no smithay Output for {output_id}"))?;
 
@@ -1259,7 +1407,7 @@ fn present_for_crtc(
         Some(m) => m.view_size(),
         // Output not in the layout yet (race between add_output and the
         // first vblank). Skip this frame; the next one will be fine.
-        None => return Ok(false),
+        None => return Ok(None),
     };
 
     let project = |rect: Rectangle<f64, Logical>| -> [f32; 4] {
@@ -1321,7 +1469,7 @@ fn present_for_crtc(
     if has_surface {
         let seen =
             FIRST_WITH_TILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-        if seen.lock().unwrap().insert(output_id.clone()) {
+        if seen.lock().unwrap().insert(output_id.to_owned()) {
             let first_surface = render_els.iter().find_map(|e| match e {
                 RenderEl::Surface(s) => Some(s.dst_rect_clip),
                 _ => None,
@@ -1342,12 +1490,23 @@ fn present_for_crtc(
     let encode_push = EncodePush::sdr_identity();
     let presented = {
         let output = state
-            .output_for_crtc(crtc)
-            .ok_or_else(|| anyhow!("no output bound to crtc {crtc:?}"))?;
+            .outputs
+            .get_mut(output_id)
+            .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
         output.present(&elements, &encode_push)?
     };
 
-    // Frame callbacks still want to iterate the toplevels mapped here.
+    if !presented {
+        // Flip still pending — caller will retry next pass.
+        return Ok(None);
+    }
+
+    // Extract pending frame_callbacks + presentation_feedback from
+    // every surface mapped to this output so we can fire them at the
+    // next vblank with the kernel-reported presentation time. Firing
+    // them now (at submit, before scanout) would lie to clients about
+    // when the buffer hit the screen and cause over-production / stalls
+    // — see the redraw module's docs.
     let surfaces: Vec<_> = state
         .xdg_shell
         .toplevel_surfaces()
@@ -1355,76 +1514,53 @@ fn present_for_crtc(
         .map(|t| t.wl_surface().clone())
         .collect();
 
-    // Fire wl_callback.frame + wp_presentation_feedback for surfaces
-    // mapped to this output, but ONLY when we actually submitted a
-    // frame. If present() returned false (a flip still in flight, our
-    // render was a no-op), the "next frame is on screen" hasn't
-    // happened yet — defer the callbacks to the next vblank.
-    if presented {
-        let mono = clock_monotonic_now();
-        let time_ms = mono.as_millis() as u32;
-
-        let refresh = state
-            .output_for_crtc(crtc)
-            .map(|o| {
-                let hz = o.mode.vrefresh().max(1);
-                smithay::wayland::presentation::Refresh::fixed(
-                    std::time::Duration::from_nanos(1_000_000_000 / hz as u64),
-                )
-            })
-            .unwrap_or(smithay::wayland::presentation::Refresh::Unknown);
-
-        for surface in &surfaces {
-            // Belongs-on-this-output is now driven by the layout: a
-            // surface lives on the monitor whose Output matches ours.
-            let belongs_here = state
-                .layout
-                .find_window_and_output(surface)
-                .and_then(|(_, out)| out)
-                .map(|out| out == &smithay_output)
-                .unwrap_or(false);
-            if !belongs_here {
-                continue;
-            }
-            let (frame_cbs, presentation_cbs) = with_states(surface, |states| {
-                let frames = std::mem::take(
-                    &mut states
-                        .cached_state
-                        .get::<smithay::wayland::compositor::SurfaceAttributes>()
-                        .current()
-                        .frame_callbacks,
-                );
-                let pres = std::mem::take(
-                    &mut states
-                        .cached_state
-                        .get::<smithay::wayland::presentation::PresentationFeedbackCachedState>()
-                        .current()
-                        .callbacks,
-                );
-                (frames, pres)
-            });
-            for cb in frame_cbs {
-                cb.done(time_ms);
-            }
-            {
-                use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
-                for fb in presentation_cbs {
-                    fb.presented(
-                        &smithay_output,
-                        mono,
-                        refresh,
-                        // We don't track a real vblank sequence yet.
-                        // mpv uses this for sanity / glitch detection;
-                        // a monotonically-increasing counter is fine.
-                        0,
-                        wp_presentation_feedback::Kind::Vsync,
-                    );
-                }
-            }
+    let mut frame_cbs = Vec::new();
+    let mut presentation_cbs = Vec::new();
+    for surface in &surfaces {
+        let belongs_here = state
+            .layout
+            .find_window_and_output(surface)
+            .and_then(|(_, out)| out)
+            .map(|out| out == &smithay_output)
+            .unwrap_or(false);
+        if !belongs_here {
+            continue;
         }
+        with_states(surface, |states| {
+            frame_cbs.append(&mut std::mem::take(
+                &mut states
+                    .cached_state
+                    .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                    .current()
+                    .frame_callbacks,
+            ));
+            presentation_cbs.append(&mut std::mem::take(
+                &mut states
+                    .cached_state
+                    .get::<smithay::wayland::presentation::PresentationFeedbackCachedState>()
+                    .current()
+                    .callbacks,
+            ));
+        });
     }
 
-    Ok(presented)
+    Ok(Some(PendingFeedback {
+        frame_cbs,
+        presentation_cbs,
+        target_time,
+    }))
+}
+
+/// Convert smithay's `DrmEventTime` (monotonic or realtime) to the
+/// CLOCK_MONOTONIC `Duration` `wp_presentation_feedback` expects. If
+/// the kernel handed us a realtime timestamp instead of monotonic (rare;
+/// requires the driver to support DRM_CAP_TIMESTAMP_MONOTONIC = 1, which
+/// AMDGPU always does), we fall back to `clock_monotonic_now()`.
+fn time_to_monotonic(time: smithay::backend::drm::DrmEventTime) -> Duration {
+    match time {
+        smithay::backend::drm::DrmEventTime::Monotonic(d) => d,
+        smithay::backend::drm::DrmEventTime::Realtime(_) => clock_monotonic_now(),
+    }
 }
 
 /// CLOCK_MONOTONIC right now as a `Duration` since the kernel's boot

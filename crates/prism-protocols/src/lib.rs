@@ -7,11 +7,13 @@
 //! lifecycle work; rendering / texture import / input come incrementally.
 
 pub mod client;
+pub mod redraw;
 pub mod server;
 pub mod state;
 pub mod surface_tex;
 
 pub use client::PrismClient;
+pub use redraw::{OutputRedrawState, PendingFeedback, RedrawState};
 pub use server::insert_wayland_sources;
 pub use state::{PrismState, new_display};
 pub use surface_tex::{SurfacePlacement, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture};
