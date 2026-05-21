@@ -1372,39 +1372,37 @@ fn present_for_crtc(
         el.lower(white_view, &mut elements);
     }
 
-    // TEMP DIAGNOSTIC: log the first 10 presents per output
-    // unconditionally — no dedup — so we definitively see post-map
-    // state. Remove once layout-driven render verified.
-    static PRESENT_COUNTS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    // TEMP DIAGNOSTIC: log every present where tile_counts contains
+    // a non-zero entry, plus first present per output that sees tiles.
+    // Helps catch the window after add_window — even if it's seconds
+    // into the run.
+    static FIRST_WITH_TILES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<String>>,
     > = std::sync::OnceLock::new();
     let n_render_els = render_els.len();
     let n_draws = elements.len();
-    let counts =
-        PRESENT_COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut g = counts.lock().unwrap();
-    let c = g.entry(output_id.clone()).or_insert(0u32);
-    if *c < 10 {
-        *c += 1;
-        let n = *c;
-        drop(g);
-        let first_surface = render_els.iter().find_map(|e| match e {
-            RenderEl::Surface(s) => Some(s.dst_rect_clip),
-            _ => None,
-        });
-        tracing::info!(
-            present_n = n,
-            output = %output_id,
-            view_w = view_size.w,
-            view_h = view_size.h,
-            monitor_found,
-            diag_ws_count,
-            ?diag_tile_counts,
-            n_render_els,
-            n_draws,
-            ?first_surface,
-            "present #{n} for output"
-        );
+    let total_tiles: usize = diag_tile_counts.iter().sum();
+    if total_tiles > 0 {
+        let seen =
+            FIRST_WITH_TILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        if seen.lock().unwrap().insert(output_id.clone()) {
+            let first_surface = render_els.iter().find_map(|e| match e {
+                RenderEl::Surface(s) => Some(s.dst_rect_clip),
+                _ => None,
+            });
+            tracing::info!(
+                output = %output_id,
+                view_w = view_size.w,
+                view_h = view_size.h,
+                monitor_found,
+                diag_ws_count,
+                ?diag_tile_counts,
+                n_render_els,
+                n_draws,
+                ?first_surface,
+                "FIRST present with tiles for output"
+            );
+        }
     }
 
     let encode_push = EncodePush::sdr_identity();
