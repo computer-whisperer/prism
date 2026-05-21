@@ -1326,7 +1326,16 @@ fn present_for_crtc(
     // immutably for the duration of render_workspaces; dropped before
     // the present below mutably re-borrows state.outputs.
     let mut render_els: Vec<RenderEl> = Vec::new();
+    let mut diag_ws_count: usize = 0;
+    let mut diag_tile_counts: Vec<usize> = Vec::new();
     let monitor_found = if let Some(monitor) = state.layout.monitor_for_output(&smithay_output) {
+        diag_ws_count = monitor
+            .workspaces_with_render_geo()
+            .count();
+        diag_tile_counts = monitor
+            .workspaces_with_render_geo()
+            .map(|(ws, _)| ws.tiles().count())
+            .collect();
         // focus_ring: this is the focused monitor's render — for
         // single-monitor configs it always is; multi-monitor focus
         // tracking lands when input dispatch does.
@@ -1364,8 +1373,29 @@ fn present_for_crtc(
             monitor_found,
             n_render_els,
             n_draws,
+            diag_ws_count,
+            ?diag_tile_counts,
             "first present for output"
         );
+    }
+    // Also log every present where the monitor has tiles but render emitted
+    // nothing — fires once globally to surface the "tiles exist but walk
+    // produces 0 elements" gap.
+    static EMPTY_WITH_TILES: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
+        std::sync::OnceLock::new();
+    let total_tiles: usize = diag_tile_counts.iter().sum();
+    if total_tiles > 0 && n_render_els == 0 {
+        let flag = EMPTY_WITH_TILES.get_or_init(|| std::sync::atomic::AtomicBool::new(false));
+        if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                output = %output_id,
+                view_w = view_size.w,
+                view_h = view_size.h,
+                diag_ws_count,
+                ?diag_tile_counts,
+                "present produced 0 render_els despite tiles in layout"
+            );
+        }
     }
     if n_render_els > 0 && nonempty.lock().unwrap().insert(output_id.clone()) {
         let first_surface = render_els.iter().find_map(|e| match e {
