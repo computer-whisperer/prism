@@ -1382,6 +1382,27 @@ fn present_for_crtc(
     let n_render_els = render_els.len();
     let n_draws = elements.len();
     let total_tiles: usize = diag_tile_counts.iter().sum();
+    // Also dump full per-monitor state on the Nth present overall (60Hz × 6
+    // outputs × 1s = ~360 presents/sec; 800 ≈ 2.2s in, well after mpv maps).
+    // Unconditional — captures whatever state the present-time layout sees.
+    static PRESENTS_SO_FAR: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    let count = PRESENTS_SO_FAR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count == 800 {
+        for mon in state.layout.monitors() {
+            let mon_name = mon.output().name();
+            let counts_render_geo: Vec<usize> = mon
+                .workspaces_with_render_geo()
+                .map(|(ws, _)| ws.tiles().count())
+                .collect();
+            tracing::warn!(
+                monitor = %mon_name,
+                counts_render_geo = ?counts_render_geo,
+                "PRESENT-TIME layout dump at present N=800"
+            );
+        }
+    }
+
     if total_tiles > 0 {
         let seen =
             FIRST_WITH_TILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
