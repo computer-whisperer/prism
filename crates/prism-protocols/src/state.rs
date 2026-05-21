@@ -27,8 +27,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use prism_animation::Clock;
 use prism_config::Config;
-use prism_layout::layout::Layout;
-use prism_layout::window::Mapped;
+use prism_layout::layout::{ActivateWindow, AddWindowTarget, Layout};
+use prism_layout::window::{Mapped, ResolvedWindowRules};
 use prism_renderer::{DrmDevId, vk};
 use smithay::backend::allocator::Format as DrmFormat;
 use smithay::backend::allocator::dmabuf::Dmabuf as SmithayDmabuf;
@@ -53,9 +53,10 @@ use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource};
 use smithay::utils::{Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-    SurfaceAttributes, get_role, with_states,
+    add_pre_commit_hook, BufferAssignment, CompositorClientState, CompositorHandler,
+    CompositorState, SurfaceAttributes, get_role, with_states,
 };
+use smithay::desktop::Window;
 use smithay::wayland::dmabuf::{
     DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
 };
@@ -552,6 +553,66 @@ impl CompositorHandler for PrismState {
                 {
                     toplevel.send_configure();
                     tracing::info!("sent initial configure to xdg_toplevel");
+                }
+            } else if self.layout.find_window_and_output(surface).is_none() {
+                // Already configured but not yet in the layout. The
+                // client has had a chance to attach a buffer in
+                // response to the initial configure; if it has, wrap
+                // in Mapped and add to the layout's focused workspace.
+                // This is the in-path bridge for niri-port 73C3.
+                //
+                // Niri tracks an `Unmapped` HashMap to defer this
+                // until the buffer arrives; we infer it from "has a
+                // current buffer". A toplevel that responded with a
+                // commit but no buffer (mapped-with-null-buffer
+                // unmap) still has BufferAssignment::Removed in
+                // current; we read that here.
+                let has_buffer = with_states(surface, |states| {
+                    let mut attrs = states
+                        .cached_state
+                        .get::<SurfaceAttributes>();
+                    matches!(attrs.current().buffer, Some(BufferAssignment::NewBuffer(_)))
+                });
+                if has_buffer {
+                    if let Some(toplevel) = self
+                        .xdg_shell
+                        .toplevel_surfaces()
+                        .iter()
+                        .find(|t| t.wl_surface() == surface)
+                        .cloned()
+                    {
+                        let window = Window::new_wayland_window(toplevel);
+                        // Pre-commit hook is a no-op for now; niri
+                        // uses it for dmabuf-readiness blockers + the
+                        // post-commit transaction queue. We don't
+                        // have those subsystems yet but Mapped::new
+                        // requires a HookId so register a no-op hook
+                        // to get one. The hook does fire on every
+                        // commit, so keep it cheap.
+                        let hook = add_pre_commit_hook::<PrismState, _>(
+                            surface,
+                            |_state, _dh, _surface| {},
+                        );
+                        let mapped = {
+                            let config = self.config.borrow();
+                            Mapped::new(window, ResolvedWindowRules::default(), hook, &config)
+                        };
+                        let id = mapped.id().clone();
+                        let output = self.layout.add_window(
+                            mapped,
+                            AddWindowTarget::Auto,
+                            None,
+                            None,
+                            false,
+                            false,
+                            ActivateWindow::Smart,
+                        );
+                        tracing::info!(
+                            ?id,
+                            output = ?output.map(|o| o.name()),
+                            "mapped xdg_toplevel into layout"
+                        );
+                    }
                 }
             }
         }
