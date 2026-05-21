@@ -1299,10 +1299,12 @@ fn on_vblank(
         }
     }
 
-    // Step 3: transition the state machine. Today: always re-queue, to
-    // preserve current "render every vblank" behaviour. Stage D will
-    // replace this unconditional re-queue with commit-driven
-    // `queue_redraw()` so idle outputs actually go idle.
+    // Step 3: transition the state machine. Damage-driven now —
+    // commit handlers call `queue_redraw_for_surface` to flip a
+    // WaitingForVBlank entry's `redraw_needed` to true; on this
+    // vblank we honour that signal. If nothing requested a redraw
+    // between submit and now, the output goes Idle until the next
+    // commit lands.
     let entry = state.output_redraw.entry(output_id).or_default();
     let prev = std::mem::take(&mut entry.redraw);
     entry.redraw = match prev {
@@ -1310,7 +1312,6 @@ fn on_vblank(
         RedrawState::WaitingForVBlank { redraw_needed: false } => RedrawState::Idle,
         other => other,
     };
-    entry.queue_redraw();
 }
 
 /// Drain every output whose `redraw` state is `Queued`: build its render

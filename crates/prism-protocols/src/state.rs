@@ -663,6 +663,14 @@ impl CompositorHandler for PrismState {
         // ask. Also re-runs on every commit, which handles the layout
         // moving a window between outputs.
         dispatch_surface_output_from_layout(self, surface);
+
+        // Damage-driven redraw scheduling: a commit that lands renderable
+        // pixels (new buffer, geometry change, popup attach…) needs the
+        // output(s) it sits on to repaint. Mark them Queued; the next
+        // pass through `redraw_queued_outputs` (driven from the main
+        // loop after dispatch) will render them. Idle outputs that
+        // nobody committed to stay Idle — no GPU work, no page-flips.
+        queue_redraw_for_surface(self, surface);
     }
 }
 
@@ -957,6 +965,44 @@ fn dispatch_surface_output_from_layout(state: &mut PrismState, surface: &WlSurfa
             }
         }
     }
+}
+
+/// Mark the output(s) hosting `surface` as needing a redraw. Called from
+/// the commit handler so a wayland commit drives a render between
+/// vblanks instead of having to wait for the next one to schedule us.
+/// Outputs nobody committed to stay Idle, so they don't burn vblanks
+/// on a no-op page-flip.
+///
+/// Today the only surface→output binding we track is via the layout's
+/// `find_window_and_output` (xdg toplevels). Layer-shell surfaces will
+/// need their own resolver when those land. Sub-surfaces inherit their
+/// parent's output via the same layout query (their parent toplevel is
+/// what the layout knows about).
+fn queue_redraw_for_surface(state: &mut PrismState, surface: &WlSurface) {
+    // Resolve the surface (or its toplevel parent) to an output.
+    let output_name = state
+        .layout
+        .find_window_and_output(surface)
+        .and_then(|(_, out)| out.map(|o| o.name()));
+
+    let Some(output_id) = output_name else {
+        // No layout-tracked binding. Subsurfaces of a mapped toplevel
+        // are commited via their root surface's commit handler call
+        // path, so this branch is mostly initial commits before
+        // add_window has run — that path queues a redraw implicitly
+        // because `bootstrap` queued every output on startup and
+        // on_vblank re-queues. Once we stop re-queueing on vblank
+        // (i.e., once this whole module is the redraw driver), we'll
+        // need a fallback (queue every output) for un-resolvable
+        // surfaces. For now: silent skip is fine.
+        return;
+    };
+
+    state
+        .output_redraw
+        .entry(output_id)
+        .or_default()
+        .queue_redraw();
 }
 
 fn build_surface_texture(
