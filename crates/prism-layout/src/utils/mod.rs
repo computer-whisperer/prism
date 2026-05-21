@@ -94,6 +94,42 @@ pub fn floor_logical_in_physical_max1(scale: f64, logical: f64) -> f64 {
     (logical * scale).max(1.).floor() / scale
 }
 
+/// "Baba is float" bob — tiny vertical offset based on wall time, used
+/// for the joke window-rule that makes windows bob up and down.
+/// Ported verbatim from niri/src/utils/mod.rs.
+pub fn baba_is_float_offset(now: std::time::Duration, view_height: f64) -> f64 {
+    let now = now.as_secs_f64();
+    let amplitude = view_height / 96.;
+    amplitude * ((core::f64::consts::TAU * now / 3.6).sin() - 1.)
+}
+
+/// Clamp `x` to the `[min_size, max_size]` range, treating 0 as
+/// "unbounded" for whichever endpoint is zero. Used to honor
+/// xdg_toplevel min/max-size hints. Ported from niri/src/utils.
+pub fn ensure_min_max_size(mut x: i32, min_size: i32, max_size: i32) -> i32 {
+    if max_size > 0 {
+        x = x.min(max_size);
+    }
+    if min_size > 0 {
+        x = x.max(min_size);
+    }
+    x
+}
+
+/// Like [`ensure_min_max_size`] but special-cases `x == 0` (the
+/// "configure picks a sensible size" sentinel): if the toplevel has a
+/// fixed-size min==max, use that; otherwise stay zero. Ported from
+/// niri/src/utils.
+pub fn ensure_min_max_size_maybe_zero(x: i32, min_size: i32, max_size: i32) -> i32 {
+    if x != 0 {
+        ensure_min_max_size(x, min_size, max_size)
+    } else if min_size > 0 && min_size == max_size {
+        min_size
+    } else {
+        0
+    }
+}
+
 /// Run `f` against a toplevel's `XdgToplevelSurfaceRoleAttributes`,
 /// holding the lock for the closure's duration. Ported verbatim from
 /// niri/src/utils/mod.rs.

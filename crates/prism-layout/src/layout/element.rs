@@ -27,6 +27,7 @@ use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
 
+use super::LayoutElementRenderSnapshot;
 use crate::utils::transaction::Transaction;
 use crate::utils::ResizeEdge;
 use crate::window::ResolvedWindowRules;
@@ -234,6 +235,15 @@ pub trait LayoutElement {
     fn interactive_resize_data(&self) -> Option<InteractiveResizeData>;
 
     fn on_commit(&mut self, serial: Serial);
+
+    /// Pop a saved render snapshot for the about-to-happen resize
+    /// animation. Niri returns a `LayoutElementRenderSnapshot` (a baked
+    /// texture buffer); prism's `LayoutElementRenderSnapshot` is stubbed
+    /// to `()` until the snapshot pipeline lands, so this returns
+    /// `Option<()>` carrying just the "have a snapshot" bit. The
+    /// surrounding `Tile` still consults it to decide whether to play
+    /// the resize animation.
+    fn take_animation_snapshot(&mut self) -> Option<LayoutElementRenderSnapshot>;
 }
 
 /// Currently-unused but kept so future render-emit functions can pass

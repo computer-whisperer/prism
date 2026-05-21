@@ -41,7 +41,7 @@ impl Shadow {
     pub fn update_render_elements(
         &mut self,
         _win_size: Size<f64, Logical>,
-        _view_rect: Rectangle<f64, Logical>,
+        _is_active: bool,
         _radius: prism_config::CornerRadius,
         _scale: f64,
         _alpha: f32,
