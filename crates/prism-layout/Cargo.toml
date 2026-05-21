@@ -39,3 +39,4 @@ smithay = { workspace = true, features = ["desktop"] }
 smithay-drm-extras.workspace = true
 tracing.workspace = true
 wayland-backend = "0.3"
+xcursor = "0.3.10"

@@ -8,6 +8,8 @@
 //! Current state: utils foundation in place; window/layer/layout/input/cursor
 //! are still being ported one chunk at a time.
 
+pub mod cursor;
+pub mod input;
 pub mod layer;
 pub mod layout;
 pub mod swipe_tracker;
