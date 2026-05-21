@@ -1326,12 +1326,15 @@ fn present_for_crtc(
     // immutably for the duration of render_workspaces; dropped before
     // the present below mutably re-borrows state.outputs.
     let mut render_els: Vec<RenderEl> = Vec::new();
-    if let Some(monitor) = state.layout.monitor_for_output(&smithay_output) {
+    let monitor_found = if let Some(monitor) = state.layout.monitor_for_output(&smithay_output) {
         // focus_ring: this is the focused monitor's render — for
         // single-monitor configs it always is; multi-monitor focus
         // tracking lands when input dispatch does.
         monitor.render_workspaces(true, &project, &ctx, &mut render_els);
-    }
+        true
+    } else {
+        false
+    };
 
     // Lower RenderEls (geometry + tint) → ElementDraws (texture + push
     // constants). One pass; SolidColor/Border elements bind the white
@@ -1339,6 +1342,40 @@ fn present_for_crtc(
     let mut elements: Vec<ElementDraw> = Vec::with_capacity(render_els.len());
     for el in &render_els {
         el.lower(white_view, &mut elements);
+    }
+
+    // TEMP DIAGNOSTIC: log the first frame per output where the layout
+    // walk produces anything non-empty. Lets us see whether the bridge
+    // is firing at all without per-frame log spam. Remove once layout-
+    // driven render is verified visually.
+    static FIRST_NONEMPTY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = FIRST_NONEMPTY.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let n_render_els = render_els.len();
+    let n_draws = elements.len();
+    if (n_render_els > 0 || n_draws > 0) && seen.lock().unwrap().insert(output_id.clone()) {
+        let first_surface = render_els.iter().find_map(|e| match e {
+            RenderEl::Surface(s) => Some(s.dst_rect_clip),
+            _ => None,
+        });
+        tracing::info!(
+            output = %output_id,
+            view_w = view_size.w,
+            view_h = view_size.h,
+            monitor_found,
+            n_render_els,
+            n_draws,
+            first_surface_clip = ?first_surface,
+            "first non-empty layout walk for output"
+        );
+    } else if !monitor_found {
+        // Less noisy variant: only log "no monitor" once per output.
+        static NO_MON_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        let s = NO_MON_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        if s.lock().unwrap().insert(output_id.clone()) {
+            tracing::info!(output = %output_id, "no monitor in layout for output");
+        }
     }
 
     let encode_push = EncodePush::sdr_identity();
