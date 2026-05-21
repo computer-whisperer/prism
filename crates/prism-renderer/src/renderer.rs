@@ -217,10 +217,25 @@ impl Renderer {
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         )];
+
+        // Global memory dependency picking up writes made outside our queue
+        // submission stream — specifically client-side writes to dmabuf BOs
+        // we're about to sample. The dmabuf's implicit-sync resv on radv
+        // already gates queue execution on producer fences, but the
+        // visibility barrier (MEMORY_WRITE → SHADER_SAMPLED_READ) is still
+        // required so the fragment shader sees fresh pixels rather than
+        // anything cached from a prior frame's sample.
+        let producer_sync = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
         unsafe {
             self.device.raw.cmd_pipeline_barrier2(
                 cb,
-                &vk::DependencyInfo::default().image_memory_barriers(&pre_intermediate),
+                &vk::DependencyInfo::default()
+                    .memory_barriers(&producer_sync)
+                    .image_memory_barriers(&pre_intermediate),
             );
         }
 

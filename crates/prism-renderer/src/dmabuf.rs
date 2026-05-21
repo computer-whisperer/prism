@@ -161,6 +161,90 @@ impl ImportedImage {
             format: vk_format,
         })
     }
+
+    /// Transition this image from UNDEFINED → SHADER_READ_ONLY_OPTIMAL on the
+    /// graphics queue, blocking until the transition completes.
+    ///
+    /// The image is created with `initial_layout = UNDEFINED`, but the render
+    /// path binds it with `image_layout = SHADER_READ_ONLY_OPTIMAL` and never
+    /// emits a layout-transition barrier of its own. Sampling from an image
+    /// whose actual layout is UNDEFINED is undefined behaviour — on radv it
+    /// hangs the queue. Doing the transition once at import time (when the
+    /// producer's pixels are already in the BO) gets the image into a
+    /// sampleable layout without us having to repeat the work every frame.
+    ///
+    /// For sampled dmabuf imports only. Color-attachment scanout images
+    /// don't need this — they're transitioned per-frame in render_frame.
+    pub fn transition_for_sampling(&self) -> Result<()> {
+        let device = &self.device.raw;
+        let queue_family = self.device.physical.graphics_queue_family;
+
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family)
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }
+            .vk_ctx("create_command_pool (dmabuf transition)")?;
+
+        let result = (|| -> Result<()> {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(pool)
+                .command_buffer_count(1)
+                .level(vk::CommandBufferLevel::PRIMARY);
+            let cbs = unsafe { device.allocate_command_buffers(&alloc_info) }
+                .vk_ctx("allocate_command_buffers (dmabuf transition)")?;
+            let cb = cbs[0];
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            unsafe { device.begin_command_buffer(cb, &begin_info) }
+                .vk_ctx("begin_command_buffer (dmabuf transition)")?;
+
+            let barriers = [vk::ImageMemoryBarrier2::default()
+                .image(self.image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .src_access_mask(vk::AccessFlags2::empty())
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+            unsafe {
+                device.cmd_pipeline_barrier2(
+                    cb,
+                    &vk::DependencyInfo::default().image_memory_barriers(&barriers),
+                );
+                device.end_command_buffer(cb)
+            }
+            .vk_ctx("end_command_buffer (dmabuf transition)")?;
+
+            let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+            let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+                .vk_ctx("create_fence (dmabuf transition)")?;
+            let submit_result = unsafe {
+                device.queue_submit2(self.device.graphics_queue, &submits, fence)
+            };
+            if let Err(e) = submit_result {
+                unsafe { device.destroy_fence(fence, None) };
+                return Err(RendererError::Vk {
+                    context: "queue_submit2 (dmabuf transition)",
+                    result: e,
+                });
+            }
+            let wait = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+            unsafe { device.destroy_fence(fence, None) };
+            wait.vk_ctx("wait_for_fences (dmabuf transition)")
+        })();
+
+        unsafe { device.destroy_command_pool(pool, None) };
+        result
+    }
 }
 
 impl Drop for ImportedImage {
