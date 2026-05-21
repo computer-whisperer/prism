@@ -11,14 +11,16 @@
 //! time on a 16.67 ms vblank budget there's plenty of slack, but real
 //! workloads (full client compositing) need this overlap.
 
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 
+use ash::khr::external_semaphore_fd;
 use ash::vk;
 
 use crate::device::Device;
 use crate::dmabuf::ImportedImage;
 use crate::encode_synth::EncodeConfig;
-use crate::error::{Result, VkResultExt};
+use crate::error::{RendererError, Result, VkResultExt};
 use crate::intermediate::Intermediate;
 use crate::pipeline::decode::{DecodePipeline, DecodePush};
 use crate::pipeline::encode::{EncodePipeline, EncodePush};
@@ -46,6 +48,14 @@ struct FrameSlot {
     /// intermediate image, the scanout image's previous content, etc.).
     /// Created in the signalled state so the first wait is a no-op.
     fence: vk::Fence,
+    /// Binary semaphore signalled by the same submission as `fence`, and
+    /// exportable as a Linux SYNC_FD via VK_KHR_external_semaphore_fd. We
+    /// hand the exported fd to the DRM atomic commit as `IN_FENCE_FD` so
+    /// the kernel can schedule the page-flip without blocking on the
+    /// dmabuf's implicit-sync reservation. Per spec the export
+    /// **unsignals** the semaphore, so on each frame we re-signal it via
+    /// the submit then re-export.
+    present_semaphore: vk::Semaphore,
 }
 
 pub struct Renderer {
@@ -65,6 +75,9 @@ pub struct Renderer {
     slots: [FrameSlot; FRAMES_IN_FLIGHT],
     /// Index into `slots` for the *next* frame.
     next_slot: usize,
+    /// Loader for VK_KHR_external_semaphore_fd — exports the per-slot
+    /// `present_semaphore` as a Linux sync_file fd for KMS.
+    semaphore_fd_loader: external_semaphore_fd::Device,
 }
 
 impl Renderer {
@@ -94,18 +107,31 @@ impl Renderer {
         // One fence per slot, signalled at creation so the first wait is a no-op.
         let fence_info =
             vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        // One exportable binary semaphore per slot. Marked exportable as
+        // SYNC_FD via the pNext export-info chain — required by Vulkan to
+        // later call vkGetSemaphoreFdKHR. Starts unsignalled (the default
+        // for VkSemaphore); the first signal happens at the first submit
+        // that uses the slot.
+        let mut export_info = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let sem_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
         let mut slots = Vec::with_capacity(FRAMES_IN_FLIGHT);
         for cb in cbs {
             let fence = unsafe { device.raw.create_fence(&fence_info, None) }
                 .vk_ctx("create_fence (renderer slot)")?;
+            let present_semaphore = unsafe { device.raw.create_semaphore(&sem_info, None) }
+                .vk_ctx("create_semaphore (renderer slot, exportable SYNC_FD)")?;
             slots.push(FrameSlot {
                 cmd_buffer: cb,
                 fence,
+                present_semaphore,
             });
         }
         let slots: [FrameSlot; FRAMES_IN_FLIGHT] = slots
             .try_into()
             .map_err(|_| crate::error::RendererError::MissingFeature("FrameSlot collect"))?;
+
+        let semaphore_fd_loader = external_semaphore_fd::Device::new(device.instance_raw(), &device.raw);
 
         // Solid-color element scratch — one 1×1 white texel, uploaded once.
         let mut white_tex = ShmTexture::new(
@@ -126,6 +152,7 @@ impl Renderer {
             command_pool,
             slots,
             next_slot: 0,
+            semaphore_fd_loader,
         })
     }
 
@@ -161,20 +188,23 @@ impl Renderer {
 
     /// Render one frame into `scanout` (which must match `scanout_format`).
     ///
-    /// Waits on the next slot's fence (gates against the GPU still using its
-    /// resources from N frames ago), records into its command buffer, submits
-    /// signalling the fence. Does NOT wait for the GPU to finish — that's
-    /// what frames-in-flight gives us. Caller should sequence the page-flip
-    /// after this; the page-flip waits implicitly because Vulkan-emitted
-    /// images get a sync-fd that the KMS path respects via dmabuf fences.
-    /// (For now we still rely on implicit sync; explicit dmabuf fence
-    /// integration is a follow-up.)
+    /// Waits on the next slot's fence (gates against the GPU still using
+    /// its resources from N frames ago), records into its command buffer,
+    /// submits signalling both the fence (for slot reuse) and the slot's
+    /// binary `present_semaphore` (exported below). Does NOT wait for the
+    /// GPU to finish.
+    ///
+    /// Returns the present-completion sync as a Linux SYNC_FD `OwnedFd` —
+    /// the caller passes it to the DRM atomic commit as `IN_FENCE_FD` so
+    /// the kernel sequences the page-flip after the GPU finishes writing
+    /// the scanout BO, without falling back to dmabuf implicit-sync
+    /// (which makes `page_flip` itself block).
     pub fn render_frame(
         &mut self,
         scanout: &ImportedImage,
         elements: &[ElementDraw],
         encode_push: &EncodePush,
-    ) -> Result<()> {
+    ) -> Result<OwnedFd> {
         let extent = scanout.extent();
         self.ensure_intermediate(extent)?;
         let intermediate = self.intermediate.as_ref().unwrap();
@@ -408,7 +438,15 @@ impl Renderer {
         unsafe { self.device.raw.end_command_buffer(cb) }.vk_ctx("end_command_buffer")?;
 
         let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
-        let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
+        // Signal the slot's exportable binary semaphore alongside the
+        // fence. The fence stays for our internal slot-reuse gate; the
+        // semaphore exists so we can export a sync_file fd handle to KMS.
+        let signal_sem = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(slot.present_semaphore)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let submit = [vk::SubmitInfo2::default()
+            .command_buffer_infos(&cb_infos)
+            .signal_semaphore_infos(&signal_sem)];
         unsafe {
             self.device
                 .raw
@@ -416,10 +454,27 @@ impl Renderer {
         }
         .vk_ctx("queue_submit2 (renderer)")?;
 
+        // Export the just-signalled semaphore as a Linux sync_file fd.
+        // Per VK_KHR_external_semaphore_fd spec, the export transfers
+        // ownership of the underlying sync state to the returned fd and
+        // unsignals the VkSemaphore — so the next queue_submit2 for this
+        // slot is free to re-signal it.
+        let get_info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(slot.present_semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let raw_fd = unsafe { self.semaphore_fd_loader.get_semaphore_fd(&get_info) }
+            .vk_ctx("vkGetSemaphoreFdKHR (SYNC_FD)")?;
+        if raw_fd < 0 {
+            return Err(RendererError::MissingFeature(
+                "vkGetSemaphoreFdKHR returned a negative fd",
+            ));
+        }
+        let present_sync_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
         // Advance to the next slot. No GPU wait — the next call to
         // render_frame will wait on its slot's fence as needed.
         self.next_slot = (slot_idx + 1) % FRAMES_IN_FLIGHT;
-        Ok(())
+        Ok(present_sync_fd)
     }
 }
 
@@ -430,6 +485,7 @@ impl Drop for Renderer {
             let _ = self.device.raw.device_wait_idle();
             for slot in &self.slots {
                 self.device.raw.destroy_fence(slot.fence, None);
+                self.device.raw.destroy_semaphore(slot.present_semaphore, None);
             }
             self.device.raw.destroy_command_pool(self.command_pool, None);
         }

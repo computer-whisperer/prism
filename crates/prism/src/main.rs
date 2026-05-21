@@ -408,10 +408,10 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     };
     let encode_push = EncodePush::sdr_identity();
 
-    renderer.render_frame(&scanout, &[element], &encode_push)?;
-    // Headless readback wants to map the scanout BO; the GPU work above
-    // was submitted with a fence we don't wait on, so make sure it's done
-    // before we map. device_wait_idle is fine here (one-shot test).
+    // Headless readback path — the SYNC_FD returned by render_frame is
+    // dropped, and we device_wait_idle for completeness. (One-shot test
+    // doesn't use the page-flip path the fd is meant for.)
+    let _present_sync = renderer.render_frame(&scanout, &[element], &encode_push)?;
     unsafe {
         let _ = device.raw.device_wait_idle();
     }
@@ -1549,8 +1549,11 @@ fn run_gradient_scanout(
         push: DecodePush::identity_srgb([-1.0, -1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
     };
     let encode_push = EncodePush::sdr_identity();
-    renderer.render_frame(&scanout_image, &[element], &encode_push)?;
-    // One-shot TTY test: page-flip below needs the render to be done.
+    // One-shot TTY test: device_wait_idle below ensures the GPU work
+    // committed by render_frame finishes before the page-flip; the
+    // returned SYNC_FD is dropped (we don't use the IN_FENCE_FD path
+    // here, the synchronous wait is simpler for a one-shot test).
+    let _present_sync = renderer.render_frame(&scanout_image, &[element], &encode_push)?;
     unsafe {
         let _ = device.raw.device_wait_idle();
     }

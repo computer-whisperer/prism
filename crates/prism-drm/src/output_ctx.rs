@@ -19,6 +19,7 @@
 //! targets the *back* buffer while the display reads the *front*; page_flip
 //! swaps them at vblank.
 
+use std::os::fd::AsFd;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -211,7 +212,16 @@ impl OutputContext {
         }
 
         let back = &self.buffers[self.back_index];
-        self.renderer
+        // render_frame returns the present-completion sync as a Linux
+        // sync_file fd; we hand it to the DRM atomic commit as
+        // IN_FENCE_FD so the kernel sequences the page-flip after our
+        // GPU writes complete, without falling back to dmabuf
+        // implicit-sync (which makes page_flip itself stall ~16ms on
+        // radv). The fd is BorrowedFd-lifetime tied to `plane_state`
+        // below; it's closed when `present_sync` drops at the end of
+        // this function.
+        let present_sync = self
+            .renderer
             .render_frame(&back.image, elements, encode_push)?;
 
         let src = Rectangle::from_size(
@@ -229,7 +239,7 @@ impl OutputContext {
                 alpha: 1.0,
                 damage_clips: None,
                 fb: back.fb,
-                fence: None,
+                fence: Some(present_sync.as_fd()),
             }),
         }];
 
