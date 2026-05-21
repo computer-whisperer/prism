@@ -28,6 +28,11 @@ pub struct DecodePush {
     pub dst_rect_clip: [f32; 4],
     pub src_rect_uv: [f32; 4],
     pub decode_matrix: [f32; 16], // mat4, column-major
+    /// Per-element tint, identity = `[1.0; 4]`. Used by solid-color elements
+    /// (window borders, layout backgrounds) that sample the renderer's 1×1
+    /// white texture with `transfer = 0` (Linear) and have the actual color
+    /// baked into this tint in BT.2020 linear nits.
+    pub tint: [f32; 4],
     pub sdr_white_nits: f32,
     pub transfer: i32,
     pub _pad0: i32,
@@ -40,9 +45,26 @@ impl DecodePush {
             dst_rect_clip: dst,
             src_rect_uv: src,
             decode_matrix: mat4_identity(),
+            tint: [1.0, 1.0, 1.0, 1.0],
             sdr_white_nits: 80.0,
             // 0 = Linear (no decode). The smoke test feeds an already-linear
             // RGBA16_SFLOAT texture, so this is the right choice for #48.
+            transfer: 0,
+            _pad0: 0,
+            _pad1: 0,
+        }
+    }
+
+    /// Solid-color draw: sample the renderer's 1×1 white texture in full,
+    /// no decode (Linear transfer), tint with the supplied color in BT.2020
+    /// linear nits. Caller supplies the destination clip-space rect.
+    pub fn solid(dst: [f32; 4], color_bt2020_nits: [f32; 4]) -> Self {
+        Self {
+            dst_rect_clip: dst,
+            src_rect_uv: [0.0, 0.0, 1.0, 1.0],
+            decode_matrix: mat4_identity(),
+            tint: color_bt2020_nits,
+            sdr_white_nits: 1.0,
             transfer: 0,
             _pad0: 0,
             _pad1: 0,

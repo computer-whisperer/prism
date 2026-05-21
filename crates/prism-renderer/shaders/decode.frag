@@ -22,6 +22,12 @@ layout(push_constant) uniform Push {
     vec4 dst_rect_clip;
     vec4 src_rect_uv;
     mat4 decode_matrix;
+    // Per-element tint, applied after decode + primaries conversion but before
+    // alpha premultiplication. Identity = vec4(1.0). Used by solid-color
+    // elements (window borders, layout backgrounds) which sample the
+    // renderer's 1×1 white texture with transfer=Linear and have the actual
+    // color baked into this tint in BT.2020 linear nits.
+    vec4 tint;
     float sdr_white_nits;
     int transfer;
     int _pad0;
@@ -85,7 +91,13 @@ void main() {
     mat3 m = mat3(push.decode_matrix);
     vec3 bt2020 = m * linear;
 
+    // Tint (multiplicative; identity = vec4(1.0)). Applied to color in
+    // linear-light + alpha — lets solid-color elements drive arbitrary
+    // hues through the white-texture path.
+    bt2020 *= push.tint.rgb;
+    float alpha = sampled.a * push.tint.a;
+
     // Output to fp16 intermediate. Alpha is passed through unchanged so
     // standard pre-multiplied blending composes correctly in linear space.
-    out_color = vec4(bt2020 * sampled.a, sampled.a);
+    out_color = vec4(bt2020 * alpha, alpha);
 }

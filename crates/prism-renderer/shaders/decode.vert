@@ -15,6 +15,8 @@ layout(push_constant) uniform Push {
     // Decode primaries → BT.2020 matrix (in linear-light space).
     // Stored as mat4 to keep push-constant alignment trivial.
     mat4 decode_matrix;
+    // Per-element tint (see decode.frag).
+    vec4 tint;
     // Scalar parameters.
     float sdr_white_nits;
     int transfer;         // see decode.frag

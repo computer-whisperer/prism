@@ -22,6 +22,7 @@ use crate::error::{Result, VkResultExt};
 use crate::intermediate::Intermediate;
 use crate::pipeline::decode::{DecodePipeline, DecodePush};
 use crate::pipeline::encode::{EncodePipeline, EncodePush};
+use crate::upload::ShmTexture;
 
 /// Number of frames the renderer keeps in flight. Matches the scanout BO
 /// count in `prism-drm::OutputContext`; the kernel only ever has one flip
@@ -52,6 +53,12 @@ pub struct Renderer {
     decode: DecodePipeline,
     encode: EncodePipeline,
     intermediate: Option<Intermediate>,
+    /// 1×1 RGBA8 white texture used as the texture binding for solid-color
+    /// elements (window borders, layer-shell backgrounds, …). Sampled in
+    /// the decode pipeline with `transfer = Linear`, `sdr_white_nits = 1.0`,
+    /// and the actual color baked into `DecodePush::tint`. Lives for the
+    /// renderer's full lifetime so the view handle is stable across frames.
+    white_tex: ShmTexture,
     scanout_format: vk::Format,
     intermediate_format: vk::Format,
     command_pool: vk::CommandPool,
@@ -100,17 +107,32 @@ impl Renderer {
             .try_into()
             .map_err(|_| crate::error::RendererError::MissingFeature("FrameSlot collect"))?;
 
+        // Solid-color element scratch — one 1×1 white texel, uploaded once.
+        let mut white_tex = ShmTexture::new(
+            device.clone(),
+            vk::Extent2D { width: 1, height: 1 },
+            vk::Format::R8G8B8A8_UNORM,
+        )?;
+        white_tex.upload_bytes(&[255, 255, 255, 255], 4)?;
+
         Ok(Self {
             device,
             decode,
             encode,
             intermediate: None,
+            white_tex,
             scanout_format,
             intermediate_format,
             command_pool,
             slots,
             next_slot: 0,
         })
+    }
+
+    /// View of the 1×1 RGBA white texture solid-color elements sample.
+    /// Pair with `DecodePush::solid(dst, color)`.
+    pub fn white_view(&self) -> vk::ImageView {
+        self.white_tex.view()
     }
 
     pub fn scanout_format(&self) -> vk::Format {
