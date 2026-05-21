@@ -569,25 +569,27 @@ impl CompositorHandler for PrismState {
                     tracing::info!("sent initial configure to xdg_toplevel");
                 }
             } else if self.layout.find_window_and_output(surface).is_none() {
-                // Already configured but not yet in the layout. The
-                // client has had a chance to attach a buffer in
-                // response to the initial configure; if it has, wrap
-                // in Mapped and add to the layout's focused workspace.
-                // This is the in-path bridge for niri-port 73C3.
+                // Already configured but not yet in the layout. We map
+                // on the first commit that successfully attached a
+                // buffer. The signal we read is the SurfaceTexSlot:
+                // process_surface_buffer (called above) consumes any
+                // BufferAssignment::NewBuffer out of cached_state and
+                // populates this slot with a SurfaceTexture on success.
+                // So if the slot is now Some, the client has produced
+                // its first renderable frame and is ready to be mapped.
                 //
-                // Niri tracks an `Unmapped` HashMap to defer this
-                // until the buffer arrives; we infer it from "has a
-                // current buffer". A toplevel that responded with a
-                // commit but no buffer (mapped-with-null-buffer
-                // unmap) still has BufferAssignment::Removed in
-                // current; we read that here.
-                let has_buffer = with_states(surface, |states| {
-                    let mut attrs = states
-                        .cached_state
-                        .get::<SurfaceAttributes>();
-                    matches!(attrs.current().buffer, Some(BufferAssignment::NewBuffer(_)))
+                // Niri does this via an explicit `unmapped_windows`
+                // HashMap that tracks the pre-buffer state; we don't
+                // need that since we can read map readiness off the
+                // texture slot directly.
+                let has_texture = with_states(surface, |states| {
+                    states
+                        .data_map
+                        .get::<SurfaceTexSlot>()
+                        .map(|s| s.0.lock().unwrap().is_some())
+                        .unwrap_or(false)
                 });
-                if has_buffer {
+                if has_texture {
                     if let Some(toplevel) = self
                         .xdg_shell
                         .toplevel_surfaces()
