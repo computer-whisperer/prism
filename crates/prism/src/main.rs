@@ -1352,18 +1352,16 @@ fn present_for_crtc(
         [x0, y0, x1, y1]
     };
 
-    let texture_lookup = |surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| -> Option<vk::ImageView> {
-        with_states(surface, |states| {
-            states
-                .data_map
-                .get::<prism_protocols::SurfaceTexSlot>()
-                .and_then(|s| {
-                    s.0.lock()
-                        .unwrap()
-                        .as_ref()
-                        .and_then(|t| t.view_for(output_gpu_id))
-                })
-        })
+    let texture_lookup = |states: &smithay::wayland::compositor::SurfaceData| -> Option<vk::ImageView> {
+        states
+            .data_map
+            .get::<prism_protocols::SurfaceTexSlot>()
+            .and_then(|s| {
+                s.0.lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|t| t.view_for(output_gpu_id))
+            })
     };
     let ctx = RenderCtx {
         texture_lookup: &texture_lookup,

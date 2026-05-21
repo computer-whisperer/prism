@@ -23,25 +23,36 @@ use prism_renderer::{vk, RenderEl};
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
+use smithay::wayland::compositor::SurfaceData;
 
 /// Side-channel a `LayoutElement` needs to actually emit content during a
 /// render walk: how to project logical rects into clip space, and how to
-/// resolve a `WlSurface` to the GPU-side texture view the render path
-/// will sample. Constructed once per output at the top of the render
-/// walk by the integrator (prism-protocols' `present_for_crtc`), then
-/// threaded through `Monitor → Workspace → Tile → Mapped`.
+/// resolve a surface (via its already-locked `SurfaceData`) to the
+/// GPU-side texture view the render path will sample. Constructed once
+/// per output at the top of the render walk by the integrator
+/// (prism-protocols' `present_for_crtc`), then threaded through
+/// `Monitor → Workspace → Tile → Mapped`.
 ///
 /// We bundle the texture lookup behind a `&dyn Fn` instead of a typed
-/// handle so prism-layout doesn't need to know how the integrator
-/// stores per-surface textures (today: `SurfaceTexSlot` on the
-/// surface's data_map; tomorrow possibly cached elsewhere).
+/// handle so prism-layout doesn't need to know how the integrator stores
+/// per-surface textures (today: `SurfaceTexSlot` on the surface's
+/// data_map; tomorrow possibly cached elsewhere).
+///
+/// **Why `&SurfaceData` and not `&WlSurface`**: the renderer's
+/// per-surface walk uses `with_surface_tree_downward`, whose visit
+/// callback already holds the surface's `SurfaceData` lock. Resolving
+/// the texture by calling `with_states(surface, ...)` again would
+/// re-acquire the same non-reentrant std::sync::Mutex inside the
+/// callback and deadlock — exactly the hang we saw on the first
+/// post-map present for the mpv-bearing output. Taking the already
+/// borrowed `&SurfaceData` keeps the lookup inside the existing scope.
 pub struct RenderCtx<'a> {
-    pub texture_lookup: &'a dyn Fn(&WlSurface) -> Option<vk::ImageView>,
+    pub texture_lookup: &'a dyn Fn(&SurfaceData) -> Option<vk::ImageView>,
 }
 
 impl<'a> RenderCtx<'a> {
-    pub fn texture_for(&self, surface: &WlSurface) -> Option<vk::ImageView> {
-        (self.texture_lookup)(surface)
+    pub fn texture_for(&self, states: &SurfaceData) -> Option<vk::ImageView> {
+        (self.texture_lookup)(states)
     }
 }
 

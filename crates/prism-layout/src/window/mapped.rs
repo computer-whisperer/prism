@@ -613,14 +613,19 @@ impl LayoutElement for Mapped {
                 }
             },
             // Visit: emit a SurfaceEl for this surface at `surf_loc + view.offset`.
-            |surf, states, &surf_loc| {
+            |_surf, states, &surf_loc| {
                 let data = states.data_map.get::<RendererSurfaceStateUserData>();
                 let Some(data) = data else { return };
                 let view = match data.lock().unwrap().view() {
                     Some(v) => v,
                     None => return,
                 };
-                let Some(texture_view) = ctx.texture_for(surf) else {
+                // texture_for reads from `states` directly — DO NOT call
+                // with_states(surf) here. We're already inside
+                // with_surface_tree_downward's visit callback, which holds
+                // this surface's SurfaceData lock; re-acquiring it would
+                // deadlock.
+                let Some(texture_view) = ctx.texture_for(states) else {
                     return;
                 };
 
