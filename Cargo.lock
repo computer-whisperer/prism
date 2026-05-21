@@ -1163,6 +1163,7 @@ dependencies = [
  "smithay",
  "smithay-drm-extras",
  "tracing",
+ "wayland-backend",
 ]
 
 [[package]]

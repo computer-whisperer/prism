@@ -12,7 +12,55 @@ pub mod vblank_throttle;
 
 use std::time::Duration;
 
+use bitflags::bitflags;
 use rustix::time::{clock_gettime, ClockId};
+use smithay::input::pointer::CursorIcon;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+
+bitflags! {
+    /// Interactive-resize edge mask. Direct copy of niri's `ResizeEdge` —
+    /// used by `LayoutElement::set_interactive_resize` and the window
+    /// configure path to convey which edges are being dragged.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct ResizeEdge: u32 {
+        const TOP          = 0b0001;
+        const BOTTOM       = 0b0010;
+        const LEFT         = 0b0100;
+        const RIGHT        = 0b1000;
+
+        const TOP_LEFT     = Self::TOP.bits() | Self::LEFT.bits();
+        const BOTTOM_LEFT  = Self::BOTTOM.bits() | Self::LEFT.bits();
+
+        const TOP_RIGHT    = Self::TOP.bits() | Self::RIGHT.bits();
+        const BOTTOM_RIGHT = Self::BOTTOM.bits() | Self::RIGHT.bits();
+
+        const LEFT_RIGHT   = Self::LEFT.bits() | Self::RIGHT.bits();
+        const TOP_BOTTOM   = Self::TOP.bits() | Self::BOTTOM.bits();
+    }
+}
+
+impl From<xdg_toplevel::ResizeEdge> for ResizeEdge {
+    #[inline]
+    fn from(x: xdg_toplevel::ResizeEdge) -> Self {
+        Self::from_bits(x as u32).unwrap()
+    }
+}
+
+impl ResizeEdge {
+    pub fn cursor_icon(self) -> CursorIcon {
+        match self {
+            Self::LEFT => CursorIcon::WResize,
+            Self::RIGHT => CursorIcon::EResize,
+            Self::TOP => CursorIcon::NResize,
+            Self::BOTTOM => CursorIcon::SResize,
+            Self::TOP_LEFT => CursorIcon::NwResize,
+            Self::TOP_RIGHT => CursorIcon::NeResize,
+            Self::BOTTOM_RIGHT => CursorIcon::SeResize,
+            Self::BOTTOM_LEFT => CursorIcon::SwResize,
+            _ => CursorIcon::Default,
+        }
+    }
+}
 
 /// Wall-clock-ish monotonic time. Matches niri's `get_monotonic_time`.
 pub fn get_monotonic_time() -> Duration {
@@ -44,4 +92,23 @@ pub fn floor_logical_in_physical_max1(scale: f64, logical: f64) -> f64 {
         return 0.;
     }
     (logical * scale).max(1.).floor() / scale
+}
+
+/// Run `f` against a toplevel's `XdgToplevelSurfaceRoleAttributes`,
+/// holding the lock for the closure's duration. Ported verbatim from
+/// niri/src/utils/mod.rs.
+pub fn with_toplevel_role<T>(
+    toplevel: &smithay::wayland::shell::xdg::ToplevelSurface,
+    f: impl FnOnce(&mut smithay::wayland::shell::xdg::XdgToplevelSurfaceRoleAttributes) -> T,
+) -> T {
+    smithay::wayland::compositor::with_states(toplevel.wl_surface(), |states| {
+        let mut role = states
+            .data_map
+            .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+            .unwrap()
+            .lock()
+            .unwrap();
+
+        f(&mut role)
+    })
 }

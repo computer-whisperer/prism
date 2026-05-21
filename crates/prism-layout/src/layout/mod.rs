@@ -7,6 +7,7 @@
 //! next port chunk.
 
 pub mod closing_window;
+pub mod element;
 pub mod focus_ring;
 pub mod insert_hint_element;
 pub mod opening_window;
@@ -14,6 +15,10 @@ pub mod shadow;
 pub mod tab_indicator;
 
 pub use closing_window::ClosingWindow;
+pub use element::{
+    ConfigureIntent, InteractiveResizeData, LayoutElement, RenderCtx, SizeFrac, SizingMode,
+    ViewRect,
+};
 pub use focus_ring::FocusRing;
 pub use insert_hint_element::InsertHintElement;
 pub use opening_window::OpenAnimation;

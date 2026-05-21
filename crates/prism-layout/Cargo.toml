@@ -34,6 +34,7 @@ prism-ipc.workspace = true
 prism-renderer.workspace = true
 rustix = { workspace = true, features = ["time"] }
 serde.workspace = true
-smithay.workspace = true
+smithay = { workspace = true, features = ["desktop"] }
 smithay-drm-extras.workspace = true
 tracing.workspace = true
+wayland-backend = "0.3"
