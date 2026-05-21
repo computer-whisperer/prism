@@ -1,0 +1,17 @@
+[package]
+name = "prism-animation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Spring/curve animation engine (ported from niri/src/animation + rubber_band)"
+
+# Ported verbatim from niri (same revision as workspace smithay pin). Bezier
+# curves, spring physics, the lazy adjustable Clock, and the RubberBand
+# helper. Standalone — only deps are keyframe + prism-config (for the
+# `niri_config::Animation` → `Animation` conversion impls).
+
+[dependencies]
+keyframe = { version = "1.1.1", default-features = false }
+prism-config.workspace = true
+rustix = { workspace = true, features = ["time"] }

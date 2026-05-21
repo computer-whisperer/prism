@@ -14,12 +14,14 @@
 pub mod breadcrumb;
 pub mod card;
 pub mod enumerate;
+pub mod frame_clock;
 pub mod gbm_dev;
 pub mod output_ctx;
 pub mod scanout;
 pub mod session;
 
 pub use card::{DrmCardContext, OutputConfig};
+pub use frame_clock::FrameClock;
 pub use enumerate::{ConnectorSummary, DeviceSummary, DrmFd, open_for_enumeration, summarize};
 pub use gbm_dev::GbmDevice;
 pub use output_ctx::OutputContext;

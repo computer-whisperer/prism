@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/prism",
+    "crates/prism-animation",
     "crates/prism-config",
     "crates/prism-drm",
     "crates/prism-frame",
@@ -24,6 +25,7 @@ authors = ["Christian Brickhouse"]
 
 [workspace.dependencies]
 # in-tree
+prism-animation = { path = "crates/prism-animation" }
 prism-config = { path = "crates/prism-config" }
 prism-drm = { path = "crates/prism-drm" }
 prism-frame = { path = "crates/prism-frame" }
