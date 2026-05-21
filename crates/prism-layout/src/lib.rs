@@ -8,4 +8,5 @@
 //! Current state: utils foundation in place; window/layer/layout/input/cursor
 //! are still being ported one chunk at a time.
 
+pub mod layout;
 pub mod utils;
