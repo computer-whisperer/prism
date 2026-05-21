@@ -101,7 +101,15 @@ fn run_wayland_server() -> Result<()> {
         .ok_or_else(|| anyhow!("Vulkan device has no DRM node id; cannot index"))?;
     gpus.insert(key, device);
     // Single-GPU wayland mode → that's the primary.
-    let mut state = prism_protocols::PrismState::new(&display, None, gpus, Some(key));
+    // No config file loaded in wayland-only mode — defaults give the
+    // layout enough to bring up an empty workspace set.
+    let mut state = prism_protocols::PrismState::new(
+        &display,
+        prism_config::Config::default(),
+        None,
+        gpus,
+        Some(key),
+    );
 
     let mut event_loop: EventLoop<'static, prism_protocols::PrismState> =
         EventLoop::try_new().context("calloop EventLoop::try_new")?;
@@ -925,8 +933,13 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     if let Some(id) = primary_gpu {
         tracing::info!("primary GPU for dmabuf-feedback: {}:{}", id.major, id.minor);
     }
-    let mut state =
-        prism_protocols::PrismState::new(&display, Some(session), gpus, primary_gpu);
+    let mut state = prism_protocols::PrismState::new(
+        &display,
+        prism_config::Config::default(),
+        Some(session),
+        gpus,
+        primary_gpu,
+    );
     for card in cards {
         state.attach_card(card);
     }

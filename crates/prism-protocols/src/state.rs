@@ -19,10 +19,16 @@
 //! On commit we currently only log; rendering hooks in once #47 (texture
 //! import) and #48 (shader pipeline) are wired up.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use prism_animation::Clock;
+use prism_config::Config;
+use prism_layout::layout::Layout;
+use prism_layout::window::Mapped;
 use prism_renderer::{DrmDevId, vk};
 use smithay::backend::allocator::Format as DrmFormat;
 use smithay::backend::allocator::dmabuf::Dmabuf as SmithayDmabuf;
@@ -86,6 +92,24 @@ pub type OutputId = String;
 /// See `run_integrated` in `prism/src/main.rs` for the canonical
 /// teardown sequence.
 pub struct PrismState {
+    /// Compositor config (config file + transient IPC overrides). Shared
+    /// `Rc<RefCell>` to mirror niri's pattern — the layout, input
+    /// dispatch, and IPC handlers all need read access.
+    pub config: Rc<RefCell<Config>>,
+
+    /// Animation/event clock. Lazy: caches the monotonic time across a
+    /// single event-loop turn and is cleared once per turn. The layout
+    /// and every animation subsystem reads from this so a single
+    /// `gettime` syscall amortizes across the whole frame.
+    pub clock: Clock,
+
+    /// Scrollable tiling layout (workspaces × monitors × tiles). The
+    /// generic parameter is `Mapped`, the production `LayoutElement`
+    /// impl that wraps an `XdgToplevel` (in the future also XWayland
+    /// surfaces). Input dispatch routes activations and resizes here;
+    /// the render path reads tile geometry from here.
+    pub layout: Layout<Mapped>,
+
     pub display_handle: DisplayHandle,
     pub compositor: CompositorState,
     pub xdg_shell: XdgShellState,
@@ -183,11 +207,16 @@ impl PrismState {
     /// them in software fallback.
     pub fn new(
         display: &Display<PrismState>,
+        config: Config,
         session: Option<prism_drm::SeatSession>,
         gpus: HashMap<DrmDevId, Arc<prism_renderer::Device>>,
         primary_gpu: Option<DrmDevId>,
     ) -> Self {
         let dh = display.handle();
+        let config = Rc::new(RefCell::new(config));
+        let clock = Clock::default();
+        let layout = Layout::<Mapped>::new(clock.clone(), &config.borrow());
+
         let compositor = CompositorState::new::<PrismState>(&dh);
         let xdg_shell = XdgShellState::new::<PrismState>(&dh);
         // Empty extra-formats list: ARGB8888 and XRGB8888 are mandatory and
@@ -276,6 +305,9 @@ impl PrismState {
             PresentationState::new::<PrismState>(&dh, libc::CLOCK_MONOTONIC as u32);
 
         Self {
+            config,
+            clock,
+            layout,
             display_handle: dh,
             compositor,
             xdg_shell,
