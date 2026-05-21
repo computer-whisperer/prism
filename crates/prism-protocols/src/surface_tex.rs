@@ -70,3 +70,33 @@ impl SurfaceTexture {
 /// but the smithay API gives us a shared reference, so we lock to mutate).
 #[derive(Default)]
 pub struct SurfaceTexSlot(pub Mutex<Option<SurfaceTexture>>);
+
+/// Per-surface layout state — where the surface lives in logical space
+/// and which output it currently belongs to. Inserted into the surface's
+/// `SurfaceData::data_map` alongside [`SurfaceTexSlot`]; mutated from
+/// the commit hook (which holds `&UserDataMap`, hence the interior
+/// `Mutex`).
+///
+/// `current_output` is updated by `process_surface_buffer` after each
+/// commit; on transitions we dispatch `wl_surface.enter` / `.leave`
+/// events to the appropriate smithay `Output`s. Today's containment
+/// rule is "the output whose geometry contains the surface's center";
+/// when surfaces span multiple outputs (real layout / overlapping
+/// outputs / fractional scaling) this becomes a `Vec<OutputId>`.
+#[derive(Default)]
+pub struct SurfacePlacementSlot(pub Mutex<SurfacePlacement>);
+
+/// Logical-space placement of a `wl_surface`.
+#[derive(Default, Clone)]
+pub struct SurfacePlacement {
+    /// Top-left in logical pixels. Defaults to `(0, 0)`; today every
+    /// new toplevel pins here until a config / layout layer assigns
+    /// real coordinates.
+    pub logical_pos: (i32, i32),
+    /// `OutputId` of the wl_output the surface most recently entered,
+    /// or `None` if not currently mapped to any output. Stored as the
+    /// stable connector-name `String` to match `PrismState::wl_outputs`'s
+    /// key. Single-output for now (center-containment); becomes a set
+    /// when surfaces span outputs.
+    pub current_output: Option<String>,
+}

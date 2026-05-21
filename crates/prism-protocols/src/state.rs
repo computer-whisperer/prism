@@ -55,7 +55,7 @@ use smithay::wayland::shell::xdg::{
 use smithay::wayland::shm::{ShmHandler, ShmState, with_buffer_contents};
 
 use crate::client::PrismClient;
-use crate::surface_tex::{SurfaceTexSlot, SurfaceTexture};
+use crate::surface_tex::{SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture};
 
 /// Stable per-output id. Today we key by the connector name (e.g. `"DP-4"`,
 /// `"HDMI-A-1"`). amdgpu's connector names are globally unique across cards
@@ -264,6 +264,29 @@ impl PrismState {
         self.wl_outputs.insert(ctx.connector_name.clone(), output);
         // unwrap: just inserted under this key
         self.wl_outputs.get(&ctx.connector_name).unwrap()
+    }
+
+    /// First `OutputId` whose advertised geometry (current_location +
+    /// current_mode.size) contains the given logical point, or `None`
+    /// if the point lies in no output's region. Iteration order is
+    /// HashMap-random; for non-overlapping layouts (today's horizontal
+    /// stack) that's fine. With overlapping outputs, becomes a "topmost
+    /// contains" rule once we have z-order.
+    pub fn output_containing(&self, point: (i32, i32)) -> Option<OutputId> {
+        for (id, output) in &self.wl_outputs {
+            let loc = output.current_location();
+            let Some(mode) = output.current_mode() else {
+                continue;
+            };
+            let x0 = loc.x;
+            let y0 = loc.y;
+            let x1 = x0.saturating_add(mode.size.w);
+            let y1 = y0.saturating_add(mode.size.h);
+            if point.0 >= x0 && point.0 < x1 && point.1 >= y0 && point.1 < y1 {
+                return Some(id.clone());
+            }
+        }
+        None
     }
 
     /// Assign logical positions to every advertised output by stacking
@@ -529,39 +552,101 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
     }
 
     // Take the new buffer assignment (if any) and act on it inside
-    // with_states (which holds the SurfaceData lock).
-    with_states(surface, |states| {
+    // with_states (which holds the SurfaceData lock). We do the texture
+    // build under the lock, then compute the surface→output assignment
+    // from the resulting extent and dispatch enter/leave.
+    //
+    // Returns (old_output, new_output) so we can dispatch the wl_surface
+    // events OUTSIDE the with_states callback — calling Output::enter/leave
+    // re-enters smithay's surface bookkeeping and we don't want to nest
+    // that under our own SurfaceData lock.
+    let transition: Option<(Option<OutputId>, Option<OutputId>)> = with_states(surface, |states| {
         let mut attrs = states.cached_state.get::<SurfaceAttributes>();
         let current = attrs.current();
         // `take()` so we don't keep re-processing the same buffer across
         // every following commit (a damage-only commit re-runs commit but
         // shouldn't re-upload).
         let Some(assignment) = current.buffer.take() else {
-            return;
+            return None;
         };
 
         states
             .data_map
             .insert_if_missing_threadsafe(SurfaceTexSlot::default);
+        states
+            .data_map
+            .insert_if_missing_threadsafe(SurfacePlacementSlot::default);
         let slot = states
             .data_map
             .get::<SurfaceTexSlot>()
             .expect("just inserted SurfaceTexSlot");
+        let placement_slot = states
+            .data_map
+            .get::<SurfacePlacementSlot>()
+            .expect("just inserted SurfacePlacementSlot");
 
         match assignment {
             BufferAssignment::Removed => {
                 *slot.0.lock().unwrap() = None;
+                // Surface is unmapping; leave its current output (if any).
+                let mut placement = placement_slot.0.lock().unwrap();
+                let old = placement.current_output.take();
+                old.map(|o| (Some(o), None))
             }
             BufferAssignment::NewBuffer(buffer) => {
-                match build_surface_texture(state, &buffer, slot) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::warn!("surface buffer import failed: {e:#}");
-                    }
+                if let Err(e) = build_surface_texture(state, &buffer, slot) {
+                    tracing::warn!("surface buffer import failed: {e:#}");
+                    return None;
+                }
+                // Compute output assignment from the freshly-built
+                // texture's extent and the surface's logical position.
+                let extent = slot
+                    .0
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|t| t.extent())
+                    .unwrap_or_default();
+                let mut placement = placement_slot.0.lock().unwrap();
+                let center = (
+                    placement.logical_pos.0 + (extent.width as i32 / 2),
+                    placement.logical_pos.1 + (extent.height as i32 / 2),
+                );
+                let new_output = state.output_containing(center);
+                if new_output == placement.current_output {
+                    None
+                } else {
+                    let old_output = placement.current_output.take();
+                    placement.current_output = new_output.clone();
+                    Some((old_output, new_output))
                 }
             }
         }
     });
+
+    // Dispatch enter/leave outside the SurfaceData lock.
+    if let Some((old, new)) = transition {
+        if let Some(old_id) = old.as_ref() {
+            if let Some(output) = state.wl_outputs.get(old_id) {
+                output.leave(surface);
+                tracing::debug!(
+                    surface_id = ?surface.id(),
+                    connector = %old_id,
+                    "wl_surface.leave dispatched"
+                );
+            }
+        }
+        if let Some(new_id) = new.as_ref() {
+            if let Some(output) = state.wl_outputs.get(new_id) {
+                output.enter(surface);
+                tracing::info!(
+                    surface_id = ?surface.id(),
+                    connector = %new_id,
+                    "wl_surface.enter dispatched"
+                );
+            }
+        }
+    }
 }
 
 fn build_surface_texture(

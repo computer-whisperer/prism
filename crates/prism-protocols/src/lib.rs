@@ -14,4 +14,4 @@ pub mod surface_tex;
 pub use client::PrismClient;
 pub use server::insert_wayland_sources;
 pub use state::{PrismState, new_display};
-pub use surface_tex::{SurfaceTexSlot, SurfaceTexture};
+pub use surface_tex::{SurfacePlacement, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture};

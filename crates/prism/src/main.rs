@@ -1190,8 +1190,10 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
 /// Returns true if a flip was submitted, false if skipped (previous flip
 /// still pending), Err if the output isn't found or presenting failed.
 ///
-/// Layout (provisional, until #59.5): every output sees every surface;
-/// first mapped toplevel covers the whole output.
+/// Per-output element mapping (#59.5): a surface "lives on" the output
+/// whose geometry contains its logical-space center; only that output
+/// includes the surface in its element list. Surfaces with no
+/// containing output are skipped everywhere (off-screen).
 fn present_for_crtc(
     state: &mut prism_protocols::PrismState,
     crtc: smithay::reexports::drm::control::crtc::Handle,
@@ -1199,13 +1201,16 @@ fn present_for_crtc(
     use prism_renderer::{DecodePush, ElementDraw, EncodePush};
     use smithay::wayland::compositor::with_states;
 
-    // Find the output for this CRTC and capture its GPU id — we need it
-    // to pick the right per-GPU texture import below. (We re-borrow the
-    // output mutably at present() time.)
-    let output_gpu_id = state
-        .output_for_crtc(crtc)
-        .ok_or_else(|| anyhow!("no output bound to crtc {crtc:?}"))?
-        .gpu_id;
+    // Find the output for this CRTC and capture its connector name
+    // (used as OutputId for placement matching) + GPU id (used to pick
+    // the right per-GPU texture import). Re-borrow the output mutably
+    // at present() time.
+    let (output_id, output_gpu_id) = {
+        let output = state
+            .output_for_crtc(crtc)
+            .ok_or_else(|| anyhow!("no output bound to crtc {crtc:?}"))?;
+        (output.connector_name.clone(), output.gpu_id)
+    };
 
     // Snapshot the toplevel surface handles so we can drop the borrow on
     // state.xdg_shell before mutably borrowing state.outputs for present().
@@ -1218,13 +1223,33 @@ fn present_for_crtc(
 
     let mut elements: Vec<ElementDraw> = Vec::new();
     for surface in &surfaces {
-        let view_opt = with_states(surface, |states| {
-            states
+        // Read placement + texture view in one lock per surface.
+        let (belongs_here, view_opt) = with_states(surface, |states| {
+            let belongs = states
+                .data_map
+                .get::<prism_protocols::SurfacePlacementSlot>()
+                .map(|p| {
+                    p.0.lock()
+                        .unwrap()
+                        .current_output
+                        .as_deref()
+                        == Some(output_id.as_str())
+                })
+                .unwrap_or(false);
+            let view = states
                 .data_map
                 .get::<prism_protocols::SurfaceTexSlot>()
-                .and_then(|s| s.0.lock().unwrap().as_ref()
-                    .and_then(|t| t.view_for(output_gpu_id)))
+                .and_then(|s| {
+                    s.0.lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|t| t.view_for(output_gpu_id))
+                });
+            (belongs, view)
         });
+        if !belongs_here {
+            continue;
+        }
         if let Some(view) = view_opt {
             elements.push(ElementDraw {
                 texture_view: view,
@@ -1233,7 +1258,9 @@ fn present_for_crtc(
                     [0.0, 0.0, 1.0, 1.0],
                 ),
             });
-            // Trivial layout: only the first mapped toplevel goes through.
+            // Per-surface positioning (dst rect from logical_pos +
+            // extent → NDC) is a follow-on; today the first mapped
+            // toplevel that belongs here fills the framebuffer.
             break;
         }
         // view_for can still return None if a per-GPU dmabuf import failed
