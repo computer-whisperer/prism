@@ -28,8 +28,10 @@ use smithay::backend::allocator::Format as DrmFormat;
 use smithay::backend::allocator::dmabuf::Dmabuf as SmithayDmabuf;
 use smithay::delegate_compositor;
 use smithay::delegate_dmabuf;
+use smithay::delegate_output;
 use smithay::delegate_shm;
 use smithay::delegate_xdg_shell;
+use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use prism_frame::{DrmFourcc, DrmModifier};
 use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::backend::{ClientData, ObjectId};
@@ -38,13 +40,14 @@ use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource};
-use smithay::utils::Serial;
+use smithay::utils::{Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
     SurfaceAttributes, get_role, with_states,
 };
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
+use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
@@ -81,6 +84,17 @@ pub struct PrismState {
     pub shm: ShmState,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: DmabufGlobal,
+    /// wl_output + xdg-output-unstable-v1 manager. Holds the global IDs
+    /// for the xdg-output manager; per-output `Output` instances live in
+    /// `wl_outputs` and carry their own wl_output global IDs.
+    pub output_manager: OutputManagerState,
+
+    /// Per-output smithay `Output`, keyed by the same `OutputId`
+    /// (connector name) as `outputs`. Populated by [`advertise_output`];
+    /// logical positions assigned by [`layout_outputs`]. Drops before
+    /// `outputs` so wl_output globals are destroyed while the
+    /// `DisplayHandle` is still alive.
+    pub wl_outputs: HashMap<OutputId, Output>,
 
     // ── Client buffer textures ─────────────────────────────────────────────
     // Reference Vulkan devices (via Arc); drop before `gpus` so we don't
@@ -155,6 +169,12 @@ impl PrismState {
         let dmabuf_global =
             dmabuf_state.create_global::<PrismState>(&dh, supported_formats.iter().copied());
 
+        // wl_output v4 + xdg-output-unstable-v1. Bundling both is the
+        // standard smithay pattern; modern clients (mpv, browsers,
+        // Firefox) probe xdg_output to get logical-pixel geometry that
+        // accounts for fractional scaling.
+        let output_manager = OutputManagerState::new_with_xdg_output::<PrismState>(&dh);
+
         Self {
             display_handle: dh,
             compositor,
@@ -162,10 +182,12 @@ impl PrismState {
             shm,
             dmabuf_state,
             dmabuf_global,
+            output_manager,
             session,
             cards: HashMap::new(),
             gpus,
             outputs: HashMap::new(),
+            wl_outputs: HashMap::new(),
             dmabuf_textures: HashMap::new(),
         }
     }
@@ -198,7 +220,95 @@ impl PrismState {
         self.outputs.values_mut().find(|o| o.crtc == crtc)
     }
 
+    /// Build a smithay `Output` mirroring the given `OutputContext` and
+    /// announce it as a wl_output global. Sets mode + scale + transform
+    /// from `ctx`; logical position is **not** assigned here — call
+    /// [`layout_outputs`] after every output is advertised.
+    ///
+    /// EDID-derived `PhysicalProperties` (mm size, make/model/serial)
+    /// aren't available yet; we advertise placeholder values that won't
+    /// confuse clients but won't drive DPI-aware scaling correctly
+    /// either. Refine when EDID parsing lands.
+    pub fn advertise_output(&mut self, ctx: &prism_drm::OutputContext) -> &Output {
+        let mode = OutputMode {
+            size: (ctx.extent.width as i32, ctx.extent.height as i32).into(),
+            // smithay::output::Mode::refresh is in milli-Hz.
+            refresh: (ctx.mode.vrefresh() as i32) * 1000,
+        };
+        let output = Output::new(
+            ctx.connector_name.clone(),
+            PhysicalProperties {
+                // (0, 0) = "unknown" per wl_output; clients fall back to
+                // DPI-agnostic scaling. EDID parsing fills this in later.
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "prism".to_string(),
+                model: ctx.connector_name.clone(),
+                serial_number: String::new(),
+            },
+        );
+        // Create the wl_output global. We drop the returned GlobalId
+        // because the Output itself carries it for the lifetime of the
+        // Output value (smithay destroys the global when the Output
+        // drops).
+        let _global = output.create_global::<PrismState>(&self.display_handle);
+        output.add_mode(mode);
+        output.set_preferred(mode);
+        output.change_current_state(
+            Some(mode),
+            Some(Transform::Normal),
+            Some(Scale::Integer(1)),
+            // location assigned by layout_outputs once all outputs known
+            None,
+        );
+        self.wl_outputs.insert(ctx.connector_name.clone(), output);
+        // unwrap: just inserted under this key
+        self.wl_outputs.get(&ctx.connector_name).unwrap()
+    }
+
+    /// Assign logical positions to every advertised output by stacking
+    /// them horizontally at `y = 0` in sorted-connector-name order.
+    /// Idempotent: safe to call repeatedly as outputs are
+    /// added/removed. Real layout (config-driven placement, per-output
+    /// scale, rotation) lands with the config layer.
+    pub fn layout_outputs(&mut self) {
+        let mut names: Vec<OutputId> = self.wl_outputs.keys().cloned().collect();
+        names.sort();
+        let mut x: i32 = 0;
+        for name in names {
+            let output = self
+                .wl_outputs
+                .get(&name)
+                .expect("name from wl_outputs.keys()");
+            let width = output.current_mode().map(|m| m.size.w).unwrap_or(0);
+            output.change_current_state(None, None, None, Some((x, 0).into()));
+            tracing::info!(
+                connector = %name,
+                logical_x = x,
+                width,
+                "wl_output positioned"
+            );
+            x = x.saturating_add(width);
+        }
+    }
 }
+
+// ─── wl_output / xdg-output ─────────────────────────────────────────────────
+
+impl OutputHandler for PrismState {
+    fn output_bound(
+        &mut self,
+        output: smithay::output::Output,
+        _wl_output: smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
+    ) {
+        // Logged at info so the integration test can confirm clients
+        // see our wl_output advertisements. enter/leave bookkeeping
+        // (and most other handler hooks) come with #59.5.
+        tracing::info!(connector = %output.name(), "client bound wl_output");
+    }
+}
+
+delegate_output!(PrismState);
 
 // ─── wl_compositor ──────────────────────────────────────────────────────────
 

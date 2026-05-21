@@ -27,11 +27,11 @@ use prism_renderer::{
     Device, DrmDevId, ElementDraw, EncodePush, ImportedImage, Renderer, vk,
 };
 use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneState};
-use smithay::reexports::drm::control::{connector, crtc, framebuffer};
+use smithay::reexports::drm::control::{Mode, connector, crtc, framebuffer};
 use smithay::utils::{Rectangle, Transform};
 
 use crate::{
-    DrmCardContext, OutputConfig, OutputPick, add_framebuffer_for_bo,
+    DrmCardContext, OutputConfig, OutputPick, add_framebuffer_for_bo, breadcrumb::breadcrumb,
     set_connector_max_bpc,
 };
 
@@ -64,6 +64,9 @@ pub struct OutputContext {
     pub renderer: Renderer,
     /// Width × height in pixels.
     pub extent: vk::Extent2D,
+    /// Active DRM mode (size + vrefresh). Kept so the wayland side can
+    /// derive `smithay::output::Mode` without re-querying the connector.
+    pub mode: Mode,
     /// Connector name for logging.
     pub connector_name: String,
     /// Connector handle (for routing / config queries).
@@ -164,6 +167,7 @@ impl OutputContext {
             back_index: 0,
             renderer,
             extent,
+            mode: pick.mode,
             connector_name: pick.connector_name,
             connector: pick.connector,
             crtc: pick.crtc,
@@ -288,8 +292,26 @@ impl Drop for OutputContext {
         // state. May still fail with EINVAL (smithay's clear_state quirk)
         // or EACCES if libseat released master before us — but the latter
         // is a Drop-order bug; complain loudly so it gets fixed.
+        //
+        // Breadcrumb wrapping (vs just tracing) because a hang here gets
+        // SIGKILLed by the watchdog and tracing's stdio buffer is lost.
+        // The breadcrumbs are fsync'd per line so we can attribute the
+        // hang to clear() vs to the subsequent implicit field drops.
+        breadcrumb(&format!(
+            "OutputContext::Drop entry: {} (crtc {:?})",
+            self.connector_name, self.crtc
+        ));
         let t0 = std::time::Instant::now();
-        match self.surface.clear() {
+        let clear_res = self.surface.clear();
+        breadcrumb(&format!(
+            "OutputContext::Drop surface.clear() returned in {}ms: {}",
+            t0.elapsed().as_millis(),
+            match &clear_res {
+                Ok(()) => "Ok".to_string(),
+                Err(e) => format!("Err({e})"),
+            }
+        ));
+        match clear_res {
             Ok(()) => tracing::debug!(
                 connector = %self.connector_name,
                 "OutputContext drop: surface.clear() OK in {}ms",
@@ -301,5 +323,11 @@ impl Drop for OutputContext {
                 t0.elapsed().as_millis()
             ),
         }
+        // Function returns here → DrmSurface drops, then buffers drop
+        // (ImportedImage + GBM BO each), then Renderer drops (persistent
+        // CB + fences + Vulkan device). main.rs's per-output "dropped
+        // output X in Yms" breadcrumb wraps the entire chain, so if it
+        // doesn't fire after our "clear returned" breadcrumb the hang
+        // is in one of those implicit drops.
     }
 }

@@ -910,12 +910,20 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         state.attach_card(card);
     }
     for output in outputs {
+        // Advertise BEFORE moving the OutputContext into state — we only
+        // need a borrow for the wl_output mode/extent/connector_name.
+        state.advertise_output(&output);
         state.attach_output(output);
     }
+    // Now that every output is advertised, assign logical positions
+    // (horizontal stack by sorted connector name). Sends wl_output.done
+    // events to any clients already bound.
+    state.layout_outputs();
     breadcrumb(&format!(
-        "wayland state up; {} card(s) + {} output(s) attached",
+        "wayland state up; {} card(s) + {} output(s) attached ({} wl_output globals)",
         state.cards.len(),
-        state.outputs.len()
+        state.outputs.len(),
+        state.wl_outputs.len()
     ));
 
     // Event loop + sources.

@@ -11,6 +11,7 @@
 //! and — future — color description, calibration, tone-map) lives in
 //! [`OutputConfig`].
 
+pub mod breadcrumb;
 pub mod card;
 pub mod enumerate;
 pub mod gbm_dev;

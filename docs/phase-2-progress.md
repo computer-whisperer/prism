@@ -8,7 +8,7 @@ Multi-output + multi-GPU foundation (59.1–59.3) complete. `prism run` opens ev
 
 Renderer CPU cost in the steady-state present path: ~60 µs/frame per output. dmabuf and shm client buffers are both imported/uploaded on every registered GPU at commit time, so any output's render path can sample without GPU↔GPU copies.
 
-Remaining within #59: `wl_output` advertisement (59.4) — needed before real clients (mpv, browsers) run through prism — and per-output element mapping (59.5). After #59 the per-output config layer is real and EDID parsing / HDR signaling / fp16 scanout / per-display calibration plug in directly.
+Remaining within #59: per-output element mapping (59.5). After #59 the per-output config layer is real and EDID parsing / HDR signaling / fp16 scanout / per-display calibration plug in directly. Real clients (mpv, browsers) can now probe wl_output / xdg-output, though they'll see all surfaces routed to every output until 59.5.
 
 ## What's built
 
@@ -26,7 +26,7 @@ Remaining within #59: `wl_output` advertisement (59.4) — needed before real cl
 | 49b | Vblank-driven render pacing | ✅ | TTY-verified at 60Hz double-buffered (kernel-wedge at single-buffered drove the BO doubling). `mark_vblank()` toggles `back_index` per vblank event from `DrmDeviceNotifier` |
 | 49c | Client compositing (shm + dmabuf) | ✅ | TTY-verified via `scripts/tty-test.sh` → `prism-shmtest` drawing cycling colors @ 60Hz. Per-surface `SurfaceTexSlot` in surface `data_map`; dmabuf imports cached on `dmabuf_imported`; shm uploads via `ShmTexture` on commit |
 | 55 | Renderer refactor (persistent CB + fences + push descriptors) | ✅ | per-frame CPU dropped from ~6 ms (queue_wait_idle) to ~60 µs (fence-gated slot reuse) |
-| 59 | Multi-output + multi-GPU foundation | 🟡 | 59.1/2/3 done (structural split, multi-output on one card, multi-GPU + per-GPU client buffer replication). 59.4 (wl_output) + 59.5 (per-output element mapping) remaining. |
+| 59 | Multi-output + multi-GPU foundation | 🟡 | 59.1/2/3/4 done (structural split, multi-output, multi-GPU + per-GPU client buffer replication, wl_output + xdg-output advertisement). 59.5 (per-output element mapping) remaining. |
 
 ## Task #59 — multi-output + multi-GPU foundation
 
@@ -68,7 +68,7 @@ dmabuf_textures: HashMap<ObjectId, HashMap<DrmDevId, Arc<ImportedImage>>>,
 - **59.1 ✅ — structural split, no enumeration change.** Layered types defined: `SeatSession::new()` → `(Self, notifier)`; `DrmCardContext::open(&mut session, path)` → `(Self, drm_notifier)`; `OutputContext::new(&mut card, device, pick, &config)`. `PrismState` carries the maps (`cards`, `gpus`, `outputs`) even though they each hold one entry. Vblank handler routes by CRTC handle. No behavior change.
 - **59.2 ✅ — multi-output on a single card.** `pick_all_connected(drm)` enumerates every connected connector with non-colliding CRTC assignment; one `OutputContext` per connector sharing the card's `DrmCardContext` + one `Arc<Device>`. Vblank routing disambiguates by CRTC. Element list (toplevels) shared across outputs. Verified on the 5 Samsungs on Vega 20.
 - **59.3 ✅ — multi-GPU.** Both cards opened; per-card `DrmCardContext`; per-GPU `Arc<Device>` keyed by `DrmDevId`. `dmabuf_textures` is per-GPU: `dmabuf_imported` imports the same buffer on every registered GPU so any output's render path can sample locally. **shm is also per-GPU**: `SurfaceTexture::Shm { by_gpu }` mirrors dmabuf — bytes are read once and uploaded into one staged `VkImage` per registered GPU on each commit. Verified: 7 outputs across both cards all rendered the client's surface concurrently.
-- **59.4 — `wl_output` advertisement.** One wl_output global per `OutputContext`; modes, transform, scale, geometry advertised to clients. Required before any real client (mpv, browsers) will run through prism.
+- **59.4 ✅ — `wl_output` advertisement.** `PrismState::advertise_output(ctx)` builds a `smithay::output::Output` mirroring each `OutputContext` (mode = ctx.extent + ctx.mode.vrefresh; transform=Normal; scale=1; placeholder PhysicalProperties), creates the wl_output global, and stashes the Output in `PrismState::wl_outputs`. `layout_outputs()` assigns logical positions by stacking horizontally at y=0 in sorted-connector-name order — non-overlapping geometry so 59.5's center-containment rule will work. xdg-output-unstable-v1 piggy-backs via `OutputManagerState::new_with_xdg_output`. enter/leave deferred to 59.5. EDID-driven `PhysicalProperties` (mm size, make/model/serial) is a follow-on when EDID parsing lands.
 - **59.5 — per-output element mapping.** First trivial rule: a surface "lives on" the output whose geometry contains its center; only that output samples it. Real placement / move-between-outputs is layout-level work for later. This is also when per-GPU shm upload can be narrowed from "every GPU" to "only the GPUs whose outputs host the surface."
 
 ### What this enables next
@@ -158,6 +158,7 @@ Listed alongside the task that introduced them so we don't lose track.
 - **VRR / Freesync wiring**. The DrmSurface API supports it (`use_vrr`, `vrr_supported`); we just don't enable it. Was a phase 2 requirement.
 - **Hot-plug handling proper.** `LibSeatSessionNotifier` and `DrmDeviceNotifier` are now drained (required for VT-switch + page-flip event accounting), but we don't yet react to hot-plug add/remove of devices or connectors. Multi-card discovery (#59.3) landed open-everything-at-startup; runtime hotplug is a follow-on.
 - **10-bit scanout availability is per-display.** `ScanoutDepth::{Bpc8,Bpc10}` selects the GBM format and Vulkan format together. The `max bpc` connector property is set accordingly (or silently skipped if the connector doesn't expose it). Per-output negotiation (which displays support 10-bit, what HDR transfer functions, etc.) belongs in the future config layer; for now `prism gradient [output] [8|10]` lets us drive each path manually.
+- **Flaky multi-output shutdown.** `OutputContext::Drop -> DrmSurface::clear()` normally takes ~100ms but occasionally an output's clear takes 400+ ms and the *next* output's clear() hangs indefinitely (watchdog SIGKILL at 13s). Per-output `OutputContext::Drop` breadcrumbs are wired so the next occurrence has fsync'd evidence of where it hung. Likely a kernel-side atomic-commit ordering issue when multiple in-flight clears overlap; nothing in our code is obviously serializing them. Track until we have enough repros to diagnose.
 
 ## Subcommands today
 
