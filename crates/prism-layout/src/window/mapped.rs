@@ -22,7 +22,11 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource as _;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
-use smithay::wayland::compositor::{remove_pre_commit_hook, with_states, HookId, SurfaceData};
+use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+use smithay::wayland::compositor::{
+    remove_pre_commit_hook, with_states, with_surface_tree_downward, HookId, SurfaceData,
+    TraversalAction,
+};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::xdg::{
     SurfaceCachedState, ToplevelCachedState, ToplevelConfigure, ToplevelSurface,
@@ -573,45 +577,74 @@ impl LayoutElement for Mapped {
         ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
-        // Root surface only — subsurface walk lands when we have a
-        // multi-surface client to test against (subsurface protocol is
-        // not yet exercised in the prism test harness). niri's path
-        // here is `surface_render_elements()` which recurses through
-        // the subsurface tree; we'll port that shape (without the
-        // GLES `Element` types) once we need it.
+        // Same shape as niri's `push_elements_from_surface_tree`:
+        // descend the wl_surface tree, accumulating per-surface offsets
+        // from `SurfaceView::offset`, and emit one SurfaceEl per
+        // surface that has a renderable view. `view.dst` is the
+        // surface's logical size; we project to clip space and
+        // hand the per-surface texture view to the renderer.
         //
-        // _alpha is dropped: SurfaceEl's per-element opacity multiplier
-        // isn't plumbed through DecodePush yet. Opacity from window
-        // rules / close animation will land with that wiring.
+        // `SurfaceView` is populated by `on_commit_buffer_handler` in
+        // the protocol layer — if it's absent, the surface has no
+        // buffer yet (no draw).
+        //
+        // Subtract `self.window.geometry().loc` to convert from
+        // "place the window CONTENT origin here" (what the layout
+        // gives us) to "place the surface BUFFER origin here" — niri
+        // does this exact subtraction. Defaults to (0,0) for clients
+        // that don't set explicit window geometry.
+        let buf_origin = location - self.window.geometry().loc.to_f64();
         let surface = self.toplevel().wl_surface();
-        let Some(view) = ctx.texture_for(surface) else {
-            // No GPU-side import yet (first frame before commit, or a
-            // failed dmabuf import on this output's GPU). Emit nothing
-            // and let the next frame retry.
-            return;
-        };
 
-        // The window's "geometry" is its logical content rect — for a
-        // toplevel with shadows it excludes the shadow inset; for plain
-        // toplevels it's just the surface size. Surface buffer can be
-        // larger; we sample the full buffer (UV [0,1]) and draw it at
-        // the geometry size for now. Honoring geometry-rect-vs-buffer
-        // (viewporter src rect) is a follow-on.
-        let geom_size = self.window.geometry().size.to_f64();
-        let dst = Rectangle::new(location, geom_size);
-        let dst_rect_clip = project(dst);
+        with_surface_tree_downward(
+            surface,
+            buf_origin,
+            // Descend predicate: gather child offsets if this surface has a view.
+            |_surf, states, &surf_loc| {
+                let data = states.data_map.get::<RendererSurfaceStateUserData>();
+                if let Some(data) = data {
+                    if let Some(view) = data.lock().unwrap().view() {
+                        TraversalAction::DoChildren(surf_loc + view.offset.to_f64())
+                    } else {
+                        TraversalAction::SkipChildren
+                    }
+                } else {
+                    TraversalAction::SkipChildren
+                }
+            },
+            // Visit: emit a SurfaceEl for this surface at `surf_loc + view.offset`.
+            |surf, states, &surf_loc| {
+                let data = states.data_map.get::<RendererSurfaceStateUserData>();
+                let Some(data) = data else { return };
+                let view = match data.lock().unwrap().view() {
+                    Some(v) => v,
+                    None => return,
+                };
+                let Some(texture_view) = ctx.texture_for(surf) else {
+                    return;
+                };
 
-        out.push(RenderEl::Surface(SurfaceEl {
-            texture_view: view,
-            dst_rect_clip,
-            src_rect_uv: [0.0, 0.0, 1.0, 1.0],
-            // Assume sRGB-encoded client buffer with 80-nit reference
-            // white. Per-surface colorspace negotiation
-            // (color-management-v1) lands separately; that's where
-            // wide-gamut and HDR clients will set this differently.
-            transfer: 1,
-            sdr_white_nits: 80.0,
-        }));
+                let pos = surf_loc + view.offset.to_f64();
+                let dst = Rectangle::new(pos, view.dst.to_f64());
+                let dst_rect_clip = project(dst);
+
+                out.push(RenderEl::Surface(SurfaceEl {
+                    texture_view,
+                    dst_rect_clip,
+                    // Full-buffer sample — viewporter src cropping
+                    // (view.src) is not yet honored. Most clients
+                    // (terminals, video players, browsers) use the
+                    // whole buffer; mpv uses viewport for letterboxing
+                    // which we'll wire up next.
+                    src_rect_uv: [0.0, 0.0, 1.0, 1.0],
+                    // Assume sRGB / 80-nit SDR white. Per-surface
+                    // color-management negotiation lands separately.
+                    transfer: 1,
+                    sdr_white_nits: 80.0,
+                }));
+            },
+            |_, _, _| true,
+        );
     }
 
     fn render_popups(

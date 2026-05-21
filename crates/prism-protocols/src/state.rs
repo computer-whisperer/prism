@@ -53,9 +53,10 @@ use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource};
 use smithay::utils::{Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    add_pre_commit_hook, BufferAssignment, CompositorClientState, CompositorHandler,
-    CompositorState, SurfaceAttributes, get_role, with_states,
+    add_pre_commit_hook, CompositorClientState, CompositorHandler, CompositorState, get_role,
+    with_states,
 };
+use smithay::backend::renderer::utils::{on_commit_buffer_handler, RendererSurfaceStateUserData};
 use smithay::desktop::Window;
 use smithay::wayland::dmabuf::{
     DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
@@ -537,10 +538,23 @@ impl CompositorHandler for PrismState {
         let role = get_role(surface);
         tracing::debug!(?role, "wl_surface commit");
 
-        // Process any newly attached buffer: import (dmabuf) or upload (shm)
-        // into a SurfaceTexture and stash on the surface's data_map. Done
-        // BEFORE the configure dance so the texture is ready by the time
-        // the next vblank fires.
+        // Populate smithay's `RendererSurfaceState` for every surface in
+        // the tree under `surface`. This is what computes the
+        // `SurfaceView` (offset / src / dst) the render walk reads in
+        // `Mapped::render_normal`, and what tracks buffer dimensions /
+        // scale / transform / viewport on our behalf. Niri calls this
+        // at the top of its commit handler for the same reason.
+        //
+        // CAUTION: this consumes the `BufferAssignment` out of
+        // `SurfaceAttributes::current`, so `process_surface_buffer`
+        // below must read the buffer from `RendererSurfaceState`
+        // instead of `cached_state` (already updated to do so).
+        on_commit_buffer_handler::<PrismState>(surface);
+
+        // Process the buffer: import (dmabuf) or upload (shm) into our
+        // Vulkan-side SurfaceTexture and stash it on the surface's
+        // data_map for the render path. Reads the buffer from the
+        // `RendererSurfaceState` populated above.
         process_surface_buffer(self, surface);
 
         // For xdg-shell toplevels, send an initial configure on first commit so
@@ -809,14 +823,14 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
     // re-enters smithay's surface bookkeeping and we don't want to nest
     // that under our own SurfaceData lock.
     let transition: Option<(Option<OutputId>, Option<OutputId>)> = with_states(surface, |states| {
-        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
-        let current = attrs.current();
-        // `take()` so we don't keep re-processing the same buffer across
-        // every following commit (a damage-only commit re-runs commit but
-        // shouldn't re-upload).
-        let Some(assignment) = current.buffer.take() else {
-            return None;
-        };
+        // `on_commit_buffer_handler` (called before us) took the
+        // BufferAssignment out of cached_state and stashed it in
+        // RendererSurfaceState. We read it back from there. The
+        // "previously imported" handle we keep in SurfaceTexSlot
+        // tells us whether to re-import or skip.
+        let renderer_state = states.data_map.get::<RendererSurfaceStateUserData>();
+        let current_buffer = renderer_state
+            .and_then(|s| s.lock().unwrap().buffer().cloned());
 
         states
             .data_map
@@ -833,30 +847,41 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
             .get::<SurfacePlacementSlot>()
             .expect("just inserted SurfacePlacementSlot");
 
-        match assignment {
-            BufferAssignment::Removed => {
-                // If we were holding a dmabuf-backed buffer, release it
-                // so the client knows the BO is reusable. (For shm we
-                // already released after the byte copy at attach time;
-                // taking the slot is a no-op as far as the wl_buffer is
-                // concerned.)
+        match current_buffer {
+            None => {
+                // No buffer currently attached — either initial (never
+                // had one) or just unmapped (BufferAssignment::Removed
+                // arrived this commit and on_commit_buffer_handler
+                // cleared the state). Drop our texture too.
                 let mut guard = slot.0.lock().unwrap();
                 if let Some(SurfaceTexture::Dmabuf { buffer, .. }) = guard.take() {
                     buffer.release();
                 }
                 drop(guard);
-                // Surface is unmapping; leave its current output (if any).
                 let mut placement = placement_slot.0.lock().unwrap();
                 let old = placement.current_output.take();
                 old.map(|o| (Some(o), None))
             }
-            BufferAssignment::NewBuffer(buffer) => {
-                if let Err(e) = build_surface_texture(state, &buffer, slot) {
-                    tracing::warn!("surface buffer import failed: {e:#}");
-                    return None;
+            Some(buffer) => {
+                // `buffer` derefs to &WlBuffer. Check whether it's the
+                // same WlBuffer we already have a SurfaceTexture for —
+                // skip the import on damage-only commits where the
+                // client reused the buffer. For shm and for any new
+                // dmabuf, (re-)import.
+                let wl_buffer: &WlBuffer = &buffer;
+                let is_same_dmabuf = matches!(
+                    &*slot.0.lock().unwrap(),
+                    Some(SurfaceTexture::Dmabuf { buffer: existing, .. }) if existing == wl_buffer
+                );
+                if !is_same_dmabuf {
+                    if let Err(e) = build_surface_texture(state, wl_buffer, slot) {
+                        tracing::warn!("surface buffer import failed: {e:#}");
+                        return None;
+                    }
                 }
-                // Compute output assignment from the freshly-built
-                // texture's extent and the surface's logical position.
+
+                // Compute output assignment from the texture extent and
+                // the surface's logical position.
                 let extent = slot
                     .0
                     .lock()
