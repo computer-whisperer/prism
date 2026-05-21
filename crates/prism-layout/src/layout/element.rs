@@ -18,14 +18,32 @@
 //! (offscreen render-to-texture). When prism eventually wants these
 //! they'll be plumbed back in.
 
-use std::time::Duration;
-
-use prism_animation::Clock;
 use prism_config::CornerRadius;
-use prism_renderer::RenderEl;
+use prism_renderer::{vk, RenderEl};
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
+
+/// Side-channel a `LayoutElement` needs to actually emit content during a
+/// render walk: how to project logical rects into clip space, and how to
+/// resolve a `WlSurface` to the GPU-side texture view the render path
+/// will sample. Constructed once per output at the top of the render
+/// walk by the integrator (prism-protocols' `present_for_crtc`), then
+/// threaded through `Monitor → Workspace → Tile → Mapped`.
+///
+/// We bundle the texture lookup behind a `&dyn Fn` instead of a typed
+/// handle so prism-layout doesn't need to know how the integrator
+/// stores per-surface textures (today: `SurfaceTexSlot` on the
+/// surface's data_map; tomorrow possibly cached elsewhere).
+pub struct RenderCtx<'a> {
+    pub texture_lookup: &'a dyn Fn(&WlSurface) -> Option<vk::ImageView>,
+}
+
+impl<'a> RenderCtx<'a> {
+    pub fn texture_for(&self, surface: &WlSurface) -> Option<vk::ImageView> {
+        (self.texture_lookup)(surface)
+    }
+}
 
 use super::LayoutElementRenderSnapshot;
 use crate::utils::transaction::Transaction;
@@ -113,10 +131,12 @@ pub trait LayoutElement {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
+        project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        ctx: &RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
-        self.render_popups(location, scale, alpha, out);
-        self.render_normal(location, scale, alpha, out);
+        self.render_popups(location, scale, alpha, project, ctx, out);
+        self.render_normal(location, scale, alpha, project, ctx, out);
     }
 
     /// Emit the non-popup parts of the element. Default = no-op.
@@ -125,9 +145,11 @@ pub trait LayoutElement {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
+        project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        ctx: &RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
-        let _ = (location, scale, alpha, out);
+        let _ = (location, scale, alpha, project, ctx, out);
     }
 
     /// Emit the popup-tree parts of the element. Default = no-op.
@@ -136,9 +158,11 @@ pub trait LayoutElement {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
+        project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        ctx: &RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
-        let _ = (location, scale, alpha, out);
+        let _ = (location, scale, alpha, project, ctx, out);
     }
 
     fn request_size(
@@ -244,25 +268,6 @@ pub trait LayoutElement {
     /// surrounding `Tile` still consults it to decide whether to play
     /// the resize animation.
     fn take_animation_snapshot(&mut self) -> Option<LayoutElementRenderSnapshot>;
-}
-
-/// Currently-unused but kept so future render-emit functions can pass
-/// the shared per-frame context (just clock + alpha multiplier for now).
-/// Niri threaded a `RenderCtx<R>` that also held the renderer; ours
-/// doesn't need that.
-#[derive(Debug, Clone, Copy)]
-pub struct RenderCtx {
-    pub clock_now: Duration,
-    pub alpha: f32,
-}
-
-impl RenderCtx {
-    pub fn new(clock: &Clock, alpha: f32) -> Self {
-        Self {
-            clock_now: clock.now(),
-            alpha,
-        }
-    }
 }
 
 /// Workspace-view rect helper — niri's render path projects element

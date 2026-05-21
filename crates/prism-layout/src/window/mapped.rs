@@ -569,16 +569,12 @@ impl LayoutElement for Mapped {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
+        project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
-        // Stubbed: niri walks the wl_surface tree here and emits
-        // `WaylandSurfaceRenderElement` per buffer (with block-out
-        // fallback). Prism's surface-tree → SurfaceEl emission lands
-        // once the renderer-side `Surface` element is wired through
-        // [`crate::layout::LayoutElement`] from the workspace render
-        // walk. Until then this is a no-op: Mapped state machine is
-        // live, but the window content doesn't actually draw.
-        let _ = (location, scale, alpha, out);
+        // Surface-tree walk + SurfaceEl emission lands in step C2.
+        let _ = (location, scale, alpha, project, ctx, out);
     }
 
     fn render_popups(
@@ -586,12 +582,11 @@ impl LayoutElement for Mapped {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
+        project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
-        // Same stub as `render_normal` — popup tree walk via
-        // `PopupManager::popups_for_surface` returns once the surface
-        // tree emission is implemented.
-        let _ = (location, scale, alpha, out);
+        let _ = (location, scale, alpha, project, ctx, out);
         let _ = &self.blur_config;
     }
 

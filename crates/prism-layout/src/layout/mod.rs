@@ -4628,6 +4628,7 @@ impl<W: LayoutElement> Layout<W> {
         &self,
         output: &Output,
         project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        ctx: &RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
         if self.update_render_elements_time != self.clock.now() {
@@ -4646,7 +4647,9 @@ impl<W: LayoutElement> Layout<W> {
         let zoom = self.overview_zoom();
         let pos_in_backdrop = move_.tile_render_location(zoom);
         let _ = zoom;
-        move_.tile.render(pos_in_backdrop, scale, true, project, out);
+        move_
+            .tile
+            .render(pos_in_backdrop, scale, true, project, ctx, out);
     }
 
     pub fn refresh(&mut self, is_active: bool) {

@@ -1059,6 +1059,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         _view_rect: Rectangle<f64, Logical>,
         focus_ring: bool,
         project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
         let scale = Scale::from(self.scale);
@@ -1071,7 +1072,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let active = self.active_window_id.clone();
         for (tile, tile_pos) in self.tiles_with_render_positions() {
             let focus_ring = focus_ring && Some(tile.window().id()) == active.as_ref();
-            tile.render(tile_pos, scale, focus_ring, project, out);
+            tile.render(tile_pos, scale, focus_ring, project, ctx, out);
         }
     }
 

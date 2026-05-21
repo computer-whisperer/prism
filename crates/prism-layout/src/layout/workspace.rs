@@ -1589,10 +1589,12 @@ impl<W: LayoutElement> Workspace<W> {
         &self,
         focus_ring: bool,
         project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
         let scrolling_focus_ring = focus_ring && !self.floating_is_active();
-        self.scrolling.render(scrolling_focus_ring, project, out);
+        self.scrolling
+            .render(scrolling_focus_ring, project, ctx, out);
     }
 
     /// Emit the floating layer's draw calls into `out`.
@@ -1600,6 +1602,7 @@ impl<W: LayoutElement> Workspace<W> {
         &self,
         focus_ring: bool,
         project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
         if !self.is_floating_visible() {
@@ -1609,7 +1612,7 @@ impl<W: LayoutElement> Workspace<W> {
         let view_rect = Rectangle::from_size(self.view_size);
         let floating_focus_ring = focus_ring && self.floating_is_active();
         self.floating
-            .render(view_rect, floating_focus_ring, project, out);
+            .render(view_rect, floating_focus_ring, project, ctx, out);
     }
 
     /// Emit the workspace's overview shadow into `out`. Shadow is

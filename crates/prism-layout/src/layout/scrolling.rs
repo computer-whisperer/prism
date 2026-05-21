@@ -2917,6 +2917,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         &self,
         focus_ring: bool,
         project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
         let scale = Scale::from(self.scale);
@@ -2967,7 +2968,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     continue;
                 }
 
-                tile.render(tile_pos, scale, focus_ring, project, out);
+                tile.render(tile_pos, scale, focus_ring, project, ctx, out);
             }
         }
     }

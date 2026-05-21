@@ -1659,6 +1659,7 @@ impl<W: LayoutElement> Monitor<W> {
         &self,
         focus_ring: bool,
         project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
         let insert_hint_render_loc = self
@@ -1666,7 +1667,7 @@ impl<W: LayoutElement> Monitor<W> {
             .filter(|_| !self.options.layout.insert_hint.off);
 
         for (ws, _geo) in self.workspaces_with_render_geo() {
-            ws.render_floating(focus_ring, project, out);
+            ws.render_floating(focus_ring, project, ctx, out);
 
             if let Some(loc) = insert_hint_render_loc {
                 if loc.workspace == InsertWorkspace::Existing(ws.id()) {
@@ -1674,7 +1675,7 @@ impl<W: LayoutElement> Monitor<W> {
                 }
             }
 
-            ws.render_scrolling(focus_ring, project, out);
+            ws.render_scrolling(focus_ring, project, ctx, out);
         }
     }
 

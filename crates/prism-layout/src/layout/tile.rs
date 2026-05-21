@@ -1045,6 +1045,7 @@ impl<W: LayoutElement> Tile<W> {
         scale: smithay::utils::Scale<f64>,
         focus_ring_visible: bool,
         project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
         let fullscreen_progress = self.fullscreen_progress();
@@ -1115,7 +1116,8 @@ impl<W: LayoutElement> Tile<W> {
         // Window content. Delegates to `LayoutElement::render` (popups
         // emit on top of normal content; we leave that ordering to the
         // trait impl).
-        self.window.render(window_render_loc, scale, win_alpha, out);
+        self.window
+            .render(window_render_loc, scale, win_alpha, project, ctx, out);
     }
 
     /// Snapshot bookkeeping for the close animation. Niri renders the
