@@ -1020,6 +1020,27 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                         };
                         output.mark_vblank();
                         let n = frame_counter_for_vblank.fetch_add(1, Ordering::SeqCst) + 1;
+                        // TEMP: crumb the first 2 vblanks per crtc so we can
+                        // confirm vblanks ARE firing post-bootstrap. Remove
+                        // once layout-render is verified.
+                        static FIRST_VBLANKS: std::sync::OnceLock<
+                            std::sync::Mutex<std::collections::HashMap<u64, u32>>,
+                        > = std::sync::OnceLock::new();
+                        let map = FIRST_VBLANKS.get_or_init(|| {
+                            std::sync::Mutex::new(std::collections::HashMap::new())
+                        });
+                        let crtc_key = format!("{crtc:?}").len() as u64
+                            ^ (format!("{crtc:?}").as_bytes().iter().fold(0u64, |a, b| a.wrapping_add(*b as u64)));
+                        let mut g = map.lock().unwrap();
+                        let count = g.entry(crtc_key).or_insert(0u32);
+                        if *count < 2 {
+                            *count += 1;
+                            breadcrumb(&format!(
+                                "vblank #{} for crtc {:?} (call {})",
+                                *count, crtc, n
+                            ));
+                        }
+                        drop(g);
                         let t0 = std::time::Instant::now();
                         let result = present_for_crtc(state, crtc);
                         let dt_us = t0.elapsed().as_micros();
