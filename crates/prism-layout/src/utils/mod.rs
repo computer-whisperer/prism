@@ -103,6 +103,37 @@ pub fn baba_is_float_offset(now: std::time::Duration, view_height: f64) -> f64 {
     amplitude * ((core::f64::consts::TAU * now / 3.6).sin() - 1.)
 }
 
+/// Move `rect` so it sits within `area`, preferring to keep its
+/// top-left corner anchored at the area's top-left if the rect is
+/// larger than the area. Used by floating window placement to keep
+/// windows on-screen across output reconfigure / display rotation.
+/// Ported verbatim from niri/src/utils.
+pub fn clamp_preferring_top_left_in_area(
+    area: smithay::utils::Rectangle<f64, smithay::utils::Logical>,
+    rect: &mut smithay::utils::Rectangle<f64, smithay::utils::Logical>,
+) {
+    rect.loc.x = f64::min(rect.loc.x, area.loc.x + area.size.w - rect.size.w);
+    rect.loc.y = f64::min(rect.loc.y, area.loc.y + area.size.h - rect.size.h);
+    rect.loc.x = f64::max(rect.loc.x, area.loc.x);
+    rect.loc.y = f64::max(rect.loc.y, area.loc.y);
+}
+
+/// Return the top-left location that centers a `size`-sized box inside
+/// `area`, but pinned to the area's top-left if the box is bigger than
+/// the area on either axis. Used for placing floating windows
+/// initially. Ported verbatim from niri/src/utils.
+pub fn center_preferring_top_left_in_area(
+    area: smithay::utils::Rectangle<f64, smithay::utils::Logical>,
+    size: smithay::utils::Size<f64, smithay::utils::Logical>,
+) -> smithay::utils::Point<f64, smithay::utils::Logical> {
+    let area_size = area.size.to_point();
+    let size = size.to_point();
+    let mut offset = (area_size - size).downscale(2.);
+    offset.x = f64::max(offset.x, 0.);
+    offset.y = f64::max(offset.y, 0.);
+    area.loc + offset
+}
+
 /// Clamp `x` to the `[min_size, max_size]` range, treating 0 as
 /// "unbounded" for whichever endpoint is zero. Used to honor
 /// xdg_toplevel min/max-size hints. Ported from niri/src/utils.

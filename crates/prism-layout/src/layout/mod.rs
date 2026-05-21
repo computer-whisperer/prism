@@ -17,6 +17,7 @@ use crate::utils::id::IdCounter;
 
 pub mod closing_window;
 pub mod element;
+pub mod floating;
 pub mod focus_ring;
 pub mod insert_hint_element;
 pub mod opening_window;
