@@ -10,9 +10,13 @@
 #   OUTPUT             prism's "run [output]" arg (e.g. DP-4). Default: first connected.
 #   DEPTH              "8" or "10". Default: 10 (matches prism's default).
 #   CLIENT_BIN         override client binary (default: target/release/prism-shmtest).
+#   CLIENT_ARGS        space-separated client args, overrides default ([seconds]).
+#                       Example: CLIENT_BIN=/usr/bin/mpv \
+#                         CLIENT_ARGS="--vo=gpu --gpu-context=wayland av://lavfi:testsrc=size=640x480:rate=30 --loop"
+#   NO_CLIENT          if set (any value), don't launch a client at all. Useful when
+#                       you want to point external clients at the socket via SSH.
 #   PRISM_CRUMBS       breadcrumb file (default: ./prism.crumbs).
 #   PRISM_WATCHDOG_SECS (default: seconds + 5).
-#   PRISM_MAX_FRAMES   (default: seconds * 60 + 30).
 #
 # After it exits, look at:
 #   - ./prism.log         compositor stdout/stderr
@@ -125,20 +129,33 @@ if [[ ! -S "$RUNTIME_DIR/$SOCKET" ]]; then
     say " WARNING: $RUNTIME_DIR/$SOCKET does not exist as a socket — client may fail to connect"
 fi
 
-# Launch the client. It runs in the background; once the SECS window ends
-# (or prism's watchdog fires), prism exits and we clean up below.
-say " launching client: $CLIENT_BIN ($SECS seconds)"
-say "   WAYLAND_DISPLAY=$SOCKET XDG_RUNTIME_DIR=$RUNTIME_DIR"
-WAYLAND_DISPLAY="$SOCKET" XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-    "$CLIENT_BIN" "$SECS" >"$CLIENT_LOG" 2>&1 &
-CLIENT_PID=$!
-say " client pid=$CLIENT_PID"
-sleep 0.5
-if kill -0 "$CLIENT_PID" 2>/dev/null; then
-    say " client is alive after 500ms"
+if [[ -n "${NO_CLIENT:-}" ]]; then
+    say " NO_CLIENT set — skipping client launch (prism socket: $SOCKET)"
+    CLIENT_PID=""
 else
-    say " client exited immediately! head of client log:"
-    head -n 10 "$CLIENT_LOG" 2>&1 | sed 's/^/   /'
+    # Default to the legacy "client gets $SECS as its only arg" behavior
+    # so existing prism-shmtest invocations keep working. If CLIENT_ARGS
+    # is set, that replaces $SECS — needed for mpv/etc. whose argv shape
+    # is different.
+    if [[ -n "${CLIENT_ARGS:-}" ]]; then
+        # shellcheck disable=SC2206
+        client_args=($CLIENT_ARGS)
+    else
+        client_args=("$SECS")
+    fi
+    say " launching client: $CLIENT_BIN ${client_args[*]}"
+    say "   WAYLAND_DISPLAY=$SOCKET XDG_RUNTIME_DIR=$RUNTIME_DIR"
+    WAYLAND_DISPLAY="$SOCKET" XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+        "$CLIENT_BIN" "${client_args[@]}" >"$CLIENT_LOG" 2>&1 &
+    CLIENT_PID=$!
+    say " client pid=$CLIENT_PID"
+    sleep 0.5
+    if kill -0 "$CLIENT_PID" 2>/dev/null; then
+        say " client is alive after 500ms"
+    else
+        say " client exited immediately! head of client log:"
+        head -n 10 "$CLIENT_LOG" 2>&1 | sed 's/^/   /'
+    fi
 fi
 
 # Wait for prism to finish (either via PRISM_MAX_RUNTIME_SECS or watchdog).
@@ -151,11 +168,13 @@ wait "$PRISM_PID" || PRISM_RC=$?
 say " prism exited (rc=$PRISM_RC)"
 
 # Make sure the client is done too.
-if kill -0 "$CLIENT_PID" 2>/dev/null; then
+if [[ -n "$CLIENT_PID" ]] && kill -0 "$CLIENT_PID" 2>/dev/null; then
     sleep 0.3
     kill -TERM "$CLIENT_PID" 2>/dev/null || true
 fi
-wait "$CLIENT_PID" 2>/dev/null || true
+if [[ -n "$CLIENT_PID" ]]; then
+    wait "$CLIENT_PID" 2>/dev/null || true
+fi
 
 echo
 say " summary"
