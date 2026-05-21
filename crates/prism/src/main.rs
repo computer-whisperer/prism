@@ -1375,37 +1375,15 @@ fn present_for_crtc(
         el.lower(white_view, &mut elements);
     }
 
-    // TEMP DIAGNOSTIC: log every present where tile_counts contains
-    // a non-zero entry, plus first present per output that sees tiles.
-    // Helps catch the window after add_window — even if it's seconds
-    // into the run.
+    // Log once per output the first present that actually carries tiles
+    // — answers "did this output's render walk see the layout's window?"
+    // without spamming the log on every frame.
     static FIRST_WITH_TILES: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashSet<String>>,
     > = std::sync::OnceLock::new();
     let n_render_els = render_els.len();
     let n_draws = elements.len();
     let total_tiles: usize = diag_tile_counts.iter().sum();
-    // Also dump full per-monitor state on the Nth present overall (60Hz × 6
-    // outputs × 1s = ~360 presents/sec; 800 ≈ 2.2s in, well after mpv maps).
-    // Unconditional — captures whatever state the present-time layout sees.
-    static PRESENTS_SO_FAR: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
-    let count = PRESENTS_SO_FAR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if count == 800 {
-        for mon in state.layout.monitors() {
-            let mon_name = mon.output().name();
-            let counts_render_geo: Vec<usize> = mon
-                .workspaces_with_render_geo()
-                .map(|(ws, _)| ws.tiles().count())
-                .collect();
-            tracing::warn!(
-                monitor = %mon_name,
-                counts_render_geo = ?counts_render_geo,
-                "PRESENT-TIME layout dump at present N=800"
-            );
-        }
-    }
-
     if total_tiles > 0 {
         let seen =
             FIRST_WITH_TILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));

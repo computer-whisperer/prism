@@ -596,15 +596,6 @@ impl LayoutElement for Mapped {
         let buf_origin = location - self.window.geometry().loc.to_f64();
         let surface = self.toplevel().wl_surface();
 
-        // TEMP DIAGNOSTIC: log once per Mapped what the tree walk saw,
-        // so we can attribute "empty layout walk" to the right cause
-        // (no view → on_commit_buffer_handler didn't populate; no
-        // texture → SurfaceTexSlot lookup failed; no surface in tree).
-        let mut diag_surfaces = 0usize;
-        let mut diag_with_view = 0usize;
-        let mut diag_with_texture = 0usize;
-        let pre_len = out.len();
-
         with_surface_tree_downward(
             surface,
             buf_origin,
@@ -623,18 +614,15 @@ impl LayoutElement for Mapped {
             },
             // Visit: emit a SurfaceEl for this surface at `surf_loc + view.offset`.
             |surf, states, &surf_loc| {
-                diag_surfaces += 1;
                 let data = states.data_map.get::<RendererSurfaceStateUserData>();
                 let Some(data) = data else { return };
                 let view = match data.lock().unwrap().view() {
                     Some(v) => v,
                     None => return,
                 };
-                diag_with_view += 1;
                 let Some(texture_view) = ctx.texture_for(surf) else {
                     return;
                 };
-                diag_with_texture += 1;
 
                 let pos = surf_loc + view.offset.to_f64();
                 let dst = Rectangle::new(pos, view.dst.to_f64());
@@ -650,24 +638,6 @@ impl LayoutElement for Mapped {
             },
             |_, _, _| true,
         );
-
-        // TEMP: log once per Mapped if we emitted nothing.
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static LOGGED: AtomicBool = AtomicBool::new(false);
-        if pre_len == out.len() && !LOGGED.swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                location_x = location.x,
-                location_y = location.y,
-                geom_loc_x = self.window.geometry().loc.x,
-                geom_loc_y = self.window.geometry().loc.y,
-                geom_size_w = self.window.geometry().size.w,
-                geom_size_h = self.window.geometry().size.h,
-                diag_surfaces,
-                diag_with_view,
-                diag_with_texture,
-                "Mapped::render_normal emitted nothing"
-            );
-        }
     }
 
     fn render_popups(
