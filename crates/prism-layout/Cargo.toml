@@ -4,10 +4,36 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Window layout (ported from niri's scrollable tiling). Produces FrameDescription"
+description = "Window layout, input routing, and the per-surface state niri keeps in its layout/ + window/ + layer/ + input/ + cursor.rs tree"
+
+# Hosts the niri-ported `shell` of the compositor: window/layer wrappers,
+# scrollable tiling, input routing, cursor state. Originally planned as four
+# separate crates (prism-window/layer/layout/input) but the cross-module
+# dependencies are tight enough (window implements layout's LayoutElement;
+# layout::tile holds Mapped; layer uses layout::shadow) that splitting added
+# friction without benefit — we collapsed to one crate matching niri's
+# in-crate module layout.
+#
+# Replaces vs depends:
+#   - niri/src/render_helpers/ → NOT brought across; emits prism-renderer's
+#     `RenderEl` vocabulary instead. Effects that needed GLES shader
+#     infrastructure (blur, background_effect, framebuffer_effect, snapshot,
+#     offscreen, gradient_fade_texture, xray) are stubbed at call sites.
+#   - niri/src/handlers/ → stays in prism-protocols (already there).
+#   - niri/src/backend/ → already replaced by prism-{drm,renderer,frame}.
 
 [dependencies]
+anyhow.workspace = true
+atomic = "0.6.1"
+bitflags.workspace = true
+calloop.workspace = true
+prism-animation.workspace = true
 prism-config.workspace = true
 prism-frame.workspace = true
+prism-ipc.workspace = true
+prism-renderer.workspace = true
+rustix = { workspace = true, features = ["time"] }
+serde.workspace = true
 smithay.workspace = true
+smithay-drm-extras.workspace = true
 tracing.workspace = true

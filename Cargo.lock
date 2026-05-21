@@ -116,6 +116,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
 
 [[package]]
+name = "atomic"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a89cbf775b137e9b968e67227ef7f775587cde3fd31b0d8599dbd0f598a48340"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "atomic_float"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1064,7 +1073,6 @@ dependencies = [
  "prism-config",
  "prism-drm",
  "prism-frame",
- "prism-input",
  "prism-layout",
  "prism-protocols",
  "prism-renderer",
@@ -1128,17 +1136,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prism-input"
-version = "0.1.0"
-dependencies = [
- "calloop",
- "prism-config",
- "prism-frame",
- "smithay",
- "tracing",
-]
-
-[[package]]
 name = "prism-ipc"
 version = "0.1.0"
 dependencies = [
@@ -1152,9 +1149,19 @@ dependencies = [
 name = "prism-layout"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "atomic",
+ "bitflags",
+ "calloop",
+ "prism-animation",
  "prism-config",
  "prism-frame",
+ "prism-ipc",
+ "prism-renderer",
+ "rustix 1.1.4",
+ "serde",
  "smithay",
+ "smithay-drm-extras",
  "tracing",
 ]
 

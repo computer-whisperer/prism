@@ -6,7 +6,6 @@ members = [
     "crates/prism-config",
     "crates/prism-drm",
     "crates/prism-frame",
-    "crates/prism-input",
     "crates/prism-ipc",
     "crates/prism-layout",
     "crates/prism-protocols",
@@ -29,7 +28,6 @@ prism-animation = { path = "crates/prism-animation" }
 prism-config = { path = "crates/prism-config" }
 prism-drm = { path = "crates/prism-drm" }
 prism-frame = { path = "crates/prism-frame" }
-prism-input = { path = "crates/prism-input" }
 prism-ipc = { path = "crates/prism-ipc" }
 prism-layout = { path = "crates/prism-layout" }
 prism-protocols = { path = "crates/prism-protocols" }

@@ -18,7 +18,6 @@ libc.workspace = true
 prism-config.workspace = true
 prism-drm.workspace = true
 prism-frame.workspace = true
-prism-input.workspace = true
 prism-layout.workspace = true
 prism-protocols.workspace = true
 prism-renderer.workspace = true
