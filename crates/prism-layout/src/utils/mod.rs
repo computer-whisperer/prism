@@ -94,6 +94,16 @@ pub fn floor_logical_in_physical_max1(scale: f64, logical: f64) -> f64 {
     (logical * scale).max(1.).floor() / scale
 }
 
+/// Returns whether `output`'s name matches the user-supplied
+/// `target` (an output name from the config). Ported from niri.
+pub fn output_matches_name(output: &smithay::output::Output, target: &str) -> bool {
+    let name = output
+        .user_data()
+        .get::<prism_config::OutputName>()
+        .unwrap();
+    name.matches(target)
+}
+
 /// Logical-space size of `output` (applying the output's transform).
 /// Niri's helper, ported verbatim from niri/src/utils.
 pub fn output_size(
