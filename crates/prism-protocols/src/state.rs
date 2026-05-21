@@ -397,6 +397,12 @@ impl PrismState {
             // location assigned by layout_outputs once all outputs known
             None,
         );
+        // Inform the layout. This creates a Monitor entry, splices in any
+        // workspaces that named this output via `original_output`, and
+        // (if this is the first output) hosts the no-output workspace
+        // backlog. `None` layout_config = use defaults; per-output config
+        // lookup arrives once we wire `config.outputs` indexing.
+        self.layout.add_output(output.clone(), None);
         self.wl_outputs.insert(ctx.connector_name.clone(), output);
         // unwrap: just inserted under this key
         self.wl_outputs.get(&ctx.connector_name).unwrap()
