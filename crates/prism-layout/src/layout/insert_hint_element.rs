@@ -30,9 +30,10 @@ impl InsertHintElement {
 
     pub fn update_render_elements(
         &mut self,
-        _area: Rectangle<f64, Logical>,
+        _size: Size<f64, Logical>,
+        _view_rect: Rectangle<f64, Logical>,
+        _radius: prism_config::CornerRadius,
         _scale: f64,
-        _alpha: f32,
     ) {
     }
 

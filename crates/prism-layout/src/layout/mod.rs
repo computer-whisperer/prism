@@ -20,6 +20,7 @@ pub mod element;
 pub mod floating;
 pub mod focus_ring;
 pub mod insert_hint_element;
+pub mod monitor;
 pub mod opening_window;
 pub mod scrolling;
 pub mod shadow;
@@ -268,6 +269,39 @@ pub enum ResolvedSize {
     Tile(f64),
     /// Size of the window excluding borders.
     Window(f64),
+}
+
+/// Overview progress — three-state union niri keeps inside its
+/// `Layout<W>` for the overview-mode animation. Lifted to the
+/// layout-mod root so `monitor.rs` can convert into its own
+/// 2-variant local enum without depending on `Layout<W>` yet.
+#[derive(Debug)]
+pub enum OverviewProgress {
+    Animation(prism_animation::Animation),
+    Gesture(OverviewGesture),
+    Open,
+}
+
+/// In-progress overview-toggle swipe.
+#[derive(Debug)]
+pub struct OverviewGesture {
+    pub tracker: crate::swipe_tracker::SwipeTracker,
+    /// Start point.
+    pub start: f64,
+    /// Current progress.
+    pub value: f64,
+}
+
+/// Overview-zoom curve. Niri's tiny helper, kept here so both
+/// `monitor.rs` and the not-yet-ported `Layout<W>` can reach it.
+pub fn compute_overview_zoom(options: &Options, overview_progress: Option<f64>) -> f64 {
+    let zoom = options.overview.zoom.clamp(0.0001, 0.75);
+
+    if let Some(p) = overview_progress {
+        (1. - p * (1. - zoom)).max(0.0001)
+    } else {
+        1.
+    }
 }
 
 /// A tile that was lifted out of the layout (interactive move, swap, …).
