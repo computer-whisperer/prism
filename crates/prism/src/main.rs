@@ -1242,53 +1242,72 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
 /// Returns true if a flip was submitted, false if skipped (previous flip
 /// still pending), Err if the output isn't found or presenting failed.
 ///
-/// Per-output element mapping (#59.5): a surface "lives on" the output
-/// whose geometry contains its logical-space center; only that output
-/// includes the surface in its element list. Surfaces with no
-/// containing output are skipped everywhere (off-screen).
+/// Layout-driven composition: walk this output's monitor in the layout,
+/// emit `RenderEl`s with each tile projected to clip space, lower to
+/// `ElementDraw`s, and submit through the OutputContext. Replaces the
+/// pre-layout "first toplevel fills the framebuffer" bypass.
 fn present_for_crtc(
     state: &mut prism_protocols::PrismState,
     crtc: smithay::reexports::drm::control::crtc::Handle,
 ) -> Result<bool> {
-    use prism_renderer::{DecodePush, ElementDraw, EncodePush};
+    use prism_layout::layout::RenderCtx;
+    use prism_renderer::{ElementDraw, EncodePush, RenderEl, vk};
+    use smithay::utils::{Logical, Rectangle};
     use smithay::wayland::compositor::with_states;
 
-    // Find the output for this CRTC and capture its connector name
-    // (used as OutputId for placement matching) + GPU id (used to pick
-    // the right per-GPU texture import). Re-borrow the output mutably
-    // at present() time.
-    let (output_id, output_gpu_id) = {
+    // Snapshot identity bits we'll need below without holding any borrow
+    // into state.outputs (so we can re-borrow mutably at present()
+    // time). `white_view` is the renderer's 1×1 white texel — every
+    // SolidColor/Border element samples it at lower-time.
+    let (output_id, output_gpu_id, white_view) = {
         let output = state
             .output_for_crtc(crtc)
             .ok_or_else(|| anyhow!("no output bound to crtc {crtc:?}"))?;
-        (output.connector_name.clone(), output.gpu_id)
+        (
+            output.connector_name.clone(),
+            output.gpu_id,
+            output.renderer.white_view(),
+        )
     };
 
-    // Snapshot the toplevel surface handles so we can drop the borrow on
-    // state.xdg_shell before mutably borrowing state.outputs for present().
-    let surfaces: Vec<_> = state
-        .xdg_shell
-        .toplevel_surfaces()
-        .iter()
-        .map(|t| t.wl_surface().clone())
-        .collect();
+    // The smithay Output is the key the layout uses to find its
+    // Monitor. wl_outputs is populated by advertise_output().
+    let smithay_output = state
+        .wl_outputs
+        .get(&output_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("no smithay Output for {output_id}"))?;
 
-    let mut elements: Vec<ElementDraw> = Vec::new();
-    for surface in &surfaces {
-        // Read placement + texture view in one lock per surface.
-        let (belongs_here, view_opt) = with_states(surface, |states| {
-            let belongs = states
-                .data_map
-                .get::<prism_protocols::SurfacePlacementSlot>()
-                .map(|p| {
-                    p.0.lock()
-                        .unwrap()
-                        .current_output
-                        .as_deref()
-                        == Some(output_id.as_str())
-                })
-                .unwrap_or(false);
-            let view = states
+    // Build the render walk's inputs:
+    //   project: logical → clip space using the monitor's view_size
+    //   ctx.texture_lookup: WlSurface → vk::ImageView (per-GPU)
+    //
+    // Both close over things that don't touch &mut state, so the
+    // walk and the present can sequence cleanly. view_size is in
+    // logical pixels; framebuffer extent (used by the renderer's
+    // viewport) is in physical pixels. The conversion logical →
+    // clip space is the same regardless of fractional scale because
+    // [-1, 1] always means "full framebuffer".
+    let view_size = match state.layout.monitor_for_output(&smithay_output) {
+        Some(m) => m.view_size(),
+        // Output not in the layout yet (race between add_output and the
+        // first vblank). Skip this frame; the next one will be fine.
+        None => return Ok(false),
+    };
+
+    let project = |rect: Rectangle<f64, Logical>| -> [f32; 4] {
+        let w = view_size.w.max(1.0);
+        let h = view_size.h.max(1.0);
+        let x0 = (2.0 * rect.loc.x / w - 1.0) as f32;
+        let y0 = (2.0 * rect.loc.y / h - 1.0) as f32;
+        let x1 = (2.0 * (rect.loc.x + rect.size.w) / w - 1.0) as f32;
+        let y1 = (2.0 * (rect.loc.y + rect.size.h) / h - 1.0) as f32;
+        [x0, y0, x1, y1]
+    };
+
+    let texture_lookup = |surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| -> Option<vk::ImageView> {
+        with_states(surface, |states| {
+            states
                 .data_map
                 .get::<prism_protocols::SurfaceTexSlot>()
                 .and_then(|s| {
@@ -1296,27 +1315,30 @@ fn present_for_crtc(
                         .unwrap()
                         .as_ref()
                         .and_then(|t| t.view_for(output_gpu_id))
-                });
-            (belongs, view)
-        });
-        if !belongs_here {
-            continue;
-        }
-        if let Some(view) = view_opt {
-            elements.push(ElementDraw {
-                texture_view: view,
-                push: DecodePush::identity_srgb(
-                    [-1.0, -1.0, 1.0, 1.0],
-                    [0.0, 0.0, 1.0, 1.0],
-                ),
-            });
-            // Per-surface positioning (dst rect from logical_pos +
-            // extent → NDC) is a follow-on; today the first mapped
-            // toplevel that belongs here fills the framebuffer.
-            break;
-        }
-        // view_for can still return None if a per-GPU dmabuf import failed
-        // on this GPU; in that case we silently skip this surface here.
+                })
+        })
+    };
+    let ctx = RenderCtx {
+        texture_lookup: &texture_lookup,
+    };
+
+    // Layout walk into a flat RenderEl vector. Monitor is borrowed
+    // immutably for the duration of render_workspaces; dropped before
+    // the present below mutably re-borrows state.outputs.
+    let mut render_els: Vec<RenderEl> = Vec::new();
+    if let Some(monitor) = state.layout.monitor_for_output(&smithay_output) {
+        // focus_ring: this is the focused monitor's render — for
+        // single-monitor configs it always is; multi-monitor focus
+        // tracking lands when input dispatch does.
+        monitor.render_workspaces(true, &project, &ctx, &mut render_els);
+    }
+
+    // Lower RenderEls (geometry + tint) → ElementDraws (texture + push
+    // constants). One pass; SolidColor/Border elements bind the white
+    // texel, Surface elements bind the per-surface view.
+    let mut elements: Vec<ElementDraw> = Vec::with_capacity(render_els.len());
+    for el in &render_els {
+        el.lower(white_view, &mut elements);
     }
 
     let encode_push = EncodePush::sdr_identity();
@@ -1327,6 +1349,14 @@ fn present_for_crtc(
         output.present(&elements, &encode_push)?
     };
 
+    // Frame callbacks still want to iterate the toplevels mapped here.
+    let surfaces: Vec<_> = state
+        .xdg_shell
+        .toplevel_surfaces()
+        .iter()
+        .map(|t| t.wl_surface().clone())
+        .collect();
+
     // Fire wl_callback.frame + wp_presentation_feedback for surfaces
     // mapped to this output, but ONLY when we actually submitted a
     // frame. If present() returned false (a flip still in flight, our
@@ -1336,35 +1366,25 @@ fn present_for_crtc(
         let mono = clock_monotonic_now();
         let time_ms = mono.as_millis() as u32;
 
-        // Look up the smithay Output handle + refresh once per crtc.
-        let (smithay_output, refresh) = {
-            let wl_out = state.wl_outputs.get(&output_id).cloned();
-            let refresh = state
-                .output_for_crtc(crtc)
-                .map(|o| {
-                    let hz = o.mode.vrefresh().max(1);
-                    smithay::wayland::presentation::Refresh::fixed(
-                        std::time::Duration::from_nanos(1_000_000_000 / hz as u64),
-                    )
-                })
-                .unwrap_or(smithay::wayland::presentation::Refresh::Unknown);
-            (wl_out, refresh)
-        };
+        let refresh = state
+            .output_for_crtc(crtc)
+            .map(|o| {
+                let hz = o.mode.vrefresh().max(1);
+                smithay::wayland::presentation::Refresh::fixed(
+                    std::time::Duration::from_nanos(1_000_000_000 / hz as u64),
+                )
+            })
+            .unwrap_or(smithay::wayland::presentation::Refresh::Unknown);
 
         for surface in &surfaces {
-            let belongs_here = with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<prism_protocols::SurfacePlacementSlot>()
-                    .map(|p| {
-                        p.0.lock()
-                            .unwrap()
-                            .current_output
-                            .as_deref()
-                            == Some(output_id.as_str())
-                    })
-                    .unwrap_or(false)
-            });
+            // Belongs-on-this-output is now driven by the layout: a
+            // surface lives on the monitor whose Output matches ours.
+            let belongs_here = state
+                .layout
+                .find_window_and_output(surface)
+                .and_then(|(_, out)| out)
+                .map(|out| out == &smithay_output)
+                .unwrap_or(false);
             if !belongs_here {
                 continue;
             }
@@ -1388,11 +1408,11 @@ fn present_for_crtc(
             for cb in frame_cbs {
                 cb.done(time_ms);
             }
-            if let Some(out) = smithay_output.as_ref() {
+            {
                 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
                 for fb in presentation_cbs {
                     fb.presented(
-                        out,
+                        &smithay_output,
                         mono,
                         refresh,
                         // We don't track a real vblank sequence yet.
