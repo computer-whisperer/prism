@@ -643,40 +643,18 @@ impl CompositorHandler for PrismState {
                             output = ?output_name,
                             "mapped xdg_toplevel into layout"
                         );
-
-                        // TEMP DIAGNOSTIC: dump the layout state per monitor
-                        // immediately after add_window. Tells us whether the
-                        // tile actually landed in a workspace anywhere. Uses
-                        // the SAME accessor the render walk does
-                        // (workspaces_with_render_geo) so we see exactly what
-                        // present_for_crtc sees.
-                        let monitor_dump: Vec<(String, usize, Vec<usize>)> = self
-                            .layout
-                            .monitors()
-                            .map(|mon| {
-                                let name = mon.output().name();
-                                let counts: Vec<usize> = mon
-                                    .workspaces_with_render_geo()
-                                    .map(|(ws, _)| ws.tiles().count())
-                                    .collect();
-                                let ws_count = counts.len();
-                                (name, ws_count, counts)
-                            })
-                            .collect();
-                        for (mon_name, ws_count, counts) in &monitor_dump {
-                            let total: usize = counts.iter().sum();
-                            tracing::info!(
-                                monitor = %mon_name,
-                                ws_count_visible = ws_count,
-                                ?counts,
-                                total_tiles = total,
-                                "post-add_window monitor state (via render-geo iter)"
-                            );
-                        }
                     }
                 }
             }
         }
+
+        // Surface→output assignment + wl_surface.enter/leave. Runs after
+        // both process_surface_buffer (in case the new buffer is what
+        // produced a layout-visible window) and the optional add_window
+        // above, so the layout has the authoritative answer by the time we
+        // ask. Also re-runs on every commit, which handles the layout
+        // moving a window between outputs.
+        dispatch_surface_output_from_layout(self, surface);
     }
 }
 
@@ -826,6 +804,13 @@ fn import_dmabuf(
         vk::ImageUsageFlags::SAMPLED,
     )
     .context("ImportedImage::import (SAMPLED)")?;
+    // Sampled dmabuf imports start in UNDEFINED layout but the render path
+    // binds them as SHADER_READ_ONLY_OPTIMAL. Run the one-shot transition
+    // here so the first frame's sample is legal — without this radv hangs
+    // the queue on the first cmd_draw that touches the descriptor.
+    image
+        .transition_for_sampling()
+        .context("ImportedImage::transition_for_sampling")?;
     Ok(image)
 }
 
@@ -844,16 +829,12 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
         return;
     }
 
-    // Take the new buffer assignment (if any) and act on it inside
-    // with_states (which holds the SurfaceData lock). We do the texture
-    // build under the lock, then compute the surface→output assignment
-    // from the resulting extent and dispatch enter/leave.
-    //
-    // Returns (old_output, new_output) so we can dispatch the wl_surface
-    // events OUTSIDE the with_states callback — calling Output::enter/leave
-    // re-enters smithay's surface bookkeeping and we don't want to nest
-    // that under our own SurfaceData lock.
-    let transition: Option<(Option<OutputId>, Option<OutputId>)> = with_states(surface, |states| {
+    // Take the new buffer assignment (if any) and (re-)build the texture
+    // under the SurfaceData lock. Output assignment + wl_surface.enter/leave
+    // dispatch happens separately (after this returns) in
+    // dispatch_surface_output_from_layout — that source of truth is the
+    // layout, not the buffer's logical_pos.
+    with_states(surface, |states| {
         // `on_commit_buffer_handler` (called before us) took the
         // BufferAssignment out of cached_state and stashed it in
         // RendererSurfaceState. We read it back from there. The
@@ -866,32 +847,21 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
         states
             .data_map
             .insert_if_missing_threadsafe(SurfaceTexSlot::default);
-        states
-            .data_map
-            .insert_if_missing_threadsafe(SurfacePlacementSlot::default);
         let slot = states
             .data_map
             .get::<SurfaceTexSlot>()
             .expect("just inserted SurfaceTexSlot");
-        let placement_slot = states
-            .data_map
-            .get::<SurfacePlacementSlot>()
-            .expect("just inserted SurfacePlacementSlot");
 
         match current_buffer {
             None => {
-                // No buffer currently attached — either initial (never
-                // had one) or just unmapped (BufferAssignment::Removed
-                // arrived this commit and on_commit_buffer_handler
-                // cleared the state). Drop our texture too.
+                // No buffer currently attached — either initial (never had
+                // one) or just unmapped (BufferAssignment::Removed arrived
+                // this commit and on_commit_buffer_handler cleared the
+                // state). Drop our texture too.
                 let mut guard = slot.0.lock().unwrap();
                 if let Some(SurfaceTexture::Dmabuf { buffer, .. }) = guard.take() {
                     buffer.release();
                 }
-                drop(guard);
-                let mut placement = placement_slot.0.lock().unwrap();
-                let old = placement.current_output.take();
-                old.map(|o| (Some(o), None))
             }
             Some(buffer) => {
                 // `buffer` derefs to &WlBuffer. Check whether it's the
@@ -907,37 +877,56 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
                 if !is_same_dmabuf {
                     if let Err(e) = build_surface_texture(state, wl_buffer, slot) {
                         tracing::warn!("surface buffer import failed: {e:#}");
-                        return None;
                     }
-                }
-
-                // Compute output assignment from the texture extent and
-                // the surface's logical position.
-                let extent = slot
-                    .0
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|t| t.extent())
-                    .unwrap_or_default();
-                let mut placement = placement_slot.0.lock().unwrap();
-                let center = (
-                    placement.logical_pos.0 + (extent.width as i32 / 2),
-                    placement.logical_pos.1 + (extent.height as i32 / 2),
-                );
-                let new_output = state.output_containing(center);
-                if new_output == placement.current_output {
-                    None
-                } else {
-                    let old_output = placement.current_output.take();
-                    placement.current_output = new_output.clone();
-                    Some((old_output, new_output))
                 }
             }
         }
     });
+}
 
-    // Dispatch enter/leave outside the SurfaceData lock.
+/// Recompute which output the surface lives on (using the layout as the
+/// source of truth) and dispatch `wl_surface.enter`/`.leave` on the
+/// transition, if any. Updates `SurfacePlacement.current_output`.
+///
+/// Called from the commit handler after `process_surface_buffer` AND after
+/// the optional `add_window` — that order matters, since on the first
+/// commit for a fresh toplevel the layout doesn't know the surface until
+/// `add_window` returns. Prior code keyed off the surface's `logical_pos`,
+/// which defaults to `(0, 0)` and ends up dispatching enter on whichever
+/// output happens to contain the origin instead of the one the layout
+/// actually placed the window on. Per-frame this also re-syncs us if the
+/// layout moved the window to a different monitor.
+fn dispatch_surface_output_from_layout(state: &mut PrismState, surface: &WlSurface) {
+    // Resolve the surface's current output via the layout. If the surface
+    // isn't a layout-tracked window (e.g., a layer surface, once those land)
+    // we silently skip — the layer-surface path will do its own dispatch.
+    let new_output: Option<String> = state
+        .layout
+        .find_window_and_output(surface)
+        .and_then(|(_, out)| out.map(|o| o.name()));
+
+    // Read + update the placement slot under the SurfaceData lock; return
+    // the transition (if any) so we can dispatch enter/leave outside the
+    // lock — Output::enter/leave re-enters smithay's surface bookkeeping
+    // and we don't want to nest that.
+    let transition: Option<(Option<String>, Option<String>)> = with_states(surface, |states| {
+        states
+            .data_map
+            .insert_if_missing_threadsafe(SurfacePlacementSlot::default);
+        let placement_slot = states
+            .data_map
+            .get::<SurfacePlacementSlot>()
+            .expect("just inserted SurfacePlacementSlot");
+        let mut placement = placement_slot.0.lock().unwrap();
+        if placement.current_output == new_output {
+            None
+        } else {
+            let old = placement.current_output.take();
+            placement.current_output = new_output.clone();
+            Some((old, new_output))
+        }
+    });
+
     if let Some((old, new)) = transition {
         if let Some(old_id) = old.as_ref() {
             if let Some(output) = state.wl_outputs.get(old_id) {
