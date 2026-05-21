@@ -10,5 +10,6 @@
 
 pub mod layer;
 pub mod layout;
+pub mod swipe_tracker;
 pub mod utils;
 pub mod window;

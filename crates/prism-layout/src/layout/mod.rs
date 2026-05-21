@@ -8,20 +8,19 @@
 //! `RESIZE_ANIMATION_THRESHOLD`, etc.). `workspace/monitor/floating/
 //! scrolling/mod.rs` proper come in later port chunks.
 
-use std::rc::Rc;
-use std::time::Duration;
-
-use prism_animation::Clock;
 use prism_config::utils::MergeWith as _;
-use prism_config::Config;
+use prism_config::{Config, CornerRadius, OutputName};
 use smithay::output::Output;
-use smithay::utils::{Logical, Point};
+use smithay::utils::{Logical, Point, Size};
+
+use crate::utils::id::IdCounter;
 
 pub mod closing_window;
 pub mod element;
 pub mod focus_ring;
 pub mod insert_hint_element;
 pub mod opening_window;
+pub mod scrolling;
 pub mod shadow;
 pub mod tab_indicator;
 pub mod tile;
@@ -126,6 +125,49 @@ pub enum HitType {
     },
 }
 
+impl HitType {
+    pub fn offset_win_pos(mut self, offset: Point<f64, Logical>) -> Self {
+        match &mut self {
+            HitType::Input { win_pos } => *win_pos += offset,
+            HitType::Activate { .. } => (),
+        }
+        self
+    }
+
+    /// Hit-test a tile at `tile_pos` against `point` (both in workspace
+    /// logical coords). Returns the window + the hit type whose
+    /// `Input.win_pos` (if any) has been offset into the workspace
+    /// frame.
+    pub fn hit_tile<W: LayoutElement>(
+        tile: &Tile<W>,
+        tile_pos: Point<f64, Logical>,
+        point: Point<f64, Logical>,
+    ) -> Option<(&W, Self)> {
+        let pos_within_tile = point - tile_pos;
+        tile.hit(pos_within_tile)
+            .map(|hit| (tile.window(), hit.offset_win_pos(tile_pos)))
+    }
+
+    pub fn to_activate(self) -> Self {
+        match self {
+            HitType::Input { .. } => HitType::Activate {
+                is_tab_indicator: false,
+            },
+            HitType::Activate { .. } => self,
+        }
+    }
+}
+
+impl ActivateWindow {
+    pub fn map_smart(self, f: impl FnOnce() -> bool) -> bool {
+        match self {
+            ActivateWindow::Yes => true,
+            ActivateWindow::Smart => f(),
+            ActivateWindow::No => false,
+        }
+    }
+}
+
 /// Whether to activate a newly added window.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ActivateWindow {
@@ -138,20 +180,100 @@ pub enum ActivateWindow {
     No,
 }
 
-/// Suppress dead-code warnings while large pieces of the layout port
-/// (`Layout`, `Workspace`, `Monitor`) are still being filled in. Lets
-/// the scaffolding compile clean before the rest lands.
-#[allow(dead_code)]
-const _: () = ();
+/// Stable per-workspace ID. Lives at the mod root because both
+/// `scrolling::ScrollingSpace` and the not-yet-ported `Workspace` /
+/// `Layout` use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WorkspaceId(u64);
 
-/// `Layout`-mod private helpers re-exported up so the not-yet-ported
-/// `Layout<W>` impl can be inserted alongside in a later port chunk
-/// without a churn pass.
-pub(crate) fn _suppress_unused_imports(
-    _: Rc<Options>,
-    _: Clock,
-    _: Duration,
-    _: &Output,
-    _: Point<f64, Logical>,
-) {
+static WORKSPACE_ID_COUNTER: IdCounter = IdCounter::new();
+
+impl WorkspaceId {
+    pub fn next() -> WorkspaceId {
+        WorkspaceId(WORKSPACE_ID_COUNTER.next())
+    }
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    pub fn specific(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+/// Stable per-output identifier — wraps the configured output name so
+/// workspaces can remember which output they came from across disconnects.
+#[derive(Debug, Clone)]
+pub struct OutputId(pub String);
+
+impl OutputId {
+    pub fn matches(&self, output: &Output) -> bool {
+        let output_name = output.user_data().get::<OutputName>().unwrap();
+        output_name.matches(&self.0)
+    }
+}
+
+/// Where a window goes when dropped on a workspace — used by
+/// interactive-move / DnD-into-workspace. Niri keeps this `pub(super)`
+/// inside `monitor.rs`; here it lives at the layout-mod root so
+/// `scrolling.rs` can reference it before `monitor.rs` lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertPosition {
+    NewColumn(usize),
+    InColumn(usize, usize),
+    Floating,
+}
+
+/// Which workspace a drop targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertWorkspace {
+    Existing(WorkspaceId),
+    NewAt(usize),
+}
+
+/// Insert-hint metadata propagated during an interactive move so the
+/// receiving workspace can paint the drop preview.
+#[derive(Debug)]
+pub struct InsertHint {
+    pub workspace: InsertWorkspace,
+    pub position: InsertPosition,
+    pub corner_radius: CornerRadius,
+}
+
+/// State carried through an in-progress interactive resize. Lives at
+/// the layout-mod root because both `scrolling.rs` (which originates
+/// the resize gesture handling) and the not-yet-ported `workspace.rs`
+/// hold one. Generic over `W: LayoutElement` because the window-ID
+/// type is `W::Id`.
+#[derive(Debug)]
+pub struct InteractiveResize<W: LayoutElement> {
+    pub window: W::Id,
+    pub original_window_size: Size<f64, Logical>,
+    pub data: InteractiveResizeData,
+}
+
+/// A user-requested width/height that may refer to the tile-including-
+/// border or to the bare window.
+#[derive(Debug, Clone, Copy)]
+pub enum ResolvedSize {
+    /// Size of the tile including borders.
+    Tile(f64),
+    /// Size of the window excluding borders.
+    Window(f64),
+}
+
+/// A tile that was lifted out of the layout (interactive move, swap, …).
+/// Niri keeps the layout-shape state alongside the tile so it can be
+/// re-inserted into a different workspace with the same column geometry.
+#[derive(Debug)]
+pub struct RemovedTile<W: LayoutElement> {
+    pub tile: Tile<W>,
+    /// Width of the column the tile was in. Stored as an opaque
+    /// `f64` ratio for now — full `ColumnWidth` type lives in
+    /// `scrolling.rs` and is reachable as `scrolling::ColumnWidth`
+    /// once that lands.
+    pub width: scrolling::ColumnWidth,
+    pub is_full_width: bool,
+    pub is_floating: bool,
 }

@@ -13,18 +13,51 @@ use prism_animation::{Animation, Clock};
 use prism_renderer::RenderEl;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
+use super::tile::Tile;
+use super::LayoutElement;
+
 #[derive(Debug)]
 pub struct TabIndicator {
     config: prism_config::TabIndicator,
     open_anim: Option<Animation>,
 }
 
+/// Per-tab metadata the indicator renders from. Niri's full version
+/// resolves per-tab gradient colors here (active/inactive/urgent
+/// branches against window rules + config defaults); the prism stub
+/// just carries the source bits and leaves gradient resolution to a
+/// future Vulkan border-shader port.
 #[derive(Debug, Clone)]
 pub struct TabInfo {
-    /// Unique id of the tab (matches the column's window id).
+    /// Unique id of the tab (matches the column's window id, as a
+    /// `u64` here so the stub doesn't have to be generic over `W::Id`).
     pub id: u64,
     pub is_active: bool,
     pub is_urgent: bool,
+}
+
+impl TabInfo {
+    /// Build a `TabInfo` from a tile. Niri's version also resolves
+    /// the gradient color from window rules + config; until the
+    /// gradient renderer lands we just capture the discrete bits.
+    pub fn from_tile<W: LayoutElement>(
+        tile: &Tile<W>,
+        _position: Point<f64, Logical>,
+        is_active: bool,
+        is_urgent: bool,
+        _config: &prism_config::TabIndicator,
+    ) -> Self {
+        // `W::Id` may not be convertible to u64 in general; stub-id
+        // until the gradient pipeline is wired. Once that lands the
+        // ID will move into a separate per-tab cache keyed by
+        // `W::Id` directly.
+        let _ = tile;
+        Self {
+            id: 0,
+            is_active,
+            is_urgent,
+        }
+    }
 }
 
 impl TabIndicator {
@@ -61,12 +94,19 @@ impl TabIndicator {
         self.open_anim = Some(Animation::new(clock, 0., 1., 0., config));
     }
 
-    pub fn update_render_elements(
+    /// Cache per-tab render geometry. Matches niri's 7-arg
+    /// signature so the upstream call site in `scrolling.rs` ports
+    /// over unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_render_elements<I: IntoIterator<Item = TabInfo>>(
         &mut self,
-        _win_size: Size<f64, Logical>,
-        _tabs: &[TabInfo],
+        _enabled: bool,
+        _area: Rectangle<f64, Logical>,
+        _area_view_rect: Rectangle<f64, Logical>,
+        _tab_count: usize,
+        _tabs: I,
+        _is_active: bool,
         _scale: f64,
-        _alpha: f32,
     ) {
     }
 
@@ -82,6 +122,7 @@ impl TabIndicator {
     /// Returns the index of the hit tab, if any. Stub returns None.
     pub fn hit(
         &self,
+        _area: Rectangle<f64, Logical>,
         _tab_count: usize,
         _scale: f64,
         _point: Point<f64, Logical>,

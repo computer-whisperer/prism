@@ -27,6 +27,7 @@ anyhow.workspace = true
 atomic = "0.6.1"
 bitflags.workspace = true
 calloop.workspace = true
+ordered-float = "4.5"
 prism-animation.workspace = true
 prism-config.workspace = true
 prism-frame.workspace = true
