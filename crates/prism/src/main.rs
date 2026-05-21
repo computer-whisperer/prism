@@ -408,7 +408,7 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     };
     let encode_push = EncodePush::sdr_identity();
 
-    renderer.render_frame(&scanout, &[element], &encode_push)?;
+    renderer.render_frame(&scanout, &[element], &encode_push, None)?;
     // Headless readback wants to map the scanout BO; the GPU work above
     // was submitted with a fence we don't wait on, so make sure it's done
     // before we map. device_wait_idle is fine here (one-shot test).
@@ -1408,12 +1408,35 @@ fn present_for_crtc(
     }
 
     let encode_push = EncodePush::sdr_identity();
+    // TEMP: bracket output.present() with crumbs for the first present that
+    // carries actual draws. If the hang shows up between BEFORE and AFTER,
+    // it lives in render_frame / page_flip. Inside render_frame, every
+    // stage emits its own crumb via the tracer closure too.
+    let crumb_present = total_tiles > 0;
+    if crumb_present {
+        breadcrumb(&format!(
+            "present(BEFORE) crtc {crtc:?} n_draws={n_draws} n_render_els={n_render_els}"
+        ));
+    }
+    let tracer_owned: Box<dyn Fn(&str)> = Box::new(move |s: &str| {
+        breadcrumb(&format!("{crtc:?}: {s}"));
+    });
     let presented = {
         let output = state
             .output_for_crtc(crtc)
             .ok_or_else(|| anyhow!("no output bound to crtc {crtc:?}"))?;
-        output.present(&elements, &encode_push)?
+        let tracer: Option<&dyn Fn(&str)> = if crumb_present {
+            Some(tracer_owned.as_ref())
+        } else {
+            None
+        };
+        output.present(&elements, &encode_push, tracer)?
     };
+    if crumb_present {
+        breadcrumb(&format!(
+            "present(AFTER) crtc {crtc:?} presented={presented}"
+        ));
+    }
 
     // Frame callbacks still want to iterate the toplevels mapped here.
     let surfaces: Vec<_> = state
@@ -1617,7 +1640,7 @@ fn run_gradient_scanout(
         push: DecodePush::identity_srgb([-1.0, -1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
     };
     let encode_push = EncodePush::sdr_identity();
-    renderer.render_frame(&scanout_image, &[element], &encode_push)?;
+    renderer.render_frame(&scanout_image, &[element], &encode_push, None)?;
     // One-shot TTY test: page-flip below needs the render to be done.
     unsafe {
         let _ = device.raw.device_wait_idle();

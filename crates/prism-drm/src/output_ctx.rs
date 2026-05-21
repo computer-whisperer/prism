@@ -205,6 +205,7 @@ impl OutputContext {
         &mut self,
         elements: &[ElementDraw],
         encode_push: &EncodePush,
+        tracer: Option<&dyn Fn(&str)>,
     ) -> Result<bool> {
         if self.frame_pending {
             return Ok(false);
@@ -212,7 +213,7 @@ impl OutputContext {
 
         let back = &self.buffers[self.back_index];
         self.renderer
-            .render_frame(&back.image, elements, encode_push)?;
+            .render_frame(&back.image, elements, encode_push, tracer)?;
 
         let src = Rectangle::from_size(
             (self.extent.width as i32, self.extent.height as i32).into(),
