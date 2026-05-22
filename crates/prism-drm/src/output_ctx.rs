@@ -396,6 +396,56 @@ impl OutputContext {
         // resolves both before we get here).
         self.config.panel_peak_nits_rgb
     }
+
+    /// Push a fresh `HDR_OUTPUT_METADATA` infoframe to the connector
+    /// reflecting the current effective per-channel panel peak.
+    ///
+    /// The infoframe's `max_display_mastering_luminance` field is a
+    /// single value — the highest mastering luminance the sink should
+    /// expect from our content — so we project the per-channel peaks
+    /// to `max(r, g, b)`. `max_cll` and `max_fall` are clamped down
+    /// to the new ceiling so the sink's tonemap targets a self-
+    /// consistent envelope. The mastering primaries / min luminance /
+    /// EOTF stay as the bringup config left them (they describe the
+    /// content's color volume, not the panel's calibrated peak).
+    ///
+    /// No-op on non-HDR outputs (no `config.hdr` block) or connectors
+    /// that don't expose HDR signaling (no `hdr_props`).
+    ///
+    /// Call this from any path that mutates `color_override
+    /// .panel_peak_nits_rgb` — the IPC `PanelPeakNits` handler is the
+    /// primary caller. Honest mid-session is the goal: a calibration
+    /// pass that discovers a tighter ceiling should immediately push
+    /// the new metadata so the sink tonemaps against measured reality
+    /// rather than the stale KDL value.
+    pub fn rebuild_hdr_infoframe(&mut self) -> Result<()> {
+        let Some(base) = self.config.hdr else {
+            return Ok(()); // non-HDR output — nothing to push
+        };
+        let peaks = self.effective_panel_peak_nits_rgb();
+        let new_max_lum = peaks
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            .clamp(0.0, u16::MAX as f32) as u16;
+        let mut signaling = base;
+        signaling.max_luminance = new_max_lum;
+        signaling.max_cll = signaling.max_cll.min(new_max_lum);
+        signaling.max_fall = signaling.max_fall.min(new_max_lum);
+        if let Some(props) = self.hdr_props.as_mut() {
+            props
+                .set_hdr(&self.surface, &signaling)
+                .context("rebuild HDR_OUTPUT_METADATA from current panel peak")?;
+            tracing::info!(
+                connector = %self.connector_name,
+                max_luminance = new_max_lum,
+                max_cll = signaling.max_cll,
+                max_fall = signaling.max_fall,
+                "HDR infoframe rebuilt from effective panel peak"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Runtime color overrides — see [`OutputContext::color_override`].
