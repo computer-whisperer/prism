@@ -978,6 +978,9 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         // overrides applied below when a connector's KDL color block
         // sets `sdr-reference-nits`.
         sdr_reference_nits: 80.0,
+        // Defaults to IEC sRGB ceiling; recalculated per-output below
+        // once HDR config / sdr-reference-nits are known.
+        panel_peak_nits: 80.0,
     };
 
     // ── Pick connectors + bring up OutputContexts on every card ────────────
@@ -1057,6 +1060,14 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                         );
                     }
                 }
+                // Resolve the decoder's display-referred clamp ceiling.
+                // HDR-on: panel peak is the user-declared HDR peak. SDR-on:
+                // the SDR reference (since SDR clients can't logically
+                // exceed that and there's no separate panel peak concept).
+                output_config.panel_peak_nits = match output_config.hdr {
+                    Some(hdr) => hdr.max_luminance as f32,
+                    None => output_config.sdr_reference_nits,
+                };
                 // Vrr always-on → wire through; on-demand currently
                 // treated as off (needs content_type signaling).
                 output_config.vrr = cfg.is_vrr_always_on();
@@ -1667,7 +1678,13 @@ fn render_output_now(
 
     // Snapshot identity bits without holding any borrow into
     // state.outputs (we'll re-borrow mutably at present() time below).
-    let (output_gpu_id, white_view, target_time, output_sdr_reference_nits) = {
+    let (
+        output_gpu_id,
+        white_view,
+        target_time,
+        output_sdr_reference_nits,
+        output_panel_peak_nits,
+    ) = {
         let output = state
             .outputs
             .get(output_id)
@@ -1677,6 +1694,7 @@ fn render_output_now(
             output.renderer.white_view(),
             output.frame_clock.next_presentation_time(),
             output.config.sdr_reference_nits,
+            output.config.panel_peak_nits,
         )
     };
 
@@ -1820,10 +1838,12 @@ fn render_output_now(
 
     // Lower RenderEls (geometry + tint) → ElementDraws (texture + push
     // constants). One pass; SolidColor/Border elements bind the white
-    // texel, Surface elements bind the per-surface view.
+    // texel, Surface elements bind the per-surface view. The per-output
+    // panel peak is threaded through so the decoder's display-referred
+    // clamp lands at the right value for each output.
     let mut elements: Vec<ElementDraw> = Vec::with_capacity(render_els.len());
     for el in &render_els {
-        el.lower(white_view, &mut elements);
+        el.lower(white_view, output_panel_peak_nits, &mut elements);
     }
 
     // Once per output, the first present that actually carries tiles —

@@ -134,4 +134,12 @@ pub struct OutputConfig {
     /// higher (203 = BT.2408 reference white, or somewhere between
     /// for taste).
     pub sdr_reference_nits: f32,
+    /// Panel luminance ceiling in cd/m² — the maximum value the
+    /// display-referred intermediate is allowed to hold for this
+    /// output. The decoder clamps post-EOTF values to this so the
+    /// rest of the pipeline (compositing, encode) operates entirely
+    /// within the panel's realizable range. Derived at bringup:
+    /// `hdr.max_luminance` for HDR outputs, `sdr_reference_nits` for
+    /// SDR outputs.
+    pub panel_peak_nits: f32,
 }
