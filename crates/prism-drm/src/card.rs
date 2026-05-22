@@ -134,14 +134,17 @@ pub struct OutputConfig {
     /// higher (203 = BT.2408 reference white, or somewhere between
     /// for taste).
     pub sdr_reference_nits: f32,
-    /// Panel luminance ceiling in cd/m² — the maximum value the
-    /// display-referred intermediate is allowed to hold for this
-    /// output. The decoder clamps post-EOTF values to this so the
-    /// rest of the pipeline (compositing, encode) operates entirely
-    /// within the panel's realizable range. Derived at bringup:
-    /// `hdr.max_luminance` for HDR outputs, `sdr_reference_nits` for
-    /// SDR outputs.
-    pub panel_peak_nits: f32,
+    /// Per-channel panel luminance ceiling in cd/m² — the maximum
+    /// value each subpixel channel of the display-referred
+    /// intermediate is allowed to hold for this output. The decoder
+    /// clamps post-EOTF values per-channel so the rest of the pipeline
+    /// operates entirely within the panel's realizable range.
+    /// Per-channel because real subpixel peaks differ — OLED ABL
+    /// allocates power per subpixel, and LCD color-filter transmission
+    /// varies per primary. Derived at bringup: KDL `panel-peak-nits
+    /// r=… g=… b=…` (preferred, from calibration), else broadcast of
+    /// `hdr.max_luminance` (HDR) or `sdr_reference_nits` (SDR).
+    pub panel_peak_nits_rgb: [f32; 3],
     /// Per-channel response correction parameters: `(gain_rgb,
     /// gamma_rgb)`. The encoder applies `(in / gain)^(1/gamma)` per
     /// channel before the OETF to compensate for the panel's measured

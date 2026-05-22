@@ -377,14 +377,24 @@ impl OutputContext {
             .or(self.config.response_curve)
     }
 
-    /// Effective panel-peak ceiling (the value the decoder clamps to).
-    /// HDR outputs always derive from `hdr.max_luminance`; SDR outputs
-    /// from the effective SDR reference (config or runtime override).
-    pub fn effective_panel_peak_nits(&self) -> f32 {
-        match self.config.hdr {
-            Some(hdr) => hdr.max_luminance as f32,
-            None => self.effective_sdr_reference_nits(),
+    /// Effective per-channel panel-peak ceiling (the value the decoder
+    /// clamps to, per channel). Resolution order:
+    ///   1. Runtime IPC override (set by calibration tools)
+    ///   2. KDL config `panel-peak-nits-r/-g/-b` (from prior calibration)
+    ///   3. Broadcast of HDR `max_luminance` (HDR-mode outputs) or
+    ///      effective `sdr_reference_nits` (SDR-mode outputs)
+    ///
+    /// The broadcast fallback is a conservative all-channels-equal
+    /// guess; once a calibration pass has run, (1) or (2) carries the
+    /// true per-subpixel ceiling.
+    pub fn effective_panel_peak_nits_rgb(&self) -> [f32; 3] {
+        if let Some(rgb) = self.color_override.panel_peak_nits_rgb {
+            return rgb;
         }
+        // Cached config value is already the per-channel value (KDL
+        // override or bringup-time broadcast — main.rs::bringup
+        // resolves both before we get here).
+        self.config.panel_peak_nits_rgb
     }
 }
 
@@ -395,6 +405,10 @@ impl OutputContext {
 pub struct ColorOverride {
     pub sdr_reference_nits: Option<f32>,
     pub response_curve: Option<([f32; 3], [f32; 3])>,
+    /// Per-channel panel luminance ceiling override. Set by
+    /// calibration tools after the per-channel saturation discovery
+    /// phase produces measured per-subpixel maxima.
+    pub panel_peak_nits_rgb: Option<[f32; 3]>,
 }
 
 impl OutputContext {

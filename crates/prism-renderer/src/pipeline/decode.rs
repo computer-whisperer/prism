@@ -35,13 +35,17 @@ pub struct DecodePush {
     pub tint: [f32; 4],
     pub sdr_white_nits: f32,
     pub transfer: i32,
-    /// Per-output panel luminance ceiling, in nits. The intermediate
-    /// is display-referred: post-decode values get clamped to this.
-    /// Defaults set by `identity_srgb`/`solid` to a very large value
-    /// (PQ's 10000-nit max) so unconfigured callers get effectively-
-    /// no-op behaviour; the render-path constructor overrides per-output.
-    pub output_peak_nits: f32,
     pub _pad1: i32,
+    pub _pad2: i32,
+    /// Per-output, per-channel panel luminance ceiling, in nits. The
+    /// intermediate is display-referred: post-decode values get
+    /// clamped per-channel to this. `.a` is unused (vec4 only because
+    /// std430 vec3 alignment is awkward in push constants). Defaults
+    /// set by `identity_srgb`/`solid` to a very large value (PQ's
+    /// 10000-nit max) broadcast to all three so unconfigured callers
+    /// get effectively-no-op behaviour; the render-path constructor
+    /// overrides per-output with the effective per-channel peaks.
+    pub output_peak_nits_rgba: [f32; 4],
 }
 
 impl DecodePush {
@@ -55,8 +59,9 @@ impl DecodePush {
             // 0 = Linear (no decode). The smoke test feeds an already-linear
             // RGBA16_SFLOAT texture, so this is the right choice for #48.
             transfer: 0,
-            output_peak_nits: 10_000.0,
             _pad1: 0,
+            _pad2: 0,
+            output_peak_nits_rgba: [10_000.0, 10_000.0, 10_000.0, 0.0],
         }
     }
 
@@ -71,8 +76,9 @@ impl DecodePush {
             tint: color_bt2020_nits,
             sdr_white_nits: 1.0,
             transfer: 0,
-            output_peak_nits: 10_000.0,
             _pad1: 0,
+            _pad2: 0,
+            output_peak_nits_rgba: [10_000.0, 10_000.0, 10_000.0, 0.0],
         }
     }
 }

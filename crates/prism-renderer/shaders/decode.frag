@@ -32,15 +32,19 @@ layout(push_constant) uniform Push {
     vec4 tint;
     float sdr_white_nits;
     int transfer;
-    // Per-output panel luminance ceiling, in nits. The intermediate
-    // is display-referred: post-decode values are clamped to this
-    // peak so downstream compositing operates entirely within the
-    // panel's realizable range, and the encoder is responsible only
-    // for emitting what the intermediate holds (no further clamping
-    // needed). Set per output from the HDR max_luminance config or
-    // sdr_reference_nits for SDR outputs.
-    float output_peak_nits;
     int _pad1;
+    int _pad2;
+    // Per-output, per-channel panel luminance ceiling, in nits. The
+    // intermediate is display-referred: post-decode values are clamped
+    // to this peak so downstream compositing operates entirely within
+    // the panel's realizable range, and the encoder is responsible
+    // only for emitting what the intermediate holds. Per-channel
+    // because subpixel peaks differ on real panels — OLED ABL allocates
+    // power per subpixel, and LCD color-filter transmission varies per
+    // primary. `.a` is unused (vec4 to avoid std430 vec3 alignment
+    // overhead). Set per output by the calibration pipeline; default
+    // broadcasts hdr.max_luminance / sdr_reference_nits to all three.
+    vec4 output_peak_nits_rgba;
 } push;
 
 layout(location = 0) in vec2 v_uv;
@@ -117,11 +121,13 @@ void main() {
     // (HDR content from clients that haven't tone-mapped to the
     // output, or sRGB content with an unusually high sdr_white_nits)
     // hard-clip here so the rest of the pipeline operates in-range.
-    // Per-channel clamp is fine for our additive-channel panels;
-    // chromaticity preservation would warrant a luminance-aware
-    // tone-map at this stage, which we don't have yet (deferred —
-    // see docs/phase-2-scanout-followups.md).
-    bt2020 = clamp(bt2020, vec3(0.0), vec3(push.output_peak_nits));
+    // Per-channel: a buffer carrying (1000, 0, 0) nits red is clipped
+    // by red's ceiling, not green's — under-clipping bright pure
+    // colors against an all-channel scalar would lose chromaticity
+    // we could otherwise preserve. Chromaticity-preserving tone-map
+    // would warrant a luminance-aware stage, which we don't have yet
+    // (deferred — see docs/phase-2-scanout-followups.md).
+    bt2020 = clamp(bt2020, vec3(0.0), push.output_peak_nits_rgba.rgb);
 
     // Output to fp16 intermediate. Alpha is passed through unchanged so
     // standard pre-multiplied blending composes correctly in linear space.

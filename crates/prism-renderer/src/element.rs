@@ -71,11 +71,12 @@ pub struct SurfaceEl {
 }
 
 impl SurfaceEl {
-    pub fn to_draw(&self, output_peak_nits: f32) -> ElementDraw {
+    pub fn to_draw(&self, output_peak_nits_rgb: [f32; 3]) -> ElementDraw {
         let mut push = DecodePush::identity_srgb(self.dst_rect_clip, self.src_rect_uv);
         push.transfer = self.color.transfer;
         push.sdr_white_nits = self.color.sdr_white_nits;
-        push.output_peak_nits = output_peak_nits;
+        let [r, g, b] = output_peak_nits_rgb;
+        push.output_peak_nits_rgba = [r, g, b, 0.0];
         ElementDraw {
             texture_view: self.texture_view,
             push,
@@ -93,9 +94,10 @@ pub struct SolidColorEl {
 }
 
 impl SolidColorEl {
-    pub fn to_draw(&self, white_view: vk::ImageView, output_peak_nits: f32) -> ElementDraw {
+    pub fn to_draw(&self, white_view: vk::ImageView, output_peak_nits_rgb: [f32; 3]) -> ElementDraw {
         let mut push = DecodePush::solid(self.rect_clip, self.color_bt2020_nits);
-        push.output_peak_nits = output_peak_nits;
+        let [r, g, b] = output_peak_nits_rgb;
+        push.output_peak_nits_rgba = [r, g, b, 0.0];
         ElementDraw {
             texture_view: white_view,
             push,
@@ -123,7 +125,7 @@ impl BorderEl {
     pub fn push_draws(
         &self,
         white_view: vk::ImageView,
-        output_peak_nits: f32,
+        output_peak_nits_rgb: [f32; 3],
         out: &mut Vec<ElementDraw>,
     ) {
         let [x_min, y_min, x_max, y_max] = self.rect_clip;
@@ -136,7 +138,7 @@ impl BorderEl {
                     rect_clip: [x_min, y_min, x_max, y_min + t],
                     color_bt2020_nits: self.color_bt2020_nits,
                 }
-                .to_draw(white_view, output_peak_nits),
+                .to_draw(white_view, output_peak_nits_rgb),
             );
         }
         // Bottom stripe — full width × b.
@@ -146,7 +148,7 @@ impl BorderEl {
                     rect_clip: [x_min, y_max - b, x_max, y_max],
                     color_bt2020_nits: self.color_bt2020_nits,
                 }
-                .to_draw(white_view, output_peak_nits),
+                .to_draw(white_view, output_peak_nits_rgb),
             );
         }
         // Left stripe — l × inner-height (between the horizontal stripes).
@@ -156,7 +158,7 @@ impl BorderEl {
                     rect_clip: [x_min, y_min + t, x_min + l, y_max - b],
                     color_bt2020_nits: self.color_bt2020_nits,
                 }
-                .to_draw(white_view, output_peak_nits),
+                .to_draw(white_view, output_peak_nits_rgb),
             );
         }
         // Right stripe — r × inner-height.
@@ -166,7 +168,7 @@ impl BorderEl {
                     rect_clip: [x_max - r, y_min + t, x_max, y_max - b],
                     color_bt2020_nits: self.color_bt2020_nits,
                 }
-                .to_draw(white_view, output_peak_nits),
+                .to_draw(white_view, output_peak_nits_rgb),
             );
         }
     }
@@ -186,13 +188,13 @@ impl RenderEl {
     pub fn lower(
         &self,
         white_view: vk::ImageView,
-        output_peak_nits: f32,
+        output_peak_nits_rgb: [f32; 3],
         out: &mut Vec<ElementDraw>,
     ) {
         match self {
-            Self::Surface(s) => out.push(s.to_draw(output_peak_nits)),
-            Self::SolidColor(s) => out.push(s.to_draw(white_view, output_peak_nits)),
-            Self::Border(b) => b.push_draws(white_view, output_peak_nits, out),
+            Self::Surface(s) => out.push(s.to_draw(output_peak_nits_rgb)),
+            Self::SolidColor(s) => out.push(s.to_draw(white_view, output_peak_nits_rgb)),
+            Self::Border(b) => b.push_draws(white_view, output_peak_nits_rgb, out),
         }
     }
 }

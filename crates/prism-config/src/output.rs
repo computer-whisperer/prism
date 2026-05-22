@@ -153,12 +153,36 @@ pub struct ColorConfig {
     pub sdr_reference_nits: Option<f64>,
     /// Per-channel response correction. The encoder inverts the
     /// panel's measured response (`emitted = gain * commanded^gamma`)
-    /// so commanded nits match emitted nits. Derive from a Spyder
-    /// sweep (`spyder sweep --hdr --window 0.1 ...`) — fit
-    /// `gain` and `gamma` per channel to the measured-vs-requested
-    /// curve. Identity (gain=1, gamma=1) when unset.
+    /// so commanded nits match emitted nits. Derive from a tristim
+    /// sweep — fit `gain` and `gamma` per channel to the measured-vs-
+    /// requested curve. Identity (gain=1, gamma=1) when unset.
     #[knuffel(child)]
     pub response_curve: Option<ResponseCurve>,
+    /// Per-channel measured panel peak luminance, in cd/m². Each
+    /// subpixel of a real panel has its own emission ceiling — OLED
+    /// ABL allocates power per subpixel; LCD color-filter transmission
+    /// varies per primary. The decoder's display-referred clamp uses
+    /// these as per-channel ceilings so the f32 intermediate stays
+    /// inside the panel's realizable range. When unset, derived from
+    /// `hdr.max_luminance` (HDR mode) or `sdr_reference_nits` (SDR
+    /// mode) broadcast to all three channels — a conservative guess
+    /// that the calibration tool replaces with measured values.
+    #[knuffel(child)]
+    pub panel_peak_nits: Option<PanelPeakNits>,
+}
+
+/// Per-channel measured panel peak luminance. See [`ColorConfig::panel_peak_nits`].
+#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+pub struct PanelPeakNits {
+    /// Red-channel measured peak (cd/m²).
+    #[knuffel(property)]
+    pub r: f64,
+    /// Green-channel measured peak (cd/m²).
+    #[knuffel(property)]
+    pub g: f64,
+    /// Blue-channel measured peak (cd/m²).
+    #[knuffel(property)]
+    pub b: f64,
 }
 
 /// Per-channel response correction parameters. See [`ColorConfig::response_curve`].

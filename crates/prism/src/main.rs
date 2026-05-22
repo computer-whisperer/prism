@@ -980,9 +980,10 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         // overrides applied below when a connector's KDL color block
         // sets `sdr-reference-nits`.
         sdr_reference_nits: 80.0,
-        // Defaults to IEC sRGB ceiling; recalculated per-output below
-        // once HDR config / sdr-reference-nits are known.
-        panel_peak_nits: 80.0,
+        // Defaults to IEC sRGB ceiling broadcast to all three channels;
+        // recalculated per-output below once HDR config / sdr-reference-nits
+        // / explicit panel-peak-nits are known.
+        panel_peak_nits_rgb: [80.0, 80.0, 80.0],
         response_curve: None,
     };
 
@@ -1063,14 +1064,33 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                         );
                     }
                 }
-                // Resolve the decoder's display-referred clamp ceiling.
-                // HDR-on: panel peak is the user-declared HDR peak. SDR-on:
-                // the SDR reference (since SDR clients can't logically
-                // exceed that and there's no separate panel peak concept).
-                output_config.panel_peak_nits = match output_config.hdr {
-                    Some(hdr) => hdr.max_luminance as f32,
-                    None => output_config.sdr_reference_nits,
+                // Resolve the decoder's display-referred clamp ceiling
+                // per channel. Resolution order:
+                //   1. Explicit KDL `color.panel-peak-nits r=… g=… b=…`
+                //      (preferred — calibrated per-subpixel)
+                //   2. Broadcast of HDR `max_luminance` (HDR mode)
+                //   3. Broadcast of SDR reference (SDR mode)
+                // The broadcast fallbacks are conservative all-channels-
+                // equal guesses; calibrate replaces them.
+                output_config.panel_peak_nits_rgb = match cfg
+                    .color
+                    .as_ref()
+                    .and_then(|c| c.panel_peak_nits)
+                {
+                    Some(p) => [p.r as f32, p.g as f32, p.b as f32],
+                    None => {
+                        let scalar = match output_config.hdr {
+                            Some(hdr) => hdr.max_luminance as f32,
+                            None => output_config.sdr_reference_nits,
+                        };
+                        [scalar, scalar, scalar]
+                    }
                 };
+                tracing::info!(
+                    connector = %name,
+                    panel_peak_nits_rgb = ?output_config.panel_peak_nits_rgb,
+                    "per-output panel peak resolved"
+                );
                 if let Some(curve) = cfg.color.as_ref().and_then(|c| c.response_curve.as_ref()) {
                     // Clamp to physically-meaningful ranges. Gain <= 0
                     // would zero-divide; gamma <= 0 would produce
@@ -1728,7 +1748,7 @@ fn render_output_now(
         white_view,
         target_time,
         output_sdr_reference_nits,
-        output_panel_peak_nits,
+        output_panel_peak_nits_rgb,
     ) = {
         let output = state
             .outputs
@@ -1739,7 +1759,7 @@ fn render_output_now(
             output.renderer.white_view(),
             output.frame_clock.next_presentation_time(),
             output.effective_sdr_reference_nits(),
-            output.effective_panel_peak_nits(),
+            output.effective_panel_peak_nits_rgb(),
         )
     };
 
@@ -1888,7 +1908,7 @@ fn render_output_now(
     // clamp lands at the right value for each output.
     let mut elements: Vec<ElementDraw> = Vec::with_capacity(render_els.len());
     for el in &render_els {
-        el.lower(white_view, output_panel_peak_nits, &mut elements);
+        el.lower(white_view, output_panel_peak_nits_rgb, &mut elements);
     }
 
     // Once per output, the first present that actually carries tiles —
