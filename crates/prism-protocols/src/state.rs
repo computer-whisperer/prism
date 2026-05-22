@@ -303,7 +303,20 @@ impl PrismState {
         let xdg_decoration = XdgDecorationState::new::<PrismState>(&dh);
         // Empty extra-formats list: ARGB8888 and XRGB8888 are mandatory and
         // smithay advertises them implicitly.
-        let shm = ShmState::new::<PrismState>(&dh, []);
+        // Advertise fp16 shm formats alongside the mandatory
+        // XRGB8888/ARGB8888 (smithay adds those implicitly). fp16 is
+        // what HDR-aware clients (Spyder calibration patches, future
+        // color-managed UI work) need to write PQ-encoded values at
+        // useful precision — 8-bit PQ has visible banding from ~30
+        // nits up. Advertised unconditionally so clients can probe;
+        // ARGB clients are unaffected.
+        let shm = ShmState::new::<PrismState>(
+            &dh,
+            [
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Xbgr16161616f,
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Abgr16161616f,
+            ],
+        );
 
         // Hardcoded minimal dmabuf format set for now: XRGB8888 / ARGB8888
         // with LINEAR modifier. Both map to vk::Format::B8G8R8A8_UNORM. Tiled
@@ -1975,6 +1988,14 @@ fn vk_format_for_shm(fmt: wl_shm::Format) -> Option<vk::Format> {
         // wl_shm formats are byte-order in memory the same way DRM fourcc
         // is: Argb8888 == B,G,R,A bytes == vk::Format::B8G8R8A8_UNORM.
         wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 => vk::Format::B8G8R8A8_UNORM,
+        // fp16. wl_shm `Abgr16161616f` is R,G,B,A half-floats in
+        // memory order — that's Vulkan's R16G16B16A16_SFLOAT. `Xbgr`
+        // is the alpha-undefined variant; Vulkan has no Xbgr float
+        // format, so we sample as R16G16B16A16_SFLOAT and the alpha
+        // channel is whatever the client wrote.
+        wl_shm::Format::Xbgr16161616f | wl_shm::Format::Abgr16161616f => {
+            vk::Format::R16G16B16A16_SFLOAT
+        }
         _ => return None,
     })
 }
