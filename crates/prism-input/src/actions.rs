@@ -15,7 +15,9 @@
 use std::process::Command;
 
 use prism_config::Action;
+use prism_layout::layout::ActivateWindow;
 use prism_protocols::PrismState;
+use smithay::output::Output;
 
 pub fn handle_action(state: &mut PrismState, action: Action) {
     use Action as A;
@@ -78,15 +80,65 @@ pub fn handle_action(state: &mut PrismState, action: Action) {
             state.layout.move_down();
             queue_redraw_active_output(state);
         }
-        // Monitor navigation — TODO: needs a "neighbour output at
-        // direction X from current focus" helper (niri walks the
-        // global_space's output geometries to find adjacency).
-        A::FocusMonitorLeft
-        | A::FocusMonitorRight
-        | A::FocusMonitorUp
-        | A::FocusMonitorDown => {
-            tracing::debug!("action: focus-monitor-* not yet wired (need directional output lookup)");
+        // Monitor navigation. Directional lookup walks every wl_output's
+        // (location, logical_size) and picks the nearest neighbor whose
+        // perpendicular extent overlaps the active output's. Mirrors
+        // niri's `output_left_of`/`output_right_of`/etc.
+        A::FocusMonitorLeft => {
+            if let Some(out) = state.output_left() {
+                state.layout.focus_output(&out);
+                queue_redraw_active_output(state);
+            }
         }
+        A::FocusMonitorRight => {
+            if let Some(out) = state.output_right() {
+                state.layout.focus_output(&out);
+                queue_redraw_active_output(state);
+            }
+        }
+        A::FocusMonitorUp => {
+            if let Some(out) = state.output_up() {
+                state.layout.focus_output(&out);
+                queue_redraw_active_output(state);
+            }
+        }
+        A::FocusMonitorDown => {
+            if let Some(out) = state.output_down() {
+                state.layout.focus_output(&out);
+                queue_redraw_active_output(state);
+            }
+        }
+        A::FocusMonitorPrevious => {
+            if let Some(out) = state.output_previous() {
+                state.layout.focus_output(&out);
+                queue_redraw_active_output(state);
+            }
+        }
+        A::FocusMonitorNext => {
+            if let Some(out) = state.output_next() {
+                state.layout.focus_output(&out);
+                queue_redraw_active_output(state);
+            }
+        }
+        // Move the active column to a neighboring monitor (the whole
+        // tile stack moves together). `activate=true` means focus
+        // follows the column to the new monitor — the most common
+        // expectation; matches niri's default.
+        A::MoveColumnToMonitorLeft => move_active_column_to(state, state.output_left()),
+        A::MoveColumnToMonitorRight => move_active_column_to(state, state.output_right()),
+        A::MoveColumnToMonitorUp => move_active_column_to(state, state.output_up()),
+        A::MoveColumnToMonitorDown => move_active_column_to(state, state.output_down()),
+        A::MoveColumnToMonitorPrevious => move_active_column_to(state, state.output_previous()),
+        A::MoveColumnToMonitorNext => move_active_column_to(state, state.output_next()),
+        // Move a single window (the active one) — leaves the rest of
+        // the column behind. Uses `Layout::move_to_output(None, ...)`
+        // which picks "the active window" when window=None.
+        A::MoveWindowToMonitorLeft => move_active_window_to(state, state.output_left()),
+        A::MoveWindowToMonitorRight => move_active_window_to(state, state.output_right()),
+        A::MoveWindowToMonitorUp => move_active_window_to(state, state.output_up()),
+        A::MoveWindowToMonitorDown => move_active_window_to(state, state.output_down()),
+        A::MoveWindowToMonitorPrevious => move_active_window_to(state, state.output_previous()),
+        A::MoveWindowToMonitorNext => move_active_window_to(state, state.output_next()),
         // Workspace navigation
         A::FocusWorkspaceUp => {
             state.layout.switch_workspace_up();
@@ -185,6 +237,35 @@ fn spawn(args: Vec<String>) {
     }
 }
 
+
+/// Move the active column to `target`. No-op if the target is `None`
+/// (i.e. there's no monitor in that direction). After moving, focus
+/// follows the column to the new monitor (`activate=true`) and we
+/// redraw both source and destination — both visibly changed.
+fn move_active_column_to(state: &mut PrismState, target: Option<Output>) {
+    let Some(out) = target else {
+        return;
+    };
+    state.layout.move_column_to_output(&out, None, true);
+    // focus_output is implied by activate=true above; the focus ring
+    // moves to the target. Queue redraws on every output — the column
+    // disappeared from one, appeared on another, and any column-shift
+    // between siblings on the source also needs to repaint.
+    queue_redraw_active_output(state);
+}
+
+/// Move just the active window (not the whole column) to `target`.
+/// `move_to_output(None, ...)` picks "the active window" by convention,
+/// matching niri's `MoveWindowToMonitor*` semantics.
+fn move_active_window_to(state: &mut PrismState, target: Option<Output>) {
+    let Some(out) = target else {
+        return;
+    };
+    state
+        .layout
+        .move_to_output(None, &out, None, ActivateWindow::Smart);
+    queue_redraw_active_output(state);
+}
 
 /// Queue a redraw on whatever output currently hosts the focus. The
 /// layout updates may have moved things across outputs; conservatively

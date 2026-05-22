@@ -17,7 +17,11 @@
 pub mod actions;
 pub mod backend_ext;
 pub mod dispatch;
+pub mod move_grab;
 pub mod pointer;
+pub mod resize_grab;
 
 pub use backend_ext::{PrismInputBackend, PrismInputDevice};
 pub use dispatch::process_input_event;
+pub use move_grab::MoveGrab;
+pub use resize_grab::ResizeGrab;

@@ -551,6 +551,123 @@ impl PrismState {
         None
     }
 
+    /// The smithay `Output` whose connector is the layout's currently
+    /// active monitor (i.e. the one carrying the focus ring). `None` if
+    /// the layout has no active output.
+    pub fn active_output(&self) -> Option<Output> {
+        self.layout.active_output().cloned()
+    }
+
+    /// Output to the left of the active one — i.e. the nearest other
+    /// output whose center is to the left of the active output's center
+    /// and whose vertical extent overlaps the active output's vertical
+    /// extent. Ported from niri's `output_left_of` in `niri.rs:3465`.
+    /// `None` if no such neighbor exists.
+    pub fn output_left(&self) -> Option<Output> {
+        let cur = self.active_output()?;
+        self.neighbor_in_direction(&cur, Direction::Left)
+    }
+
+    /// Output to the right of the active one. See [`output_left`].
+    pub fn output_right(&self) -> Option<Output> {
+        let cur = self.active_output()?;
+        self.neighbor_in_direction(&cur, Direction::Right)
+    }
+
+    /// Output above the active one. See [`output_left`].
+    pub fn output_up(&self) -> Option<Output> {
+        let cur = self.active_output()?;
+        self.neighbor_in_direction(&cur, Direction::Up)
+    }
+
+    /// Output below the active one. See [`output_left`].
+    pub fn output_down(&self) -> Option<Output> {
+        let cur = self.active_output()?;
+        self.neighbor_in_direction(&cur, Direction::Down)
+    }
+
+    /// Previous output in sorted-connector-name order, wrapping at the
+    /// front (so calling Previous from the leftmost returns the rightmost).
+    /// `None` if there's only one output.
+    pub fn output_previous(&self) -> Option<Output> {
+        let cur = self.active_output()?;
+        self.cyclic_neighbor(&cur, /* forward */ false)
+    }
+
+    /// Next output in sorted-connector-name order, wrapping at the end.
+    /// `None` if there's only one output.
+    pub fn output_next(&self) -> Option<Output> {
+        let cur = self.active_output()?;
+        self.cyclic_neighbor(&cur, /* forward */ true)
+    }
+
+    fn neighbor_in_direction(&self, current: &Output, dir: Direction) -> Option<Output> {
+        // Build (output, logical_rect) for everyone. Skip outputs we
+        // can't measure (no mode).
+        let mut all: Vec<(&Output, i32, i32, i32, i32)> = Vec::new();
+        for o in self.wl_outputs.values() {
+            let loc = o.current_location();
+            let (lw, lh) = output_logical_size(o)?;
+            all.push((o, loc.x, loc.y, lw, lh));
+        }
+        let cur = all.iter().find(|(o, ..)| *o == current).copied()?;
+        let cur_cx = cur.1 + cur.3 / 2;
+        let cur_cy = cur.2 + cur.4 / 2;
+
+        // "Extended" rect mirroring niri: same height (for left/right)
+        // or same width (for up/down), stretched to the screen-edge so
+        // we pick up any output that overlaps the relevant axis stripe.
+        all.iter()
+            .filter(|(o, ..)| *o != current)
+            .filter_map(|&(o, x, y, w, h)| {
+                let cx = x + w / 2;
+                let cy = y + h / 2;
+                match dir {
+                    Direction::Left => (cx < cur_cx
+                        && overlaps_y(cur.2, cur.4, y, h))
+                        .then(|| (o, cur_cx - cx)),
+                    Direction::Right => (cx > cur_cx
+                        && overlaps_y(cur.2, cur.4, y, h))
+                        .then(|| (o, cx - cur_cx)),
+                    Direction::Up => (cy < cur_cy
+                        && overlaps_x(cur.1, cur.3, x, w))
+                        .then(|| (o, cur_cy - cy)),
+                    Direction::Down => (cy > cur_cy
+                        && overlaps_x(cur.1, cur.3, x, w))
+                        .then(|| (o, cy - cur_cy)),
+                }
+            })
+            .min_by_key(|(_, d)| *d)
+            .map(|(o, _)| o.clone())
+    }
+
+    fn cyclic_neighbor(&self, current: &Output, forward: bool) -> Option<Output> {
+        let mut sorted: Vec<&Output> = self.wl_outputs.values().collect();
+        sorted.sort_by(|a, b| {
+            let an = a
+                .user_data()
+                .get::<prism_config::OutputName>()
+                .map(|n| n.connector.clone())
+                .unwrap_or_default();
+            let bn = b
+                .user_data()
+                .get::<prism_config::OutputName>()
+                .map(|n| n.connector.clone())
+                .unwrap_or_default();
+            an.cmp(&bn)
+        });
+        if sorted.len() < 2 {
+            return None;
+        }
+        let i = sorted.iter().position(|o| *o == current)?;
+        let next = if forward {
+            (i + 1) % sorted.len()
+        } else {
+            (i + sorted.len() - 1) % sorted.len()
+        };
+        Some(sorted[next].clone())
+    }
+
     /// Look up the config-specified scale + transform for a connector.
     /// Falls back to `(Scale::Integer(1), Transform::Normal)` when there's
     /// no matching `output "..."` block. Transform != Normal logs a
@@ -1034,11 +1151,11 @@ impl XdgShellHandler for PrismState {
         // in sync; a fresh transaction is the "don't coordinate with
         // anyone" default).
         let wl_surface = surface.wl_surface();
-        let window_id = self
+        let lookup = self
             .layout
             .find_window_and_output(wl_surface)
-            .map(|(mapped, _)| mapped.window.clone());
-        if let Some(window) = window_id {
+            .map(|(mapped, out)| (mapped.window.clone(), out.cloned()));
+        if let Some((window, output)) = lookup {
             self.layout.remove_window(
                 &window,
                 prism_layout::utils::transaction::Transaction::new(),
@@ -1047,6 +1164,29 @@ impl XdgShellHandler for PrismState {
                 surface_id = ?wl_surface.id(),
                 "removed destroyed xdg_toplevel from layout"
             );
+            // After removing the last window on an output, the screen
+            // hangs on the previous frame until something else triggers
+            // a redraw (vblank doesn't fire on its own — render is
+            // damage-driven). Queue a redraw on the affected output (or
+            // every output as a fallback if we couldn't determine which
+            // one) so the now-empty workspace repaints once.
+            match output {
+                Some(out) => {
+                    if let Some(name) = self
+                        .wl_outputs
+                        .iter()
+                        .find_map(|(id, o)| (o == &out).then_some(id.clone()))
+                    {
+                        self.output_redraw.entry(name).or_default().queue_redraw();
+                    }
+                }
+                None => {
+                    let ids: Vec<_> = self.outputs.keys().cloned().collect();
+                    for id in ids {
+                        self.output_redraw.entry(id).or_default().queue_redraw();
+                    }
+                }
+            }
         }
     }
 }
@@ -1655,6 +1795,28 @@ fn vk_format_for(fourcc: DrmFourcc) -> Option<vk::Format> {
 }
 
 // ─── Per-output config helpers ──────────────────────────────────────────────
+
+/// Cardinal directions used by `PrismState::output_left/right/up/down`.
+/// Kept private; the public API exposes one method per direction.
+#[derive(Clone, Copy, Debug)]
+enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Do two 1-D intervals overlap? `a_start..a_start+a_len` ∩
+/// `b_start..b_start+b_len` non-empty. Used by `neighbor_in_direction`
+/// to require y-overlap for left/right neighbors (and x-overlap for
+/// up/down).
+fn overlaps_x(ax: i32, aw: i32, bx: i32, bw: i32) -> bool {
+    ax < bx.saturating_add(bw) && bx < ax.saturating_add(aw)
+}
+
+fn overlaps_y(ay: i32, ah: i32, by: i32, bh: i32) -> bool {
+    ay < by.saturating_add(bh) && by < ay.saturating_add(ah)
+}
 
 /// Logical (post-scale) size of an `Output` in logical pixels. `None` if no
 /// current mode is set. Mirrors `Mode.size.to_logical(scale)` but spelled

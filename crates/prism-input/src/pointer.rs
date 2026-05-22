@@ -59,6 +59,7 @@ pub fn on_pointer_motion<I: PrismInputBackend>(
         },
     );
     pointer.frame(state);
+    maybe_focus_follows_mouse(state, serial);
     // Walk the cursor plane on every output: show on the output the
     // pointer is in, hide on the rest, queue redraws on changes.
     prism_protocols::state::update_output_cursors(state);
@@ -100,6 +101,7 @@ pub fn on_pointer_motion_absolute<I: PrismInputBackend>(
         },
     );
     pointer.frame(state);
+    maybe_focus_follows_mouse(state, serial);
     prism_protocols::state::update_output_cursors(state);
 }
 
@@ -112,10 +114,12 @@ pub fn on_pointer_button<I: PrismInputBackend>(
     };
     let serial = SERIAL_COUNTER.next_serial();
     let time = smithay::backend::input::Event::time_msec(&event);
-    let button = match event.button() {
-        Some(b) => b as u32,
-        None => return,
-    };
+    // `event.button()` returns Option<MouseButton> (an enum); casting
+    // its discriminant via `as u32` gives 0/1/2/… — not the linux
+    // input event code (`BTN_LEFT=0x110`, `BTN_RIGHT=0x111`, …) that
+    // clients and our grab triggers actually expect. Use button_code()
+    // for the raw kernel value.
+    let button = event.button_code();
     let state_pressed = event.state() == ButtonState::Pressed;
 
     // Click-to-focus: on press, take keyboard focus to the surface
@@ -126,7 +130,7 @@ pub fn on_pointer_button<I: PrismInputBackend>(
     // DP-4 on the current hardware), even when the user clicks
     // somewhere else. niri runs the same `focus_output` from its
     // input handlers.
-    if state_pressed {
+    if state_pressed && !pointer.is_grabbed() {
         if let Some((surface, _)) = surface_under_pointer(state) {
             // Resolve the surface's output for focus_output.
             let output_for_focus = state
@@ -137,6 +141,16 @@ pub fn on_pointer_button<I: PrismInputBackend>(
             if let Some(out) = output_for_focus {
                 state.layout.focus_output(&out);
             }
+        }
+
+        // Mod+LeftClick / Mod+RightClick on a window installs an
+        // interactive grab — move / resize respectively. Mirrors
+        // niri's `on_pointer_button` triggers (input/mod.rs:2895+).
+        if try_begin_window_grab(state, button, serial) {
+            // Don't forward this button press to clients — the press
+            // is consumed by the grab. The release will be delivered
+            // by the grab's own button handler when it unsets.
+            return;
         }
     }
 
@@ -150,6 +164,101 @@ pub fn on_pointer_button<I: PrismInputBackend>(
         },
     );
     pointer.frame(state);
+}
+
+/// Linux input-event codes for the mouse buttons we trigger grabs on.
+/// Match niri's hardcoded constants in `input/mod.rs::on_pointer_button`.
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+
+/// Try to start an interactive move (Mod+LeftClick) or resize
+/// (Mod+RightClick) grab. Returns `true` if a grab was installed (in
+/// which case the caller should not forward the originating button
+/// press to clients).
+fn try_begin_window_grab(
+    state: &mut PrismState,
+    button: u32,
+    serial: smithay::utils::Serial,
+) -> bool {
+    use prism_config::ModKey;
+    use smithay::input::pointer::Focus;
+
+    // Only the two buttons we use as gesture triggers.
+    if button != BTN_LEFT && button != BTN_RIGHT {
+        return false;
+    }
+
+    // Mod-down check. Without it, plain LeftClick would also start a
+    // move grab — not what the user wants.
+    let mod_key = state
+        .config
+        .borrow()
+        .input
+        .mod_key
+        .unwrap_or(ModKey::Super);
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return false;
+    };
+    let mods = keyboard.modifier_state();
+    let mods_bits = crate::dispatch::modifiers_from_state(mods);
+    if !mods_bits.contains(mod_key.to_modifiers()) {
+        return false;
+    }
+
+    // Window + output + position-within-output under the cursor.
+    let px = state.pointer_pos.x as i32;
+    let py = state.pointer_pos.y as i32;
+    let Some(output_id) = state.output_containing((px, py)) else {
+        return false;
+    };
+    let Some(out) = state.wl_outputs.get(&output_id).cloned() else {
+        return false;
+    };
+    let origin = out.current_location();
+    let pos_within_output = Point::<f64, Logical>::from((
+        state.pointer_pos.x - origin.x as f64,
+        state.pointer_pos.y - origin.y as f64,
+    ));
+    let Some((mapped, _hit)) = state.layout.window_under(&out, pos_within_output) else {
+        return false;
+    };
+    let window = mapped.window.clone();
+
+    let Some(pointer) = state.seat.get_pointer() else {
+        return false;
+    };
+    let location = state.pointer_pos;
+    let start_data = smithay::input::pointer::GrabStartData {
+        focus: None,
+        button,
+        location,
+    };
+
+    if button == BTN_LEFT {
+        let Some(grab) = crate::MoveGrab::new(state, start_data, window, pos_within_output, out)
+        else {
+            return false;
+        };
+        pointer.set_grab(state, grab, serial, Focus::Clear);
+        true
+    } else {
+        // BTN_RIGHT — resize. Need the edge under the cursor; if the
+        // pointer is dead-center of the window there's no edge to
+        // resize, so we bail (niri does the same).
+        let edges = state
+            .layout
+            .resize_edges_under(&out, pos_within_output)
+            .unwrap_or_else(prism_layout::utils::ResizeEdge::empty);
+        if edges.is_empty() {
+            return false;
+        }
+        if !state.layout.interactive_resize_begin(window.clone(), edges) {
+            return false;
+        }
+        let grab = crate::ResizeGrab::new(start_data, window);
+        pointer.set_grab(state, grab, serial, Focus::Clear);
+        true
+    }
 }
 
 pub fn on_pointer_axis<I: PrismInputBackend>(
@@ -251,6 +360,59 @@ fn surface_under_pointer(state: &PrismState) -> Option<(WlSurface, Point<f64, Lo
     // common single-tile / full-output case.
     let surface_origin = Point::from((output_loc.x as f64, output_loc.y as f64));
     Some((wl_surface, surface_origin))
+}
+
+/// If `input { focus-follows-mouse }` is enabled, update the layout's
+/// active monitor + active window + keyboard focus to track the pointer.
+///
+/// Mirrors niri's `handle_focus_follows_mouse` (niri.rs:6175):
+///   - skip when disabled
+///   - skip when the pointer is in a grab (drag/resize)
+///   - update active output when the pointer crosses output boundaries
+///   - activate the window under the pointer (without raising), and
+///     hand keyboard focus to its surface
+///
+/// `max_scroll_amount` (ignore the focus update while the cursor is
+/// inside a scrolling viewport beyond N% of one screen) is not yet
+/// honored — needs scroll-amount tracking that we don't have.
+fn maybe_focus_follows_mouse(state: &mut PrismState, serial: smithay::utils::Serial) {
+    let ffm = state.config.borrow().input.focus_follows_mouse;
+    if ffm.is_none() {
+        return;
+    }
+    if let Some(pointer) = state.seat.get_pointer() {
+        if pointer.is_grabbed() {
+            return;
+        }
+    }
+
+    // Output under pointer → active monitor.
+    let px = state.pointer_pos.x as i32;
+    let py = state.pointer_pos.y as i32;
+    if let Some(output_id) = state.output_containing((px, py)) {
+        let target_output = state.wl_outputs.get(&output_id).cloned();
+        if let Some(out) = target_output.as_ref() {
+            if state.layout.active_output() != Some(out) {
+                state.layout.focus_output(out);
+            }
+        }
+    }
+
+    // Window under pointer → activate without raising; keyboard focus
+    // to its surface. Skip the keyboard re-focus if we're already on
+    // the right surface (avoids a no-op enter/leave dance on every
+    // motion event inside the same window).
+    let under = surface_under_pointer(state);
+    if let Some((surface, _)) = under {
+        let window = state
+            .layout
+            .find_window_and_output(&surface)
+            .map(|(mapped, _)| mapped.window.clone());
+        if let Some(w) = window {
+            state.layout.activate_window_without_raising(&w);
+        }
+        set_keyboard_focus(state, Some(surface), serial);
+    }
 }
 
 /// Move keyboard focus to `surface` (or clear it if None), sending

@@ -1662,6 +1662,21 @@ fn render_output_now(
         false
     };
 
+    // During an interactive move, the moving tile is detached from its
+    // workspace's normal layout — `render_workspaces` above does NOT
+    // include it. The layout exposes the moving tile separately;
+    // `render_interactive_move_for_output` early-returns unless the
+    // tile is currently assigned to *this* output (the layout transfers
+    // the assignment as the cursor crosses output boundaries during
+    // the drag). Append after the workspace pass so the moving window
+    // draws on top of normal tiles.
+    state.layout.render_interactive_move_for_output(
+        &smithay_output,
+        &project,
+        &ctx,
+        &mut render_els,
+    );
+
     // Lower RenderEls (geometry + tint) → ElementDraws (texture + push
     // constants). One pass; SolidColor/Border elements bind the white
     // texel, Surface elements bind the per-surface view.

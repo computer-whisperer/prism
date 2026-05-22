@@ -187,7 +187,7 @@ fn on_keyboard<I: PrismInputBackend>(state: &mut PrismState, event: I::KeyboardK
 
 /// Convert smithay's `ModifiersState` (bool fields) into the
 /// `bitflags` `Modifiers` set the bind table uses.
-fn modifiers_from_state(mods: ModifiersState) -> Modifiers {
+pub(crate) fn modifiers_from_state(mods: ModifiersState) -> Modifiers {
     let mut m = Modifiers::empty();
     if mods.ctrl {
         m |= Modifiers::CTRL;
