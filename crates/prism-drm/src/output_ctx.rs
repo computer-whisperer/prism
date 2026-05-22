@@ -87,6 +87,11 @@ pub struct OutputContext {
     /// The static config used at construction. Held so HDR / calibration
     /// reconfig later can read what we currently have.
     pub config: OutputConfig,
+    /// Runtime color overrides set via IPC (calibration tooling, etc.).
+    /// Sticky across config-file reloads — only `OutputAction::ResetColor`
+    /// or a compositor restart clears them. When set, the render path
+    /// uses these values in preference to the equivalents in `config`.
+    pub color_override: ColorOverride,
     /// Set on first present to switch from `commit` (mode-set) to `page_flip`
     /// (just-swap-fb) for subsequent frames.
     mode_set_done: bool,
@@ -345,6 +350,7 @@ impl OutputContext {
             crtc: pick.crtc,
             gpu_id,
             config: config.clone(),
+            color_override: ColorOverride::default(),
             mode_set_done: false,
             frame_pending: false,
             frame_clock,
@@ -354,6 +360,44 @@ impl OutputContext {
             scanout_formats,
         })
     }
+
+    /// Effective SDR reference luminance for this output, taking any
+    /// runtime IPC override into account before falling back to the
+    /// KDL-config value.
+    pub fn effective_sdr_reference_nits(&self) -> f32 {
+        self.color_override
+            .sdr_reference_nits
+            .unwrap_or(self.config.sdr_reference_nits)
+    }
+
+    /// Effective response curve, override-then-config.
+    pub fn effective_response_curve(&self) -> Option<([f32; 3], [f32; 3])> {
+        self.color_override
+            .response_curve
+            .or(self.config.response_curve)
+    }
+
+    /// Effective panel-peak ceiling (the value the decoder clamps to).
+    /// HDR outputs always derive from `hdr.max_luminance`; SDR outputs
+    /// from the effective SDR reference (config or runtime override).
+    pub fn effective_panel_peak_nits(&self) -> f32 {
+        match self.config.hdr {
+            Some(hdr) => hdr.max_luminance as f32,
+            None => self.effective_sdr_reference_nits(),
+        }
+    }
+}
+
+/// Runtime color overrides — see [`OutputContext::color_override`].
+/// Each field is `None` until an IPC request sets it; setting any field
+/// shadows the matching `OutputConfig` value in the render path.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ColorOverride {
+    pub sdr_reference_nits: Option<f32>,
+    pub response_curve: Option<([f32; 3], [f32; 3])>,
+}
+
+impl OutputContext {
 
     /// Clear the `frame_pending` flag, advance the back-buffer index, and
     /// feed the actual kernel-reported presentation time into the

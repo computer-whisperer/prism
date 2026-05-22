@@ -6,6 +6,8 @@ use prism_frame::{DrmFourcc, DrmModifier};
 use prism_renderer::vk;
 use tracing_subscriber::EnvFilter;
 
+mod ipc;
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1073,7 +1075,11 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                     // Clamp to physically-meaningful ranges. Gain <= 0
                     // would zero-divide; gamma <= 0 would produce
                     // pow(x, +inf); silly-large values blow up
-                    // commanded-nits to past PQ peak.
+                    // commanded-nits to past PQ peak. The fragment is
+                    // already in the encode chain for any HDR output
+                    // (default_pq always includes it); we only need to
+                    // stash the configured values so per-frame push
+                    // construction picks them up.
                     let g_r = (curve.gain_r as f32).clamp(0.01, 10.0);
                     let g_g = (curve.gain_g as f32).clamp(0.01, 10.0);
                     let g_b = (curve.gain_b as f32).clamp(0.01, 10.0);
@@ -1081,30 +1087,11 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                     let y_g = (curve.gamma_g as f32).clamp(0.1, 10.0);
                     let y_b = (curve.gamma_b as f32).clamp(0.1, 10.0);
                     output_config.response_curve = Some(([g_r, g_g, g_b], [y_r, y_g, y_b]));
-                    // Splice the PerChannelResponseGainGamma fragment
-                    // into the encode chain just before the output
-                    // transfer (so it operates in linear-nits domain).
-                    let mut frags = output_config.encode_config.fragments.clone();
-                    let insert_at = frags
-                        .iter()
-                        .position(|f| matches!(
-                            f,
-                            prism_renderer::EncodeFragment::OutputTransferSrgb
-                                | prism_renderer::EncodeFragment::OutputTransferPq
-                                | prism_renderer::EncodeFragment::OutputTransferLinear
-                        ))
-                        .unwrap_or(frags.len());
-                    frags.insert(
-                        insert_at,
-                        prism_renderer::EncodeFragment::PerChannelResponseGainGamma,
-                    );
-                    output_config.encode_config =
-                        prism_renderer::EncodeConfig { fragments: frags };
                     tracing::info!(
                         connector = %name,
                         gain = ?[g_r, g_g, g_b],
                         gamma = ?[y_r, y_g, y_b],
-                        "per-output response correction wired into encode chain"
+                        "per-output response correction set from KDL"
                     );
                 }
                 // Vrr always-on → wire through; on-demand currently
@@ -1193,6 +1180,16 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         EventLoop::try_new().context("EventLoop::try_new")?;
     let socket = prism_protocols::insert_wayland_sources(&event_loop.handle(), display)?;
     tracing::info!("WAYLAND_DISPLAY={socket}");
+    // IPC socket for runtime control (prism-tune, future prism-msg, etc.).
+    // Best-effort: a bringup failure here would lock us out of calibration
+    // tooling but shouldn't take the compositor down.
+    let ipc_socket_path = match ipc::insert_ipc_source(&event_loop.handle()) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::warn!("ipc bringup failed; runtime control disabled: {e:#}");
+            None
+        }
+    };
     for output in state.outputs.values() {
         tracing::info!(
             "scanout target: {} {}×{} (crtc {:?})",
@@ -1411,6 +1408,13 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
 
     breadcrumb("dispatch loop exited cleanly");
     tracing::info!("integrated loop stopped");
+
+    // Drop the IPC socket file so we don't leave a stale node in
+    // $XDG_RUNTIME_DIR (next bringup would remove it anyway, but it's
+    // tidier to clean up after ourselves).
+    if let Some(path) = ipc_socket_path.as_deref() {
+        ipc::remove_socket(path);
+    }
 
     // Explicit, instrumented teardown.
     //
@@ -1717,6 +1721,8 @@ fn render_output_now(
 
     // Snapshot identity bits without holding any borrow into
     // state.outputs (we'll re-borrow mutably at present() time below).
+    // The "effective" reads here pick runtime IPC overrides ahead of
+    // the persisted KDL values, so calibration tools can iterate live.
     let (
         output_gpu_id,
         white_view,
@@ -1732,8 +1738,8 @@ fn render_output_now(
             output.gpu_id,
             output.renderer.white_view(),
             output.frame_clock.next_presentation_time(),
-            output.config.sdr_reference_nits,
-            output.config.panel_peak_nits,
+            output.effective_sdr_reference_nits(),
+            output.effective_panel_peak_nits(),
         )
     };
 
@@ -1931,7 +1937,7 @@ fn render_output_now(
             }
             None => EncodePush::sdr_identity(),
         };
-        if let Some((gain, gamma)) = output.config.response_curve {
+        if let Some((gain, gamma)) = output.effective_response_curve() {
             p.set_response_gain_gamma(gain, gamma);
         }
         p

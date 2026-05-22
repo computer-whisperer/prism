@@ -1085,9 +1085,11 @@ dependencies = [
  "prism-drm",
  "prism-frame",
  "prism-input",
+ "prism-ipc",
  "prism-layout",
  "prism-protocols",
  "prism-renderer",
+ "serde_json",
  "smithay",
  "tracing",
  "tracing-subscriber",
@@ -1242,6 +1244,16 @@ dependencies = [
  "rustix 1.1.4",
  "wayland-client",
  "wayland-protocols",
+]
+
+[[package]]
+name = "prism-tune"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "prism-ipc",
+ "serde_json",
 ]
 
 [[package]]

@@ -69,11 +69,19 @@ impl EncodeConfig {
         }
     }
 
-    /// HDR PQ default: identity calibration + PQ OETF.
+    /// HDR PQ default: identity calibration + identity response
+    /// correction + PQ OETF. The response correction stage is always
+    /// included for HDR outputs (even when no per-output calibration
+    /// is configured) so runtime IPC can flip on a panel-specific
+    /// curve without rebuilding the encode pipeline. Identity gain
+    /// and gamma values make the stage a no-op; cost is one extra
+    /// `pow` per pixel that the shader compiler can sometimes
+    /// optimize away.
     pub fn default_pq() -> Self {
         Self {
             fragments: vec![
                 EncodeFragment::CalibrationMatrix,
+                EncodeFragment::PerChannelResponseGainGamma,
                 EncodeFragment::OutputTransferPq,
             ],
         }

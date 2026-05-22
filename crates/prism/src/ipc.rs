@@ -1,0 +1,267 @@
+//! IPC server — Unix-socket request/reply using the `prism_ipc` vocabulary.
+//!
+//! Protocol: one JSON `Request` per line in, one JSON `Reply` per line
+//! out. Each connection is one-shot today (client sends request, gets
+//! reply, both sides close). The long-lived event-stream form (niri's
+//! `EventStream` request) is future work.
+//!
+//! Dispatch is single-threaded on the main calloop — each connection
+//! is handled synchronously inside the listener's read-event handler,
+//! so requests cannot interleave with each other or with the render
+//! loop. That's the right semantics for state-mutating requests (e.g.
+//! a calibration tool flipping color overrides between sweep frames)
+//! and is acceptable for read-only ones since the payloads are tiny.
+//! A misbehaving client that connects but never sends data could
+//! block the loop; the per-socket read timeout below bounds that.
+//!
+//! Bringup wires in `insert_ipc_source` from main.rs after the
+//! wayland sources are up. The socket path lives in `$XDG_RUNTIME_DIR`
+//! and is exported via `PRISM_SOCKET` so child processes (and any
+//! `prism-tune` invocation) can find us.
+
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use calloop::generic::Generic;
+use calloop::{Interest, LoopHandle, Mode, PostAction};
+use prism_ipc::{
+    self, LogicalOutput, Output, OutputAction, OutputConfigChanged, Reply, Request, Response,
+    Transform,
+};
+use prism_protocols::{OutputRedrawState, PrismState};
+use smithay::utils::Size;
+
+/// Insert the IPC `UnixListener` calloop source. Binds a fresh socket
+/// in `$XDG_RUNTIME_DIR` (falling back to `/tmp`), removes any stale
+/// file at that path, sets `PRISM_SOCKET` for child processes, and
+/// returns the path so the caller can log + arrange cleanup on exit.
+pub fn insert_ipc_source(handle: &LoopHandle<'static, PrismState>) -> Result<PathBuf> {
+    let path = default_socket_path();
+    // Stale socket left over from a previous run: remove it so bind() doesn't
+    // EADDRINUSE. (Other compositors do the same; correct because we're
+    // the only writer of this path.)
+    let _ = std::fs::remove_file(&path);
+    let listener =
+        UnixListener::bind(&path).with_context(|| format!("bind ipc socket {}", path.display()))?;
+    listener.set_nonblocking(true).context("set_nonblocking")?;
+
+    // SAFETY: set_var is sound while we're still single-threaded at
+    // server-startup time (matches the WAYLAND_DISPLAY pattern in
+    // prism-protocols::server).
+    unsafe {
+        std::env::set_var(prism_ipc::socket::SOCKET_PATH_ENV, &path);
+    }
+
+    handle
+        .insert_source(
+            Generic::new(listener, Interest::READ, Mode::Level),
+            move |_event, listener, state| {
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _addr)) => {
+                            if let Err(e) = handle_connection(stream, state) {
+                                tracing::warn!("ipc connection handler error: {e:#}");
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            tracing::warn!("ipc accept error: {e}");
+                            break;
+                        }
+                    }
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("insert ipc source: {e}"))?;
+
+    tracing::info!(path = %path.display(), "ipc socket listening");
+    Ok(path)
+}
+
+/// Decide where the IPC socket lives. Prefers `$XDG_RUNTIME_DIR` (the
+/// usual home for user-scoped sockets); falls back to `/tmp` if that
+/// isn't set. Filename includes the PID so two prism instances on the
+/// same machine don't collide; child processes inherit
+/// `PRISM_SOCKET` and find ours by env var, not by guessing.
+fn default_socket_path() -> PathBuf {
+    let base: PathBuf = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join(format!("prism-{}.sock", std::process::id()))
+}
+
+/// Read one JSON request from `stream`, dispatch, write one JSON reply,
+/// then close. Connection lifetime is one request — clients that want
+/// to make multiple requests reconnect, which is what
+/// `prism_ipc::socket::Socket` does anyway.
+fn handle_connection(stream: UnixStream, state: &mut PrismState) -> Result<()> {
+    // Bound how long a slow / malicious client can hold the main loop.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .context("set_read_timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .context("set_write_timeout")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).context("read request line")?;
+
+    let reply: Reply = match serde_json::from_str::<Request>(&line) {
+        Ok(req) => dispatch(state, req),
+        Err(e) => Err(format!("parse request: {e}")),
+    };
+
+    let mut buf = serde_json::to_string(&reply).context("serialize reply")?;
+    buf.push('\n');
+    reader.get_mut().write_all(buf.as_bytes()).context("write reply")?;
+    Ok(())
+}
+
+/// Route a parsed Request to the matching handler. Unsupported variants
+/// return `Err("not implemented")` rather than panic — clients then know
+/// which surface area is still future work.
+fn dispatch(state: &mut PrismState, req: Request) -> Reply {
+    match req {
+        Request::Version => Ok(Response::Version(env!("CARGO_PKG_VERSION").to_string())),
+        Request::Outputs => Ok(Response::Outputs(collect_outputs(state))),
+        Request::FocusedOutput => {
+            // True focus tracking lives in input dispatch (not yet
+            // multi-output-aware); for now report the first connected
+            // output so the IPC at least has a defined answer.
+            let map = collect_outputs(state);
+            let first = map.into_values().next();
+            Ok(Response::FocusedOutput(first))
+        }
+        Request::Output { output, action } => handle_output_action(state, &output, action),
+        other => Err(format!("request {other:?} is not implemented in this build")),
+    }
+}
+
+/// Build the IPC `Output` info map for every live `OutputContext`.
+fn collect_outputs(state: &PrismState) -> HashMap<String, Output> {
+    let mut map = HashMap::new();
+    for ctx in state.outputs.values() {
+        let mode = ctx.mode;
+        let (mw, mh) = mode.size();
+        let modes = vec![prism_ipc::Mode {
+            width: mw,
+            height: mh,
+            refresh_rate: mode.vrefresh() as u32 * 1000,
+            is_preferred: true,
+        }];
+        let logical = state
+            .wl_outputs
+            .get(&ctx.connector_name)
+            .and_then(|wl| state.layout.monitor_for_output(wl))
+            .map(|monitor| {
+                let view: Size<f64, smithay::utils::Logical> = monitor.view_size();
+                LogicalOutput {
+                    x: 0,
+                    y: 0,
+                    width: view.w as u32,
+                    height: view.h as u32,
+                    scale: 1.0,
+                    transform: Transform::Normal,
+                }
+            });
+        let info = Output {
+            name: ctx.connector_name.clone(),
+            make: ctx.edid.make.clone().unwrap_or_default(),
+            model: ctx.edid.model.clone().unwrap_or_default(),
+            serial: ctx.edid.serial.clone(),
+            physical_size: ctx.edid.size_mm,
+            modes,
+            current_mode: Some(0),
+            is_custom_mode: false,
+            vrr_supported: ctx.config.vrr,
+            vrr_enabled: ctx.config.vrr,
+            logical,
+        };
+        map.insert(ctx.connector_name.clone(), info);
+    }
+    map
+}
+
+/// Apply a state-mutating `OutputAction`. Color-related variants are
+/// the only ones implemented today; modeset / scale / etc. return
+/// `Err("not implemented")` until the corresponding compositor
+/// machinery is plumbed.
+fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction) -> Reply {
+    let Some(output_id) = state
+        .outputs
+        .iter()
+        .find(|(_id, ctx)| ctx.connector_name == name)
+        .map(|(id, _)| id.clone())
+    else {
+        // Niri's "OutputWasMissing" semantic: a Request::Output for an
+        // absent output isn't an error — it's just queued. We don't
+        // have a queue today, so report it but still succeed.
+        return Ok(Response::OutputConfigChanged(
+            OutputConfigChanged::OutputWasMissing,
+        ));
+    };
+
+    let output_ctx = state.outputs.get_mut(&output_id).expect("just found above");
+    match action {
+        OutputAction::SdrReferenceNits { nits } => {
+            let v = (nits.clamp(1.0, 10_000.0)) as f32;
+            output_ctx.color_override.sdr_reference_nits = Some(v);
+            tracing::info!(connector = %name, sdr_reference_nits = v, "ipc: set sdr-reference-nits override");
+        }
+        OutputAction::ResponseCurve {
+            gain_r,
+            gain_g,
+            gain_b,
+            gamma_r,
+            gamma_g,
+            gamma_b,
+        } => {
+            let g_r = (gain_r as f32).clamp(0.01, 10.0);
+            let g_g = (gain_g as f32).clamp(0.01, 10.0);
+            let g_b = (gain_b as f32).clamp(0.01, 10.0);
+            let y_r = (gamma_r as f32).clamp(0.1, 10.0);
+            let y_g = (gamma_g as f32).clamp(0.1, 10.0);
+            let y_b = (gamma_b as f32).clamp(0.1, 10.0);
+            output_ctx.color_override.response_curve = Some(([g_r, g_g, g_b], [y_r, y_g, y_b]));
+            tracing::info!(
+                connector = %name,
+                gain = ?[g_r, g_g, g_b],
+                gamma = ?[y_r, y_g, y_b],
+                "ipc: set response-curve override"
+            );
+        }
+        OutputAction::ResetColor => {
+            output_ctx.color_override = prism_drm::ColorOverride::default();
+            tracing::info!(connector = %name, "ipc: cleared color overrides");
+        }
+        other => {
+            return Err(format!(
+                "OutputAction {other:?} is not implemented in this build"
+            ));
+        }
+    }
+
+    // Override won't be observable until the next frame — kick a
+    // redraw so users see the change immediately even on otherwise-
+    // idle outputs.
+    state
+        .output_redraw
+        .entry(output_id)
+        .or_insert_with(OutputRedrawState::default)
+        .queue_redraw();
+
+    Ok(Response::OutputConfigChanged(OutputConfigChanged::Applied))
+}
+
+/// Best-effort socket cleanup on shutdown. Doesn't panic on failure —
+/// the path was set with `prism_ipc::socket::SOCKET_PATH_ENV` so callers
+/// already know where it lives if manual cleanup is needed.
+pub fn remove_socket(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}

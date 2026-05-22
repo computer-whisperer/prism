@@ -1,0 +1,25 @@
+[package]
+name = "prism-tune"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Closed-loop color calibration tool for prism (IPC client + colorimeter + patch surface)"
+
+[[bin]]
+name = "prism-tune"
+path = "src/main.rs"
+
+# Phase 1 (this commit) ships the `msg` subcommand only — a thin wrapper
+# around the prism-ipc client vocabulary, useful as a swaymsg-equivalent
+# for the IPC surface area we currently expose.
+#
+# Phase 2 will vendor in the spyder-driver (colorimeter USB protocol)
+# and the patch-display layer-shell client, and add a `calibrate`
+# subcommand that iterates the panel response correction live.
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+prism-ipc = { workspace = true, features = ["clap"] }
+serde_json.workspace = true

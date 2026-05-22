@@ -1097,6 +1097,45 @@ pub enum OutputAction {
         #[cfg_attr(feature = "clap", command(flatten))]
         vrr: VrrToSet,
     },
+    /// Set what absolute luminance (cd/m²) "SDR white" maps to for
+    /// color-unaware clients on this output. Persists until cleared
+    /// with `reset-color` or the compositor restarts (sticky across
+    /// config-file reloads, by design — calibration runs take minutes
+    /// and shouldn't race the file watcher). IEC sRGB default is 80.
+    SdrReferenceNits {
+        /// Reference luminance, cd/m². Clamped to [1, 10_000].
+        #[cfg_attr(feature = "clap", arg())]
+        nits: f64,
+    },
+    /// Set the panel response correction (per-channel gain + gamma).
+    /// The encoder inverts the panel's measured
+    /// `emitted = gain * commanded^gamma` so commanded nits match
+    /// what the panel actually emits. Identity = gain 1, gamma 1.
+    /// Persists until `reset-color` or restart.
+    ResponseCurve {
+        /// Red-channel gain.
+        #[cfg_attr(feature = "clap", arg(long))]
+        gain_r: f64,
+        /// Green-channel gain.
+        #[cfg_attr(feature = "clap", arg(long))]
+        gain_g: f64,
+        /// Blue-channel gain.
+        #[cfg_attr(feature = "clap", arg(long))]
+        gain_b: f64,
+        /// Red-channel gamma exponent.
+        #[cfg_attr(feature = "clap", arg(long))]
+        gamma_r: f64,
+        /// Green-channel gamma exponent.
+        #[cfg_attr(feature = "clap", arg(long))]
+        gamma_g: f64,
+        /// Blue-channel gamma exponent.
+        #[cfg_attr(feature = "clap", arg(long))]
+        gamma_b: f64,
+    },
+    /// Clear all runtime color overrides for this output (sdr
+    /// reference, response curve). Subsequent rendering reverts to
+    /// whatever's in the persisted KDL config.
+    ResetColor,
 }
 
 /// Output mode to set.
