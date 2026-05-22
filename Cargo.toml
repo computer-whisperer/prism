@@ -21,8 +21,8 @@ edition = "2021"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
 description = "Vulkan-native, HDR-native Wayland compositor"
-repository = "https://github.com/christianbrickhouse/prism"
-authors = ["Christian Brickhouse"]
+repository = "https://github.com/computer-whisperer/prism"
+authors = ["Christian Balcom"]
 
 [workspace.dependencies]
 # in-tree

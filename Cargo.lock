@@ -179,6 +179,20 @@ dependencies = [
 
 [[package]]
 name = "calloop"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b99da2f8558ca23c71f4fd15dc57c906239752dd27ff3c00a1d56b685b7cbfec"
+dependencies = [
+ "bitflags",
+ "log",
+ "polling",
+ "rustix 0.38.44",
+ "slab",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "calloop"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4dbf9978365bac10f54d1d4b04f7ce4427e51f71d61f2fe15e3fed5166474df7"
@@ -190,6 +204,18 @@ dependencies = [
  "rustix 1.1.4",
  "slab",
  "tracing",
+]
+
+[[package]]
+name = "calloop-wayland-source"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95a66a987056935f7efce4ab5668920b5d0dac4a7c99991a67395f13702ddd20"
+dependencies = [
+ "calloop 0.13.0",
+ "rustix 0.38.44",
+ "wayland-backend",
+ "wayland-client",
 ]
 
 [[package]]
@@ -323,6 +349,12 @@ name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
+name = "crunchy"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crypto-common"
@@ -505,6 +537,17 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "wasi",
+]
+
+[[package]]
+name = "getrandom"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
@@ -544,6 +587,17 @@ dependencies = [
  "log",
  "presser",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "zerocopy",
 ]
 
 [[package]]
@@ -822,6 +876,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "libusb1-sys"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da050ade7ac4ff1ba5379af847a10a10a8e284181e060105bf8d86960ce9ce0f"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -859,6 +925,15 @@ name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+
+[[package]]
+name = "memmap2"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43a5a03cefb0d953ec0be133036f14e109412fa594edc2f77227249db66cc3ed"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "memmap2"
@@ -1078,7 +1153,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
- "calloop",
+ "calloop 0.14.4",
  "input",
  "libc",
  "prism-config",
@@ -1127,7 +1202,7 @@ name = "prism-drm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "calloop",
+ "calloop 0.14.4",
  "drm-fourcc",
  "gbm",
  "libc",
@@ -1156,7 +1231,7 @@ name = "prism-input"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "calloop",
+ "calloop 0.14.4",
  "input",
  "libc",
  "prism-config",
@@ -1183,7 +1258,7 @@ dependencies = [
  "anyhow",
  "atomic",
  "bitflags",
- "calloop",
+ "calloop 0.14.4",
  "ordered-float",
  "prism-animation",
  "prism-config",
@@ -1204,7 +1279,7 @@ name = "prism-protocols"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "calloop",
+ "calloop 0.14.4",
  "input",
  "libc",
  "prism-animation",
@@ -1240,7 +1315,7 @@ name = "prism-shmtest"
 version = "0.1.0"
 dependencies = [
  "libc",
- "memmap2",
+ "memmap2 0.9.10",
  "rustix 1.1.4",
  "wayland-client",
  "wayland-protocols",
@@ -1254,6 +1329,8 @@ dependencies = [
  "clap",
  "prism-ipc",
  "serde_json",
+ "tristim-display",
+ "tristim-driver",
 ]
 
 [[package]]
@@ -1340,12 +1417,33 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
+dependencies = [
+ "libc",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+]
+
+[[package]]
+name = "rand"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
- "rand_chacha",
- "rand_core",
+ "rand_chacha 0.9.0",
+ "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -1355,7 +1453,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
- "rand_core",
+ "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+dependencies = [
+ "getrandom 0.2.17",
 ]
 
 [[package]]
@@ -1424,6 +1531,16 @@ checksum = "091dca2e1d6fd3098417b5ec88e77e80d1ba5945750943419dc976858082c296"
 dependencies = [
  "rustc-hash",
  "spirv",
+]
+
+[[package]]
+name = "rusb"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab9f9ff05b63a786553a4c02943b74b34a988448671001e9a27e2f0565cc05a4"
+dependencies = [
+ "libc",
+ "libusb1-sys",
 ]
 
 [[package]]
@@ -1622,7 +1739,7 @@ dependencies = [
  "appendlist",
  "atomic_float",
  "bitflags",
- "calloop",
+ "calloop 0.14.4",
  "cc",
  "cgmath",
  "cursor-icon",
@@ -1638,7 +1755,7 @@ dependencies = [
  "libseat",
  "pkg-config",
  "profiling",
- "rand",
+ "rand 0.9.4",
  "rustix 1.1.4",
  "sha2",
  "smallvec",
@@ -1652,7 +1769,35 @@ dependencies = [
  "wayland-protocols-wlr",
  "wayland-server",
  "wayland-sys",
- "xkbcommon",
+ "xkbcommon 0.9.0",
+]
+
+[[package]]
+name = "smithay-client-toolkit"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3457dea1f0eb631b4034d61d4d8c32074caa6cd1ab2d59f2327bd8461e2c0016"
+dependencies = [
+ "bitflags",
+ "bytemuck",
+ "calloop 0.13.0",
+ "calloop-wayland-source",
+ "cursor-icon",
+ "libc",
+ "log",
+ "memmap2 0.9.10",
+ "pkg-config",
+ "rustix 0.38.44",
+ "thiserror 1.0.69",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-csd-frame",
+ "wayland-cursor",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
+ "wayland-scanner",
+ "xkbcommon 0.7.0",
+ "xkeysym",
 ]
 
 [[package]]
@@ -1933,6 +2078,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "tristim-display"
+version = "0.1.0"
+source = "git+https://github.com/computer-whisperer/tristim.git?rev=37c03bd#37c03bd3733d262d7f49ee276f8be78c363e11f6"
+dependencies = [
+ "half",
+ "memmap2 0.9.10",
+ "rustix 0.38.44",
+ "smithay-client-toolkit",
+ "thiserror 1.0.69",
+ "wayland-client",
+ "wayland-protocols",
+]
+
+[[package]]
+name = "tristim-driver"
+version = "0.1.0"
+source = "git+https://github.com/computer-whisperer/tristim.git?rev=37c03bd#37c03bd3733d262d7f49ee276f8be78c363e11f6"
+dependencies = [
+ "rand 0.8.6",
+ "rusb",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2002,6 +2171,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
 name = "version-compare"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2012,6 +2187,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "wasi"
+version = "0.11.1+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wasip2"
@@ -2092,6 +2273,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "wayland-csd-frame"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "625c5029dbd43d25e6aa9615e88b829a5cad13b2819c4ae129fdbb7c31ab4c7e"
+dependencies = [
+ "bitflags",
+ "cursor-icon",
+ "wayland-backend",
+]
+
+[[package]]
+name = "wayland-cursor"
+version = "0.31.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a52d18780be9b1314328a3de5f930b73d2200112e3849ca6cb11822793fb34d"
+dependencies = [
+ "rustix 1.1.4",
+ "wayland-client",
+ "xcursor",
+]
+
+[[package]]
 name = "wayland-protocols"
 version = "0.32.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2125,6 +2328,7 @@ checksum = "eb04e52f7836d7c7976c78ca0250d61e33873c34156a2a1fc9474828ec268234"
 dependencies = [
  "bitflags",
  "wayland-backend",
+ "wayland-client",
  "wayland-protocols",
  "wayland-scanner",
  "wayland-server",
@@ -2451,12 +2655,23 @@ checksum = "bec9e4a500ca8864c5b47b8b482a73d62e4237670e5b5f1d6b9e3cae50f28f2b"
 
 [[package]]
 name = "xkbcommon"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13867d259930edc7091a6c41b4ce6eee464328c6ff9659b7e4c668ca20d4c91e"
+dependencies = [
+ "libc",
+ "memmap2 0.8.0",
+ "xkeysym",
+]
+
+[[package]]
+name = "xkbcommon"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7a974f48060a14e95705c01f24ad9c3345022f4d97441b8a36beb7ed5c4a02d"
 dependencies = [
  "libc",
- "memmap2",
+ "memmap2 0.9.10",
  "xkeysym",
 ]
 
@@ -2465,6 +2680,9 @@ name = "xkeysym"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "yansi"

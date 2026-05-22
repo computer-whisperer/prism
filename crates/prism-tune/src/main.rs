@@ -1,26 +1,30 @@
 //! `prism-tune` — closed-loop calibration + IPC client for the prism
 //! compositor.
 //!
-//! Phase 1 (this binary today): the `msg` subcommand. Connects to a
-//! running prism's `PRISM_SOCKET`, sends a `prism_ipc::Request`, prints
-//! the reply. Same shape as `niri msg` / `swaymsg`.
+//! Subcommands:
 //!
-//! Phase 2 (future): vendor in the spyder-driver + patch surface and
-//! add a `calibrate` subcommand that runs the full sweep → fit →
-//! apply → verify loop.
+//! - `msg` — swaymsg-equivalent: send one `prism_ipc::Request`, print the
+//!   reply. Useful for one-shot queries and manual overrides.
+//! - `calibrate` — closed-loop panel response correction. Drives the
+//!   tristim USB colorimeter against an HDR PQ patch on the chosen
+//!   output, fits `(gain, gamma)`, applies it live via IPC, and
+//!   iterates a fixed number of times.
 //!
 //! Usage examples:
 //!
 //! ```text
 //! prism-tune msg version
 //! prism-tune msg outputs
-//! prism-tune msg focused-output
 //! prism-tune msg output DP-4 sdr-reference-nits 100
 //! prism-tune msg output DP-4 response-curve \
 //!     --gain-r 0.45 --gain-g 0.46 --gain-b 0.43 \
 //!     --gamma-r 1.08 --gamma-g 1.07 --gamma-b 1.10
 //! prism-tune msg output DP-4 reset-color
+//!
+//! prism-tune calibrate --output DP-4 --peak-nits 400 --window 0.10
 //! ```
+
+mod calibrate;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -39,6 +43,9 @@ enum TopCommand {
     /// Send one Request to the prism IPC socket and print the reply.
     #[command(subcommand)]
     Msg(MsgCommand),
+    /// Closed-loop panel calibration via the tristim colorimeter +
+    /// HDR PQ patch surface + the prism IPC.
+    Calibrate(calibrate::CalibrateArgs),
 }
 
 #[derive(Subcommand)]
@@ -63,6 +70,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         TopCommand::Msg(cmd) => run_msg(cmd),
+        TopCommand::Calibrate(args) => calibrate::run(args),
     }
 }
 

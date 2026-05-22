@@ -10,16 +10,19 @@ description = "Closed-loop color calibration tool for prism (IPC client + colori
 name = "prism-tune"
 path = "src/main.rs"
 
-# Phase 1 (this commit) ships the `msg` subcommand only — a thin wrapper
-# around the prism-ipc client vocabulary, useful as a swaymsg-equivalent
-# for the IPC surface area we currently expose.
+# Phase 1 ships the `msg` subcommand — a swaymsg-equivalent wrapper
+# around the prism-ipc client vocabulary.
 #
-# Phase 2 will vendor in the spyder-driver (colorimeter USB protocol)
-# and the patch-display layer-shell client, and add a `calibrate`
-# subcommand that iterates the panel response correction live.
+# Phase 2 (in progress) adds the `calibrate` subcommand, which drives
+# the tristim USB colorimeter against the tristim Wayland patch surface
+# and iterates the panel response correction live via the prism IPC.
+# tristim is pinned to a git rev (not crates.io yet) — bump the rev when
+# the driver or patch-surface API changes shape.
 
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 prism-ipc = { workspace = true, features = ["clap"] }
 serde_json.workspace = true
+tristim-driver = { git = "https://github.com/computer-whisperer/tristim.git", rev = "37c03bd" }
+tristim-display = { git = "https://github.com/computer-whisperer/tristim.git", rev = "37c03bd" }
