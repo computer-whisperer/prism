@@ -417,13 +417,15 @@ fn discover_per_channel_peaks(
 
     for c in Channel::ALL {
         eprintln!("\n--- phase 1 probe: {} channel ---", c.label());
-        device.send_reset().context("colorimeter reset")?;
-
+        // measure_raw() resets per-call — Argyll's auto-zero behaviour.
+        // Skipping it (the earlier --no-reset optimisation) made dim
+        // single-channel reads unreliable on real LCDs; honest dark-
+        // current refresh per measurement is the only safe default.
         let mut measurements: Vec<(f64, f64)> = Vec::with_capacity(probe_targets.len());
         for (patch_idx, &target_nits) in probe_targets.iter().enumerate() {
             set_channel_patch(patch, baseline, c, target_nits)?;
             thread::sleep(settle);
-            let raw = device.measure_raw_no_reset(setup).context("measure")?;
+            let raw = device.measure_raw(setup).context("measure")?;
             let xyz = raw_to_xyz(&raw, setup, cal);
             let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
             eprintln!(
@@ -448,14 +450,14 @@ fn discover_per_channel_peaks(
         // the panel's ceiling for this channel. Threshold 1.2 is loose
         // — real panels deviate from clean power-law near the top, and
         // a tighter threshold would prematurely flag the soft knee.
-        let mut last_good_idx = measurements.len() - 1;
+        let mut saturated_at: Option<usize> = None;
         for i in 1..measurements.len() {
             let (prev_t, prev_y) = measurements[i - 1];
             let (this_t, this_y) = measurements[i];
             let t_ratio = this_t / prev_t.max(0.01);
             let y_ratio = this_y / prev_y.max(0.01);
             if t_ratio >= 2.0 && y_ratio < 1.2 {
-                last_good_idx = i - 1;
+                saturated_at = Some(i);
                 eprintln!(
                     "  {} saturation detected at target {:.1} (Y ratio {:.2} vs target ratio {:.2})",
                     c.label(), this_t, y_ratio, t_ratio,
@@ -463,18 +465,90 @@ fn discover_per_channel_peaks(
                 break;
             }
         }
-        // Measured peak: the *commanded* value at the last non-saturated
-        // sample. The compositor's panel-peak clamp uses this as the
-        // intermediate-nits ceiling, so it's correctly in commanded units.
-        let (measured_peak, _) = measurements[last_good_idx];
-        peaks[c.idx()] = measured_peak;
+
+        // Bisection sub-probe: when the initial coarse ramp brackets
+        // the cliff in a single decade (e.g. (400, 1500) for a panel
+        // that actually caps at ~700), bisect 3 times in log space to
+        // tighten the discovered peak. Without this, the refinement
+        // phase uses 0.85 × coarse_last_good — which could be either
+        // too conservative (leave headroom unused) or too aggressive
+        // (sit on the soft knee). Three bisections narrows the cliff
+        // to ~12% relative width, giving safe_peak room to land in.
+        let (left_t, left_y) = match saturated_at {
+            Some(i) => {
+                // measurements[i-1] is last non-sat, [i] is first sat.
+                let right_t = measurements[i].0;
+                let lt = measurements[i - 1].0;
+                let ly = measurements[i - 1].1;
+                eprintln!(
+                    "  {} bisecting cliff in ({:.1}, {:.1}) cd/m² (3 steps)…",
+                    c.label(), lt, right_t,
+                );
+                let mut right_t = right_t;
+                let mut left_t = lt;
+                let mut left_y = ly;
+                let mut patch_idx = measurements.len();
+                for _step in 0..3 {
+                    patch_idx += 1;
+                    // Geometric midpoint — log-space bisection matches
+                    // how the coarse ramp was spaced and the panel's
+                    // power-law response.
+                    let mid_t = (left_t * right_t).sqrt();
+                    set_channel_patch(patch, baseline, c, mid_t)?;
+                    thread::sleep(settle);
+                    let raw = device.measure_raw(setup).context("measure (bisect)")?;
+                    let xyz = raw_to_xyz(&raw, setup, cal);
+                    let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
+                    let mid_y = xyz.y;
+                    // Saturated when mid_y is barely above left_y
+                    // (Y_ratio < 1.2). Sub-saturation means the panel
+                    // is still ramping at mid_t.
+                    let saturated = mid_y / left_y.max(0.01) < 1.2;
+                    eprintln!(
+                        "    bisect target {:>7.1} cd/m² → Y={:>7.2} ({})",
+                        mid_t,
+                        mid_y,
+                        if saturated { "saturated" } else { "ramping" },
+                    );
+                    if let Some((_, w)) = log.as_mut() {
+                        writeln!(
+                            w,
+                            "{},{},1,{},{:.4},1.0,1.0,1.0,1.0,1.0,1.0,{:.4},{:.4},{:.4},{:.6},{:.6}",
+                            Phase::Probe.label(),
+                            c.label(),
+                            patch_idx,
+                            mid_t,
+                            xyz.x, xyz.y, xyz.z, cx, cy,
+                        )?;
+                    }
+                    if saturated {
+                        right_t = mid_t;
+                    } else {
+                        left_t = mid_t;
+                        left_y = mid_y;
+                    }
+                }
+                (left_t, left_y)
+            }
+            None => {
+                // No saturation in the coarse probe — the top sample
+                // is the best estimate we have. (Unlikely in practice;
+                // even 6000 cd/m² targets on real panels hit clipping
+                // somewhere in our buffer/sink chain.)
+                let last = measurements.len() - 1;
+                (measurements[last].0, measurements[last].1)
+            }
+        };
+        let _ = left_y; // silence unused; semantic value is the target
+
+        peaks[c.idx()] = left_t;
 
         if let Some((_, w)) = log.as_mut() {
             writeln!(
                 w,
-                "# probe {} measured peak commanded = {:.3} cd/m² (last non-saturated)",
+                "# probe {} measured peak commanded = {:.3} cd/m² (after bisection)",
                 c.label(),
-                measured_peak,
+                left_t,
             )?;
         }
     }
@@ -544,26 +618,30 @@ fn refine_per_channel_curve(
             curve.gain,
             curve.gamma,
         );
-        device.send_reset().context("colorimeter reset")?;
+        // measure_raw() resets per-call so we don't pre-reset here.
 
-        // For each channel: 5 log-ish-spaced targets within its discovered
-        // peak. Skip pure 0 (log undefined); start at 5% of peak for a
-        // dark-end sample, scale up to 95% (avoid the saturated edge).
+        // For each channel: targets inside a "safe zone" — 25..=85% of
+        // a margined safe_peak (90% of the discovered cliff). Avoids
+        // both the dim-end measurement floor (Y < ~1 cd/m² is unreliable
+        // on a Spyder, especially for the channels whose Y coefficient
+        // is small like blue) and the soft-knee saturation region near
+        // the panel's discovered cliff.
         for c in Channel::ALL {
             let peak = discovered_peaks[c.idx()];
+            let safe_peak = peak * 0.90;
             let targets: Vec<f64> = vec![
-                peak * 0.05,
-                peak * 0.15,
-                peak * 0.35,
-                peak * 0.65,
-                peak * 0.95,
+                safe_peak * 0.25,
+                safe_peak * 0.40,
+                safe_peak * 0.55,
+                safe_peak * 0.70,
+                safe_peak * 0.85,
             ];
 
             let mut samples: Vec<(f64, f64)> = Vec::with_capacity(targets.len());
             for (patch_idx, &t) in targets.iter().enumerate() {
                 set_channel_patch(patch, baseline, c, t)?;
                 thread::sleep(settle);
-                let raw = device.measure_raw_no_reset(setup).context("measure")?;
+                let raw = device.measure_raw(setup).context("measure")?;
                 let xyz = raw_to_xyz(&raw, setup, cal);
                 let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
                 eprintln!(
@@ -587,29 +665,93 @@ fn refine_per_channel_curve(
                 }
             }
 
-            // Log-linear fit on this channel's samples. With current curve
-            // V_k = (gain_k, gamma_k) already applied by the compositor:
-            //   measured_Y = panel_gain * commanded^panel_gamma where
+            // Filter samples that are below the colorimeter's reliable
+            // floor (~1 cd/m² of Y is the practical minimum on a Spyder
+            // — below that, dark-current drift and Z-channel ambient
+            // pickup dominate and skew the log-log slope wildly).
+            let useful: Vec<(f64, f64)> = samples
+                .iter()
+                .copied()
+                .filter(|(_, y)| *y >= 1.0)
+                .collect();
+            if useful.len() < 2 {
+                eprintln!(
+                    "  {} only {} useful sample(s) after Y>=1 filter; skipping fit this iter",
+                    c.label(),
+                    useful.len()
+                );
+                if let Some((_, w)) = log.as_mut() {
+                    writeln!(
+                        w,
+                        "# refine {} iter {} fit: SKIPPED (insufficient samples above noise floor)",
+                        c.label(),
+                        iter + 1
+                    )?;
+                }
+                continue;
+            }
+
+            // Log-linear fit. With current curve V_k = (gain_k, gamma_k)
+            // already applied by the compositor:
+            //   measured_Y = panel_gain * commanded^panel_gamma  where
             //   commanded = (T / gain_k)^(1/gamma_k)
             // So log(Y) = log(panel_gain) + (panel_gamma/gamma_k) * (log T - log gain_k)
             // Slope b, intercept a → panel_gamma = b * gamma_k,
             //                        panel_gain = exp(a) * gain_k^b.
-            let (slope, intercept) = log_linear_fit(&samples);
+            let (slope, intercept) = log_linear_fit(&useful);
             let prev_gain = curve.gain[c.idx()];
             let prev_gamma = curve.gamma[c.idx()];
-            let new_gamma = slope * prev_gamma;
-            let new_gain = intercept.exp() * prev_gain.powf(slope);
+            let fit_gamma = slope * prev_gamma;
+            let fit_gain = intercept.exp() * prev_gain.powf(slope);
+
+            // Sanity check: does the fit actually predict the top
+            // measured point? If the model says "for target T=top you
+            // should see Y=X" and we measured Y=2X (or X/3), the fit
+            // doesn't describe reality and we shouldn't apply it.
+            // Saturation or low-end noise in the residuals is the
+            // typical cause; skip and try again next iteration with
+            // whatever data the (still-old) curve produces.
+            let (top_target, top_measured_y) = *useful.last().unwrap();
+            let predicted_top_y = fit_gain * top_target.powf(fit_gamma);
+            let ratio = predicted_top_y / top_measured_y.max(0.01);
+            if !(0.5..=2.0).contains(&ratio) {
+                eprintln!(
+                    "  {} fit failed sanity (predicted Y={:.2} vs measured Y={:.2}, ratio {:.2}); keeping prior curve",
+                    c.label(),
+                    predicted_top_y,
+                    top_measured_y,
+                    ratio,
+                );
+                if let Some((_, w)) = log.as_mut() {
+                    writeln!(
+                        w,
+                        "# refine {} iter {} fit: REJECTED (predicted_y={:.4} measured_y={:.4} ratio={:.4})",
+                        c.label(), iter + 1, predicted_top_y, top_measured_y, ratio,
+                    )?;
+                }
+                continue;
+            }
+
+            // Damped blend with the prior curve. α=0.5 halves the step
+            // size — slows convergence on cleanly-behaved data but
+            // protects against runaway when the fit is right at the
+            // edge of plausible. Linear blend is fine; gain/gamma are
+            // small numbers and the math is dominated by the iteration
+            // sequence not the per-step interpolation choice.
+            const ALPHA: f64 = 0.5;
+            let new_gain = (1.0 - ALPHA) * prev_gain + ALPHA * fit_gain;
+            let new_gamma = (1.0 - ALPHA) * prev_gamma + ALPHA * fit_gamma;
             curve.gain[c.idx()] = new_gain;
             curve.gamma[c.idx()] = new_gamma;
             eprintln!(
-                "  {} fit: panel_gain={:.4}, panel_gamma={:.4}",
-                c.label(), new_gain, new_gamma,
+                "  {} fit: panel_gain={:.4}, panel_gamma={:.4} → applied (damped): gain={:.4}, gamma={:.4}",
+                c.label(), fit_gain, fit_gamma, new_gain, new_gamma,
             );
             if let Some((_, w)) = log.as_mut() {
                 writeln!(
                     w,
-                    "# refine {} iter {} fit: gain={:.6} gamma={:.6}",
-                    c.label(), iter + 1, new_gain, new_gamma,
+                    "# refine {} iter {} fit: panel_gain={:.6} panel_gamma={:.6} → applied gain={:.6} gamma={:.6}",
+                    c.label(), iter + 1, fit_gain, fit_gamma, new_gain, new_gamma,
                 )?;
             }
         }
