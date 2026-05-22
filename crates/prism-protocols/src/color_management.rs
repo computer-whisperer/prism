@@ -54,6 +54,7 @@ use smithay::reexports::wayland_server::{
 use smithay::wayland::compositor::{self, SurfaceData};
 
 use crate::state::PrismState;
+use crate::surface_tex::SurfacePlacementSlot;
 
 // ─── Public types ──────────────────────────────────────────────────────────
 
@@ -181,6 +182,52 @@ pub struct SurfaceColorState {
     pub pending_unset: bool,
 }
 
+/// Per-surface tracker for active `wp_color_management_surface_feedback_v1`
+/// resources. Stored on `SurfaceData` like `SurfaceDmabufFeedbackState` is.
+/// Mirrors the smithay pattern: hold weak refs to the protocol
+/// objects so dropped clients don't keep us alive, and push
+/// `preferred_changed2` to the live ones when the surface's output
+/// changes.
+#[derive(Default)]
+pub struct SurfaceColorFeedbackSlot(pub Mutex<SurfaceColorFeedbackInner>);
+
+#[derive(Default)]
+pub struct SurfaceColorFeedbackInner {
+    pub instances: Vec<smithay::reexports::wayland_server::Weak<
+        smithay::reexports::wayland_protocols::wp::color_management::v1::server::wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
+    >>,
+    /// Identity of the last description we sent via
+    /// `preferred_changed2`. Skip the send if it matches the current
+    /// preferred — `preferred_changed2` is the *change* notification,
+    /// the get_preferred* requests are how clients fetch initial
+    /// state.
+    pub last_sent_identity: Option<u64>,
+}
+
+impl SurfaceColorFeedbackSlot {
+    /// Push `preferred_changed2` to every live feedback instance on
+    /// this surface, if the identity differs from what we last sent.
+    /// No-op if no feedback was ever requested for the surface.
+    pub fn notify_preferred_changed(states: &SurfaceData, identity: u64) {
+        let Some(slot) = states.data_map.get::<SurfaceColorFeedbackSlot>() else {
+            return;
+        };
+        let mut st = slot.0.lock().unwrap();
+        if st.last_sent_identity == Some(identity) {
+            return;
+        }
+        st.instances.retain(|w| w.upgrade().is_ok());
+        let hi = (identity >> 32) as u32;
+        let lo = (identity & 0xffff_ffff) as u32;
+        for w in &st.instances {
+            if let Ok(inst) = w.upgrade() {
+                inst.preferred_changed2(hi, lo);
+            }
+        }
+        st.last_sent_identity = Some(identity);
+    }
+}
+
 impl SurfaceColorSlot {
     /// Fetch the committed image description for a surface, if any.
     /// Render path entry point.
@@ -212,10 +259,20 @@ impl SurfaceColorSlot {
 
 // ─── Server-side state ─────────────────────────────────────────────────────
 
-/// Holds the description-identity counter and the global handle.
+/// Holds the description-identity counter, the global handle, and
+/// the per-output preferred-description cache used by
+/// `wp_color_management_surface_feedback_v1`.
 /// Single instance lives on `PrismState`.
 pub struct ColorManagementState {
     next_identity: AtomicU64,
+    /// Per-output preferred image description. Built once at output
+    /// bringup via [`Self::set_output_preferred`] from the HDR config
+    /// + EDID. Cleared when an output drops. Identity is stable for
+    /// the lifetime of the cached `Arc` (re-derivation only happens
+    /// when HDR config changes, which today is bringup-static).
+    output_preferred: std::sync::Mutex<
+        std::collections::HashMap<crate::state::OutputId, Arc<ImageDescription>>,
+    >,
 }
 
 impl ColorManagementState {
@@ -225,11 +282,93 @@ impl ColorManagementState {
         let _global = dh.create_global::<PrismState, WpColorManagerV1, ()>(2, ());
         Self {
             next_identity: AtomicU64::new(1),
+            output_preferred: std::sync::Mutex::new(Default::default()),
         }
     }
 
     fn next_identity(&self) -> u64 {
         self.next_identity.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Register the preferred image description for an output. Called
+    /// from `attach_output` after building from the output's
+    /// HDR/EDID state. Returns the registered Arc so the caller can
+    /// also push it to any feedback resources already bound on
+    /// surfaces newly-mapped to this output.
+    pub fn set_output_preferred(
+        &self,
+        id: crate::state::OutputId,
+        desc: Arc<ImageDescription>,
+    ) {
+        self.output_preferred
+            .lock()
+            .unwrap()
+            .insert(id, desc);
+    }
+
+    /// Look up an output's preferred description.
+    pub fn output_preferred(
+        &self,
+        id: &crate::state::OutputId,
+    ) -> Option<Arc<ImageDescription>> {
+        self.output_preferred.lock().unwrap().get(id).cloned()
+    }
+}
+
+/// Build the preferred parametric image description for an output
+/// from its HDR / EDID state. HDR-configured outputs get PQ + BT.2020
+/// with the mastering values we'd push to the panel via
+/// HDR_OUTPUT_METADATA; SDR outputs get sRGB primaries + gamma22
+/// with default luminances.
+///
+/// This is what `wp_color_management_surface_feedback_v1` advertises
+/// as `preferred_changed2` — clients that match it can hit the
+/// pass-through render path (Step 4) instead of going through
+/// transfer-function conversion.
+pub fn build_output_preferred(
+    ctx: &prism_drm::OutputContext,
+    cm: &ColorManagementState,
+) -> Arc<ImageDescription> {
+    let identity = cm.next_identity();
+    if let Some(hdr) = ctx.config.hdr.as_ref() {
+        // PQ HDR. Mastering primaries default to BT.2020 (same as
+        // primary color volume) when the panel doesn't advertise
+        // narrower ones via EDID — matches what build_hdr_metadata_blob
+        // ships in the HDR_OUTPUT_METADATA infoframe.
+        let max_lum = hdr.max_luminance as u32;
+        let min_lum_ticks = hdr.min_luminance_ticks as u32;
+        Arc::new(ImageDescription {
+            identity,
+            tf: TransferFunction::St2084Pq,
+            primaries: PrimaryVolume::Named(Primaries::Bt2020),
+            luminances: Some(Luminances {
+                min_lum_ticks,
+                // spec: max_lum is ignored for st2084_pq (always
+                // implies min + 10000); we set it anyway for clarity.
+                max_lum: 10_000,
+                reference_lum: 203,
+            }),
+            mastering_primaries: None,
+            mastering_luminance: Some(MasteringLuminance {
+                min_lum_ticks,
+                max_lum,
+            }),
+            max_cll: Some(hdr.max_cll as u32),
+            max_fall: Some(hdr.max_fall as u32),
+        })
+    } else {
+        // SDR. gamma22 is the spec-recommended modern default
+        // (Srgb is deprecated since v2 for being ambiguous).
+        Arc::new(ImageDescription {
+            identity,
+            tf: TransferFunction::Gamma22,
+            primaries: PrimaryVolume::Named(Primaries::Srgb),
+            luminances: None,
+            mastering_primaries: None,
+            mastering_luminance: None,
+            max_cll: None,
+            max_fall: None,
+        })
     }
 }
 
@@ -272,6 +411,14 @@ pub struct ImageDescriptionData {
 /// set/unset request — and detect inertness if the surface was
 /// destroyed.
 pub struct ColorSurfaceData {
+    pub surface: smithay::reexports::wayland_server::Weak<WlSurface>,
+}
+
+/// User data for `WpColorManagementSurfaceFeedbackV1`. Same shape as
+/// `ColorSurfaceData` — a Weak to the underlying surface so the
+/// get_preferred / get_preferred_parametric requests can resolve the
+/// surface's current output.
+pub struct ColorSurfaceFeedbackData {
     pub surface: smithay::reexports::wayland_server::Weak<WlSurface>,
 }
 
@@ -336,12 +483,41 @@ impl Dispatch<WpColorManagerV1, ()> for PrismState {
                 };
                 let _ = data_init.init(id, data);
             }
-            Request::GetSurfaceFeedback { id, surface: _ } => {
-                // Step 3.
-                let _ = data_init.init(id, ());
-                tracing::debug!(
-                    "wp_color_manager_v1.get_surface_feedback: not yet implemented"
-                );
+            Request::GetSurfaceFeedback { id, surface } => {
+                // Step 3: real handler. Resource carries a Weak to
+                // the wl_surface so get_preferred* can look up which
+                // output the surface is currently on. The actual
+                // protocol object is also added to the surface's
+                // SurfaceColorFeedbackSlot so future output
+                // transitions can push preferred_changed2.
+                let data = ColorSurfaceFeedbackData {
+                    surface: surface.downgrade(),
+                };
+                let instance = data_init.init(id, data);
+                compositor::with_states(&surface, |states| {
+                    states.data_map.insert_if_missing_threadsafe(
+                        SurfaceColorFeedbackSlot::default,
+                    );
+                    let slot = states.data_map.get::<SurfaceColorFeedbackSlot>().unwrap();
+                    let mut st = slot.0.lock().unwrap();
+                    st.instances.push(instance.downgrade());
+                    // Send the current preferred (if known) so
+                    // clients that bind feedback after the surface
+                    // already has an output see the right state
+                    // without needing an explicit get_preferred*.
+                    let current_output = states
+                        .data_map
+                        .get::<SurfacePlacementSlot>()
+                        .and_then(|s| s.0.lock().unwrap().current_output.clone());
+                    if let Some(out_id) = current_output {
+                        if let Some(desc) = state.color_management.output_preferred(&out_id) {
+                            let hi = (desc.identity >> 32) as u32;
+                            let lo = (desc.identity & 0xffff_ffff) as u32;
+                            instance.preferred_changed2(hi, lo);
+                            st.last_sent_identity = Some(desc.identity);
+                        }
+                    }
+                });
             }
             Request::CreateIccCreator { obj } => {
                 // We don't advertise IccV2V4 so a spec-compliant
@@ -418,13 +594,13 @@ impl Dispatch<WpColorManagementOutputV1, ()> for PrismState {
 use smithay::reexports::wayland_protocols::wp::color_management::v1::server::wp_color_management_surface_feedback_v1::{
     self, WpColorManagementSurfaceFeedbackV1,
 };
-impl Dispatch<WpColorManagementSurfaceFeedbackV1, ()> for PrismState {
+impl Dispatch<WpColorManagementSurfaceFeedbackV1, ColorSurfaceFeedbackData> for PrismState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         resource: &WpColorManagementSurfaceFeedbackV1,
         request: <WpColorManagementSurfaceFeedbackV1 as Resource>::Request,
-        _data: &(),
+        data: &ColorSurfaceFeedbackData,
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
@@ -433,15 +609,73 @@ impl Dispatch<WpColorManagementSurfaceFeedbackV1, ()> for PrismState {
             Request::Destroy => {}
             Request::GetPreferred { image_description }
             | Request::GetPreferredParametric { image_description } => {
-                let desc =
-                    data_init.init(image_description, ImageDescriptionData { description: None });
-                desc.failed(
-                    wp_image_description_v1::Cause::NoOutput,
-                    "surface_feedback not implemented yet".to_string(),
+                // Both variants behave the same for us — every
+                // description we mint is parametric. Resolve the
+                // surface's current output, look up the cached
+                // preferred description, init the resource with it,
+                // send `ready` (low 32 bits of identity).
+                let Ok(surface) = data.surface.upgrade() else {
+                    let desc = data_init.init(
+                        image_description,
+                        ImageDescriptionData { description: None },
+                    );
+                    desc.failed(
+                        wp_image_description_v1::Cause::NoOutput,
+                        "wl_surface gone".to_string(),
+                    );
+                    let _ = resource;
+                    return;
+                };
+                let preferred = compositor::with_states(&surface, |states| {
+                    states
+                        .data_map
+                        .get::<SurfacePlacementSlot>()
+                        .and_then(|s| s.0.lock().unwrap().current_output.clone())
+                })
+                .and_then(|out_id| state.color_management.output_preferred(&out_id));
+                let Some(desc) = preferred else {
+                    // Surface isn't on any known output (unmapped or
+                    // pre-first-commit). Spec wants us to still
+                    // produce a description — emit failed so the
+                    // client knows.
+                    let d = data_init.init(
+                        image_description,
+                        ImageDescriptionData { description: None },
+                    );
+                    d.failed(
+                        wp_image_description_v1::Cause::NoOutput,
+                        "surface not yet mapped to an output".to_string(),
+                    );
+                    return;
+                };
+                let identity = desc.identity;
+                let d = data_init.init(
+                    image_description,
+                    ImageDescriptionData {
+                        description: Some(desc),
+                    },
                 );
-                let _ = resource;
+                let lo = (identity & 0xffff_ffff) as u32;
+                d.ready(lo);
             }
             _ => {}
+        }
+    }
+
+    fn destroyed(
+        _state: &mut Self,
+        _client: ClientId,
+        resource: &WpColorManagementSurfaceFeedbackV1,
+        data: &ColorSurfaceFeedbackData,
+    ) {
+        if let Ok(surface) = data.surface.upgrade() {
+            compositor::with_states(&surface, |states| {
+                if let Some(slot) = states.data_map.get::<SurfaceColorFeedbackSlot>() {
+                    let mut st = slot.0.lock().unwrap();
+                    st.instances
+                        .retain(|w| w.upgrade().is_ok() && w.id() != resource.id());
+                }
+            });
         }
     }
 }

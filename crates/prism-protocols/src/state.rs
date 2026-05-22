@@ -475,6 +475,23 @@ impl PrismState {
         ) {
             self.output_feedback.insert(id.clone(), feedback);
         }
+        // Same step for wp_color_management_v1: derive the output's
+        // preferred image description from HDR config + EDID. Used
+        // by `wp_color_management_surface_feedback_v1` so clients
+        // know "this surface, on this output, should be PQ BT.2020
+        // mastered to X nits" (HDR) or sRGB+gamma22 (SDR).
+        let preferred = crate::color_management::build_output_preferred(
+            &output,
+            &self.color_management,
+        );
+        tracing::info!(
+            connector = %output.connector_name,
+            identity = preferred.identity,
+            tf = ?preferred.tf,
+            "color-mgmt: output preferred description registered"
+        );
+        self.color_management
+            .set_output_preferred(id.clone(), preferred);
         self.outputs.insert(id, output)
     }
 
@@ -1642,6 +1659,19 @@ fn dispatch_surface_output_from_layout(state: &mut PrismState, surface: &WlSurfa
                     if let Some(sfs) = SurfaceDmabufFeedbackState::from_states(states) {
                         sfs.set_feedback(feedback);
                     }
+                });
+            }
+            // Same shape for wp_color_management_v1 surface_feedback:
+            // push preferred_changed2 with the new output's preferred
+            // image description identity. Skipped if the client
+            // never bound a feedback object (the slot is missing)
+            // or if the identity matches what we last sent.
+            if let Some(preferred) = state.color_management.output_preferred(new_id) {
+                with_states(surface, |states| {
+                    crate::color_management::SurfaceColorFeedbackSlot::notify_preferred_changed(
+                        states,
+                        preferred.identity,
+                    );
                 });
             }
         }
