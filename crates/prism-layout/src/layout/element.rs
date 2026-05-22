@@ -53,9 +53,14 @@ pub struct RenderCtx<'a> {
     /// description. Same shape as `texture_lookup`: closure over
     /// `&SurfaceData` so we don't double-acquire the `with_states`
     /// lock during a surface-tree walk. Returning `None` falls back
-    /// to `SurfaceColorParams::default()` (the historical
-    /// sRGB-with-80-nit-white assumption).
+    /// to a sRGB EOTF with the output's `sdr_reference_nits` as the
+    /// white-point luminance.
     pub color_lookup: &'a dyn Fn(&SurfaceData) -> Option<SurfaceColorParams>,
+    /// Per-output luminance to map "color-unaware client white" to,
+    /// in cd/m². Used as the default `sdr_white_nits` for surfaces
+    /// with no `wp_color_management_v1` description. IEC sRGB default
+    /// is 80; HDR-configured outputs typically want higher.
+    pub sdr_reference_nits: f32,
 }
 
 impl<'a> RenderCtx<'a> {
@@ -63,7 +68,10 @@ impl<'a> RenderCtx<'a> {
         (self.texture_lookup)(states)
     }
     pub fn color_for(&self, states: &SurfaceData) -> SurfaceColorParams {
-        (self.color_lookup)(states).unwrap_or_default()
+        (self.color_lookup)(states).unwrap_or(SurfaceColorParams {
+            transfer: 1,
+            sdr_white_nits: self.sdr_reference_nits,
+        })
     }
 }
 

@@ -126,4 +126,12 @@ pub struct OutputConfig {
     /// connector-side advertisement (HDR_OUTPUT_METADATA blob +
     /// Colorspace).
     pub hdr: Option<crate::HdrSignaling>,
+    /// What absolute luminance "SDR white" (= 1.0 from a color-unaware
+    /// client) maps to on this output, in cd/m². Plumbed through to
+    /// the per-surface decode push as the `sdr_white_nits` parameter
+    /// fallback when the surface has no `wp_color_management_v1`
+    /// description. IEC sRGB default is 80; HDR outputs may want
+    /// higher (203 = BT.2408 reference white, or somewhere between
+    /// for taste).
+    pub sdr_reference_nits: f32,
 }

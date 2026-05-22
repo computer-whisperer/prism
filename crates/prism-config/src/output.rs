@@ -136,6 +136,21 @@ pub struct ColorConfig {
     pub max_bpc: Option<u32>,
     #[knuffel(child)]
     pub hdr: Option<HdrConfig>,
+    /// What absolute luminance (cd/m²) "SDR white" maps to for
+    /// color-unaware clients on this output. Only meaningful when the
+    /// output is in HDR mode (no effect on SDR scanout, which always
+    /// uses the IEC sRGB 80 cd/m² convention). Color-managed clients
+    /// (those that attach a `wp_color_management_v1` description) are
+    /// unaffected — they declare their own absolute luminance via the
+    /// protocol.
+    ///
+    /// Defaults to 80 (= IEC sRGB spec). BT.2408's "HDR reference
+    /// white" is 203; Windows lets users pick 80–450 via the
+    /// per-display "SDR content brightness" slider. Higher values
+    /// brighten ordinary desktop/SDR content in HDR mode; lower values
+    /// dim it.
+    #[knuffel(child, unwrap(argument))]
+    pub sdr_reference_nits: Option<f64>,
 }
 
 /// 3x3 calibration matrix in row-major order (`r0c0 r0c1 r0c2  r1c0 r1c1 r1c2  r2c0 r2c1 r2c2`).

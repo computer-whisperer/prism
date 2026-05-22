@@ -974,6 +974,10 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         encode_config: prism_renderer::EncodeConfig::default_srgb(),
         vrr: false,
         hdr: None,
+        // IEC sRGB default: 1.0 client-side = 80 cd/m². Per-output
+        // overrides applied below when a connector's KDL color block
+        // sets `sdr-reference-nits`.
+        sdr_reference_nits: 80.0,
     };
 
     // ── Pick connectors + bring up OutputContexts on every card ────────────
@@ -1039,6 +1043,18 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                             output_config.depth = prism_drm::ScanoutDepth::Bpc8;
                         }
                         output_config.vk_format = vk_format_for_depth(output_config.depth);
+                    }
+                    if let Some(nits) = color.sdr_reference_nits {
+                        // Clamp to a sane physical range (1..=10000). Negative
+                        // or zero would zero-out all color-unaware content;
+                        // values above 10000 exceed PQ's encoding range.
+                        let clamped = nits.clamp(1.0, 10_000.0) as f32;
+                        output_config.sdr_reference_nits = clamped;
+                        tracing::info!(
+                            connector = %name,
+                            sdr_reference_nits = clamped,
+                            "per-output SDR reference luminance set"
+                        );
                     }
                 }
                 // Vrr always-on → wire through; on-demand currently
@@ -1651,7 +1667,7 @@ fn render_output_now(
 
     // Snapshot identity bits without holding any borrow into
     // state.outputs (we'll re-borrow mutably at present() time below).
-    let (output_gpu_id, white_view, target_time) = {
+    let (output_gpu_id, white_view, target_time, output_sdr_reference_nits) = {
         let output = state
             .outputs
             .get(output_id)
@@ -1660,6 +1676,7 @@ fn render_output_now(
             output.gpu_id,
             output.renderer.white_view(),
             output.frame_clock.next_presentation_time(),
+            output.config.sdr_reference_nits,
         )
     };
 
@@ -1710,10 +1727,10 @@ fn render_output_now(
             })
     };
     // Per-surface decode params from wp_color_management_v1. Falls
-    // through to RenderCtx::color_for's default
-    // (SurfaceColorParams::default()) for surfaces with no
-    // description set — that's the pre-color-management sRGB/80-nit
-    // path every existing client still uses.
+    // through to RenderCtx::color_for's default (sRGB + the output's
+    // sdr_reference_nits) for surfaces with no description set —
+    // that's the pre-color-management path every existing client
+    // still uses, now scaled per the output's KDL config.
     let color_lookup = |states: &smithay::wayland::compositor::SurfaceData|
         -> Option<prism_renderer::SurfaceColorParams> {
         prism_protocols::color_management::SurfaceColorSlot::current(states)
@@ -1723,6 +1740,7 @@ fn render_output_now(
     let ctx = RenderCtx {
         texture_lookup: &texture_lookup,
         color_lookup: &color_lookup,
+        sdr_reference_nits: output_sdr_reference_nits,
     };
 
     // Refresh per-tile cached render elements (focus ring / border /
@@ -1786,11 +1804,12 @@ fn render_output_now(
             (rect.size.w as f64, rect.size.h as f64).into(),
         );
         let dst_rect_clip = project(dst);
+        // Use RenderCtx::color_for so layer-shell surfaces share the
+        // same per-output sdr_reference_nits fallback as toplevels.
         let color = smithay::wayland::compositor::with_states(
             wl_surface,
-            |states| (ctx.color_lookup)(states),
-        )
-        .unwrap_or_default();
+            |states| ctx.color_for(states),
+        );
         render_els.push(RenderEl::Surface(prism_renderer::SurfaceEl {
             texture_view,
             dst_rect_clip,
@@ -1837,7 +1856,23 @@ fn render_output_now(
         }
     }
 
-    let encode_push = EncodePush::sdr_identity();
+    // Build the encode push from the output's HDR config so PQ outputs
+    // clamp at the panel's declared peak (not at the SDR-default 80 nits,
+    // which would flatten any patch ≥ 80 nits to the same scanout code).
+    let encode_push = {
+        let output = state
+            .outputs
+            .get(output_id)
+            .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
+        match output.config.hdr {
+            Some(hdr) => {
+                let mut p = EncodePush::pq_identity();
+                p.target_peak_nits = hdr.max_luminance as f32;
+                p
+            }
+            None => EncodePush::sdr_identity(),
+        }
+    };
     let presented = {
         let output = state
             .outputs
