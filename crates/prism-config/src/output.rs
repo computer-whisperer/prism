@@ -151,6 +151,33 @@ pub struct ColorConfig {
     /// dim it.
     #[knuffel(child, unwrap(argument))]
     pub sdr_reference_nits: Option<f64>,
+    /// Per-channel response correction. The encoder inverts the
+    /// panel's measured response (`emitted = gain * commanded^gamma`)
+    /// so commanded nits match emitted nits. Derive from a Spyder
+    /// sweep (`spyder sweep --hdr --window 0.1 ...`) — fit
+    /// `gain` and `gamma` per channel to the measured-vs-requested
+    /// curve. Identity (gain=1, gamma=1) when unset.
+    #[knuffel(child)]
+    pub response_curve: Option<ResponseCurve>,
+}
+
+/// Per-channel response correction parameters. See [`ColorConfig::response_curve`].
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct ResponseCurve {
+    /// Per-channel response gain. Identity = 1.0.
+    #[knuffel(property, default = 1.0)]
+    pub gain_r: f64,
+    #[knuffel(property, default = 1.0)]
+    pub gain_g: f64,
+    #[knuffel(property, default = 1.0)]
+    pub gain_b: f64,
+    /// Per-channel response gamma exponent. Identity = 1.0.
+    #[knuffel(property, default = 1.0)]
+    pub gamma_r: f64,
+    #[knuffel(property, default = 1.0)]
+    pub gamma_g: f64,
+    #[knuffel(property, default = 1.0)]
+    pub gamma_b: f64,
 }
 
 /// 3x3 calibration matrix in row-major order (`r0c0 r0c1 r0c2  r1c0 r1c1 r1c2  r2c0 r2c1 r2c2`).

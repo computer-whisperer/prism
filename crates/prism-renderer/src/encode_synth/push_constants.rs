@@ -7,9 +7,13 @@
 //!
 //! Layout aims for std430 + Vulkan push-constants compatibility:
 //!   - `mat4 cal_matrix` at offset 0   (64 B, MatrixStride 16, ColMajor)
-//!   - `vec4 fir_kernel_r` at offset 64 (xyz = 3-tap weights, w unused)
-//!   - `vec4 fir_kernel_g` at offset 80
-//!   - `vec4 fir_kernel_b` at offset 96
+//!   - `vec4 response_gain` at offset 64 (per-channel response gain,
+//!     used by `EncodeFragment::PerChannelResponseGainGamma`. `.w`
+//!     unused but reserved.)
+//!   - `vec4 response_gamma` at offset 80 (per-channel response gamma
+//!     exponent. `.w` unused but reserved.)
+//!   - `vec4 aux2_reserved` at offset 96 (placeholder for future FIR
+//!     weights or a small inline LUT segment.)
 //!   - `float sdr_white_nits` at offset 112
 //!   - `float target_peak_nits` at offset 116
 //!   - `float dither_strength` at offset 120
@@ -29,12 +33,17 @@ pub struct EncodePushSynth {
     /// absolute nits). 4×4 storage with the upper-left 3×3 used; the rest
     /// is zero-padded for std430 alignment.
     pub cal_matrix: [f32; 16],
-    /// Subpixel FIR weights, per-channel. `xyz` = three horizontal taps
-    /// (left, center, right). `w` is padding. Used by
-    /// `EncodeFragment::SubpixelFir3Horizontal`.
-    pub fir_kernel_r: [f32; 4],
-    pub fir_kernel_g: [f32; 4],
-    pub fir_kernel_b: [f32; 4],
+    /// Per-channel response gain — multiplier the panel applies to a
+    /// commanded value. Used by `EncodeFragment::PerChannelResponseGainGamma`
+    /// to invert the panel's measured response (`commanded =
+    /// (target/gain)^(1/gamma)`). Identity = `[1.0, 1.0, 1.0, 0.0]`.
+    /// `.w` is unused/reserved.
+    pub response_gain: [f32; 4],
+    /// Per-channel response gamma — exponent. Identity = `[1.0, 1.0, 1.0, 0.0]`.
+    pub response_gamma: [f32; 4],
+    /// Reserved vec4 slot. Originally allocated for FIR weights; not
+    /// currently used. Future FIR or small LUT segment can live here.
+    pub aux2_reserved: [f32; 4],
     /// For SDR encode: how many nits is the input value `1.0`.
     pub sdr_white_nits: f32,
     /// For PQ encode and linear scanout: clip / normalize ceiling.
@@ -46,14 +55,13 @@ pub struct EncodePushSynth {
 }
 
 impl EncodePushSynth {
-    /// Identity calibration + 80-nit SDR white, no dither, no FIR.
-    /// Matches the previous hard-coded `EncodePush::sdr_identity` defaults.
+    /// Identity calibration + 80-nit SDR white, no dither, identity response.
     pub fn sdr_identity() -> Self {
         Self {
             cal_matrix: mat4_identity(),
-            fir_kernel_r: identity_fir_tap(),
-            fir_kernel_g: identity_fir_tap(),
-            fir_kernel_b: identity_fir_tap(),
+            response_gain: identity_response_vec(),
+            response_gamma: identity_response_vec(),
+            aux2_reserved: [0.0; 4],
             sdr_white_nits: 80.0,
             target_peak_nits: 80.0,
             dither_strength: 0.0,
@@ -61,18 +69,28 @@ impl EncodePushSynth {
         }
     }
 
-    /// Identity calibration + 10000-nit PQ peak, no dither, no FIR.
+    /// Identity calibration + 10000-nit PQ peak, no dither, identity response.
     pub fn pq_identity() -> Self {
         Self {
             cal_matrix: mat4_identity(),
-            fir_kernel_r: identity_fir_tap(),
-            fir_kernel_g: identity_fir_tap(),
-            fir_kernel_b: identity_fir_tap(),
+            response_gain: identity_response_vec(),
+            response_gamma: identity_response_vec(),
+            aux2_reserved: [0.0; 4],
             sdr_white_nits: 80.0,
             target_peak_nits: 10000.0,
             dither_strength: 0.0,
             _pad: 0.0,
         }
+    }
+
+    /// Set the per-channel response correction values. `gain` and
+    /// `gamma` are arrays of length 3 (R, G, B). The fragment shader
+    /// computes `compensated = (target / gain)^(1/gamma)` per channel
+    /// before the OETF, so the panel — which emits
+    /// `gain * commanded^gamma` — ends up emitting the target value.
+    pub fn set_response_gain_gamma(&mut self, gain: [f32; 3], gamma: [f32; 3]) {
+        self.response_gain = [gain[0], gain[1], gain[2], 0.0];
+        self.response_gamma = [gamma[0], gamma[1], gamma[2], 0.0];
     }
 }
 
@@ -85,9 +103,9 @@ fn mat4_identity() -> [f32; 16] {
     ]
 }
 
-/// 3-tap FIR pass-through: center weight = 1, neighbors = 0.
-fn identity_fir_tap() -> [f32; 4] {
-    [0.0, 1.0, 0.0, 0.0]
+/// Identity response: gain=1, gamma=1, .w slot unused.
+fn identity_response_vec() -> [f32; 4] {
+    [1.0, 1.0, 1.0, 0.0]
 }
 
 /// Push-constant byte size. Must equal the SPIR-V Push struct size.
@@ -95,9 +113,9 @@ pub const PUSH_CONSTANTS_SIZE: u32 = std::mem::size_of::<EncodePushSynth>() as u
 
 // Byte offsets — used by the SPIR-V builder for OpMemberDecorate Offset.
 pub const OFFSET_CAL_MATRIX: u32 = 0;
-pub const OFFSET_FIR_KERNEL_R: u32 = 64;
-pub const OFFSET_FIR_KERNEL_G: u32 = 80;
-pub const OFFSET_FIR_KERNEL_B: u32 = 96;
+pub const OFFSET_RESPONSE_GAIN: u32 = 64;
+pub const OFFSET_RESPONSE_GAMMA: u32 = 80;
+pub const OFFSET_AUX2_RESERVED: u32 = 96;
 pub const OFFSET_SDR_WHITE_NITS: u32 = 112;
 pub const OFFSET_TARGET_PEAK_NITS: u32 = 116;
 pub const OFFSET_DITHER_STRENGTH: u32 = 120;
@@ -105,9 +123,9 @@ pub const OFFSET_PAD: u32 = 124;
 
 // Member indices within the SPIR-V struct (same order as Rust struct).
 pub const MEMBER_CAL_MATRIX: u32 = 0;
-pub const MEMBER_FIR_KERNEL_R: u32 = 1;
-pub const MEMBER_FIR_KERNEL_G: u32 = 2;
-pub const MEMBER_FIR_KERNEL_B: u32 = 3;
+pub const MEMBER_RESPONSE_GAIN: u32 = 1;
+pub const MEMBER_RESPONSE_GAMMA: u32 = 2;
+pub const MEMBER_AUX2_RESERVED: u32 = 3;
 pub const MEMBER_SDR_WHITE_NITS: u32 = 4;
 pub const MEMBER_TARGET_PEAK_NITS: u32 = 5;
 pub const MEMBER_DITHER_STRENGTH: u32 = 6;
@@ -130,16 +148,16 @@ mod tests {
             OFFSET_CAL_MATRIX
         );
         assert_eq!(
-            (&zero.fir_kernel_r as *const _ as usize - base) as u32,
-            OFFSET_FIR_KERNEL_R
+            (&zero.response_gain as *const _ as usize - base) as u32,
+            OFFSET_RESPONSE_GAIN
         );
         assert_eq!(
-            (&zero.fir_kernel_g as *const _ as usize - base) as u32,
-            OFFSET_FIR_KERNEL_G
+            (&zero.response_gamma as *const _ as usize - base) as u32,
+            OFFSET_RESPONSE_GAMMA
         );
         assert_eq!(
-            (&zero.fir_kernel_b as *const _ as usize - base) as u32,
-            OFFSET_FIR_KERNEL_B
+            (&zero.aux2_reserved as *const _ as usize - base) as u32,
+            OFFSET_AUX2_RESERVED
         );
         assert_eq!(
             (&zero.sdr_white_nits as *const _ as usize - base) as u32,

@@ -18,6 +18,7 @@ use super::push_constants::*;
 // GLSL.std.450 instruction numbers we use. From the spec.
 const GLSL_POW: u32 = 26;
 const GLSL_FCLAMP: u32 = 43;
+const GLSL_FMAX: u32 = 40;
 
 /// Sample `u_intermediate` at `v_uv` and return the .rgb of the sampled vec4.
 /// This is the first thing every synthesized encode shader does — produces
@@ -265,6 +266,62 @@ pub fn emit_output_transfer_linear(ctx: &mut ShaderCtx, in_nits: spirv::Word) ->
         .expect("divide by peak")
 }
 
+/// Per-channel response correction: invert the panel's measured
+/// `emitted = gain * commanded^gamma` curve. Computes
+/// `out = (in / max(gain, eps))^(1 / max(gamma, eps))` per channel.
+///
+/// `gain` and `gamma` come from push constant members `response_gain`
+/// and `response_gamma` (each `vec4`, only `.rgb` used). Identity values
+/// are `gain = (1, 1, 1)` and `gamma = (1, 1, 1)` — those make this
+/// fragment a no-op (`out = in`), which is what unconfigured panels
+/// (e.g. the OLED in its linear range) want.
+///
+/// The epsilon floor (`1e-3`) prevents division by zero and zero^k
+/// surprises for misconfigured panels. A panel-author who sets gain
+/// or gamma below epsilon gets clipped to epsilon, which produces
+/// huge but bounded commanded values that the encoder's downstream
+/// PQ_OETF can still process.
+pub fn emit_per_channel_response_gain_gamma(
+    ctx: &mut ShaderCtx,
+    in_nits: spirv::Word,
+) -> spirv::Word {
+    let vec3_t = ctx.types.vec3;
+    let glsl_ext = ctx.iface.glsl_ext;
+
+    let gain_vec4 = load_push_vec4(ctx, MEMBER_RESPONSE_GAIN);
+    let gamma_vec4 = load_push_vec4(ctx, MEMBER_RESPONSE_GAMMA);
+    let gain = vec4_xyz(ctx, gain_vec4);
+    let gamma = vec4_xyz(ctx, gamma_vec4);
+
+    let eps = ctx.const_f32(1.0e-3);
+    let eps_vec = ctx.vec3_splat(eps);
+    let f_zero = ctx.consts.f_zero;
+    let zero_vec = ctx.vec3_splat(f_zero);
+    let f_one = ctx.consts.f_one;
+    let one_vec = ctx.vec3_splat(f_one);
+
+    // safe_gain = max(gain, eps); safe_gamma = max(gamma, eps)
+    let safe_gain = ctx.glsl_call_vec3(GLSL_FMAX, [gain, eps_vec]);
+    let safe_gamma = ctx.glsl_call_vec3(GLSL_FMAX, [gamma, eps_vec]);
+
+    // ratio = max(in_nits, 0) / safe_gain
+    let in_clamped = ctx.glsl_call_vec3(GLSL_FMAX, [in_nits, zero_vec]);
+    let ratio = ctx
+        .b
+        .f_div(vec3_t, None, in_clamped, safe_gain)
+        .expect("ratio = in / gain");
+
+    // inv_gamma = 1 / safe_gamma
+    let inv_gamma = ctx
+        .b
+        .f_div(vec3_t, None, one_vec, safe_gamma)
+        .expect("inv_gamma = 1 / gamma");
+
+    // out = pow(ratio, inv_gamma)
+    let _ = glsl_ext; // already referenced via ext_inst calls above
+    ctx.glsl_call_vec3(GLSL_POW, [ratio, inv_gamma])
+}
+
 /// Helper: load a single f32 push-constant member.
 fn load_push_f32(ctx: &mut ShaderCtx, member_index: u32) -> spirv::Word {
     let idx = ctx.const_u32(member_index);
@@ -278,4 +335,40 @@ fn load_push_f32(ctx: &mut ShaderCtx, member_index: u32) -> spirv::Word {
     ctx.b
         .load(f32_t, None, ptr, None, [])
         .expect("load push f32")
+}
+
+/// Helper: load a single vec4 push-constant member.
+fn load_push_vec4(ctx: &mut ShaderCtx, member_index: u32) -> spirv::Word {
+    let idx = ctx.const_u32(member_index);
+    let push_vec4_ptr_t = ctx.ptrs.push_constant_vec4;
+    let push_ptr = ctx.iface.push_ptr;
+    let vec4_t = ctx.types.vec4;
+    let ptr = ctx
+        .b
+        .access_chain(push_vec4_ptr_t, None, push_ptr, [idx])
+        .expect("access_chain push vec4");
+    ctx.b
+        .load(vec4_t, None, ptr, None, [])
+        .expect("load push vec4")
+}
+
+/// Helper: extract the xyz of a vec4 into a vec3.
+fn vec4_xyz(ctx: &mut ShaderCtx, v: spirv::Word) -> spirv::Word {
+    let f32_t = ctx.types.f32_t;
+    let vec3_t = ctx.types.vec3;
+    let x = ctx
+        .b
+        .composite_extract(f32_t, None, v, [0])
+        .expect("extract x");
+    let y = ctx
+        .b
+        .composite_extract(f32_t, None, v, [1])
+        .expect("extract y");
+    let z = ctx
+        .b
+        .composite_extract(f32_t, None, v, [2])
+        .expect("extract z");
+    ctx.b
+        .composite_construct(vec3_t, None, [x, y, z])
+        .expect("composite_construct vec3 from xyz")
 }

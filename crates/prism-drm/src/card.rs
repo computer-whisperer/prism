@@ -142,4 +142,10 @@ pub struct OutputConfig {
     /// `hdr.max_luminance` for HDR outputs, `sdr_reference_nits` for
     /// SDR outputs.
     pub panel_peak_nits: f32,
+    /// Per-channel response correction parameters: `(gain_rgb,
+    /// gamma_rgb)`. The encoder applies `(in / gain)^(1/gamma)` per
+    /// channel before the OETF to compensate for the panel's measured
+    /// `emitted = gain * commanded^gamma` response. `None` =
+    /// identity (no correction).
+    pub response_curve: Option<([f32; 3], [f32; 3])>,
 }

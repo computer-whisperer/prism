@@ -981,6 +981,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         // Defaults to IEC sRGB ceiling; recalculated per-output below
         // once HDR config / sdr-reference-nits are known.
         panel_peak_nits: 80.0,
+        response_curve: None,
     };
 
     // ── Pick connectors + bring up OutputContexts on every card ────────────
@@ -1068,6 +1069,44 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                     Some(hdr) => hdr.max_luminance as f32,
                     None => output_config.sdr_reference_nits,
                 };
+                if let Some(curve) = cfg.color.as_ref().and_then(|c| c.response_curve.as_ref()) {
+                    // Clamp to physically-meaningful ranges. Gain <= 0
+                    // would zero-divide; gamma <= 0 would produce
+                    // pow(x, +inf); silly-large values blow up
+                    // commanded-nits to past PQ peak.
+                    let g_r = (curve.gain_r as f32).clamp(0.01, 10.0);
+                    let g_g = (curve.gain_g as f32).clamp(0.01, 10.0);
+                    let g_b = (curve.gain_b as f32).clamp(0.01, 10.0);
+                    let y_r = (curve.gamma_r as f32).clamp(0.1, 10.0);
+                    let y_g = (curve.gamma_g as f32).clamp(0.1, 10.0);
+                    let y_b = (curve.gamma_b as f32).clamp(0.1, 10.0);
+                    output_config.response_curve = Some(([g_r, g_g, g_b], [y_r, y_g, y_b]));
+                    // Splice the PerChannelResponseGainGamma fragment
+                    // into the encode chain just before the output
+                    // transfer (so it operates in linear-nits domain).
+                    let mut frags = output_config.encode_config.fragments.clone();
+                    let insert_at = frags
+                        .iter()
+                        .position(|f| matches!(
+                            f,
+                            prism_renderer::EncodeFragment::OutputTransferSrgb
+                                | prism_renderer::EncodeFragment::OutputTransferPq
+                                | prism_renderer::EncodeFragment::OutputTransferLinear
+                        ))
+                        .unwrap_or(frags.len());
+                    frags.insert(
+                        insert_at,
+                        prism_renderer::EncodeFragment::PerChannelResponseGainGamma,
+                    );
+                    output_config.encode_config =
+                        prism_renderer::EncodeConfig { fragments: frags };
+                    tracing::info!(
+                        connector = %name,
+                        gain = ?[g_r, g_g, g_b],
+                        gamma = ?[y_r, y_g, y_b],
+                        "per-output response correction wired into encode chain"
+                    );
+                }
                 // Vrr always-on → wire through; on-demand currently
                 // treated as off (needs content_type signaling).
                 output_config.vrr = cfg.is_vrr_always_on();
@@ -1876,22 +1915,26 @@ fn render_output_now(
         }
     }
 
-    // Build the encode push from the output's HDR config so PQ outputs
-    // clamp at the panel's declared peak (not at the SDR-default 80 nits,
-    // which would flatten any patch ≥ 80 nits to the same scanout code).
+    // Build the encode push from the output's config: PQ outputs clamp
+    // at the panel's declared peak, and per-output response correction
+    // (if configured) gets its push-constant slots filled.
     let encode_push = {
         let output = state
             .outputs
             .get(output_id)
             .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
-        match output.config.hdr {
+        let mut p = match output.config.hdr {
             Some(hdr) => {
                 let mut p = EncodePush::pq_identity();
                 p.target_peak_nits = hdr.max_luminance as f32;
                 p
             }
             None => EncodePush::sdr_identity(),
+        };
+        if let Some((gain, gamma)) = output.config.response_curve {
+            p.set_response_gain_gamma(gain, gamma);
         }
+        p
     };
     let presented = {
         let output = state

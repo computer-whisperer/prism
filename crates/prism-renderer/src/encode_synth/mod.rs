@@ -39,6 +39,12 @@ pub enum EncodeFragment {
     OutputTransferPq,
     /// `out = in / max(target_peak_nits, 1)`. For fp16 scanout.
     OutputTransferLinear,
+    /// Per-channel response correction: `out = (in / gain)^(1/gamma)`.
+    /// Inverts the panel's measured `emitted = gain * commanded^gamma`
+    /// curve. Identity (gain=1, gamma=1) is a no-op. Stage before any
+    /// of the OutputTransfer* fragments so the correction is in
+    /// linear-nits domain.
+    PerChannelResponseGainGamma,
     /// Per-channel 3-tap horizontal FIR filter for non-stripe subpixel
     /// layouts (QD-OLED triangular). Requires multi-sample handling that
     /// the synthesizer doesn't implement yet — emitting this currently
@@ -101,6 +107,9 @@ pub fn synthesize_fragment_shader(config: &EncodeConfig) -> Result<Vec<u32>> {
             EncodeFragment::OutputTransferPq => fragment::emit_output_transfer_pq(&mut ctx, color),
             EncodeFragment::OutputTransferLinear => {
                 fragment::emit_output_transfer_linear(&mut ctx, color)
+            }
+            EncodeFragment::PerChannelResponseGainGamma => {
+                fragment::emit_per_channel_response_gain_gamma(&mut ctx, color)
             }
             EncodeFragment::SubpixelFir3Horizontal => {
                 return Err(RendererError::MissingFeature(
