@@ -170,6 +170,11 @@ pub struct PrismState {
     /// (mpv): without it they fall back to wl_callback.frame timestamp
     /// guesses and end up dropping frames pessimistically.
     pub presentation: PresentationState,
+    /// `wp_color_management_v1` identity counter + global handle.
+    /// Dispatch for the manager + creator + description + surface
+    /// extension interfaces lives in [`crate::color_management`]; this
+    /// struct just owns the state the dispatch code references.
+    pub color_management: crate::color_management::ColorManagementState,
 
     /// Per-output smithay `Output`, keyed by the same `OutputId`
     /// (connector name) as `outputs`. Populated by [`advertise_output`];
@@ -381,6 +386,11 @@ impl PrismState {
         let presentation =
             PresentationState::new::<PrismState>(&dh, libc::CLOCK_MONOTONIC as u32);
 
+        // wp_color_management_v1 global. See module doc for scope —
+        // accepts parametric image descriptions, surfaces them via
+        // `SurfaceColorSlot`, render path consumption is Step 4.
+        let color_management = crate::color_management::ColorManagementState::new(&dh);
+
         Self {
             config,
             clock,
@@ -399,6 +409,7 @@ impl PrismState {
             seat,
             viewporter,
             presentation,
+            color_management,
             session,
             cards: HashMap::new(),
             gpus,
@@ -920,6 +931,16 @@ impl CompositorHandler for PrismState {
         // below must read the buffer from `RendererSurfaceState`
         // instead of `cached_state` (already updated to do so).
         on_commit_buffer_handler::<PrismState>(surface);
+
+        // Apply any pending wp_color_management_surface_v1 state
+        // (set/unset_image_description is double-buffered per the
+        // spec). Cheap no-op for surfaces without an image
+        // description attachment. Done before the buffer-import path
+        // so future Step-4 work that picks a decode shader per
+        // surface can read the committed description.
+        with_states(surface, |states| {
+            crate::color_management::SurfaceColorSlot::commit_pending(states);
+        });
 
         // Process the buffer: import (dmabuf) or upload (shm) into our
         // Vulkan-side SurfaceTexture and stash it on the surface's

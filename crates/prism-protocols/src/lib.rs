@@ -7,6 +7,7 @@
 //! lifecycle work; rendering / texture import / input come incrementally.
 
 pub mod client;
+pub mod color_management;
 pub mod input_state;
 pub mod redraw;
 pub mod server;
