@@ -459,10 +459,12 @@ impl PrismState {
     /// is logged when the config asks for one. Render-side rotation lands
     /// with its own task.
     ///
-    /// EDID-derived `PhysicalProperties` (mm size, make/model/serial)
-    /// aren't available yet; we advertise placeholder values that won't
-    /// confuse clients but won't drive DPI-aware scaling correctly
-    /// either. Refine when EDID parsing lands.
+    /// `PhysicalProperties` are populated from the parsed EDID
+    /// (`OutputContext.edid`): make/model/serial drive both
+    /// `wl_output` advertisement and config matching by "make model
+    /// serial"; physical mm size lets DPI-aware clients pick correct
+    /// font sizes. Fields the panel didn't advertise fall back to the
+    /// strings smithay treats as "unknown" ("Unknown" / empty / 0×0).
     pub fn advertise_output(&mut self, ctx: &prism_drm::OutputContext) -> &Output {
         let mode = OutputMode {
             size: (ctx.extent.width as i32, ctx.extent.height as i32).into(),
@@ -470,16 +472,26 @@ impl PrismState {
             refresh: (ctx.mode.vrefresh() as i32) * 1000,
         };
         let (scale, transform) = self.resolve_output_scale_transform(&ctx.connector_name);
+        let size_mm = ctx
+            .edid
+            .size_mm
+            .map(|(w, h)| (w as i32, h as i32).into())
+            .unwrap_or_else(|| (0, 0).into());
+        let make = ctx.edid.make.clone().unwrap_or_else(|| "Unknown".to_owned());
+        let model = ctx
+            .edid
+            .model
+            .clone()
+            .unwrap_or_else(|| ctx.connector_name.clone());
+        let serial_number = ctx.edid.serial.clone().unwrap_or_default();
         let output = Output::new(
             ctx.connector_name.clone(),
             PhysicalProperties {
-                // (0, 0) = "unknown" per wl_output; clients fall back to
-                // DPI-agnostic scaling. EDID parsing fills this in later.
-                size: (0, 0).into(),
+                size: size_mm,
                 subpixel: Subpixel::Unknown,
-                make: "prism".to_string(),
-                model: ctx.connector_name.clone(),
-                serial_number: String::new(),
+                make,
+                model,
+                serial_number,
             },
         );
         // Create the wl_output global. We drop the returned GlobalId
@@ -505,17 +517,16 @@ impl PrismState {
         );
         // Attach the OutputName user data the layout uses to track
         // outputs across disconnects (workspaces remember which
-        // output they originated on by name). Must happen before
-        // layout.add_output below — that path unwraps this user data.
-        // make/model/serial are None until EDID parsing lands;
-        // matching today is by connector name alone.
+        // output they originated on by name). Populated from EDID so
+        // `OutputName::matches` can now match either the kernel
+        // connector name OR a `"Make Model Serial"` config target.
         output
             .user_data()
             .insert_if_missing(|| prism_config::OutputName {
                 connector: ctx.connector_name.clone(),
-                make: None,
-                model: None,
-                serial: None,
+                make: ctx.edid.make.clone(),
+                model: ctx.edid.model.clone(),
+                serial: ctx.edid.serial.clone(),
             });
         // Inform the layout. This creates a Monitor entry, splices in any
         // workspaces that named this output via `original_output`, and

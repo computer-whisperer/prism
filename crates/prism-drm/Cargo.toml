@@ -12,6 +12,7 @@ calloop.workspace = true
 drm-fourcc.workspace = true
 gbm.workspace = true
 libc.workspace = true
+libdisplay-info = { version = "0.3.0", features = ["v0_2"] }
 prism-config.workspace = true
 prism-frame.workspace = true
 prism-renderer.workspace = true

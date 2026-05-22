@@ -14,6 +14,7 @@
 pub mod breadcrumb;
 pub mod card;
 pub mod cursor_plane;
+pub mod edid;
 pub mod enumerate;
 pub mod frame_clock;
 pub mod gbm_dev;
@@ -23,6 +24,7 @@ pub mod session;
 
 pub use card::{DrmCardContext, OutputConfig};
 pub use cursor_plane::CursorPlane;
+pub use edid::{ColorPrimaries, EdidInfo, HdrCapabilities};
 pub use frame_clock::FrameClock;
 pub use enumerate::{ConnectorSummary, DeviceSummary, DrmFd, open_for_enumeration, summarize};
 pub use gbm_dev::GbmDevice;

@@ -1129,6 +1129,7 @@ dependencies = [
  "drm-fourcc",
  "gbm",
  "libc",
+ "libdisplay-info",
  "prism-config",
  "prism-frame",
  "prism-renderer",

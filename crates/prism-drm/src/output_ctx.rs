@@ -105,6 +105,12 @@ pub struct OutputContext {
     /// driven by `prism_protocols::update_output_cursors`; we just
     /// include its `to_plane_state()` in the page-flip below.
     pub cursor: Option<CursorPlane>,
+    /// Parsed EDID — make / model / serial / physical mm size / HDR
+    /// capabilities / default primaries. Always populated; fields
+    /// inside are `None` when the panel didn't advertise them. Read
+    /// at bringup and stashed so per-output config defaulting +
+    /// `wl_output` advertisement can pick it up.
+    pub edid: crate::EdidInfo,
 }
 
 impl OutputContext {
@@ -139,6 +145,13 @@ impl OutputContext {
             config.depth,
             gpu_id.major,
             gpu_id.minor,
+        );
+
+        let edid = crate::EdidInfo::read(&card.drm, pick.connector);
+        tracing::info!(
+            connector = %pick.connector_name,
+            "EDID: {}",
+            edid.log_line()
         );
 
         match set_connector_max_bpc(&card.drm, pick.connector, config.depth.max_bpc()) {
@@ -262,6 +275,7 @@ impl OutputContext {
             frame_pending: false,
             frame_clock,
             cursor,
+            edid,
         })
     }
 
