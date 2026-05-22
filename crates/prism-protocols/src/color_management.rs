@@ -228,6 +228,51 @@ impl SurfaceColorFeedbackSlot {
     }
 }
 
+/// Map a committed image description to the renderer's
+/// `SurfaceColorParams`. This is the bridge between the protocol-side
+/// description (semantic: "PQ encoded BT.2020 mastered to 400 nits")
+/// and the shader-side decode parameters (mechanical: "shader code 2,
+/// 80-nit reference white").
+///
+/// `None` description ⇒ `None` (caller falls back to
+/// `SurfaceColorParams::default()`). The mapping is deliberately
+/// total over every TF we advertise in `SUPPORTED_TFS`; unsupported
+/// TFs can never reach a committed description (the params creator
+/// rejects them with `invalid_tf`).
+pub fn description_to_params(
+    desc: &ImageDescription,
+) -> prism_renderer::SurfaceColorParams {
+    let transfer = match desc.tf {
+        // Linear path — pixels already in linear-light. Caller
+        // anchors via sdr_white_nits.
+        TransferFunction::ExtLinear => 0,
+        // sRGB piecewise EOTF — matches the deprecated `srgb`
+        // protocol value that some toolkits still ship.
+        TransferFunction::Srgb => 1,
+        // PQ absolute-nits domain.
+        TransferFunction::St2084Pq => 2,
+        // Gamma 2.2 — modern SDR default in protocol v2.
+        TransferFunction::Gamma22 => 4,
+        // BT.1886 — fragment shader implements the default-Lw/Lb
+        // pure-pow 2.4 degenerate.
+        TransferFunction::Bt1886 => 5,
+        // Anything else (HLG, st240, log_*, etc.) isn't in
+        // SUPPORTED_TFS so shouldn't reach here; if it does
+        // (future expansion bug) fall back to sRGB rather than
+        // silently rendering wrong.
+        _ => 1,
+    };
+    let sdr_white_nits = desc
+        .luminances
+        .map(|l| l.reference_lum as f32)
+        // sRGB default reference white per the protocol spec.
+        .unwrap_or(80.0);
+    prism_renderer::SurfaceColorParams {
+        transfer,
+        sdr_white_nits,
+    }
+}
+
 impl SurfaceColorSlot {
     /// Fetch the committed image description for a surface, if any.
     /// Render path entry point.

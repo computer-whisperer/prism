@@ -1709,8 +1709,20 @@ fn render_output_now(
                     .and_then(|t| t.view_for(output_gpu_id))
             })
     };
+    // Per-surface decode params from wp_color_management_v1. Falls
+    // through to RenderCtx::color_for's default
+    // (SurfaceColorParams::default()) for surfaces with no
+    // description set — that's the pre-color-management sRGB/80-nit
+    // path every existing client still uses.
+    let color_lookup = |states: &smithay::wayland::compositor::SurfaceData|
+        -> Option<prism_renderer::SurfaceColorParams> {
+        prism_protocols::color_management::SurfaceColorSlot::current(states)
+            .as_deref()
+            .map(prism_protocols::color_management::description_to_params)
+    };
     let ctx = RenderCtx {
         texture_lookup: &texture_lookup,
+        color_lookup: &color_lookup,
     };
 
     // Refresh per-tile cached render elements (focus ring / border /

@@ -3,16 +3,18 @@
 // Pipeline stage 1 of 2. Inputs one element's texture (any transfer/primaries).
 // Outputs BT.2020 linear absolute nits into the fp16 intermediate.
 //
-// Transfer enum (matches prism_frame::TransferFunction):
+// Transfer enum (kept in sync with prism_renderer::SurfaceColorParams):
 //   0 = Linear (no-op, assume input is already linear-light)
-//   1 = sRGB EOTF
-//   2 = PQ (SMPTE ST 2084) EOTF
+//   1 = sRGB piecewise EOTF (IEC 61966-2-1)
+//   2 = PQ (SMPTE ST 2084) EOTF — output is absolute nits
 //   3 = HLG (BT.2100) — TODO not implemented yet
-//   4 = BT.1886 — TODO not implemented yet
-//   5 = Gamma  — TODO not implemented yet
+//   4 = Gamma 2.2 (BT.470 / NTSC display assumption)
+//   5 = BT.1886 (display gamma 2.4 with defaults; pure pow for now —
+//       precise BT.1886 has Lb/Lw black-lift terms but most content
+//       authors expect the pure-pow degenerate case)
 //
-// For now we support Linear + sRGB; PQ/HLG/BT.1886/Gamma will be added as
-// soon as we have client buffers in those formats to test against.
+// All transfers other than PQ scale the linear result by sdr_white_nits
+// to get into absolute-nits domain.
 
 #version 450
 
@@ -75,6 +77,12 @@ void main() {
         linear = srgb_eotf(sampled.rgb);
     } else if (push.transfer == 2) {
         linear = pq_eotf(sampled.rgb);
+    } else if (push.transfer == 4) {
+        // Gamma 2.2. `pow` on the negative half is undefined; clamp.
+        linear = pow(max(sampled.rgb, vec3(0.0)), vec3(2.2));
+    } else if (push.transfer == 5) {
+        // BT.1886 with defaults — degenerate pure-pow 2.4.
+        linear = pow(max(sampled.rgb, vec3(0.0)), vec3(2.4));
     } else {
         // Linear (or unhandled transfer → identity for now).
         linear = sampled.rgb;

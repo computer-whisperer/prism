@@ -637,8 +637,7 @@ impl LayoutElement for Mapped {
                     texture_view,
                     dst_rect_clip,
                     src_rect_uv: [0.0, 0.0, 1.0, 1.0],
-                    transfer: 1,
-                    sdr_white_nits: 80.0,
+                    color: ctx.color_for(states),
                 }));
             },
             |_, _, _| true,

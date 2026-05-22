@@ -107,7 +107,56 @@ short-circuit `pick_scanout_modifiers` when set. ~20 LOC.
 that our modifier negotiation picks wrong. Cheap insurance to add
 proactively, but not blocking anything today.
 
-## 5. Renderer-side intermediate-buffer modifier negotiation
+## 5. Primary-space conversion in the decode pass
+
+**Status:** the decode shader has a `decode_matrix` push constant
+(`mat3` lifted to `mat4` for storage) intended for surface-primaries
+→ intermediate-primaries conversion (typically BT.709 → BT.2020).
+`DecodePush::identity_srgb` constructs it as identity, and the
+mapped-window render walk never overrides it. So today every
+surface's pixels are treated as already-in-intermediate-primaries
+no matter what the surface's actual primaries are.
+
+**Why it doesn't break visibly today:** the encode pass also does
+not perform an intermediate → output primaries conversion. Both the
+SDR sRGB output (which would want BT.2020 → BT.709) and the HDR PQ
+output (BT.2020 → BT.2020 ≈ identity) use the identity calibration
+matrix slot. So an sRGB-primaries client renders as: sRGB EOTF →
+"BT.2020 linear nits" (mislabeled — actually still BT.709
+primaries) → sRGB OETF. Decode and encode are inverse so the round
+trip is null. The "BT.2020" label is descriptive, not active.
+
+**Why it matters for HDR mixing:** when an SDR client (BT.709
+primaries) and an HDR PQ client (BT.2020 primaries) both render to
+the same output, blending them in the intermediate produces wrong
+chromaticity for the SDR portion. Saturated red on the BT.709 client
+ends up at BT.2020 coordinates, which is visibly out of gamut.
+
+**What it costs to fix:**
+- Decode side: compute the surface→intermediate primaries matrix
+  in `description_to_params` from the image description's
+  `PrimaryVolume`, fill `DecodePush::decode_matrix` accordingly.
+  Three matrices needed for the protocols we support today (sRGB →
+  BT.2020, BT.2020 → BT.2020 = identity, sRGB → sRGB = identity for
+  SDR-only paths). ~30 LOC + a tiny `primaries.rs` with the
+  3×3 conversions in linear light.
+- Encode side: add an `IntermediatePrimariesToOutput` fragment
+  (parallel to `CalibrationMatrix`) that picks the matrix from
+  the output's preferred primaries vs the intermediate's working
+  primaries. Or just inline into `CalibrationMatrix`. ~60 LOC.
+- Per-output intermediate working-space: today the intermediate is
+  hardcoded "BT.2020 linear nits" regardless of output. A real
+  primaries-aware pipeline would either pick the intermediate's
+  primaries per-output or commit to BT.2020 universally and pay
+  the conversion. Recommend BT.2020 universally — simpler, future-
+  proofs for wide-gamut work.
+
+**Trigger:** when we have mixed-primaries content rendering on a
+single output (HDR window + SDR window) and the SDR window's
+saturated colors look visibly wrong. Not blocking Spyder calibration
+(BT.2020 patches on BT.2020 output is identity primaries-wise).
+
+## 6. Renderer-side intermediate-buffer modifier negotiation
 
 **Status:** the renderer's intermediate buffer (the fp16 linear-light
 working surface between decode and encode passes) is still allocated

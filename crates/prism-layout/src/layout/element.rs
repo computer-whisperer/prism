@@ -19,7 +19,7 @@
 //! they'll be plumbed back in.
 
 use prism_config::CornerRadius;
-use prism_renderer::{vk, RenderEl};
+use prism_renderer::{vk, RenderEl, SurfaceColorParams};
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
@@ -48,11 +48,22 @@ use smithay::wayland::compositor::SurfaceData;
 /// borrowed `&SurfaceData` keeps the lookup inside the existing scope.
 pub struct RenderCtx<'a> {
     pub texture_lookup: &'a dyn Fn(&SurfaceData) -> Option<vk::ImageView>,
+    /// Look up the surface's color-decoding parameters (TF +
+    /// reference white) from its `wp_color_management_v1` image
+    /// description. Same shape as `texture_lookup`: closure over
+    /// `&SurfaceData` so we don't double-acquire the `with_states`
+    /// lock during a surface-tree walk. Returning `None` falls back
+    /// to `SurfaceColorParams::default()` (the historical
+    /// sRGB-with-80-nit-white assumption).
+    pub color_lookup: &'a dyn Fn(&SurfaceData) -> Option<SurfaceColorParams>,
 }
 
 impl<'a> RenderCtx<'a> {
     pub fn texture_for(&self, states: &SurfaceData) -> Option<vk::ImageView> {
         (self.texture_lookup)(states)
+    }
+    pub fn color_for(&self, states: &SurfaceData) -> SurfaceColorParams {
+        (self.color_lookup)(states).unwrap_or_default()
     }
 }
 

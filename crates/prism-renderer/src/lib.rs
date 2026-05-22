@@ -17,7 +17,9 @@ pub mod upload;
 
 pub use device::{Device, DrmDevId, DrmFormatModifierInfo, PhysicalDeviceInfo};
 pub use dmabuf::ImportedImage;
-pub use element::{BorderEl, RenderEl, SolidColorEl, SurfaceEl, srgb_to_bt2020_nits};
+pub use element::{
+    BorderEl, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl, srgb_to_bt2020_nits,
+};
 pub use encode_synth::{EncodeConfig, EncodeFragment, EncodePushSynth};
 pub use error::{RendererError, Result};
 pub use instance::Instance;

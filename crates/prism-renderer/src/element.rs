@@ -21,6 +21,44 @@ use crate::pipeline::decode::DecodePush;
 use crate::renderer::ElementDraw;
 use ash::vk;
 
+/// Color-decoding parameters for a [`SurfaceEl`]. Captures *what
+/// colorspace the client's pixels are in* so the decode shader picks
+/// the right inverse transfer function. Constructed by the integrator
+/// (prism-protocols) from the surface's `wp_color_management_v1`
+/// image description; the default mirrors the historical pre-color-
+/// management behavior (sRGB with 80-nit white).
+///
+/// Transfer codes match `decode.frag`:
+///   - 0 = Linear (already-linear pixels, e.g. ext_linear)
+///   - 1 = sRGB piecewise EOTF (default for unmanaged surfaces)
+///   - 2 = PQ (SMPTE ST 2084) — `sdr_white_nits` ignored, pixels
+///         already in absolute nits after decode
+///   - 4 = Gamma 2.2 (modern SDR default per wp_color_management v2)
+///   - 5 = BT.1886 (with default Lw/Lb → pure pow 2.4)
+#[derive(Clone, Copy, Debug)]
+pub struct SurfaceColorParams {
+    pub transfer: i32,
+    /// Nits value the client's 1.0 white maps to. Ignored when
+    /// `transfer == 2` (PQ); else multiplied into the linear result
+    /// to anchor into the same absolute-nits coordinate system the
+    /// intermediate buffer uses.
+    pub sdr_white_nits: f32,
+}
+
+impl Default for SurfaceColorParams {
+    fn default() -> Self {
+        // Matches the pre-color-management hard-coded default the
+        // mapped-window render walk used: sRGB EOTF + 80-nit white.
+        // Surfaces that never set an image description (every client
+        // before wp_color_management_v1 lands in their toolkit) flow
+        // through this path unchanged.
+        Self {
+            transfer: 1,
+            sdr_white_nits: 80.0,
+        }
+    }
+}
+
 /// Sampled-texture surface element. Used for wl_surface content (xdg-shell
 /// toplevels, popups, layer-shell content, subsurfaces) and for the cursor.
 /// One per surface tree node; produced by walking the surface tree at
@@ -29,19 +67,14 @@ pub struct SurfaceEl {
     pub texture_view: vk::ImageView,
     pub dst_rect_clip: [f32; 4],
     pub src_rect_uv: [f32; 4],
-    /// `prism_frame::TransferFunction` as an i32, matching
-    /// [`DecodePush::transfer`]. 0 = Linear, 1 = sRGB, 2 = PQ.
-    pub transfer: i32,
-    /// Nits value for the source's 1.0 white. Ignored when `transfer == 2`
-    /// (PQ already encodes absolute nits).
-    pub sdr_white_nits: f32,
+    pub color: SurfaceColorParams,
 }
 
 impl SurfaceEl {
     pub fn to_draw(&self) -> ElementDraw {
         let mut push = DecodePush::identity_srgb(self.dst_rect_clip, self.src_rect_uv);
-        push.transfer = self.transfer;
-        push.sdr_white_nits = self.sdr_white_nits;
+        push.transfer = self.color.transfer;
+        push.sdr_white_nits = self.color.sdr_white_nits;
         ElementDraw {
             texture_view: self.texture_view,
             push,
