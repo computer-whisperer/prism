@@ -43,8 +43,13 @@ enum TopCommand {
     /// Send one Request to the prism IPC socket and print the reply.
     #[command(subcommand)]
     Msg(MsgCommand),
-    /// Closed-loop panel calibration via the tristim colorimeter +
-    /// HDR PQ patch surface + the prism IPC.
+    /// Closed-loop per-channel panel calibration via the tristim
+    /// colorimeter + a patch surface (HDR or SDR — branched from the
+    /// output's current mode via prism IPC). Three phases: query
+    /// state → per-channel saturation discovery → per-channel
+    /// response refinement. Outputs all per-output color parameters
+    /// (panel-peak-nits for HDR, response-curve always) as a paste-
+    /// ready KDL block.
     Calibrate(calibrate::CalibrateArgs),
 }
 
