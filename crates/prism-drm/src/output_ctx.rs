@@ -119,6 +119,14 @@ pub struct OutputContext {
     /// doesn't need to re-walk properties. `None` if the connector
     /// can't carry HDR signaling (some virtual / dock outputs).
     pub hdr_props: Option<crate::HdrProps>,
+    /// The (DRM fourcc, modifier) candidate list this output's scanout
+    /// pipeline can directly accept — driven by the same modifier
+    /// negotiation that picked the format for our internal buffers.
+    /// First entry is the chosen / preferred modifier; LINEAR comes
+    /// last as the universal fallback. Exposed so the wayland-side
+    /// `wp_linux_dmabuf_v1` feedback path can advertise per-output
+    /// direct-scanout-friendly tranches to clients.
+    pub scanout_formats: Vec<(drm_fourcc::DrmFourcc, drm_fourcc::DrmModifier)>,
 }
 
 impl OutputContext {
@@ -230,12 +238,22 @@ impl OutputContext {
             height: h as u32,
         };
 
-        // Two scanout buffers (double-buffered). See module doc.
+        // Two scanout buffers (double-buffered). See module doc. Both
+        // are allocated with the same modifier list; the candidate set
+        // returned with `buffer A` is what we expose for the wayland
+        // dmabuf-feedback path (per-output direct-scanout tranche).
         tracing::info!(connector = %pick.connector_name, "OutputContext::new step: alloc buffer A");
-        let buffer_a = alloc_scanout_buffer(&device, card, config, extent, "buffer A")?;
+        let alloc_a = alloc_scanout_buffer(&device, card, config, extent, "buffer A")?;
         tracing::info!(connector = %pick.connector_name, "OutputContext::new step: alloc buffer B");
-        let buffer_b = alloc_scanout_buffer(&device, card, config, extent, "buffer B")?;
-        let buffers = [buffer_a, buffer_b];
+        let alloc_b = alloc_scanout_buffer(&device, card, config, extent, "buffer B")?;
+        let scanout_fourcc = config.depth.drm_fourcc();
+        let scanout_formats: Vec<_> = alloc_a
+            .candidates
+            .iter()
+            .copied()
+            .map(|m| (scanout_fourcc, m))
+            .collect();
+        let buffers = [alloc_a.buffer, alloc_b.buffer];
 
         tracing::info!(connector = %pick.connector_name, "OutputContext::new step: Renderer::new");
         let renderer = Renderer::new(
@@ -333,6 +351,7 @@ impl OutputContext {
             cursor,
             edid,
             hdr_props,
+            scanout_formats,
         })
     }
 
@@ -458,13 +477,25 @@ impl OutputContext {
     }
 }
 
+/// Result of `alloc_scanout_buffer` — the buffer itself plus the
+/// per-format/modifier list that's compatible with this output's
+/// scanout pipeline (chosen modifier first, LINEAR fallback last).
+/// Returned so the caller can stash the candidate set on
+/// `OutputContext.scanout_formats` for the wayland dmabuf-feedback
+/// path; allocation is the natural place to compute it because we
+/// run modifier negotiation here anyway.
+struct AllocResult {
+    buffer: ScanoutBuffer,
+    candidates: Vec<DrmModifier>,
+}
+
 fn alloc_scanout_buffer(
     device: &Arc<Device>,
     card: &DrmCardContext,
     config: &OutputConfig,
     extent: vk::Extent2D,
     label: &str,
-) -> Result<ScanoutBuffer> {
+) -> Result<AllocResult> {
     // Modifier negotiation. Query what the Vulkan driver will accept as
     // a color attachment for this format, pass the resulting candidate
     // list through `pick_scanout_modifiers` (drops multi-plane / non-
@@ -521,10 +552,13 @@ fn alloc_scanout_buffer(
         vk::ImageUsageFlags::COLOR_ATTACHMENT,
     )?;
     let fb = add_framebuffer_for_bo(&card.drm, &bo)?;
-    Ok(ScanoutBuffer {
-        image,
-        _bo: bo,
-        fb,
+    Ok(AllocResult {
+        buffer: ScanoutBuffer {
+            image,
+            _bo: bo,
+            fb,
+        },
+        candidates,
     })
 }
 

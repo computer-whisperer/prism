@@ -61,7 +61,8 @@ use smithay::wayland::compositor::{
 use smithay::backend::renderer::utils::{on_commit_buffer_handler, RendererSurfaceStateUserData};
 use smithay::desktop::Window;
 use smithay::wayland::dmabuf::{
-    DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
+    DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState,
+    ImportNotifier, SurfaceDmabufFeedbackState,
 };
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::presentation::PresentationState;
@@ -128,6 +129,20 @@ pub struct PrismState {
     pub shm: ShmState,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: DmabufGlobal,
+    /// Format set we advertise as the "main" tranche for *every* dmabuf
+    /// feedback object (global default + per-output). Built once at
+    /// startup; today this is the broad render-friendly set. Per-output
+    /// preference tranches are prepended on top via
+    /// [`build_output_feedback`].
+    pub dmabuf_main_formats: Vec<DrmFormat>,
+    /// Per-output `DmabufFeedback`, keyed by `OutputId`. Built lazily
+    /// in [`attach_output`] from the output's `scanout_formats` plus
+    /// `dmabuf_main_formats`. Returned from
+    /// [`DmabufHandler::new_surface_feedback`] and dispatched again
+    /// (via `SurfaceDmabufFeedbackState::set_feedback`) when a surface
+    /// changes its bound output. `None`-keyed surfaces (not yet mapped
+    /// to an output) fall back to the global default.
+    pub output_feedback: HashMap<OutputId, DmabufFeedback>,
     /// wl_output + xdg-output-unstable-v1 manager. Holds the global IDs
     /// for the xdg-output manager; per-output `Output` instances live in
     /// `wl_outputs` and carry their own wl_output global IDs.
@@ -377,6 +392,8 @@ impl PrismState {
             shm,
             dmabuf_state,
             dmabuf_global,
+            dmabuf_main_formats: supported_formats.to_vec(),
+            output_feedback: HashMap::new(),
             output_manager,
             seat_state,
             seat,
@@ -412,6 +429,11 @@ impl PrismState {
 
     /// Insert a built output. Returns the previous entry for that
     /// OutputId if there was one (shouldn't happen in normal use).
+    ///
+    /// Also builds and caches the per-output `DmabufFeedback` so the
+    /// wayland-side `wp_linux_dmabuf_v1.get_surface_feedback` path can
+    /// advertise direct-scanout-friendly formats to clients whose
+    /// surfaces land on this output.
     pub fn attach_output(
         &mut self,
         mut output: prism_drm::OutputContext,
@@ -429,6 +451,18 @@ impl PrismState {
                     output.connector_name
                 );
             }
+        }
+        // Build the per-output dmabuf feedback before moving `output`.
+        // Skipped (and logged) if the output's GPU isn't registered
+        // (shouldn't happen — `gpus` is populated before bringup) or
+        // if feedback build fails (e.g. shm shortage). Either way the
+        // client gets the global default feedback as a fallback.
+        if let Some(feedback) = build_output_feedback(
+            &output,
+            &self.gpus,
+            &self.dmabuf_main_formats,
+        ) {
+            self.output_feedback.insert(id.clone(), feedback);
         }
         self.outputs.insert(id, output)
     }
@@ -1262,6 +1296,33 @@ impl DmabufHandler for PrismState {
         &mut self.dmabuf_state
     }
 
+    /// Override the default feedback for a freshly-requested
+    /// `wp_linux_dmabuf_feedback_v1` if the surface is already mapped
+    /// to a known output. Per-output feedback advertises the
+    /// direct-scanout-friendly format+modifier we negotiated at output
+    /// bringup, so a client allocating against it can produce buffers
+    /// the display engine can fetch without going through our
+    /// recomposite path.
+    ///
+    /// Returning `None` lets smithay fall back to the global default
+    /// (the broad set we register on the dmabuf global), which is
+    /// correct for unmapped surfaces and as a safety net if the
+    /// surface's output isn't (yet) in `output_feedback`.
+    fn new_surface_feedback(
+        &mut self,
+        surface: &WlSurface,
+        _global: &DmabufGlobal,
+    ) -> Option<DmabufFeedback> {
+        let current_output = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<SurfacePlacementSlot>()
+                .and_then(|slot| slot.0.lock().unwrap().current_output.clone())
+        });
+        let id = current_output?;
+        self.output_feedback.get(&id).cloned()
+    }
+
     fn dmabuf_imported(
         &mut self,
         _global: &DmabufGlobal,
@@ -1327,6 +1388,65 @@ impl DmabufHandler for PrismState {
 }
 
 delegate_dmabuf!(PrismState);
+
+/// Build the per-output `DmabufFeedback` published to clients whose
+/// surfaces map onto this output.
+///
+/// Shape:
+///   - **main_device** = the output's GPU render node (falling back to
+///     the primary node if no render node is exposed). Tells clients
+///     "render here for the cheapest path to this output."
+///   - **preference tranche** = the output's `scanout_formats`
+///     (direct-scanout-compatible fourcc + modifier list, ordered with
+///     the preferred modifier first and LINEAR last). target_device
+///     equals main_device — a buffer allocated on the rendering GPU
+///     with one of these formats can be scanned out without an
+///     intermediate copy through our compositor.
+///   - **main tranche** = the broad render-friendly fallback set
+///     (`dmabuf_main_formats`). Used by clients that need a wider
+///     format range than scanout supports.
+///
+/// Returns `None` (caller falls back to the global default) if the
+/// output's GPU isn't registered or if the feedback builder errored.
+/// Both are unexpected in steady state but we don't want them to
+/// hard-fail output bringup.
+fn build_output_feedback(
+    ctx: &prism_drm::OutputContext,
+    gpus: &HashMap<DrmDevId, Arc<prism_renderer::Device>>,
+    main_formats: &[DrmFormat],
+) -> Option<DmabufFeedback> {
+    let device = gpus.get(&ctx.gpu_id)?;
+    let node = device.physical.drm_render.or(device.physical.drm_primary)?;
+    let main_device = libc::makedev(node.major as u32, node.minor as u32);
+    let scanout_formats: Vec<DrmFormat> = ctx
+        .scanout_formats
+        .iter()
+        .copied()
+        .map(|(code, modifier)| DrmFormat { code, modifier })
+        .collect();
+    let mut builder = DmabufFeedbackBuilder::new(main_device, main_formats.iter().copied());
+    if !scanout_formats.is_empty() {
+        builder = builder.add_preference_tranche(main_device, None, scanout_formats);
+    }
+    match builder.build() {
+        Ok(fb) => {
+            tracing::info!(
+                connector = %ctx.connector_name,
+                main_device = format!("{}:{}", node.major, node.minor),
+                scanout_n = ctx.scanout_formats.len(),
+                "per-output dmabuf feedback built"
+            );
+            Some(fb)
+        }
+        Err(e) => {
+            tracing::warn!(
+                connector = %ctx.connector_name,
+                "build_output_feedback: {e:#}; falling back to global default"
+            );
+            None
+        }
+    }
+}
 
 /// Import a client-provided dmabuf as a sampled `VkImage`. Returned image
 /// is owned by the caller; the dmabuf fds are dup'd by Vulkan during import
@@ -1488,6 +1608,20 @@ fn dispatch_surface_output_from_layout(state: &mut PrismState, surface: &WlSurfa
                     connector = %new_id,
                     "wl_surface.enter dispatched"
                 );
+            }
+            // If this surface already has a wp_linux_dmabuf_feedback_v1
+            // bound (because the client called get_surface_feedback at
+            // some earlier point), push the new output's feedback so
+            // the client can re-allocate against scanout-friendly
+            // formats for the new output. Surfaces without a feedback
+            // object pick up the per-output feedback on their next
+            // `get_surface_feedback` via DmabufHandler::new_surface_feedback.
+            if let Some(feedback) = state.output_feedback.get(new_id) {
+                with_states(surface, |states| {
+                    if let Some(sfs) = SurfaceDmabufFeedbackState::from_states(states) {
+                        sfs.set_feedback(feedback);
+                    }
+                });
             }
         }
     }
