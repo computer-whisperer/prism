@@ -177,11 +177,64 @@ impl OutputContext {
         )?;
         tracing::info!(connector = %pick.connector_name, "OutputContext::new step: done");
 
+        // VRR / Adaptive Sync. Probe support per-connector first; if the
+        // kernel says it's not supported on this connector, don't try to
+        // turn it on — we'd hit an EINVAL on the next atomic commit. The
+        // value the config wanted is logged so the user can see when their
+        // request is being silently downgraded.
+        let vrr_actual = if config.vrr {
+            match surface.vrr_supported(pick.connector) {
+                Ok(support) => {
+                    use smithay::backend::drm::VrrSupport;
+                    let supported = matches!(
+                        support,
+                        VrrSupport::Supported | VrrSupport::RequiresModeset
+                    );
+                    if !supported {
+                        tracing::warn!(
+                            connector = %pick.connector_name,
+                            "VRR configured on but connector advertises NotSupported; \
+                             leaving fixed-refresh"
+                        );
+                        false
+                    } else {
+                        match surface.use_vrr(true) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    connector = %pick.connector_name,
+                                    "VRR enabled"
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    connector = %pick.connector_name,
+                                    "use_vrr(true) rejected: {e:#}; leaving fixed-refresh"
+                                );
+                                false
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        connector = %pick.connector_name,
+                        "vrr_supported query failed: {e:#}; assuming unsupported"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
         // FrameClock seed: refresh interval from the picked mode (vrefresh
-        // is Hz). VRR not yet plumbed through config, so off for now.
+        // is Hz). `vrr=true` lets the predictor stretch past the nominal
+        // interval when no flip is pending — the kernel honors that on
+        // VRR-enabled scanout.
         let vrefresh = pick.mode.vrefresh().max(1);
         let refresh_interval = Duration::from_nanos(1_000_000_000 / u64::from(vrefresh));
-        let frame_clock = FrameClock::new(Some(refresh_interval), false);
+        let frame_clock = FrameClock::new(Some(refresh_interval), vrr_actual);
 
         // Try to claim a hardware cursor plane. Failure is non-fatal —
         // the output renders fine without one, just with no cursor.

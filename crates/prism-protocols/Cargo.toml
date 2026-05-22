@@ -15,6 +15,7 @@ prism-animation.workspace = true
 prism-config.workspace = true
 prism-drm.workspace = true
 prism-frame.workspace = true
+prism-ipc.workspace = true
 prism-layout.workspace = true
 prism-renderer.workspace = true
 smithay.workspace = true

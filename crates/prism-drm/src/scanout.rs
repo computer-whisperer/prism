@@ -4,11 +4,13 @@
 use anyhow::{Context, Result, anyhow};
 use drm_fourcc::DrmFourcc;
 use gbm::BufferObject;
+use prism_config::output::Output as OutputCfg;
 use smithay::backend::drm::DrmDevice;
+use smithay::output::Mode as WlMode;
 use smithay::reexports::drm::buffer::PlanarBuffer;
 use smithay::reexports::drm::control::{
-    Device as ControlDevice, FbCmd2Flags, Mode, ModeTypeFlags, ResourceHandle, connector, crtc,
-    framebuffer, property,
+    Device as ControlDevice, FbCmd2Flags, Mode, ModeFlags, ModeTypeFlags, ResourceHandle,
+    connector, crtc, framebuffer, property,
 };
 
 /// Bit depth + format selection for a scanout BO. Picks the matching DRM
@@ -58,19 +60,35 @@ pub struct OutputPick {
 /// and a compatible (currently-unused) CRTC. Good enough for the single-screen
 /// scanout smoke test; the real compositor will allow user-driven assignments.
 pub fn pick_first_connected(drm: &DrmDevice) -> Result<OutputPick> {
-    pick_matching(drm, |_name| true)
+    pick_matching(drm, |_name| true, &[])
 }
 
 /// Pick a specific output by name. Accepts the full connector name
 /// (`DisplayPort-6`) or the common short alias (`DP-6`, `HDMI-1`),
-/// case-insensitively.
+/// case-insensitively. Pass `&[]` for `outputs_cfg` when running outside the
+/// integrated compositor (no KDL config to consult).
 pub fn pick_by_name(drm: &DrmDevice, want: &str) -> Result<OutputPick> {
+    pick_by_name_with_config(drm, want, &[])
+}
+
+/// Same as [`pick_by_name`] but also honors the config's `mode`/`off` for the
+/// matched connector. `off` aborts with an explanatory error (since the user
+/// explicitly asked for this connector by name).
+pub fn pick_by_name_with_config(
+    drm: &DrmDevice,
+    want: &str,
+    outputs_cfg: &[OutputCfg],
+) -> Result<OutputPick> {
     let want_lc = want.to_lowercase();
     let want_normalized = expand_alias(&want_lc);
-    pick_matching(drm, |name| {
-        let lc = name.to_lowercase();
-        lc == want_lc || lc == want_normalized
-    })
+    pick_matching(
+        drm,
+        |name| {
+            let lc = name.to_lowercase();
+            lc == want_lc || lc == want_normalized
+        },
+        outputs_cfg,
+    )
     .with_context(|| format!("no connected output matched {want:?}"))
 }
 
@@ -85,7 +103,7 @@ fn expand_alias(input: &str) -> String {
     }
 }
 
-fn pick_matching<F>(drm: &DrmDevice, matches: F) -> Result<OutputPick>
+fn pick_matching<F>(drm: &DrmDevice, matches: F, outputs_cfg: &[OutputCfg]) -> Result<OutputPick>
 where
     F: Fn(&str) -> bool,
 {
@@ -103,9 +121,15 @@ where
         if !matches(&name) {
             continue;
         }
-        let Some(mode) = preferred_mode(&info) else {
+        let cfg = match_config_for_connector(&name, outputs_cfg);
+        let Some((mode, fallback)) = pick_mode(&info, cfg) else {
             continue;
         };
+        if fallback {
+            tracing::warn!(
+                "{name}: configured mode not available; falling back to preferred",
+            );
+        }
         let pick = match resolve_pick(drm, &resources, conn_h, &info, &name, mode, &occupied_by_other, &[]) {
             Ok(p) => p,
             Err(e) => return Err(e),
@@ -116,17 +140,31 @@ where
 }
 
 /// Pick every connected connector with a usable mode + free CRTC.
+/// No config consulted — used by the headless tracer paths.
+pub fn pick_all_connected(drm: &DrmDevice) -> Result<Vec<OutputPick>> {
+    pick_all_connected_with_config(drm, &[])
+}
+
+/// Same as [`pick_all_connected`] but honors per-output `off` and
+/// `mode`/`modeline` from the KDL config.
 ///
 /// Each successful pick reserves its CRTC against subsequent picks in the
 /// same call, so two of our outputs can't accidentally collide on the same
-/// CRTC. Connectors that can't be assigned (no free CRTC, no preferred
-/// mode, etc.) are skipped with a warning rather than aborting the whole
-/// bringup — useful on hardware with more connectors than CRTCs (DP MST
-/// splitters etc.) where partial bringup is the right answer.
+/// CRTC. Connectors that can't be assigned (no free CRTC, no usable mode,
+/// `off=true`, etc.) are skipped with a warning rather than aborting the
+/// whole bringup — useful on hardware with more connectors than CRTCs (DP
+/// MST splitters etc.) where partial bringup is the right answer.
+///
+/// `outputs_cfg` is matched against each connector's kernel name (e.g.
+/// `DisplayPort-4`) case-insensitively, expanding short aliases like
+/// `DP-4` to `DisplayPort-4` (mirrors what [`pick_by_name`] accepts).
 ///
 /// Returns the picks in connector-order. Empty result is success-with-zero-
 /// outputs (caller may treat that as an error of its own).
-pub fn pick_all_connected(drm: &DrmDevice) -> Result<Vec<OutputPick>> {
+pub fn pick_all_connected_with_config(
+    drm: &DrmDevice,
+    outputs_cfg: &[OutputCfg],
+) -> Result<Vec<OutputPick>> {
     let resources = drm.resource_handles().context("resource_handles")?;
     let occupied_by_other = collect_other_session_crtcs(drm, &resources);
 
@@ -143,10 +181,22 @@ pub fn pick_all_connected(drm: &DrmDevice) -> Result<Vec<OutputPick>> {
             continue;
         }
         let name = format!("{:?}-{}", info.interface(), info.interface_id());
-        let Some(mode) = preferred_mode(&info) else {
+
+        let cfg = match_config_for_connector(&name, outputs_cfg);
+        if cfg.is_some_and(|c| c.off) {
+            tracing::info!("{name}: config `off`; skipping");
+            continue;
+        }
+
+        let Some((mode, fallback)) = pick_mode(&info, cfg) else {
             tracing::warn!("{name}: no usable mode; skipping");
             continue;
         };
+        if fallback {
+            tracing::warn!(
+                "{name}: configured mode not available; falling back to preferred",
+            );
+        }
 
         let used_by_us: Vec<crtc::Handle> = picks.iter().map(|p| p.crtc).collect();
         match resolve_pick(
@@ -201,12 +251,115 @@ fn collect_other_session_crtcs(
     out
 }
 
-fn preferred_mode(info: &connector::Info) -> Option<Mode> {
-    info.modes()
-        .iter()
-        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-        .or_else(|| info.modes().first())
-        .copied()
+/// Find the config entry for a given DRM connector name (e.g.
+/// `DisplayPort-4`). Matches against the user-typed `output "..."` argument
+/// case-insensitively and accepts both the kernel-long form and the
+/// short alias (e.g. `DP-4`).
+///
+/// Today match is purely by connector. Once EDID parsing lands the
+/// `make model serial` form will be matched here too (see
+/// [`prism_config::output::OutputName::matches`] for the target shape).
+fn match_config_for_connector<'a>(
+    connector_name: &str,
+    outputs_cfg: &'a [OutputCfg],
+) -> Option<&'a OutputCfg> {
+    let kernel_lc = connector_name.to_lowercase();
+    outputs_cfg.iter().find(|o| {
+        let user_lc = o.name.to_lowercase();
+        if user_lc == kernel_lc {
+            return true;
+        }
+        // User typed `DP-4`, kernel name is `DisplayPort-4` — expand the
+        // user side and retry.
+        expand_alias(&user_lc) == kernel_lc
+    })
+}
+
+/// Pick a mode for `info`, honoring the config's optional `mode` override.
+/// Returns `(mode, fallback)` where `fallback=true` means the configured
+/// mode was not available and we fell back to the preferred mode.
+///
+/// Selection order (mirrors niri's `pick_mode`):
+///   1. If config specifies `mode "WxH[@R]"`:
+///       - find connector modes matching width × height; if `@R` is set
+///         match refresh too (×1000 since smithay's `output::Mode` reports
+///         refresh in millihertz); otherwise pick the highest-refresh
+///         matching mode. Interlaced modes are excluded.
+///       - if no match, set `fallback=true` and fall through to (2).
+///   2. Pick the highest-refresh `PREFERRED` mode.
+///   3. Last resort: first advertised mode.
+///
+/// `modeline` (custom CVT-derived modes) is not yet supported here —
+/// would need to depend on `libdisplay-info` (already in our tree
+/// transitively via smithay) and mirror niri's `calculate_mode_cvt` /
+/// `create_mode_from_modeline` in `tty.rs`. Logs a warning if used.
+fn pick_mode(info: &connector::Info, cfg: Option<&OutputCfg>) -> Option<(Mode, bool)> {
+    let mut chosen: Option<&Mode> = None;
+    let mut fallback = false;
+
+    if let Some(cfg) = cfg {
+        if cfg.modeline.is_some() {
+            tracing::warn!(
+                "config `modeline` not yet implemented; falling back to preferred mode",
+            );
+            // Treat as a fallback too — the user asked for something
+            // specific and we couldn't honor it.
+            fallback = true;
+        }
+
+        if let Some(target) = cfg.mode {
+            if target.custom {
+                tracing::warn!(
+                    "config `mode custom=true` not yet implemented (needs CVT); \
+                     trying connector mode list, then preferred",
+                );
+            }
+            let target_mode = target.mode;
+            // smithay's output::Mode reports refresh in mHz (Hz × 1000).
+            let refresh_mhz = target_mode.refresh.map(|r| (r * 1000.).round() as i32);
+            for m in info.modes() {
+                if m.size() != (target_mode.width, target_mode.height) {
+                    continue;
+                }
+                if m.flags().contains(ModeFlags::INTERLACE) {
+                    continue;
+                }
+                if let Some(refresh) = refresh_mhz {
+                    let wl = WlMode::from(*m);
+                    if wl.refresh == refresh {
+                        chosen = Some(m);
+                    }
+                } else if let Some(curr) = chosen {
+                    if curr.vrefresh() < m.vrefresh() {
+                        chosen = Some(m);
+                    }
+                } else {
+                    chosen = Some(m);
+                }
+            }
+            if chosen.is_none() {
+                fallback = true;
+            }
+        }
+    }
+
+    if chosen.is_none() {
+        for m in info.modes() {
+            if !m.mode_type().contains(ModeTypeFlags::PREFERRED) {
+                continue;
+            }
+            match chosen {
+                Some(curr) if curr.vrefresh() >= m.vrefresh() => {}
+                _ => chosen = Some(m),
+            }
+        }
+    }
+
+    if chosen.is_none() {
+        chosen = info.modes().first();
+    }
+
+    chosen.map(|m| (*m, fallback))
 }
 
 /// Find a free CRTC for this connector, building an `OutputPick`.

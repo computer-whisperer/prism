@@ -447,6 +447,18 @@ impl PrismState {
     /// from `ctx`; logical position is **not** assigned here — call
     /// [`layout_outputs`] after every output is advertised.
     ///
+    /// Per-output `scale` is taken from the KDL config (`output "NAME"
+    /// { scale 1.5 }`); integer values become `Scale::Integer`, anything
+    /// else becomes `Scale::Fractional`. Range 0.1..10 (validated at
+    /// parse time by `FloatOrInt<0,10>`).
+    ///
+    /// `transform` is currently advertised as `Normal` regardless of the
+    /// config — the render path does not yet rotate scanout buffers, so
+    /// advertising a non-Normal transform would make clients render
+    /// pre-rotated buffers that we'd then scan out un-rotated. A warning
+    /// is logged when the config asks for one. Render-side rotation lands
+    /// with its own task.
+    ///
     /// EDID-derived `PhysicalProperties` (mm size, make/model/serial)
     /// aren't available yet; we advertise placeholder values that won't
     /// confuse clients but won't drive DPI-aware scaling correctly
@@ -457,6 +469,7 @@ impl PrismState {
             // smithay::output::Mode::refresh is in milli-Hz.
             refresh: (ctx.mode.vrefresh() as i32) * 1000,
         };
+        let (scale, transform) = self.resolve_output_scale_transform(&ctx.connector_name);
         let output = Output::new(
             ctx.connector_name.clone(),
             PhysicalProperties {
@@ -478,10 +491,17 @@ impl PrismState {
         output.set_preferred(mode);
         output.change_current_state(
             Some(mode),
-            Some(Transform::Normal),
-            Some(Scale::Integer(1)),
+            Some(transform),
+            Some(scale),
             // location assigned by layout_outputs once all outputs known
             None,
+        );
+        tracing::info!(
+            connector = %ctx.connector_name,
+            mode_w = mode.size.w,
+            mode_h = mode.size.h,
+            scale = scale.fractional_scale(),
+            "wl_output advertised"
         );
         // Attach the OutputName user data the layout uses to track
         // outputs across disconnects (workspaces remember which
@@ -509,21 +529,21 @@ impl PrismState {
     }
 
     /// First `OutputId` whose advertised geometry (current_location +
-    /// current_mode.size) contains the given logical point, or `None`
-    /// if the point lies in no output's region. Iteration order is
-    /// HashMap-random; for non-overlapping layouts (today's horizontal
-    /// stack) that's fine. With overlapping outputs, becomes a "topmost
-    /// contains" rule once we have z-order.
+    /// current_mode.size, scaled to logical units) contains the given
+    /// logical point, or `None` if the point lies in no output's region.
+    /// Iteration order is HashMap-random; for non-overlapping layouts
+    /// (today's horizontal stack) that's fine. With overlapping outputs,
+    /// becomes a "topmost contains" rule once we have z-order.
     pub fn output_containing(&self, point: (i32, i32)) -> Option<OutputId> {
         for (id, output) in &self.wl_outputs {
             let loc = output.current_location();
-            let Some(mode) = output.current_mode() else {
+            let Some((lw, lh)) = output_logical_size(output) else {
                 continue;
             };
             let x0 = loc.x;
             let y0 = loc.y;
-            let x1 = x0.saturating_add(mode.size.w);
-            let y1 = y0.saturating_add(mode.size.h);
+            let x1 = x0.saturating_add(lw);
+            let y1 = y0.saturating_add(lh);
             if point.0 >= x0 && point.0 < x1 && point.1 >= y0 && point.1 < y1 {
                 return Some(id.clone());
             }
@@ -531,29 +551,133 @@ impl PrismState {
         None
     }
 
-    /// Assign logical positions to every advertised output by stacking
-    /// them horizontally at `y = 0` in sorted-connector-name order.
-    /// Idempotent: safe to call repeatedly as outputs are
-    /// added/removed. Real layout (config-driven placement, per-output
-    /// scale, rotation) lands with the config layer.
+    /// Look up the config-specified scale + transform for a connector.
+    /// Falls back to `(Scale::Integer(1), Transform::Normal)` when there's
+    /// no matching `output "..."` block. Transform != Normal logs a
+    /// warning and is downgraded to Normal — see [`advertise_output`].
+    fn resolve_output_scale_transform(&self, connector_name: &str) -> (Scale, Transform) {
+        let cfg = self.config.borrow();
+        let Some(out) = find_output_cfg(connector_name, &cfg.outputs.0) else {
+            return (Scale::Integer(1), Transform::Normal);
+        };
+        let scale = match out.scale {
+            None => Scale::Integer(1),
+            Some(s) => {
+                let v = s.0;
+                if v == v.trunc() && v >= 1.0 {
+                    Scale::Integer(v as i32)
+                } else {
+                    Scale::Fractional(v)
+                }
+            }
+        };
+        let cfg_transform = out.transform;
+        if !matches!(cfg_transform, prism_ipc::Transform::Normal) {
+            tracing::warn!(
+                connector = %connector_name,
+                transform = ?cfg_transform,
+                "output `transform` configured but render path does not yet rotate; \
+                 advertising Normal — config ignored"
+            );
+        }
+        (scale, Transform::Normal)
+    }
+
+    /// Assign logical positions to every advertised output. Outputs with
+    /// an explicit `position x=… y=…` in the KDL config get that exact
+    /// location; unpositioned outputs are stacked horizontally at `y=0`
+    /// starting from the right edge of the rightmost positioned output
+    /// (or `x=0` if none are positioned), in sorted-connector-name order
+    /// for stable assignment across runs.
+    ///
+    /// Logs (warns) if any pair of advertised outputs overlap, but does
+    /// not refuse to set them — overlapping outputs may legitimately be
+    /// used for mirroring or other intentional cases. The user is the
+    /// authority.
+    ///
+    /// Idempotent: safe to call repeatedly as outputs are added/removed.
     pub fn layout_outputs(&mut self) {
-        let mut names: Vec<OutputId> = self.wl_outputs.keys().cloned().collect();
-        names.sort();
-        let mut x: i32 = 0;
-        for name in names {
-            let output = self
-                .wl_outputs
-                .get(&name)
-                .expect("name from wl_outputs.keys()");
-            let width = output.current_mode().map(|m| m.size.w).unwrap_or(0);
+        // Snapshot config so we don't hold a borrow while we mutate
+        // outputs via change_current_state (which doesn't touch
+        // self.config, but cleaner this way).
+        let positions: HashMap<OutputId, Option<prism_config::output::Position>> = {
+            let cfg = self.config.borrow();
+            self.wl_outputs
+                .keys()
+                .map(|name| {
+                    let pos = find_output_cfg(name, &cfg.outputs.0).and_then(|o| o.position);
+                    (name.clone(), pos)
+                })
+                .collect()
+        };
+
+        // First pass: positioned outputs go where the user asked. Track the
+        // rightmost edge so the fallback stack picks up from there.
+        let mut rightmost: i32 = 0;
+        let mut positioned: Vec<OutputId> = Vec::new();
+        for (name, pos) in &positions {
+            if let Some(p) = pos {
+                let output = self.wl_outputs.get(name).expect("from positions iter");
+                output.change_current_state(None, None, None, Some((p.x, p.y).into()));
+                if let Some((lw, _lh)) = output_logical_size(output) {
+                    rightmost = rightmost.max(p.x.saturating_add(lw));
+                }
+                tracing::info!(
+                    connector = %name,
+                    logical_x = p.x,
+                    logical_y = p.y,
+                    "wl_output positioned (from config)"
+                );
+                positioned.push(name.clone());
+            }
+        }
+
+        // Second pass: stack remaining outputs to the right of the
+        // positioned region, in sorted-connector-name order.
+        let mut remaining: Vec<OutputId> = positions
+            .keys()
+            .filter(|n| !positioned.contains(n))
+            .cloned()
+            .collect();
+        remaining.sort();
+        let mut x = rightmost;
+        for name in remaining {
+            let output = self.wl_outputs.get(&name).expect("from positions iter");
+            let (lw, _) = output_logical_size(output).unwrap_or((0, 0));
             output.change_current_state(None, None, None, Some((x, 0).into()));
             tracing::info!(
                 connector = %name,
                 logical_x = x,
-                width,
-                "wl_output positioned"
+                width = lw,
+                "wl_output positioned (auto-stack)"
             );
-            x = x.saturating_add(width);
+            x = x.saturating_add(lw);
+        }
+
+        // Overlap detection. Quadratic in outputs (6 today, fine).
+        let rects: Vec<(OutputId, i32, i32, i32, i32)> = self
+            .wl_outputs
+            .iter()
+            .filter_map(|(name, out)| {
+                let loc = out.current_location();
+                let (lw, lh) = output_logical_size(out)?;
+                Some((name.clone(), loc.x, loc.y, lw, lh))
+            })
+            .collect();
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                let (a, ax, ay, aw, ah) = &rects[i];
+                let (b, bx, by, bw, bh) = &rects[j];
+                let overlap_x = *ax < bx.saturating_add(*bw) && *bx < ax.saturating_add(*aw);
+                let overlap_y = *ay < by.saturating_add(*bh) && *by < ay.saturating_add(*ah);
+                if overlap_x && overlap_y {
+                    tracing::warn!(
+                        a = %a, b = %b,
+                        "wl_output regions overlap; cursor routing + window placement may behave \
+                         oddly. Check `output \"…\" {{ position x=… y=… }}` blocks in the config."
+                    );
+                }
+            }
         }
     }
 }
@@ -1335,9 +1459,23 @@ pub fn update_output_cursors(state: &mut PrismState) {
         let prev_pos = cursor.position();
 
         if is_owner {
+            // pointer_pos and origin are both in logical coords; the
+            // delta is the logical offset within the output (0..logical_w).
+            // The DRM cursor plane wants physical CRTC pixels, so
+            // multiply by the output's fractional scale before placing.
+            // Hotspot is in cursor-sprite pixels (physical, since the
+            // sprite is uploaded at native size into the cursor BO) and
+            // subtracts from the physical position as-is.
+            //
+            // TODO: pick a per-output cursor sprite scale to match —
+            // today we always request scale=1 from CursorManager so on
+            // a scale=2 monitor the cursor is half its natural size.
             let origin = wl_output.current_location();
-            let x = (pointer_pos.x - origin.x as f64) as i32 - hotspot.0;
-            let y = (pointer_pos.y - origin.y as f64) as i32 - hotspot.1;
+            let scale = wl_output.current_scale().fractional_scale().max(0.01);
+            let lx = pointer_pos.x - origin.x as f64;
+            let ly = pointer_pos.y - origin.y as f64;
+            let x = (lx * scale).round() as i32 - hotspot.0;
+            let y = (ly * scale).round() as i32 - hotspot.1;
             cursor.set_position(x, y);
             cursor.set_visible(true);
         } else {
@@ -1514,6 +1652,50 @@ fn vk_format_for(fourcc: DrmFourcc) -> Option<vk::Format> {
         DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => vk::Format::B8G8R8A8_UNORM,
         _ => return None,
     })
+}
+
+// ─── Per-output config helpers ──────────────────────────────────────────────
+
+/// Logical (post-scale) size of an `Output` in logical pixels. `None` if no
+/// current mode is set. Mirrors `Mode.size.to_logical(scale)` but spelled
+/// out so we don't depend on a particular smithay overload.
+pub(crate) fn output_logical_size(output: &Output) -> Option<(i32, i32)> {
+    let mode = output.current_mode()?;
+    let scale = output.current_scale().fractional_scale().max(0.01);
+    let w = ((mode.size.w as f64) / scale).round() as i32;
+    let h = ((mode.size.h as f64) / scale).round() as i32;
+    Some((w, h))
+}
+
+/// Find the `output "..."` config block for a kernel connector name (e.g.
+/// `DisplayPort-4`). Accepts the short alias the user is more likely to
+/// type (`DP-4`) by walking the same alias-expansion table used at pick
+/// time. Returns `None` for connectors with no matching block.
+pub(crate) fn find_output_cfg<'a>(
+    connector_name: &str,
+    outputs_cfg: &'a [prism_config::output::Output],
+) -> Option<&'a prism_config::output::Output> {
+    let kernel_lc = connector_name.to_lowercase();
+    outputs_cfg.iter().find(|o| {
+        let user_lc = o.name.to_lowercase();
+        if user_lc == kernel_lc {
+            return true;
+        }
+        expand_connector_alias(&user_lc) == kernel_lc
+    })
+}
+
+/// Mirror of `prism_drm::scanout::expand_alias` — kept here to avoid a
+/// re-export. Cheap one-liner; the two crates have different module
+/// shapes so duplicating is simpler than weaving a pub helper through.
+fn expand_connector_alias(input: &str) -> String {
+    if let Some(rest) = input.strip_prefix("dp-") {
+        format!("displayport-{rest}")
+    } else if let Some(rest) = input.strip_prefix("hdmi-") {
+        format!("hdmi-a-{rest}")
+    } else {
+        input.to_string()
+    }
 }
 
 // ─── Per-client data helper ─────────────────────────────────────────────────

@@ -29,6 +29,7 @@ pub use gbm_dev::GbmDevice;
 pub use output_ctx::OutputContext;
 pub use scanout::{
     OutputPick, ScanoutDepth, add_framebuffer_for_bo, find_property, pick_all_connected,
-    pick_by_name, pick_first_connected, set_connector_max_bpc,
+    pick_all_connected_with_config, pick_by_name, pick_by_name_with_config, pick_first_connected,
+    set_connector_max_bpc,
 };
 pub use session::SeatSession;

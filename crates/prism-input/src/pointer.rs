@@ -194,9 +194,11 @@ pub fn on_pointer_axis<I: PrismInputBackend>(
 /// Union of all advertised output geometries in global logical
 /// coordinates. None if no outputs are advertised.
 ///
-/// Today we assume scale=1, mirroring `PrismState::output_containing`.
-/// When fractional scaling lands this needs to use
-/// `mode.size.to_logical(scale)` instead.
+/// Per-output logical size is `physical_mode_size / fractional_scale`,
+/// matching `PrismState::output_containing`. The clamp inside
+/// `clamp_pointer_to_outputs` keeps the pointer within the union, so
+/// per-output scale changes show up immediately as a smaller addressable
+/// area on that output.
 fn global_bounding_rect(state: &PrismState) -> Option<Rectangle<i32, Logical>> {
     let mut acc: Option<Rectangle<i32, Logical>> = None;
     for output in state.wl_outputs.values() {
@@ -204,7 +206,10 @@ fn global_bounding_rect(state: &PrismState) -> Option<Rectangle<i32, Logical>> {
         let Some(mode) = output.current_mode() else {
             continue;
         };
-        let size: Size<i32, Logical> = (mode.size.w, mode.size.h).into();
+        let scale = output.current_scale().fractional_scale().max(0.01);
+        let lw = ((mode.size.w as f64) / scale).round() as i32;
+        let lh = ((mode.size.h as f64) / scale).round() as i32;
+        let size: Size<i32, Logical> = (lw, lh).into();
         let rect = Rectangle::new(loc, size);
         acc = Some(acc.map(|a| a.merge(rect)).unwrap_or(rect));
     }

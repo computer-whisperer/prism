@@ -109,4 +109,14 @@ pub struct OutputConfig {
     /// Encode-shader composition. Determines which OETF + calibration +
     /// post-process effects run in the per-output encode pass.
     pub encode_config: EncodeConfig,
+    /// If true, enable variable-refresh-rate (Adaptive Sync / Freesync /
+    /// HDMI VRR) on the connector at bringup and tell `FrameClock` it can
+    /// stretch the interval past the nominal refresh when no frame is
+    /// pending. Logs a warning and falls back to fixed refresh if the
+    /// connector does not advertise VRR support.
+    ///
+    /// OnDemand (per niri config) is treated as `false` for now — needs
+    /// content_type / fullscreen-window inspection to flip on/off
+    /// dynamically.
+    pub vrr: bool,
 }

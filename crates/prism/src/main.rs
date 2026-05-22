@@ -100,6 +100,32 @@ fn load_config() -> prism_config::Config {
     }
 }
 
+/// Find the `output "..."` config block for a kernel connector name (e.g.
+/// `DisplayPort-4`). Accepts the short alias (`DP-4`) by expanding both
+/// sides. Same logic as `prism_drm::scanout::match_config_for_connector`
+/// and `prism_protocols::find_output_cfg` — local copy to avoid plumbing
+/// it across crate boundaries for this one call site.
+fn find_connector_config<'a>(
+    connector_name: &str,
+    outputs_cfg: &'a [prism_config::output::Output],
+) -> Option<&'a prism_config::output::Output> {
+    let kernel_lc = connector_name.to_lowercase();
+    outputs_cfg.iter().find(|o| {
+        let user_lc = o.name.to_lowercase();
+        if user_lc == kernel_lc {
+            return true;
+        }
+        let expanded = if let Some(rest) = user_lc.strip_prefix("dp-") {
+            format!("displayport-{rest}")
+        } else if let Some(rest) = user_lc.strip_prefix("hdmi-") {
+            format!("hdmi-a-{rest}")
+        } else {
+            user_lc
+        };
+        expanded == kernel_lc
+    })
+}
+
 fn parse_depth(arg: Option<&str>) -> Result<prism_drm::ScanoutDepth> {
     match arg {
         None | Some("10") => Ok(prism_drm::ScanoutDepth::Bpc10),
@@ -838,6 +864,12 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         ));
     }
 
+    // ── Load user config up-front ─────────────────────────────────────────
+    // Both bringup (mode / off / depth selection) and PrismState::new need it;
+    // load once and share. `load_config()` already falls back to defaults on
+    // failure with a loud log line, so this is safe before anything else.
+    let config = load_config();
+
     // ── Open every card we want to drive ───────────────────────────────────
     // CARDS env var overrides the hard-coded list (comma-separated paths,
     // e.g. CARDS=/dev/dri/card1). Default: both cards on this hardware.
@@ -902,15 +934,16 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     }
     breadcrumb(&format!("vulkan devices: {} GPU(s)", gpus.len()));
 
-    // For now every output uses the same OutputConfig (same depth, same
-    // encode chain). Per-output config (from EDID + user config) is the
-    // job of #59.x-later; today we let depth come from the CLI to keep
-    // existing test flows working.
-    let output_config = prism_drm::OutputConfig {
+    // Default OutputConfig built from CLI depth. Per-connector overrides
+    // (config.color.max_bpc → depth; config.variable_refresh_rate → vrr)
+    // are applied just below, inside the per-output bringup loop, where
+    // the connector name is known.
+    let default_output_config = prism_drm::OutputConfig {
         depth,
         vk_format: vk_format_for_depth(depth),
         intermediate_format: prism_renderer::DEFAULT_INTERMEDIATE_FORMAT,
         encode_config: prism_renderer::EncodeConfig::default_srgb(),
+        vrr: false,
     };
 
     // ── Pick connectors + bring up OutputContexts on every card ────────────
@@ -932,11 +965,16 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         };
         breadcrumb(&format!("bringup loop: {} picking connectors", card.path));
         let picks: Vec<prism_drm::OutputPick> = match output_name {
-            Some(name) => match prism_drm::pick_by_name(&card.drm, name) {
+            Some(name) => match prism_drm::pick_by_name_with_config(
+                &card.drm,
+                name,
+                &config.outputs.0,
+            ) {
                 Ok(p) => vec![p],
                 Err(_) => Vec::new(), // OUTPUT might be on a different card
             },
-            None => prism_drm::pick_all_connected(&card.drm).unwrap_or_default(),
+            None => prism_drm::pick_all_connected_with_config(&card.drm, &config.outputs.0)
+                .unwrap_or_default(),
         };
         breadcrumb(&format!(
             "bringup loop: {} got {} pick(s)",
@@ -945,6 +983,31 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         ));
         for pick in picks {
             let name = pick.connector_name.clone();
+            // Per-output config: start from the CLI default, then apply
+            // any per-connector overrides from the KDL `output "…"` block.
+            let mut output_config = default_output_config.clone();
+            if let Some(cfg) = find_connector_config(&name, &config.outputs.0) {
+                if let Some(color) = cfg.color.as_ref() {
+                    if let Some(bpc) = color.max_bpc {
+                        if bpc >= 10 {
+                            output_config.depth = prism_drm::ScanoutDepth::Bpc10;
+                        } else {
+                            output_config.depth = prism_drm::ScanoutDepth::Bpc8;
+                        }
+                        output_config.vk_format = vk_format_for_depth(output_config.depth);
+                    }
+                }
+                // Vrr always-on → wire through; on-demand currently
+                // treated as off (needs content_type signaling).
+                output_config.vrr = cfg.is_vrr_always_on();
+                if cfg.is_vrr_on_demand() {
+                    tracing::warn!(
+                        connector = %name,
+                        "VRR on_demand=true ignored — falling back to off until \
+                         content_type signaling lands"
+                    );
+                }
+            }
             breadcrumb(&format!("bringup loop: building OutputContext for {name}"));
             match prism_drm::OutputContext::new(card, device.clone(), pick, &output_config) {
                 Ok(output) => {
@@ -990,7 +1053,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     }
     let mut state = prism_protocols::PrismState::new(
         &display,
-        load_config(),
+        config,
         Some(session),
         gpus,
         primary_gpu,
