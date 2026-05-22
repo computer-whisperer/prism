@@ -24,5 +24,5 @@ anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 prism-ipc = { workspace = true, features = ["clap"] }
 serde_json.workspace = true
-tristim-driver = { git = "https://github.com/computer-whisperer/tristim.git", rev = "37c03bd" }
-tristim-display = { git = "https://github.com/computer-whisperer/tristim.git", rev = "37c03bd" }
+tristim-driver = { git = "https://github.com/computer-whisperer/tristim.git", rev = "17a4966" }
+tristim-display = { git = "https://github.com/computer-whisperer/tristim.git", rev = "17a4966" }

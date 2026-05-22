@@ -83,6 +83,23 @@ pub struct CalibrateArgs {
     /// Skip writing the CSV log entirely.
     #[arg(long)]
     pub no_log: bool,
+    /// Border luminance (cd/m²) painted around the centered patch.
+    /// Default 50 — high enough to keep most panels' content-adaptive
+    /// backlight from gating off during low-intensity measurements
+    /// (the LU28R55 turns the backlight off entirely below ~30 cd/m²
+    /// frame average, which then reads dim patches as black). The
+    /// colorimeter only sees the centered patch so the border doesn't
+    /// pollute measurements.
+    ///
+    /// In SDR mode the value is converted to an equivalent sRGB
+    /// fraction via `border_nits / sdr_reference_nits`.
+    #[arg(long, default_value_t = 50.0)]
+    pub border_nits: f64,
+    /// Disable the border entirely (legacy black surround). Use if a
+    /// panel's CABL isn't an issue and you want the cleanest signal
+    /// — small benefit, but the option is here.
+    #[arg(long)]
+    pub no_border: bool,
 }
 
 /// Channel identifier — used to pick a patch driver and to label CSV
@@ -205,20 +222,45 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
     // Patch surface. Mode picks the constructor.
     let mut patch = open_patch_surface(&args, &baseline)?;
     patch.set_window_fraction(args.window).context("set window fraction")?;
-    set_patch_off(&mut patch, baseline.hdr_active)?;
+
+    // Configure the border (anti-CABL surround) unless --no-border.
+    // The border colour is held across all subsequent set_color /
+    // set_nits calls — only the centred patch changes per measurement.
+    if !args.no_border {
+        apply_border(&mut patch, &baseline, args.border_nits)?;
+        eprintln!(
+            "Anti-CABL border set to {:.1} cd/m² (override with --border-nits or --no-border).",
+            args.border_nits
+        );
+    } else {
+        eprintln!("Border disabled (--no-border); surround is black.");
+    }
+
+    // Alignment patch during the countdown: paint a moderately-bright
+    // gray in the centered window so the user can see exactly where
+    // the patch will appear and position the puck precisely. Without
+    // this the countdown happens with both centre and border at the
+    // border colour (or pure black with --no-border), giving the user
+    // nothing to align against.
+    let alignment_nits = (args.border_nits * 2.0).max(40.0);
+    show_alignment_patch(&mut patch, &baseline, alignment_nits)?;
 
     // CSV log — open up front so a permission/path error fails before
     // the user has held the puck.
     let mut log = open_log(&args, &baseline)?;
 
     eprintln!(
-        "Place the puck flat on {} now. Calibration starts in {}s.",
+        "Place the puck flat on the centred patch on {} now. Calibration starts in {}s.",
         args.output, args.prep_secs
     );
     for s in (1..=args.prep_secs).rev() {
         eprintln!("  starting in {s}s...");
         thread::sleep(Duration::from_secs(1));
     }
+
+    // Now go to black before the probe begins — the probe expects to
+    // start from a known state. Border stays as configured.
+    set_patch_off(&mut patch, baseline.hdr_active)?;
 
     // ─── Phase 1: per-channel saturation discovery ────────────────────
     let (discovered_peaks, probe_peak_y) = discover_per_channel_peaks(
@@ -374,6 +416,51 @@ fn set_patch_off(patch: &mut PatchSurface, hdr_active: bool) -> Result<()> {
         patch.set_nits([0.0, 0.0, 0.0]).context("set black (HDR)")
     } else {
         patch.set_color([0.0, 0.0, 0.0]).context("set black (SDR)")
+    }
+}
+
+/// Configure the patch's surround colour at a fixed luminance, mode-
+/// aware. HDR sets the nits directly; SDR converts the absolute nits
+/// to an sRGB-encoded RGB via `border_nits / sdr_reference_nits`,
+/// matching how the rest of the calibrator translates between domains.
+fn apply_border(
+    patch: &mut PatchSurface,
+    baseline: &OutputBaseline,
+    border_nits: f64,
+) -> Result<()> {
+    if baseline.hdr_active {
+        patch
+            .set_border_nits([border_nits, border_nits, border_nits])
+            .context("set HDR border")
+    } else {
+        let linear = (border_nits / baseline.sdr_reference_nits).clamp(0.0, 1.0);
+        let encoded = srgb_oetf(linear);
+        patch
+            .set_border_color([encoded, encoded, encoded])
+            .context("set SDR border")
+    }
+}
+
+/// Paint a clearly-visible mid-gray patch in the centred window so the
+/// user can see where to place the colorimeter puck during the
+/// prep countdown. The border (if configured) is already painted by
+/// the existing surface state — this call only updates the centred
+/// foreground.
+fn show_alignment_patch(
+    patch: &mut PatchSurface,
+    baseline: &OutputBaseline,
+    alignment_nits: f64,
+) -> Result<()> {
+    if baseline.hdr_active {
+        patch
+            .set_nits([alignment_nits, alignment_nits, alignment_nits])
+            .context("alignment patch (HDR)")
+    } else {
+        let linear = (alignment_nits / baseline.sdr_reference_nits).clamp(0.0, 1.0);
+        let encoded = srgb_oetf(linear);
+        patch
+            .set_color([encoded, encoded, encoded])
+            .context("alignment patch (SDR)")
     }
 }
 
