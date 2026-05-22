@@ -126,6 +126,31 @@ fn find_connector_config<'a>(
     })
 }
 
+/// Resolve a parsed `HdrConfig` (KDL) into a kernel-ready
+/// `HdrSignaling`. Clamps user values to the u16 ranges the kernel
+/// HDR_OUTPUT_METADATA infoframe uses; defaults max_cll to
+/// max_luminance and max_fall to half max_luminance when omitted.
+/// Mirrors niri's `ResolvedHdrConfig::from_config` (tty.rs:3323).
+fn resolve_hdr_signaling(cfg: &prism_config::output::HdrConfig) -> prism_drm::HdrSignaling {
+    use prism_config::output::HdrMode;
+    let eotf = match cfg.mode {
+        HdrMode::Pq => prism_drm::HdrEotf::Pq,
+    };
+    let clamp_u16 = |v: u32| v.min(u16::MAX as u32) as u16;
+    let max_lum = clamp_u16(cfg.max_luminance);
+    prism_drm::HdrSignaling {
+        eotf,
+        max_luminance: max_lum,
+        // min_luminance is in nits; the kernel field is in 0.0001-nit
+        // ticks (i.e. multiply by 10_000 before clamping to u16).
+        min_luminance_ticks: (cfg.min_luminance * 10_000.0)
+            .round()
+            .clamp(0.0, u16::MAX as f64) as u16,
+        max_cll: clamp_u16(cfg.max_cll.unwrap_or(cfg.max_luminance)),
+        max_fall: clamp_u16(cfg.max_fall.unwrap_or(cfg.max_luminance / 2)),
+    }
+}
+
 fn parse_depth(arg: Option<&str>) -> Result<prism_drm::ScanoutDepth> {
     match arg {
         None | Some("10") => Ok(prism_drm::ScanoutDepth::Bpc10),
@@ -143,6 +168,10 @@ fn vk_format_for_depth(depth: prism_drm::ScanoutDepth) -> prism_renderer::vk::Fo
         // X in the high bits. Vulkan A2R10G10B10_UNORM_PACK32 uses the
         // exact same component ordering inside the 32-bit word.
         Bpc10 => vk::Format::A2R10G10B10_UNORM_PACK32,
+        // DRM XBGR16161616F: little-endian half-floats laid out R, G, B,
+        // X in memory order (the fourcc name reads the channels MSB-to-
+        // LSB). Vulkan R16G16B16A16_SFLOAT reads the same byte layout.
+        Fp16 => vk::Format::R16G16B16A16_SFLOAT,
     }
 }
 
@@ -944,6 +973,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         intermediate_format: prism_renderer::DEFAULT_INTERMEDIATE_FORMAT,
         encode_config: prism_renderer::EncodeConfig::default_srgb(),
         vrr: false,
+        hdr: None,
     };
 
     // ── Pick connectors + bring up OutputContexts on every card ────────────
@@ -988,7 +1018,21 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             let mut output_config = default_output_config.clone();
             if let Some(cfg) = find_connector_config(&name, &config.outputs.0) {
                 if let Some(color) = cfg.color.as_ref() {
-                    if let Some(bpc) = color.max_bpc {
+                    // HDR-on overrides max_bpc to 10 + flips depth to
+                    // fp16 + flips encode chain to PQ. Done before
+                    // the bare-max_bpc branch so an explicit max_bpc
+                    // in config is still honored as the ceiling.
+                    if let Some(hdr_cfg) = color.hdr.as_ref() {
+                        output_config.hdr = Some(resolve_hdr_signaling(hdr_cfg));
+                        output_config.depth = prism_drm::ScanoutDepth::Fp16;
+                        output_config.vk_format = vk_format_for_depth(output_config.depth);
+                        output_config.encode_config =
+                            prism_renderer::EncodeConfig::default_pq();
+                        tracing::info!(
+                            connector = %name,
+                            "HDR config present: fp16 scanout + PQ encode + KMS signaling"
+                        );
+                    } else if let Some(bpc) = color.max_bpc {
                         if bpc >= 10 {
                             output_config.depth = prism_drm::ScanoutDepth::Bpc10;
                         } else {
@@ -1442,6 +1486,13 @@ fn on_vblank(
         return;
     };
 
+    prism_drm::flip_trace(&format!(
+        "vblank {} crtc={:?} pres_us={}",
+        output_id,
+        crtc,
+        presentation_time.as_micros()
+    ));
+
     // Step 1: per-output DRM bookkeeping (frame_pending, back_buffer
     // toggle, frame_clock update).
     if let Some(ctx) = state.outputs.get_mut(&output_id) {
@@ -1535,30 +1586,50 @@ fn redraw_queued_outputs(state: &mut prism_protocols::PrismState) {
         .collect();
 
     for output_id in to_render {
-        match render_output_now(state, &output_id) {
-            Ok(Some(pending)) => {
-                let entry = state
-                    .output_redraw
-                    .entry(output_id)
-                    .or_default();
-                entry.pending_feedback = Some(pending);
-                entry.redraw = RedrawState::WaitingForVBlank {
-                    redraw_needed: false,
-                };
-            }
-            Ok(None) => {
-                // present() returned Ok(false) — flip still in flight.
-                // Shouldn't normally happen because we only enter Queued
-                // after a vblank cleared frame_pending, but defensive:
-                // leave Queued so the next pass retries.
-                tracing::debug!(output = %output_id, "render_output_now: flip still pending, retry next pass");
-            }
-            Err(e) => {
-                tracing::warn!("render_output_now({output_id}) failed: {e:#}");
-                breadcrumb(&format!("render_output_now({output_id}) ERROR: {e:#}"));
-                if let Some(entry) = state.output_redraw.get_mut(&output_id) {
-                    entry.redraw = RedrawState::Idle;
-                }
+        render_one_queued(state, &output_id);
+    }
+}
+
+/// Render one queued output, stash its presentation feedback, and
+/// transition its redraw state to `WaitingForVBlank { redraw_needed:
+/// false }`. Called both from the per-vblank handler (so each output's
+/// next frame is submitted at the moment of its own vblank — natural
+/// staggering across the wall-clock, no burst-submit of N outputs in a
+/// single tight loop) and from `redraw_queued_outputs` as a backstop
+/// for outputs queued from non-vblank sources (commit handlers,
+/// animation ticks, bootstrap).
+///
+/// Without per-vblank dispatch we had all per-card outputs page-flipping
+/// inside one ~150µs window per main-loop tick, which on Vega 20 + fp16
+/// scanout overflowed amdgpu's atomic-commit allocator ceiling
+/// (ENOMEM on the next submit). wlroots/sway run per-output commits
+/// from their own per-CRTC vblank handler for the same reason —
+/// `backend/drm/drm.c:2086 wlr_output_send_frame`.
+fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
+    use prism_protocols::redraw::RedrawState;
+    match render_output_now(state, output_id) {
+        Ok(Some(pending)) => {
+            let entry = state
+                .output_redraw
+                .entry(output_id.to_owned())
+                .or_default();
+            entry.pending_feedback = Some(pending);
+            entry.redraw = RedrawState::WaitingForVBlank {
+                redraw_needed: false,
+            };
+        }
+        Ok(None) => {
+            // present() returned Ok(false) — flip still in flight.
+            // Shouldn't normally happen because we only enter Queued
+            // after a vblank cleared frame_pending, but defensive:
+            // leave Queued so the next pass retries.
+            tracing::debug!(output = %output_id, "render_output_now: flip still pending, retry next pass");
+        }
+        Err(e) => {
+            tracing::warn!("render_output_now({output_id}) failed: {e:#}");
+            breadcrumb(&format!("render_output_now({output_id}) ERROR: {e:#}"));
+            if let Some(entry) = state.output_redraw.get_mut(output_id) {
+                entry.redraw = RedrawState::Idle;
             }
         }
     }

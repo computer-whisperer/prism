@@ -18,13 +18,18 @@ pub mod edid;
 pub mod enumerate;
 pub mod frame_clock;
 pub mod gbm_dev;
+pub mod hdr;
+pub mod modifiers;
 pub mod output_ctx;
 pub mod scanout;
 pub mod session;
 
+pub use breadcrumb::{breadcrumb as drm_breadcrumb, flip_trace};
 pub use card::{DrmCardContext, OutputConfig};
 pub use cursor_plane::CursorPlane;
 pub use edid::{ColorPrimaries, EdidInfo, HdrCapabilities};
+pub use hdr::{HdrEotf, HdrProps, HdrSignaling};
+pub use modifiers::pick_scanout_modifiers;
 pub use frame_clock::FrameClock;
 pub use enumerate::{ConnectorSummary, DeviceSummary, DrmFd, open_for_enumeration, summarize};
 pub use gbm_dev::GbmDevice;

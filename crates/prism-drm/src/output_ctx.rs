@@ -36,7 +36,8 @@ use smithay::utils::{Rectangle, Transform};
 
 use crate::{
     CursorPlane, DrmCardContext, OutputConfig, OutputPick, add_framebuffer_for_bo,
-    breadcrumb::breadcrumb, set_connector_max_bpc,
+    breadcrumb::{breadcrumb, flip_trace},
+    set_connector_max_bpc,
 };
 
 /// One BO + Vulkan view + DRM framebuffer handle. Two of these live in
@@ -111,6 +112,13 @@ pub struct OutputContext {
     /// at bringup and stashed so per-output config defaulting +
     /// `wl_output` advertisement can pick it up.
     pub edid: crate::EdidInfo,
+    /// KMS HDR property handles + currently-installed blob ID.
+    /// `Some` whenever the connector exposes HDR_OUTPUT_METADATA +
+    /// Colorspace, regardless of whether HDR is *currently* enabled
+    /// — we hold the handles either way so toggling on/off later
+    /// doesn't need to re-walk properties. `None` if the connector
+    /// can't carry HDR signaling (some virtual / dock outputs).
+    pub hdr_props: Option<crate::HdrProps>,
 }
 
 impl OutputContext {
@@ -153,6 +161,54 @@ impl OutputContext {
             "EDID: {}",
             edid.log_line()
         );
+
+        // HDR property discovery. Failing to find the props is not
+        // an error — many connectors don't carry HDR signaling.
+        let mut hdr_props = match crate::HdrProps::lookup(&card.drm, pick.connector) {
+            Ok(Some(p)) => Some(p),
+            Ok(None) => {
+                if config.hdr.is_some() {
+                    tracing::warn!(
+                        connector = %pick.connector_name,
+                        "HDR configured but connector exposes no HDR_OUTPUT_METADATA / Colorspace"
+                    );
+                }
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    connector = %pick.connector_name,
+                    "HDR property lookup failed: {e:#}"
+                );
+                None
+            }
+        };
+        // Either install or explicitly clear at bringup — clearing
+        // is what prevents stickiness from the prior session
+        // (phase-1 "DP-4 stuck on PQ" bug). Both branches no-op
+        // gracefully if hdr_props is None.
+        if let Some(props) = hdr_props.as_mut() {
+            match &config.hdr {
+                Some(signaling) => {
+                    if let Err(e) = props.set_hdr(&card.drm, signaling) {
+                        tracing::warn!(
+                            connector = %pick.connector_name,
+                            "set HDR signaling failed: {e:#}"
+                        );
+                    } else {
+                        tracing::info!(
+                            connector = %pick.connector_name,
+                            ?signaling,
+                            "HDR signaling installed"
+                        );
+                    }
+                }
+                None => {
+                    // Best-effort clear; failure logs only.
+                    let _ = props.clear(&card.drm);
+                }
+            }
+        }
 
         match set_connector_max_bpc(&card.drm, pick.connector, config.depth.max_bpc()) {
             Ok(true) => tracing::info!("connector max bpc set to {}", config.depth.max_bpc()),
@@ -276,6 +332,7 @@ impl OutputContext {
             frame_clock,
             cursor,
             edid,
+            hdr_props,
         })
     }
 
@@ -357,14 +414,44 @@ impl OutputContext {
         }
 
         if !self.mode_set_done {
-            self.surface
+            flip_trace(&format!(
+                "submit modeset {} crtc={:?} back={}",
+                self.connector_name, self.crtc, self.back_index
+            ));
+            let res = self
+                .surface
                 .commit(plane_state.iter().cloned(), true)
-                .context("DrmSurface::commit (initial mode-set)")?;
+                .context("DrmSurface::commit (initial mode-set)");
+            flip_trace(&format!(
+                "result modeset {} crtc={:?} -> {}",
+                self.connector_name,
+                self.crtc,
+                match &res {
+                    Ok(()) => "Ok".to_string(),
+                    Err(e) => format!("Err({e})"),
+                }
+            ));
+            res?;
             self.mode_set_done = true;
         } else {
-            self.surface
+            flip_trace(&format!(
+                "submit page_flip {} crtc={:?} back={}",
+                self.connector_name, self.crtc, self.back_index
+            ));
+            let res = self
+                .surface
                 .page_flip(plane_state.iter().cloned(), true)
-                .context("DrmSurface::page_flip")?;
+                .context("DrmSurface::page_flip");
+            flip_trace(&format!(
+                "result page_flip {} crtc={:?} -> {}",
+                self.connector_name,
+                self.crtc,
+                match &res {
+                    Ok(()) => "Ok".to_string(),
+                    Err(e) => format!("Err({e})"),
+                }
+            ));
+            res?;
         }
         self.frame_pending = true;
         Ok(true)
@@ -378,23 +465,55 @@ fn alloc_scanout_buffer(
     extent: vk::Extent2D,
     label: &str,
 ) -> Result<ScanoutBuffer> {
-    let (bo, dmabuf) = card
-        .gbm
-        .allocate_scanout(
-            extent.width,
-            extent.height,
-            config.depth.drm_fourcc(),
-            &[DrmModifier::Linear],
-        )
-        .with_context(|| {
-            format!(
-                "GBM allocate {} {}×{} {:?}",
-                label,
-                extent.width,
-                extent.height,
-                config.depth.drm_fourcc()
-            )
-        })?;
+    // Modifier negotiation. Query what the Vulkan driver will accept as
+    // a color attachment for this format, pass the resulting candidate
+    // list through `pick_scanout_modifiers` (drops multi-plane / non-
+    // renderable, orders tiled-first with LINEAR fallback), and let GBM
+    // pick one that's also acceptable to the scanout pipe.
+    //
+    // The first allocate_scanout pass uses the full candidate list. If
+    // it fails (driver/GBM couldn't find a mutually-supported tiled
+    // modifier under the SCANOUT|RENDERING constraint), we retry with
+    // LINEAR-only as the explicit fallback. LINEAR is universally
+    // scanout-capable for the formats we use; the only cost is the
+    // bandwidth we were trying to avoid.
+    let render_mods = device.supported_drm_format_modifiers(config.vk_format);
+    let candidates = crate::pick_scanout_modifiers(&render_mods);
+    let fourcc = config.depth.drm_fourcc();
+    let (bo, dmabuf) = match card.gbm.allocate_scanout(
+        extent.width,
+        extent.height,
+        fourcc,
+        &candidates,
+    ) {
+        Ok(pair) => pair,
+        Err(first_err) => {
+            tracing::warn!(
+                buffer = label,
+                ?candidates,
+                "scanout alloc with tiled-modifier candidates failed ({first_err:#}); \
+                 retrying LINEAR-only"
+            );
+            card.gbm
+                .allocate_scanout(
+                    extent.width,
+                    extent.height,
+                    fourcc,
+                    &[DrmModifier::Linear],
+                )
+                .with_context(|| {
+                    format!(
+                        "GBM allocate {} {}×{} {:?} (LINEAR fallback after tiled failed)",
+                        label, extent.width, extent.height, fourcc
+                    )
+                })?
+        }
+    };
+    tracing::debug!(
+        buffer = label,
+        modifier = ?bo.modifier(),
+        "scanout buffer allocated"
+    );
     let image = ImportedImage::import(
         device.clone(),
         &dmabuf,
@@ -424,6 +543,15 @@ impl Drop for OutputContext {
             "OutputContext::Drop entry: {} (crtc {:?})",
             self.connector_name, self.crtc
         ));
+        // Clear HDR signaling first so the next session sees a fresh
+        // SDR connector. DrmSurface impls ControlDevice so we can
+        // run the property writes through it without needing the
+        // owning DrmDevice. Failure is logged and ignored — the
+        // kernel will reset on fd close anyway, this just avoids
+        // the cross-session "stuck on PQ" handoff bug.
+        if let Some(hdr) = self.hdr_props.as_mut() {
+            let _ = hdr.clear(&self.surface);
+        }
         let t0 = std::time::Instant::now();
         let clear_res = self.surface.clear();
         breadcrumb(&format!(

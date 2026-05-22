@@ -21,13 +21,20 @@ use smithay::reexports::drm::control::{
 ///   precision; required for HDR and for SDR-without-banding on smooth
 ///   gradients. Pair with `max_bpc=10` on the connector to actually push
 ///   10 bits over the wire (else driver dithers down).
+/// `Fp16` → DRM `XB4F` (`XBGR16161616F`) ↔ Vulkan `R16G16B16A16_SFLOAT`.
+///   16 bits per channel as half-floats; the only scanout format with
+///   enough headroom for absolute-nits PQ encode (10000-nit peak). Used
+///   for HDR-configured outputs. The kernel splits this back down to the
+///   connector's negotiated link depth (8/10/12) on scanout.
 ///
-/// Choice is per-output; some displays don't support 10-bit links (cheap
-/// 1080p panels). Negotiation belongs in the per-output config layer.
+/// Choice is per-output; some displays don't support 10-bit links or
+/// fp16 framebuffers (cheap 1080p panels). Negotiation belongs in the
+/// per-output config layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanoutDepth {
     Bpc8,
     Bpc10,
+    Fp16,
 }
 
 impl ScanoutDepth {
@@ -35,14 +42,18 @@ impl ScanoutDepth {
         match self {
             Self::Bpc8 => DrmFourcc::Xrgb8888,
             Self::Bpc10 => DrmFourcc::Xrgb2101010,
+            Self::Fp16 => DrmFourcc::Xbgr16161616f,
         }
     }
 
     /// The `max bpc` value to push to the connector for this depth.
+    /// Fp16 stays at 10 because that's the highest most consumer
+    /// HDR displays accept over DP/HDMI (12 is rare and the link
+    /// negotiation will reject it on most panels).
     pub fn max_bpc(self) -> u64 {
         match self {
             Self::Bpc8 => 8,
-            Self::Bpc10 => 10,
+            Self::Bpc10 | Self::Fp16 => 10,
         }
     }
 }

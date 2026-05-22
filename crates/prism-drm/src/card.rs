@@ -119,4 +119,11 @@ pub struct OutputConfig {
     /// content_type / fullscreen-window inspection to flip on/off
     /// dynamically.
     pub vrr: bool,
+    /// HDR signaling to push to the connector at bringup. `None` =
+    /// SDR scanout. When `Some`, the bringup path also flips
+    /// `depth`/`vk_format`/`encode_config` upstream (in main.rs) to
+    /// fp16 + PQ encode. The signaling here only controls the KMS
+    /// connector-side advertisement (HDR_OUTPUT_METADATA blob +
+    /// Colorspace).
+    pub hdr: Option<crate::HdrSignaling>,
 }

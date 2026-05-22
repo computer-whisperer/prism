@@ -65,10 +65,80 @@ pub struct Device {
     pub graphics_queue: vk::Queue,
 }
 
+/// One entry from `vkGetPhysicalDeviceFormatProperties2` +
+/// `VkDrmFormatModifierPropertiesListEXT`. Describes one DRM format
+/// modifier the Vulkan driver supports for a given Vulkan format,
+/// along with how many memory planes the modifier uses and which
+/// usage classes (color attachment / sampling / etc.) work with it.
+#[derive(Clone, Copy, Debug)]
+pub struct DrmFormatModifierInfo {
+    pub modifier: u64,
+    pub plane_count: u32,
+    pub tiling_features: vk::FormatFeatureFlags,
+}
+
 impl Device {
     /// Access the raw `ash::Instance` for building extension loaders.
     pub fn instance_raw(&self) -> &ash::Instance {
         self.instance.raw()
+    }
+
+    /// Query the Vulkan driver for the DRM format modifiers it supports for
+    /// `format`. Used to negotiate a tiled scanout layout we can both render
+    /// into (via `ImportedImage`) and feed to KMS, instead of falling back
+    /// to LINEAR which on amdgpu+fp16 burns enough scanout bandwidth to
+    /// trigger transient `-ENOMEM` from the DCN validator under contention.
+    ///
+    /// Caller filters the returned list (e.g. by `plane_count == 1`,
+    /// required `tiling_features`). An empty result means the driver
+    /// doesn't advertise any modifier for this format — caller should
+    /// fall back to LINEAR.
+    ///
+    /// Two-pass query: first call gets the count, second fills the buffer.
+    /// Done unconditionally per-output at bringup; the cost is one
+    /// `vkGetPhysicalDeviceFormatProperties2` round-trip.
+    pub fn supported_drm_format_modifiers(
+        &self,
+        format: vk::Format,
+    ) -> Vec<DrmFormatModifierInfo> {
+        let phys = self.physical.raw;
+        let instance = self.instance.raw();
+
+        // Pass 1: query count with a null buffer.
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+        let mut props2 = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe {
+            instance.get_physical_device_format_properties2(phys, format, &mut props2);
+        }
+        let count = list.drm_format_modifier_count as usize;
+        if count == 0 {
+            return Vec::new();
+        }
+
+        // Pass 2: fill the buffer. `props2` re-uses the pNext chain; we
+        // rebuild it so `list` points at the freshly-allocated storage.
+        let mut storage: Vec<vk::DrmFormatModifierPropertiesEXT> = vec![Default::default(); count];
+        let filled = {
+            let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+                .drm_format_modifier_properties(&mut storage);
+            let mut props2 = vk::FormatProperties2::default().push_next(&mut list);
+            unsafe {
+                instance.get_physical_device_format_properties2(phys, format, &mut props2);
+            }
+            list.drm_format_modifier_count as usize
+        };
+        // Truncate to what the second call actually filled (drivers may
+        // report a smaller count on the second pass; not common but spec-allowed).
+        storage.truncate(filled);
+
+        storage
+            .into_iter()
+            .map(|p| DrmFormatModifierInfo {
+                modifier: p.drm_format_modifier,
+                plane_count: p.drm_format_modifier_plane_count,
+                tiling_features: p.drm_format_modifier_tiling_features,
+            })
+            .collect()
     }
 
     /// Open a Vulkan logical device.
