@@ -47,7 +47,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 use tristim_display::{PatchSurface, PqDescriptionParams};
-use tristim_driver::{Calibration, Colorimeter, Setup, measurement::raw_to_xyz};
+use tristim_driver::{Calibration, Colorimeter, Setup, Xyz, measurement::raw_to_xyz};
 
 #[derive(Args)]
 pub struct CalibrateArgs {
@@ -263,7 +263,7 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
     set_patch_off(&mut patch, baseline.hdr_active)?;
 
     // ─── Phase 1: per-channel saturation discovery ────────────────────
-    let (discovered_peaks, probe_peak_y) = discover_per_channel_peaks(
+    let (discovered_peaks, probe_peak_y, probe_cabl_count) = discover_per_channel_peaks(
         &args,
         &baseline,
         &mut device,
@@ -313,7 +313,7 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
     }
 
     // ─── Phase 2: per-channel response refinement ─────────────────────
-    let curve = refine_per_channel_curve(
+    let (curve, refine_cabl_count) = refine_per_channel_curve(
         &args,
         &baseline,
         &discovered_peaks,
@@ -338,6 +338,31 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
         )?;
         w.flush().ok();
         eprintln!("CSV log written to {}", path.display());
+    }
+
+    // Backlight-off summary across the whole run. The fit filters out
+    // affected samples but the user might still want to know — if the
+    // count is non-zero, the border was too dim for this panel's CABL
+    // threshold and a re-run with --border-nits N (N > current) would
+    // produce more confident readings.
+    let total_cabl = probe_cabl_count + refine_cabl_count;
+    if total_cabl > 0 {
+        eprintln!(
+            "\n⚠  {} backlight-off event(s) detected during run (probe {} + refine {}).",
+            total_cabl, probe_cabl_count, refine_cabl_count,
+        );
+        eprintln!(
+            "   The panel's content-adaptive backlight gated samples to ambient noise."
+        );
+        eprintln!(
+            "   Affected samples were dropped from the fit; current curve uses surviving data."
+        );
+        eprintln!(
+            "   Re-run with `--border-nits {}` (or higher) for cleaner results.",
+            (args.border_nits * 2.0).round(),
+        );
+    } else {
+        eprintln!("\nNo backlight-off events detected — border at {:.0} cd/m² was sufficient.", args.border_nits);
     }
 
     // ─── Print KDL block for paste-in ─────────────────────────────────
@@ -468,7 +493,7 @@ fn show_alignment_patch(
 
 /// Walk each channel ascending; find where measured Y plateaus.
 ///
-/// Returns `(peaks, probe_peak_y)`:
+/// Returns `(peaks, probe_peak_y, backlight_off_count)`:
 /// - `peaks[c]` = highest commanded value that produced a non-saturated
 ///   measurement (used as the panel-peak ceiling for clamping the
 ///   intermediate buffer).
@@ -476,6 +501,9 @@ fn show_alignment_patch(
 ///   during probe (used by refinement to filter out saturation-
 ///   polluted samples — if `Y >= 0.95 × probe_peak_y[c]` the panel was
 ///   clipping and the data point doesn't reflect linear response).
+/// - `backlight_off_count` = number of measurements flagged by
+///   [`is_backlight_off`] — surfaced to the final summary so the user
+///   knows to bump `--border-nits` if CABL is gating samples.
 fn discover_per_channel_peaks(
     args: &CalibrateArgs,
     baseline: &OutputBaseline,
@@ -484,7 +512,7 @@ fn discover_per_channel_peaks(
     setup: &Setup,
     cal: &Calibration,
     mut log: Option<&mut (PathBuf, BufWriter<File>)>,
-) -> Result<([f64; 3], [f64; 3])> {
+) -> Result<([f64; 3], [f64; 3], usize)> {
     // HDR mode: lift the compositor clamp temporarily so the buffer's
     // nits aren't pre-clipped before reaching the panel. SDR mode:
     // leave the user's policy alone — sdr_reference_nits + panel peak
@@ -515,6 +543,7 @@ fn discover_per_channel_peaks(
     let settle = Duration::from_millis(args.settle_ms);
     let mut peaks = [0.0f64; 3];
     let mut probe_peak_y = [0.0f64; 3];
+    let mut backlight_off_count = 0usize;
 
     for c in Channel::ALL {
         eprintln!("\n--- phase 1 probe: {} channel ---", c.label());
@@ -529,10 +558,22 @@ fn discover_per_channel_peaks(
             let raw = device.measure_raw(setup).context("measure")?;
             let xyz = raw_to_xyz(&raw, setup, cal);
             let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
+            let cabl = is_backlight_off(target_nits, c, &xyz);
             eprintln!(
-                "  {} target {:>7.1} cd/m²  →  X={:>7.2}  Y={:>7.2}  Z={:>7.2}",
+                "  {} target {:>7.1} cd/m²  →  X={:>7.2}  Y={:>7.2}  Z={:>7.2}{}",
                 c.label(), target_nits, xyz.x, xyz.y, xyz.z,
+                if cabl { "  ⚠ backlight-off" } else { "" },
             );
+            if cabl {
+                backlight_off_count += 1;
+                if let Some((_, w)) = log.as_mut() {
+                    writeln!(
+                        w,
+                        "# WARN backlight-off detected (probe {} patch_idx {}, target {:.2}): xy=({:.4},{:.4}) Y={:.4}",
+                        c.label(), patch_idx + 1, target_nits, cx, cy, xyz.y,
+                    )?;
+                }
+            }
             measurements.push((target_nits, xyz.y));
             probe_peak_y[c.idx()] = probe_peak_y[c.idx()].max(xyz.y);
             if let Some((_, w)) = log.as_mut() {
@@ -602,6 +643,16 @@ fn discover_per_channel_peaks(
                     let xyz = raw_to_xyz(&raw, setup, cal);
                     let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
                     let mid_y = xyz.y;
+                    if is_backlight_off(mid_t, c, &xyz) {
+                        backlight_off_count += 1;
+                        if let Some((_, w)) = log.as_mut() {
+                            writeln!(
+                                w,
+                                "# WARN backlight-off detected during {} bisection (target {:.2}): xy=({:.4},{:.4}) Y={:.4}",
+                                c.label(), mid_t, cx, cy, mid_y,
+                            )?;
+                        }
+                    }
                     // Saturated when mid_y is barely above left_y
                     // (Y_ratio < 1.2). Sub-saturation means the panel
                     // is still ramping at mid_t.
@@ -657,7 +708,7 @@ fn discover_per_channel_peaks(
         }
     }
 
-    Ok((peaks, probe_peak_y))
+    Ok((peaks, probe_peak_y, backlight_off_count))
 }
 
 /// Drive a single-channel patch using the right setter for the mode.
@@ -693,6 +744,57 @@ fn srgb_oetf(linear: f64) -> f64 {
     } else {
         1.055 * linear.powf(1.0 / 2.4) - 0.055
     }
+}
+
+/// Detect a backlight-off / dead measurement on a pure-channel patch.
+///
+/// Some panels (the LU28R55 in HDR mode is the example we hit during
+/// DP-4 calibration) gate the backlight off entirely when frame-
+/// average brightness falls below a threshold. If the colorimeter is
+/// looking at the centred patch while this happens, the reading is
+/// ambient noise (or a tiny remnant of OLED-style emission) rather
+/// than the intended colour. The `Y >= 1 cd/m²` filter in the fit
+/// catches the obvious cases, but borderline ones (Y just over the
+/// floor, but chromaticity clearly not the requested primary) also
+/// shouldn't feed the fit.
+///
+/// Returns `true` when the sample looks like a CABL event:
+/// - target is non-trivial (> 5 nits — below this we can't
+///   distinguish "panel emits little" from "backlight off"), AND
+/// - the magnitude is below an absolute noise floor (`Y < 0.3`),
+///   OR the chromaticity is more than 0.05 in xy distance from the
+///   channel's expected primary (= clear sign the panel didn't emit
+///   the requested colour).
+///
+/// The 0.05 threshold is loose enough to tolerate normal per-panel
+/// primary variation (~0.005-0.01 from BT.2020 anchors) but tight
+/// enough to flag a backlight-off reading (where xy lands far away
+/// in the white/grey region, distance ~0.5).
+fn is_backlight_off(target_nits: f64, channel: Channel, xyz: &Xyz) -> bool {
+    if target_nits <= 5.0 {
+        return false;
+    }
+    // Magnitude check first — even pure blue (smallest Y coefficient,
+    // ~0.07 for BT.2020 blue) at 5 nits commanded should produce
+    // ~0.35 Y once any panel response is applied.
+    if xyz.y < 0.3 {
+        return true;
+    }
+    let (cx, cy) = match xyz.chromaticity() {
+        Some(pair) => pair,
+        None => return true, // XYZ all-zero / negative → dead
+    };
+    // Expected primaries (approximate; allow generous radius). The
+    // exact values vary per panel; we just need to be in the right
+    // region of the chromaticity diagram.
+    let (px, py) = match channel {
+        Channel::R => (0.67, 0.32),
+        Channel::G => (0.27, 0.60),
+        Channel::B => (0.14, 0.07),
+    };
+    let dx = cx - px;
+    let dy = cy - py;
+    (dx * dx + dy * dy).sqrt() > 0.05
 }
 
 // ─── Phase 2 helpers ───────────────────────────────────────────────────────
@@ -745,7 +847,7 @@ fn refine_per_channel_curve(
     setup: &Setup,
     cal: &Calibration,
     mut log: Option<&mut (PathBuf, BufWriter<File>)>,
-) -> Result<PerChannelCurve> {
+) -> Result<(PerChannelCurve, usize)> {
     /// Lowest commanded value to sample. 50 cd/m² is well above the
     /// Spyder's Y reliability floor for all three primaries (B's peak
     /// Y on a typical panel is ~25, so commanded 50 → Y ~3 even
@@ -779,6 +881,7 @@ fn refine_per_channel_curve(
     let mut curve = PerChannelCurve::IDENTITY;
     let mut last_curve = curve;
     let settle = Duration::from_millis(args.settle_ms);
+    let mut backlight_off_count = 0usize;
 
     for iter in 0..args.iterations {
         eprintln!(
@@ -806,18 +909,23 @@ fn refine_per_channel_curve(
                 })
                 .collect();
 
-            let mut samples: Vec<(f64, f64)> = Vec::with_capacity(targets.len());
+            let mut samples: Vec<(f64, f64, bool)> = Vec::with_capacity(targets.len());
             for (patch_idx, &t) in targets.iter().enumerate() {
                 set_channel_patch(patch, baseline, c, t)?;
                 thread::sleep(settle);
                 let raw = device.measure_raw(setup).context("measure")?;
                 let xyz = raw_to_xyz(&raw, setup, cal);
                 let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
+                let cabl = is_backlight_off(t, c, &xyz);
+                if cabl {
+                    backlight_off_count += 1;
+                }
                 eprintln!(
-                    "  {} target {:>7.2} cd/m² → X={:>7.2} Y={:>7.2} Z={:>7.2}",
+                    "  {} target {:>7.2} cd/m² → X={:>7.2} Y={:>7.2} Z={:>7.2}{}",
                     c.label(), t, xyz.x, xyz.y, xyz.z,
+                    if cabl { "  ⚠ backlight-off" } else { "" },
                 );
-                samples.push((t, xyz.y));
+                samples.push((t, xyz.y, cabl));
                 if let Some((_, w)) = log.as_mut() {
                     writeln!(
                         w,
@@ -834,29 +942,29 @@ fn refine_per_channel_curve(
                 }
             }
 
-            // Filter both ends: noise-floor + saturation-polluted.
+            // Filter all three: backlight-off (CABL), noise-floor,
+            // saturation-polluted. Each catches a different failure
+            // mode of the underlying model assumption (clean power-law
+            // response in the panel's linear region).
             let y_sat = probe_peak_y[c.idx()] * SATURATION_FILTER_FRAC;
             let useful: Vec<(f64, f64)> = samples
                 .iter()
                 .copied()
-                .filter(|(_, y)| *y >= NOISE_FLOOR_Y && *y <= y_sat)
+                .filter(|(_, y, cabl)| !*cabl && *y >= NOISE_FLOOR_Y && *y <= y_sat)
+                .map(|(t, y, _)| (t, y))
                 .collect();
             if useful.len() < 2 {
                 eprintln!(
-                    "  {} only {} useful sample(s) after Y in [{}, {:.1}] filter; skipping fit",
+                    "  {} only {} useful sample(s) after CABL+noise+saturation filter; skipping fit",
                     c.label(),
                     useful.len(),
-                    NOISE_FLOOR_Y,
-                    y_sat,
                 );
                 if let Some((_, w)) = log.as_mut() {
                     writeln!(
                         w,
-                        "# refine {} iter {} fit: SKIPPED (insufficient samples in [{}, {:.3}])",
+                        "# refine {} iter {} fit: SKIPPED (insufficient samples after CABL+noise+saturation filter)",
                         c.label(),
                         iter + 1,
-                        NOISE_FLOOR_Y,
-                        y_sat,
                     )?;
                 }
                 continue;
@@ -889,9 +997,18 @@ fn refine_per_channel_curve(
                 continue;
             }
 
-            // Plausibility: predicted top-Y vs measured top-Y.
+            // Plausibility: predicted top-Y vs measured top-Y. The
+            // panel's response is `Y = fit_gain × commanded^fit_gamma`
+            // (per the linearisation comment above), NOT
+            // `Y = fit_gain × target^fit_gamma`. The previous version
+            // used `target` directly, which only worked when the
+            // current curve V_k was identity (target == commanded);
+            // for iter 2+ with a non-identity curve, it silently
+            // produced wrong predictions and rejected valid fits.
+            // Convert target → commanded via the inverse of V_k.
             let (top_target, top_measured_y) = *useful.last().unwrap();
-            let predicted_top_y = fit_gain * top_target.powf(fit_gamma);
+            let top_commanded = (top_target / gain_k.max(1e-6)).powf(1.0 / gamma_k.max(1e-3));
+            let predicted_top_y = fit_gain * top_commanded.powf(fit_gamma);
             let ratio = predicted_top_y / top_measured_y.max(0.01);
             if !(0.5..=2.0).contains(&ratio) {
                 eprintln!(
@@ -987,7 +1104,7 @@ fn refine_per_channel_curve(
         last_curve = curve;
     }
 
-    Ok(curve)
+    Ok((curve, backlight_off_count))
 }
 
 /// Ordinary-least-squares fit on log-log. Skips non-positive points.
