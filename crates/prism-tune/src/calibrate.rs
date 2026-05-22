@@ -18,6 +18,9 @@ use anyhow::{Context, Result};
 use clap::Args;
 use prism_ipc::socket::Socket;
 use prism_ipc::{OutputAction, Request, Response};
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 use tristim_display::{PatchSurface, PqDescriptionParams};
@@ -38,8 +41,10 @@ pub struct CalibrateArgs {
     /// ABL-throttled OLEDs to measure peak response; 1.0 fills the screen.
     #[arg(long, default_value_t = 0.10)]
     pub window: f64,
-    /// Number of measure → fit → apply iterations.
-    #[arg(long, default_value_t = 3)]
+    /// Number of measure → fit → apply iterations. Default 5 — on the
+    /// LU28R55 the curve was still drifting at 3, so 5 trades ~5 sec of
+    /// extra hold time for visibly better convergence.
+    #[arg(long, default_value_t = 5)]
     pub iterations: u32,
     /// Seconds to wait for the puck to be placed before the first sweep.
     #[arg(long, default_value_t = 5)]
@@ -51,6 +56,14 @@ pub struct CalibrateArgs {
     /// the persisted KDL config wins again).
     #[arg(long)]
     pub keep: bool,
+    /// Per-measurement CSV log path. Defaults to
+    /// `prism-tune-calibrate-<output>.csv` in the current directory.
+    /// Pass `--log /dev/null` (or `--no-log`) to skip logging.
+    #[arg(long)]
+    pub log: Option<PathBuf>,
+    /// Skip writing the CSV log entirely.
+    #[arg(long)]
+    pub no_log: bool,
 }
 
 pub fn run(args: CalibrateArgs) -> Result<()> {
@@ -79,6 +92,22 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
         .with_context(|| format!("open HDR patch on {}", args.output))?;
     patch.set_window_fraction(args.window).context("set window fraction")?;
     patch.set_nits([0.0, 0.0, 0.0]).context("initial black")?;
+
+    // Open the CSV log up front so a permission / path error fails before
+    // the user has held the puck for 30 sec.
+    let mut log = open_log(&args)?;
+    if let Some((path, w)) = log.as_mut() {
+        writeln!(
+            w,
+            "# prism-tune calibrate — output={} peak_nits={} window={} iterations={} settle_ms={}",
+            args.output, args.peak_nits, args.window, args.iterations, args.settle_ms
+        )?;
+        writeln!(
+            w,
+            "iter,patch_idx,target_nits,applied_gain,applied_gamma,X,Y,Z,x,y"
+        )?;
+        eprintln!("Logging per-measurement CSV to {}", path.display());
+    }
 
     eprintln!(
         "Place the puck flat on {} now. Calibration starts in {}s.",
@@ -112,16 +141,33 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
         device.send_reset().context("colorimeter reset")?;
 
         let mut samples: Vec<(f64, f64)> = Vec::with_capacity(targets.len());
-        for &t in &targets {
+        for (patch_idx, &t) in targets.iter().enumerate() {
             patch.set_nits([t, t, t]).with_context(|| format!("set {t} nits"))?;
             thread::sleep(settle);
             let raw = device.measure_raw_no_reset(&setup).context("measure")?;
             let xyz = raw_to_xyz(&raw, &setup, &cal);
+            let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
             eprintln!(
                 "  target {:>6.1} cd/m²  →  measured Y = {:>7.3}",
                 t, xyz.y
             );
             samples.push((t, xyz.y));
+            if let Some((_, w)) = log.as_mut() {
+                writeln!(
+                    w,
+                    "{},{},{:.4},{:.6},{:.6},{:.4},{:.4},{:.4},{:.6},{:.6}",
+                    iter + 1,
+                    patch_idx + 1,
+                    t,
+                    gain,
+                    gamma,
+                    xyz.x,
+                    xyz.y,
+                    xyz.z,
+                    cx,
+                    cy,
+                )?;
+            }
         }
 
         // After applying compositor curve V_k = (gain_k, gamma_k):
@@ -138,6 +184,15 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
             "  fit: panel_gain = {:.4}, panel_gamma = {:.4}",
             new_gain, new_gamma
         );
+        if let Some((_, w)) = log.as_mut() {
+            writeln!(
+                w,
+                "# iter {} fit: gain={:.6} gamma={:.6}",
+                iter + 1,
+                new_gain,
+                new_gamma
+            )?;
+        }
         gain = new_gain;
         gamma = new_gamma;
 
@@ -157,6 +212,16 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
 
     // Black before the user lifts the puck — both polite and ABL-friendly.
     let _ = patch.set_nits([0.0, 0.0, 0.0]);
+
+    if let Some((path, mut w)) = log {
+        writeln!(
+            w,
+            "# final: gain={:.6} gamma={:.6}",
+            gain, gamma
+        )?;
+        w.flush().ok();
+        eprintln!("CSV log written to {}", path.display());
+    }
 
     println!();
     println!("# Paste into the matching output block in your prism config:");
@@ -178,6 +243,28 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Open the per-measurement CSV log if logging is enabled. Returns
+/// `Ok(None)` when `--no-log` is set or the user explicitly routes to
+/// /dev/null. Otherwise creates / truncates the path and returns the
+/// resolved path alongside its writer.
+fn open_log(args: &CalibrateArgs) -> Result<Option<(PathBuf, BufWriter<File>)>> {
+    if args.no_log {
+        return Ok(None);
+    }
+    let path = args.log.clone().unwrap_or_else(|| {
+        // Substitute slashes in the connector name (none today, but safe)
+        // so a hypothetical "DP-0/1" doesn't escape into a subdirectory.
+        let safe = args.output.replace('/', "_");
+        PathBuf::from(format!("prism-tune-calibrate-{safe}.csv"))
+    });
+    if path.as_os_str() == "/dev/null" {
+        return Ok(None);
+    }
+    let file = File::create(&path)
+        .with_context(|| format!("create log file {}", path.display()))?;
+    Ok(Some((path, BufWriter::new(file))))
 }
 
 /// Ordinary-least-squares fit on log-log. Skips non-positive points.
