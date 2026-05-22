@@ -9,6 +9,7 @@
 pub mod client;
 pub mod color_management;
 pub mod input_state;
+pub mod layer_shell;
 pub mod redraw;
 pub mod server;
 pub mod state;

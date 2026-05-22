@@ -1760,6 +1760,45 @@ fn render_output_now(
         &mut render_els,
     );
 
+    // wlr_layer_shell Overlay surfaces: drawn on top of the layout
+    // walk (and above any interactive-move tile). MVP only renders
+    // Overlay — the other layers (Background, Bottom, Top) are
+    // tracked but not yet composited. See crate::layer_shell for the
+    // deliberate scope gaps.
+    //
+    // Subsurfaces aren't walked here either: Spyder doesn't use
+    // them, and a fuller layer-shell client (bars, notifications)
+    // will arrive with its own pass that mirrors mapped.rs's
+    // with_surface_tree_downward.
+    let output_id_owned = output_id.to_string();
+    for (wl_surface, rect, layer) in state.layer_surfaces_for_output(&output_id_owned) {
+        if !matches!(layer, smithay::wayland::shell::wlr_layer::Layer::Overlay) {
+            continue;
+        }
+        let Some(texture_view) = smithay::wayland::compositor::with_states(
+            wl_surface,
+            |states| (ctx.texture_lookup)(states),
+        ) else {
+            continue;
+        };
+        let dst = smithay::utils::Rectangle::<f64, smithay::utils::Logical>::new(
+            (rect.loc.x as f64, rect.loc.y as f64).into(),
+            (rect.size.w as f64, rect.size.h as f64).into(),
+        );
+        let dst_rect_clip = project(dst);
+        let color = smithay::wayland::compositor::with_states(
+            wl_surface,
+            |states| (ctx.color_lookup)(states),
+        )
+        .unwrap_or_default();
+        render_els.push(RenderEl::Surface(prism_renderer::SurfaceEl {
+            texture_view,
+            dst_rect_clip,
+            src_rect_uv: [0.0, 0.0, 1.0, 1.0],
+            color,
+        }));
+    }
+
     // Lower RenderEls (geometry + tint) → ElementDraws (texture + push
     // constants). One pass; SolidColor/Border elements bind the white
     // texel, Surface elements bind the per-surface view.

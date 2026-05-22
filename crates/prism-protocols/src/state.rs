@@ -175,6 +175,14 @@ pub struct PrismState {
     /// extension interfaces lives in [`crate::color_management`]; this
     /// struct just owns the state the dispatch code references.
     pub color_management: crate::color_management::ColorManagementState,
+    /// `wlr_layer_shell_unstable_v1` server state. MVP — see
+    /// [`crate::layer_shell`] for the deliberate scope gaps.
+    pub layer_shell_state:
+        smithay::wayland::shell::wlr_layer::WlrLayerShellState,
+    /// Per-output layer-shell surfaces. Render order within a vec
+    /// is creation order; cross-layer Z is enforced at render time
+    /// (Background, Bottom, normal-layout, Top, Overlay).
+    pub layer_surfaces: HashMap<OutputId, Vec<crate::layer_shell::LayerEntry>>,
 
     /// Per-output smithay `Output`, keyed by the same `OutputId`
     /// (connector name) as `outputs`. Populated by [`advertise_output`];
@@ -404,6 +412,10 @@ impl PrismState {
         // `SurfaceColorSlot`, render path consumption is Step 4.
         let color_management = crate::color_management::ColorManagementState::new(&dh);
 
+        // wlr_layer_shell global. MVP scope — see crate::layer_shell.
+        let layer_shell_state =
+            smithay::wayland::shell::wlr_layer::WlrLayerShellState::new::<PrismState>(&dh);
+
         Self {
             config,
             clock,
@@ -423,6 +435,8 @@ impl PrismState {
             viewporter,
             presentation,
             color_management,
+            layer_shell_state,
+            layer_surfaces: HashMap::new(),
             session,
             cards: HashMap::new(),
             gpus,
@@ -1440,6 +1454,14 @@ impl DmabufHandler for PrismState {
 
 delegate_dmabuf!(PrismState);
 
+// ─── wlr_layer_shell ────────────────────────────────────────────────────────
+// Handler impl lives in `crate::layer_shell`; this just hooks the
+// smithay delegate macro so dispatch routes here. The macro generates
+// GlobalDispatch + Dispatch impls for the manager + per-surface
+// interfaces.
+
+smithay::delegate_layer_shell!(PrismState);
+
 /// Build the per-output `DmabufFeedback` published to clients whose
 /// surfaces map onto this output.
 ///
@@ -1704,10 +1726,13 @@ fn dispatch_surface_output_from_layout(state: &mut PrismState, surface: &WlSurfa
 /// what the layout knows about).
 fn queue_redraw_for_surface(state: &mut PrismState, surface: &WlSurface) {
     // Resolve the surface (or its toplevel parent) to an output.
+    // First the layout (xdg toplevels), then the layer-shell
+    // tracking (wlr_layer_shell surfaces don't live in the layout).
     let output_name = state
         .layout
         .find_window_and_output(surface)
-        .and_then(|(_, out)| out.map(|o| o.name()));
+        .and_then(|(_, out)| out.map(|o| o.name()))
+        .or_else(|| layer_surface_output(state, surface));
 
     let Some(output_id) = output_name else {
         // No layout-tracked binding. Subsurfaces of a mapped toplevel
@@ -1727,6 +1752,21 @@ fn queue_redraw_for_surface(state: &mut PrismState, surface: &WlSurface) {
         .entry(output_id)
         .or_default()
         .queue_redraw();
+}
+
+/// Search layer-shell tracking for a surface, returning the OutputId
+/// it's bound to. Used by queue_redraw_for_surface (and by
+/// dispatch_surface_output_from_layout's enter/leave logic) so a
+/// layer-surface commit drives a redraw on the right output.
+fn layer_surface_output(state: &PrismState, surface: &WlSurface) -> Option<OutputId> {
+    for (id, list) in &state.layer_surfaces {
+        for entry in list {
+            if entry.surface.wl_surface() == surface {
+                return Some(id.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Upload the current default cursor sprite (frame 0) into a given
