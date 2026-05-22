@@ -45,6 +45,61 @@ fn main() -> Result<()> {
     result
 }
 
+/// Resolve the prism config to load:
+///   1. `$PRISM_CONFIG` if set (full path)
+///   2. `$XDG_CONFIG_HOME/prism/config.kdl` (XDG default)
+///   3. `~/.config/prism/config.kdl` (fallback)
+///
+/// On read / parse error: log loudly via `tracing::error!` AND a
+/// `breadcrumb` (TTY runs lose stderr; the breadcrumb survives), then
+/// fall back to `Config::default()` so the compositor still boots.
+fn load_config() -> prism_config::Config {
+    use std::path::PathBuf;
+
+    let candidate: Option<PathBuf> = std::env::var_os("PRISM_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(|h| PathBuf::from(h).join("prism/config.kdl"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/prism/config.kdl"))
+        });
+
+    let Some(path) = candidate else {
+        tracing::warn!(
+            "no config path resolvable (PRISM_CONFIG / XDG_CONFIG_HOME / HOME all unset); using defaults"
+        );
+        return prism_config::Config::default();
+    };
+
+    if !path.exists() {
+        tracing::info!(
+            "no config file at {}; using defaults — set PRISM_CONFIG or create that file to customize",
+            path.display()
+        );
+        return prism_config::Config::default();
+    }
+
+    let res = prism_config::Config::load(&path);
+    if !res.includes.is_empty() {
+        tracing::info!("config: loaded {} include(s)", res.includes.len());
+    }
+    match res.config {
+        Ok(cfg) => {
+            tracing::info!("loaded prism config from {}", path.display());
+            cfg
+        }
+        Err(e) => {
+            let msg = format!("config parse failed for {}: {e:?}", path.display());
+            breadcrumb(&msg);
+            tracing::error!("{msg}");
+            tracing::error!("falling back to default config — fix the file and restart");
+            prism_config::Config::default()
+        }
+    }
+}
+
 fn parse_depth(arg: Option<&str>) -> Result<prism_drm::ScanoutDepth> {
     match arg {
         None | Some("10") => Ok(prism_drm::ScanoutDepth::Bpc10),
@@ -105,7 +160,7 @@ fn run_wayland_server() -> Result<()> {
     // layout enough to bring up an empty workspace set.
     let mut state = prism_protocols::PrismState::new(
         &display,
-        prism_config::Config::default(),
+        load_config(),
         None,
         gpus,
         Some(key),
@@ -935,7 +990,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     }
     let mut state = prism_protocols::PrismState::new(
         &display,
-        prism_config::Config::default(),
+        load_config(),
         Some(session),
         gpus,
         primary_gpu,
@@ -1057,6 +1112,43 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         })
         .map_err(|e| anyhow!("insert session notifier: {e}"))?;
 
+    // libinput → LibinputInputBackend → calloop source.
+    //
+    // The PrismState carries a Weak<LibSeatSession>, but Libinput
+    // wants a Session impl by value. The owning LibSeatSession lives
+    // in the notifier inserted above; we clone the underlying
+    // (Arc-backed) handle here for the libinput interface.
+    //
+    // udev_assign_seat enumerates every libinput-eligible device
+    // (keyboards, mice, touchpads, tablets, touch) on the named seat
+    // and emits a DeviceAdded for each — those drive the wl_seat
+    // capability flips in prism_input::dispatch::on_device_added.
+    {
+        use input::Libinput;
+        use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+        use smithay::backend::session::Session as _;
+
+        let seat_session = state
+            .session
+            .as_ref()
+            .expect("integrated mode always has a session")
+            .libseat_clone();
+        let seat_name = seat_session.seat();
+        let mut libinput =
+            Libinput::new_with_udev(LibinputSessionInterface::from(seat_session));
+        libinput
+            .udev_assign_seat(&seat_name)
+            .map_err(|()| anyhow!("libinput.udev_assign_seat({seat_name}) failed"))?;
+        let input_backend = LibinputInputBackend::new(libinput);
+        event_loop
+            .handle()
+            .insert_source(input_backend, |event, _, state| {
+                prism_input::process_input_event(state, event);
+            })
+            .map_err(|e| anyhow!("insert libinput source: {e}"))?;
+        tracing::info!("libinput backend running on seat {seat_name}");
+    }
+
     // SIGINT / SIGTERM → clean shutdown.
     {
         let running = running.clone();
@@ -1084,6 +1176,10 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             .or_default()
             .queue_redraw();
     }
+    // Seed cursor visibility/position on every output's cursor plane
+    // before the first present so the cursor appears immediately
+    // (otherwise it'd stay invisible until the first pointer event).
+    prism_protocols::state::update_output_cursors(&mut state);
     breadcrumb(&format!(
         "bootstrap: {} output(s) queued",
         state.output_redraw.len()
@@ -1091,10 +1187,30 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     redraw_queued_outputs(&mut state);
 
     breadcrumb("entering dispatch loop");
-    while running.load(Ordering::SeqCst) {
+    while running.load(Ordering::SeqCst) && !state.should_stop {
         event_loop
             .dispatch(Some(Duration::from_millis(100)), &mut state)
             .context("event_loop.dispatch")?;
+
+        // Advance every running animation (view-offset scrolls,
+        // window movement, opening/closing fades, etc.). Without
+        // this, `Layout::add_window` queues a view-offset animation
+        // when a column overflows but the animation never progresses
+        // — so a third window stays off-screen rather than scrolling
+        // into view.
+        state.layout.advance_animations();
+
+        // Flush layout state to clients: walks every window and sends
+        // any pending xdg_toplevel.configure (size, position,
+        // activation). Without this, newly-mapped windows never learn
+        // their column geometry and pile up at (0,0) at their own
+        // preferred size. niri does the same via
+        // `state.refresh_and_flush_clients()` after every dispatch.
+        // `is_active=true` is the layout-focus flag — true while the
+        // layout owns keyboard focus (no lock screen / overlay UI
+        // intercepting); for prism today that's always.
+        state.layout.refresh(true);
+
         state
             .display_handle
             .flush_clients()
@@ -1108,6 +1224,16 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             .display_handle
             .flush_clients()
             .context("flush_clients (after redraw)")?;
+
+        // Clear the cached monotonic time so the next iteration's
+        // `advance_animations` / `update_render_elements` / `refresh`
+        // pulls a fresh `gettime()` instead of re-reading the same
+        // sample. Without this the layout's animation engine sees
+        // zero elapsed time per tick and animations (view-offset
+        // scroll, close-window reflow, etc.) never progress.
+        // Mirrors niri/src/niri.rs:776 (`self.niri.clock.clear()`),
+        // which is the last thing inside its post-dispatch refresh.
+        state.clock.clear();
     }
 
     breadcrumb("dispatch loop exited cleanly");
@@ -1304,12 +1430,29 @@ fn on_vblank(
     // WaitingForVBlank entry's `redraw_needed` to true; on this
     // vblank we honour that signal. If nothing requested a redraw
     // between submit and now, the output goes Idle until the next
-    // commit lands.
+    // commit lands UNLESS the layout has an animation in progress
+    // on this output's monitor — in that case we need another frame
+    // to advance the animation (close-window column reflow,
+    // view-offset scroll-to-new-column, etc.). Without this check the
+    // animation ticks once via `Layout::advance_animations` in the
+    // main loop but no fresh frame ever renders.
+    let smithay_output = state.wl_outputs.get(&output_id).cloned();
+    let animations_ongoing = smithay_output
+        .as_ref()
+        .map(|o| state.layout.are_animations_ongoing(Some(o)))
+        .unwrap_or(false);
+
     let entry = state.output_redraw.entry(output_id).or_default();
     let prev = std::mem::take(&mut entry.redraw);
     entry.redraw = match prev {
         RedrawState::WaitingForVBlank { redraw_needed: true } => RedrawState::Queued,
-        RedrawState::WaitingForVBlank { redraw_needed: false } => RedrawState::Idle,
+        RedrawState::WaitingForVBlank { redraw_needed: false } => {
+            if animations_ongoing {
+                RedrawState::Queued
+            } else {
+                RedrawState::Idle
+            }
+        }
         other => other,
     };
 }
@@ -1435,6 +1578,12 @@ fn render_output_now(
     let ctx = RenderCtx {
         texture_lookup: &texture_lookup,
     };
+
+    // Refresh per-tile cached render elements (focus ring / border /
+    // shadow geometry). Without this, the FocusRing's `cached` is
+    // never populated and `render` early-returns — the ring is
+    // invisible even when configured.
+    state.layout.update_render_elements(Some(&smithay_output));
 
     // Layout walk into a flat RenderEl vector. Monitor is borrowed
     // immutably for the duration of render_workspaces; dropped before

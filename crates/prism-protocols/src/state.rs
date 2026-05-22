@@ -27,6 +27,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use prism_animation::Clock;
 use prism_config::Config;
+use prism_layout::cursor::{CursorManager, CursorTextureCache, RenderCursor};
 use prism_layout::layout::{ActivateWindow, AddWindowTarget, Layout};
 use prism_layout::window::{Mapped, ResolvedWindowRules};
 use prism_renderer::{DrmDevId, vk};
@@ -39,6 +40,7 @@ use smithay::delegate_presentation;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_viewporter;
+use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
@@ -64,6 +66,7 @@ use smithay::wayland::dmabuf::{
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
@@ -71,6 +74,7 @@ use smithay::wayland::shell::xdg::{
 use smithay::wayland::shm::{ShmHandler, ShmState, with_buffer_contents};
 
 use crate::client::PrismClient;
+use crate::input_state::{KeyboardFocus, PointerVisibility};
 use crate::surface_tex::{SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture};
 
 /// Stable per-output id. Today we key by the connector name (e.g. `"DP-4"`,
@@ -115,6 +119,12 @@ pub struct PrismState {
     pub display_handle: DisplayHandle,
     pub compositor: CompositorState,
     pub xdg_shell: XdgShellState,
+    /// zxdg-decoration-manager-v1 — lets us negotiate SSD with
+    /// clients that support it. We advertise the global; the
+    /// [`XdgDecorationHandler`] decides per-toplevel whether to push
+    /// `ServerSide` mode (when `config.prefer_no_csd` is set) or
+    /// leave it client-controlled.
+    pub xdg_decoration: XdgDecorationState,
     pub shm: ShmState,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: DmabufGlobal,
@@ -191,6 +201,48 @@ pub struct PrismState {
     /// while DRM devices and surfaces are torn down. `None` for headless
     /// usage (`prism wayland`).
     pub session: Option<prism_drm::SeatSession>,
+
+    // ── Input state ────────────────────────────────────────────────────────
+    /// Where the next keyboard event should land. Defaults to
+    /// `Layout { surface: None }` until a window maps.
+    pub keyboard_focus: KeyboardFocus,
+    /// Cursor visibility tri-state — `Visible` normally, `Hidden`
+    /// during auto-hide grace, `Disabled` after touch input. See
+    /// [`PointerVisibility`].
+    pub pointer_visibility: PointerVisibility,
+    /// Keycodes whose press was swallowed by a compositor binding;
+    /// release events for these are filtered out so the focused
+    /// client never sees a dangling release. Keyed by raw keycode
+    /// (same `Keycode` type smithay's `KeyboardKeyEvent::key_code`
+    /// returns).
+    pub suppressed_keys:
+        std::collections::HashSet<smithay::input::keyboard::Keycode>,
+    /// libinput devices currently plugged in. Used to recompute seat
+    /// capabilities and apply per-device settings on (re)load.
+    pub libinput_devices: std::collections::HashSet<input::Device>,
+    /// Whether monitors are powered on. Stub: always true until we
+    /// wire DPMS / idle-blank. Input dispatch checks this to decide
+    /// whether to forward activity or just wake the screens.
+    pub monitors_active: bool,
+    /// Set by a quit binding (or other shutdown trigger) — the main
+    /// loop reads this between dispatches and falls out of the loop.
+    /// Avoids dragging `LoopSignal` or `Arc<AtomicBool>` into every
+    /// caller of input dispatch.
+    pub should_stop: bool,
+    /// Current cursor position in global logical coordinates.
+    /// Updated by pointer motion / motion-absolute handlers; sampled
+    /// by hit-test and (later) cursor-plane setup. Starts at (0, 0).
+    pub pointer_pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+
+    /// XCursor theme + sprite source. Resolves [`CursorImageStatus`]
+    /// (Hidden / Named / client-Surface) into a renderable sprite
+    /// every frame. Initialized in [`Self::new`] with a config-derived
+    /// theme name + size.
+    pub cursor_manager: CursorManager,
+    /// Decoded sprite cache feeding the cursor-plane uploader. Keys
+    /// by (icon, scale); values are the per-frame ARGB8888 pixels +
+    /// dimensions. Populated lazily on first need.
+    pub cursor_texture_cache: CursorTextureCache,
 }
 
 impl PrismState {
@@ -228,6 +280,7 @@ impl PrismState {
 
         let compositor = CompositorState::new::<PrismState>(&dh);
         let xdg_shell = XdgShellState::new::<PrismState>(&dh);
+        let xdg_decoration = XdgDecorationState::new::<PrismState>(&dh);
         // Empty extra-formats list: ARGB8888 and XRGB8888 are mandatory and
         // smithay advertises them implicitly.
         let shm = ShmState::new::<PrismState>(&dh, []);
@@ -320,6 +373,7 @@ impl PrismState {
             display_handle: dh,
             compositor,
             xdg_shell,
+            xdg_decoration,
             shm,
             dmabuf_state,
             dmabuf_global,
@@ -335,6 +389,15 @@ impl PrismState {
             wl_outputs: HashMap::new(),
             dmabuf_textures: HashMap::new(),
             output_redraw: HashMap::new(),
+            keyboard_focus: KeyboardFocus::default(),
+            pointer_visibility: PointerVisibility::default(),
+            suppressed_keys: std::collections::HashSet::new(),
+            libinput_devices: std::collections::HashSet::new(),
+            monitors_active: true,
+            should_stop: false,
+            pointer_pos: smithay::utils::Point::from((0.0, 0.0)),
+            cursor_manager: CursorManager::new("default", 24),
+            cursor_texture_cache: CursorTextureCache::default(),
         }
     }
 
@@ -351,9 +414,22 @@ impl PrismState {
     /// OutputId if there was one (shouldn't happen in normal use).
     pub fn attach_output(
         &mut self,
-        output: prism_drm::OutputContext,
+        mut output: prism_drm::OutputContext,
     ) -> Option<prism_drm::OutputContext> {
         let id: OutputId = output.connector_name.clone();
+        // Seed the cursor plane (if any) with the default sprite so a
+        // subsequent show won't flash. set_visible(false) keeps it off
+        // until update_output_cursors flips it.
+        if let Some(cursor_plane) = output.cursor.as_mut() {
+            if let Err(e) =
+                upload_default_cursor(&self.cursor_manager, &self.cursor_texture_cache, cursor_plane)
+            {
+                tracing::warn!(
+                    "cursor seed failed on {}: {e:#} — cursor will not appear on this output",
+                    output.connector_name
+                );
+            }
+        }
         self.outputs.insert(id, output)
     }
 
@@ -620,6 +696,18 @@ impl CompositorHandler for PrismState {
                         .cloned()
                     {
                         let window = Window::new_wayland_window(toplevel);
+                        // Update the window's cached bbox from the
+                        // committed surface tree. Without this,
+                        // `Window::geometry()` returns an empty rect
+                        // (the bbox is initialised to zero), so
+                        // `tile.size = window.geometry().size` is
+                        // (0,0) — and `Column::width()` (which is
+                        // `max(tile.size.w)`) hands the layout a
+                        // zero-width column. Every column then sits
+                        // at x = sum of zeros + gaps, producing the
+                        // "stacked tiles, 16-px-offset-per-window"
+                        // visual.
+                        window.on_commit();
                         // Pre-commit hook is a no-op for now; niri
                         // uses it for dmabuf-readiness blockers + the
                         // post-commit transaction queue. We don't
@@ -631,21 +719,75 @@ impl CompositorHandler for PrismState {
                             surface,
                             |_state, _dh, _surface| {},
                         );
-                        let mapped = {
+                        let (mapped, default_column_width) = {
                             let config = self.config.borrow();
-                            Mapped::new(window, ResolvedWindowRules::default(), hook, &config)
+                            let m = Mapped::new(
+                                window,
+                                ResolvedWindowRules::default(),
+                                hook,
+                                &config,
+                            );
+                            // Without an explicit per-window-rule width,
+                            // fall back to the configured default. niri
+                            // resolves this via
+                            // `ws.resolve_default_width(rules.default_width, false)`
+                            // which collapses to `options.layout.default_column_width`
+                            // when no rule overrides. Skipping this is
+                            // what makes new windows arrive at width 0
+                            // — `resolve_scrolling_width` then falls back
+                            // to `Fixed(window.size().w)` which is 0 for
+                            // a just-mapped surface.
+                            let w = config.layout.default_column_width;
+                            (m, w)
                         };
                         let id = mapped.id().clone();
+                        // Place the new window on the output that
+                        // currently hosts the pointer (rather than
+                        // always falling back to the layout's active
+                        // monitor, which today is just whichever
+                        // output got added first — DP-4 in the
+                        // current hardware-test setup). niri uses
+                        // its `focus_follows_mouse` infra plus the
+                        // last-active monitor to make this choice;
+                        // we approximate by reading
+                        // `state.pointer_pos` directly. When focus
+                        // tracking lands the `Auto` path will be
+                        // sufficient on its own.
+                        let pointer_output_id = self.output_containing((
+                            self.pointer_pos.x as i32,
+                            self.pointer_pos.y as i32,
+                        ));
+                        let pointer_output = pointer_output_id
+                            .as_ref()
+                            .and_then(|id| self.wl_outputs.get(id))
+                            .cloned();
+                        let target = match pointer_output.as_ref() {
+                            Some(out) => AddWindowTarget::Output(out),
+                            None => AddWindowTarget::Auto,
+                        };
                         let output = self.layout.add_window(
                             mapped,
-                            AddWindowTarget::Auto,
-                            None,
+                            target,
+                            default_column_width,
                             None,
                             false,
                             false,
                             ActivateWindow::Smart,
                         );
-                        let output_name = output.map(|o| o.name());
+                        // Make the new window's monitor the active
+                        // one so its tile's focus ring renders with
+                        // active-color, not inactive-color. Without
+                        // this `active_monitor_idx` stays pinned to
+                        // monitor 0 (DP-4 in connector-name sort
+                        // order) and only DP-4 windows ever look
+                        // focused. niri does this from its input
+                        // handlers via `layout.focus_output(&output)`;
+                        // for the MVP we do it at add_window time.
+                        let output_for_focus = output.cloned();
+                        let output_name = output_for_focus.as_ref().map(|o| o.name());
+                        if let Some(out) = output_for_focus {
+                            self.layout.focus_output(&out);
+                        }
                         tracing::info!(
                             ?id,
                             output = ?output_name,
@@ -653,6 +795,33 @@ impl CompositorHandler for PrismState {
                         );
                     }
                 }
+            } else if let Some((mapped, _)) =
+                self.layout.find_window_and_output(surface)
+            {
+                // Re-commit on an already-mapped window.
+                //
+                // First refresh the smithay Window's cached bbox from
+                // the newly-committed surface tree. Without this,
+                // `Window::geometry()` returns the bbox at the time
+                // of the *previous* commit (or empty on the first),
+                // so all the downstream size readers — including
+                // `Tile::tile_size()` / `Column::width()` — see
+                // stale dimensions. Mirrors niri/src/handlers/compositor.rs:90.
+                let window = mapped.window.clone();
+                window.on_commit();
+
+                // Then forward through to the layout so it can update
+                // its per-tile/per-column size record (ColumnData /
+                // TileData) from the now-fresh window geometry.
+                //
+                // Mirrors niri/src/handlers/compositor.rs:346:
+                //   self.niri.layout.update_window(&window, serial);
+                //
+                // We don't yet thread the ack_configure serial through
+                // (would let the layout match commits to specific
+                // configures for animation purposes); `None` is the
+                // "just resync from the current window geometry" path.
+                self.layout.update_window(&window, None);
             }
         }
 
@@ -725,9 +894,91 @@ impl XdgShellHandler for PrismState {
         _token: u32,
     ) {
     }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // Pop the window out of the layout so the columns behind it
+        // can fall into the freed slot. Without this the layout keeps
+        // a tile for a window whose surface is gone — invisible (no
+        // texture) but still occupying a column, which manifests as
+        // "I closed the middle window and the third one didn't slide
+        // back."
+        //
+        // Mirrors niri's `Layout::remove_window` call from its
+        // unmap path. `Transaction::new()` is an empty transaction
+        // (we don't yet thread the cross-window commit-atomicity
+        // transaction system that niri uses to keep resize neighbours
+        // in sync; a fresh transaction is the "don't coordinate with
+        // anyone" default).
+        let wl_surface = surface.wl_surface();
+        let window_id = self
+            .layout
+            .find_window_and_output(wl_surface)
+            .map(|(mapped, _)| mapped.window.clone());
+        if let Some(window) = window_id {
+            self.layout.remove_window(
+                &window,
+                prism_layout::utils::transaction::Transaction::new(),
+            );
+            tracing::info!(
+                surface_id = ?wl_surface.id(),
+                "removed destroyed xdg_toplevel from layout"
+            );
+        }
+    }
 }
 
 delegate_xdg_shell!(PrismState);
+
+// ─── xdg-decoration v1 ──────────────────────────────────────────────────────
+//
+// Clients that opt into negotiation get told "server-side" iff
+// `config.prefer_no_csd` is set. Clients that don't engage with this
+// protocol keep drawing their own decorations regardless (mpv is one
+// such example); the focus ring will be occluded for those.
+//
+// niri's deeper rule (in window-rule:draw-border-with-background) can
+// override per-window — not ported yet, simple all-or-nothing here.
+
+impl XdgDecorationHandler for PrismState {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        if self.config.borrow().prefer_no_csd {
+            toplevel.with_pending_state(|s| {
+                s.decoration_mode = Some(Mode::ServerSide);
+            });
+            toplevel.send_configure();
+        }
+    }
+
+    fn request_mode(
+        &mut self,
+        toplevel: ToplevelSurface,
+        mode: smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
+    ) {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        let chosen = if self.config.borrow().prefer_no_csd {
+            // Even if the client asks for CSD, prefer SSD when the
+            // compositor is configured that way. Client can override
+            // later via another request_mode.
+            Mode::ServerSide
+        } else {
+            mode
+        };
+        toplevel.with_pending_state(|s| {
+            s.decoration_mode = Some(chosen);
+        });
+        toplevel.send_configure();
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|s| {
+            s.decoration_mode = None;
+        });
+        toplevel.send_configure();
+    }
+}
+
+delegate_xdg_decoration!(PrismState);
 
 // ─── linux-dmabuf ───────────────────────────────────────────────────────────
 
@@ -1003,6 +1254,120 @@ fn queue_redraw_for_surface(state: &mut PrismState, surface: &WlSurface) {
         .entry(output_id)
         .or_default()
         .queue_redraw();
+}
+
+/// Upload the current default cursor sprite (frame 0) into a given
+/// cursor plane. Used at output attach + on icon changes.
+///
+/// Phase A: hardcoded to the Named/Default cursor at scale 1. Client
+/// surfaces and animation lands later.
+fn upload_default_cursor(
+    cursor_manager: &CursorManager,
+    cache: &CursorTextureCache,
+    cursor_plane: &mut prism_drm::CursorPlane,
+) -> Result<()> {
+    let render = cursor_manager.get_render_cursor(1);
+    let (icon, scale, xcursor) = match render {
+        RenderCursor::Named { icon, scale, cursor } => (icon, scale, cursor),
+        RenderCursor::Hidden | RenderCursor::Surface { .. } => {
+            return Ok(());
+        }
+    };
+    let frame = cache.get(icon, scale, &xcursor, 0);
+    cursor_plane
+        .upload_sprite(&frame.pixels_rgba, frame.width, frame.height)
+        .context("CursorPlane::upload_sprite")?;
+    Ok(())
+}
+
+/// Walk every output, update its cursor plane to show the cursor on
+/// the output containing the pointer (and hide on the rest), and
+/// queue redraws on outputs whose state changed.
+///
+/// Called from the input pointer-motion path. Returns the hotspot
+/// offset of the current sprite (the cursor *position* on screen is
+/// the pointer position minus this hotspot).
+///
+/// Phase A: a single output ever shows the cursor at a time. Cursor
+/// position is computed CRTC-local (pointer global - output origin).
+/// The cursor only updates at vblank cadence — Phase B will add
+/// sub-vblank cursor-only commits.
+pub fn update_output_cursors(state: &mut PrismState) {
+    // Resolve the current sprite. If hidden / unsupported, just hide
+    // everywhere.
+    let render = state.cursor_manager.get_render_cursor(1);
+    let (hotspot, owning_output) = match &render {
+        RenderCursor::Hidden | RenderCursor::Surface { .. } => {
+            // Surface-backed cursor isn't supported yet; treat as
+            // hidden for hardware cursor purposes.
+            hide_all_cursors(state);
+            return;
+        }
+        RenderCursor::Named { icon, scale, cursor } => {
+            let frame = state.cursor_texture_cache.get(*icon, *scale, cursor, 0);
+            // xcursor hotspot lives on the original Image, not on
+            // CursorImageFrame — fish it back out via xcursor.frame(0).
+            let (_idx, image) = cursor.frame(0);
+            let hot = (image.xhot as i32, image.yhot as i32);
+            // Pick the output the pointer is in.
+            let owner = state
+                .output_containing((state.pointer_pos.x as i32, state.pointer_pos.y as i32));
+            let _ = frame; // sprite already seeded at attach_output
+            (hot, owner)
+        }
+    };
+
+    // Apply visibility + position to each output.
+    let pointer_pos = state.pointer_pos;
+    for (id, output_ctx) in state.outputs.iter_mut() {
+        let Some(cursor) = output_ctx.cursor.as_mut() else {
+            continue;
+        };
+        let wl_output = match state.wl_outputs.get(id) {
+            Some(o) => o,
+            None => {
+                cursor.set_visible(false);
+                continue;
+            }
+        };
+        let is_owner = owning_output.as_ref().map_or(false, |o| o == id);
+        let was_visible = cursor.visible();
+        let prev_pos = cursor.position();
+
+        if is_owner {
+            let origin = wl_output.current_location();
+            let x = (pointer_pos.x - origin.x as f64) as i32 - hotspot.0;
+            let y = (pointer_pos.y - origin.y as f64) as i32 - hotspot.1;
+            cursor.set_position(x, y);
+            cursor.set_visible(true);
+        } else {
+            cursor.set_visible(false);
+        }
+
+        let changed = was_visible != cursor.visible() || prev_pos != cursor.position();
+        if changed {
+            state
+                .output_redraw
+                .entry(id.clone())
+                .or_default()
+                .queue_redraw();
+        }
+    }
+}
+
+fn hide_all_cursors(state: &mut PrismState) {
+    for (id, output_ctx) in state.outputs.iter_mut() {
+        if let Some(cursor) = output_ctx.cursor.as_mut() {
+            if cursor.visible() {
+                cursor.set_visible(false);
+                state
+                    .output_redraw
+                    .entry(id.clone())
+                    .or_default()
+                    .queue_redraw();
+            }
+        }
+    }
 }
 
 fn build_surface_texture(

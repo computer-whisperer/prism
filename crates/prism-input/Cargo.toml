@@ -1,21 +1,18 @@
 [package]
-name = "prism-protocols"
+name = "prism-input"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Wayland protocol wiring (smithay handlers, dispatch to layout/input/renderer)"
+description = "Input dispatch (libinput → seat → focused surface) for prism"
 
 [dependencies]
 anyhow.workspace = true
 calloop.workspace = true
 input = { version = "0.10", features = ["libinput_1_19"] }
 libc.workspace = true
-prism-animation.workspace = true
 prism-config.workspace = true
-prism-drm.workspace = true
-prism-frame.workspace = true
 prism-layout.workspace = true
-prism-renderer.workspace = true
+prism-protocols.workspace = true
 smithay.workspace = true
 tracing.workspace = true

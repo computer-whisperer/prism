@@ -125,4 +125,25 @@ impl GbmDevice {
 
         Ok((bo, dmabuf))
     }
+
+    /// Allocate a cursor BO: `CURSOR|WRITE` lets the CPU update the
+    /// sprite via `bo.write`, `LINEAR` keeps the layout writable and
+    /// scanout-able without driver-specific tiling.
+    ///
+    /// Always ARGB8888 — the only format universally supported by
+    /// hardware cursor planes.
+    pub fn allocate_cursor(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<BufferObject<()>> {
+        let usage = BufferObjectFlags::CURSOR
+            | BufferObjectFlags::WRITE
+            | BufferObjectFlags::LINEAR;
+        let bo = self
+            .inner
+            .create_buffer_object::<()>(width, height, DrmFourcc::Argb8888, usage)
+            .with_context(|| format!("create_buffer_object cursor {width}x{height}"))?;
+        Ok(bo)
+    }
 }

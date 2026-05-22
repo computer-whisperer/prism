@@ -30,6 +30,19 @@ pub fn insert_wayland_sources(
         .to_string_lossy()
         .into_owned();
 
+    // Set WAYLAND_DISPLAY in our own process env so child processes
+    // we later spawn (Mod+Return → alacritty, etc.) inherit it and
+    // can connect to this socket. Without this, prism spawns succeed
+    // but the child has no way to find our socket and exits
+    // silently. SAFETY: set_var has soundness caveats on some
+    // platforms when other threads read env concurrently, but we're
+    // still single-threaded at server-startup time (event loop hasn't
+    // started yet).
+    // SAFETY: see comment above — single-threaded at this point.
+    unsafe {
+        std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+    }
+
     handle
         .insert_source(listening, |client_stream, _, state| {
             match state

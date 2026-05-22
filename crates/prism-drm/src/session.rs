@@ -51,6 +51,14 @@ impl SeatSession {
         self.session.seat()
     }
 
+    /// A clone of the underlying `LibSeatSession`. Needed for the
+    /// libinput backend, which takes ownership of a `Session`-bound
+    /// interface (`LibinputSessionInterface<S>`) for fd open/close.
+    /// Cheap — `LibSeatSession` is an `Arc` under the hood.
+    pub fn libseat_clone(&self) -> LibSeatSession {
+        self.session.clone()
+    }
+
     pub fn is_active(&self) -> bool {
         self.session.is_active()
     }

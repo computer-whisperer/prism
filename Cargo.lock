@@ -625,6 +625,7 @@ dependencies = [
  "bitflags",
  "input-sys",
  "libc",
+ "log",
  "udev",
 ]
 
@@ -1078,10 +1079,12 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "calloop",
+ "input",
  "libc",
  "prism-config",
  "prism-drm",
  "prism-frame",
+ "prism-input",
  "prism-layout",
  "prism-protocols",
  "prism-renderer",
@@ -1145,6 +1148,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "prism-input"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calloop",
+ "input",
+ "libc",
+ "prism-config",
+ "prism-layout",
+ "prism-protocols",
+ "smithay",
+ "tracing",
+]
+
+[[package]]
 name = "prism-ipc"
 version = "0.1.0"
 dependencies = [
@@ -1183,6 +1201,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "calloop",
+ "input",
  "libc",
  "prism-animation",
  "prism-config",

@@ -35,8 +35,8 @@ use crate::frame_clock::FrameClock;
 use smithay::utils::{Rectangle, Transform};
 
 use crate::{
-    DrmCardContext, OutputConfig, OutputPick, add_framebuffer_for_bo, breadcrumb::breadcrumb,
-    set_connector_max_bpc,
+    CursorPlane, DrmCardContext, OutputConfig, OutputPick, add_framebuffer_for_bo,
+    breadcrumb::breadcrumb, set_connector_max_bpc,
 };
 
 /// One BO + Vulkan view + DRM framebuffer handle. Two of these live in
@@ -99,6 +99,12 @@ pub struct OutputContext {
     /// `target_presentation_time` it hands to clients via
     /// `wp_presentation_feedback`.
     pub frame_clock: FrameClock,
+    /// Hardware cursor plane for this output, if the driver exposed
+    /// one and we could claim it. `None` ⇒ no cursor on this output
+    /// until software cursor lands. The position/visibility/sprite are
+    /// driven by `prism_protocols::update_output_cursors`; we just
+    /// include its `to_plane_state()` in the page-flip below.
+    pub cursor: Option<CursorPlane>,
 }
 
 impl OutputContext {
@@ -177,6 +183,16 @@ impl OutputContext {
         let refresh_interval = Duration::from_nanos(1_000_000_000 / u64::from(vrefresh));
         let frame_clock = FrameClock::new(Some(refresh_interval), false);
 
+        // Try to claim a hardware cursor plane. Failure is non-fatal —
+        // the output renders fine without one, just with no cursor.
+        let cursor = match CursorPlane::try_new(card, &card.gbm, &surface) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("cursor plane init failed: {e:#}");
+                None
+            }
+        };
+
         Ok(Self {
             surface,
             buffers,
@@ -192,6 +208,7 @@ impl OutputContext {
             mode_set_done: false,
             frame_pending: false,
             frame_clock,
+            cursor,
         })
     }
 
@@ -251,7 +268,12 @@ impl OutputContext {
         .to_f64();
         let dst =
             Rectangle::from_size((self.extent.width as i32, self.extent.height as i32).into());
-        let plane_state = [PlaneState {
+        // Build the plane state vector: primary first, then the
+        // cursor plane if we own one. Cursor visibility/position are
+        // owned by `prism_protocols::update_output_cursors`; we just
+        // serialize whatever's there.
+        let mut plane_state: Vec<PlaneState<'_>> = Vec::with_capacity(2);
+        plane_state.push(PlaneState {
             handle: self.surface.plane(),
             config: Some(PlaneConfig {
                 src,
@@ -262,7 +284,10 @@ impl OutputContext {
                 fb: back.fb,
                 fence: Some(present_sync.as_fd()),
             }),
-        }];
+        });
+        if let Some(cursor) = self.cursor.as_ref() {
+            plane_state.push(cursor.to_plane_state());
+        }
 
         if !self.mode_set_done {
             self.surface
