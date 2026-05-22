@@ -1132,9 +1132,27 @@ pub enum OutputAction {
         #[cfg_attr(feature = "clap", arg(long))]
         gamma_b: f64,
     },
+    /// Set the per-channel panel peak luminance — the f32 IR's
+    /// per-subpixel clamp ceiling and the basis for the
+    /// HDR_OUTPUT_METADATA infoframe pushed to the connected sink.
+    /// Real subpixel peaks differ (OLED ABL, LCD color-filter
+    /// transmission), so the calibration pipeline measures each
+    /// independently and applies them as a triple here. Sticky
+    /// until `reset-color` or restart.
+    PanelPeakNits {
+        /// Red-channel peak luminance, cd/m². Clamped to [1, 10_000].
+        #[cfg_attr(feature = "clap", arg(long))]
+        nits_r: f64,
+        /// Green-channel peak luminance, cd/m². Clamped to [1, 10_000].
+        #[cfg_attr(feature = "clap", arg(long))]
+        nits_g: f64,
+        /// Blue-channel peak luminance, cd/m². Clamped to [1, 10_000].
+        #[cfg_attr(feature = "clap", arg(long))]
+        nits_b: f64,
+    },
     /// Clear all runtime color overrides for this output (sdr
-    /// reference, response curve). Subsequent rendering reverts to
-    /// whatever's in the persisted KDL config.
+    /// reference, response curve, panel peak nits). Subsequent
+    /// rendering reverts to whatever's in the persisted KDL config.
     ResetColor,
 }
 
@@ -1267,6 +1285,44 @@ pub struct Output {
     ///
     /// `None` if the output is not mapped to any logical output (for example, if it is disabled).
     pub logical: Option<LogicalOutput>,
+    /// Current color-pipeline state — what the render path is actually
+    /// using on this output right now, after runtime overrides and KDL
+    /// config resolution. Calibration tools query this to decide whether
+    /// to run in SDR or HDR mode and what the current per-channel peaks
+    /// + response curve already are.
+    pub color: ColorState,
+}
+
+/// Snapshot of the effective per-output color pipeline state. Reflects
+/// runtime overrides (from `OutputAction::SdrReferenceNits` /
+/// `ResponseCurve` / `PanelPeakNits`) and persisted KDL config,
+/// resolved into the values the render path actually uses.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ColorState {
+    /// True when the output's HDR signaling path is active — i.e.
+    /// `wp_color_management_v1` PQ + BT.2020 with `HDR_OUTPUT_METADATA`
+    /// pushed to the sink. False for SDR (sRGB) outputs.
+    pub hdr_active: bool,
+    /// Effective per-channel panel peak luminance (cd/m²) used by the
+    /// decoder's display-referred clamp.
+    pub panel_peak_nits: [f64; 3],
+    /// Effective absolute luminance "SDR white" maps to (cd/m²). Used
+    /// by color-unaware clients.
+    pub sdr_reference_nits: f64,
+    /// Effective per-channel response correction. `None` = identity
+    /// (no correction applied).
+    pub response_curve: Option<ResponseCurveState>,
+}
+
+/// Per-channel response correction snapshot. See [`ColorState::response_curve`].
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ResponseCurveState {
+    /// Per-channel gain (R, G, B).
+    pub gain: [f64; 3],
+    /// Per-channel gamma exponent (R, G, B).
+    pub gamma: [f64; 3],
 }
 
 /// Output mode.

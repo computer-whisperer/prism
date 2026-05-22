@@ -29,8 +29,8 @@ use anyhow::{Context, Result};
 use calloop::generic::Generic;
 use calloop::{Interest, LoopHandle, Mode, PostAction};
 use prism_ipc::{
-    self, LogicalOutput, Output, OutputAction, OutputConfigChanged, Reply, Request, Response,
-    Transform,
+    self, ColorState, LogicalOutput, Output, OutputAction, OutputConfigChanged, Reply, Request,
+    Response, ResponseCurveState, Transform,
 };
 use prism_protocols::{OutputRedrawState, PrismState};
 use smithay::utils::Size;
@@ -170,6 +170,23 @@ fn collect_outputs(state: &PrismState) -> HashMap<String, Output> {
                     transform: Transform::Normal,
                 }
             });
+        // Snapshot the effective color pipeline state so callers
+        // (calibration tooling, debug UIs) can branch on HDR/SDR mode
+        // and read the current per-channel peaks + response curve
+        // without a second round-trip.
+        let peaks = ctx.effective_panel_peak_nits_rgb();
+        let curve = ctx.effective_response_curve().map(|(gain, gamma)| {
+            ResponseCurveState {
+                gain: [gain[0] as f64, gain[1] as f64, gain[2] as f64],
+                gamma: [gamma[0] as f64, gamma[1] as f64, gamma[2] as f64],
+            }
+        });
+        let color = ColorState {
+            hdr_active: ctx.config.hdr.is_some(),
+            panel_peak_nits: [peaks[0] as f64, peaks[1] as f64, peaks[2] as f64],
+            sdr_reference_nits: ctx.effective_sdr_reference_nits() as f64,
+            response_curve: curve,
+        };
         let info = Output {
             name: ctx.connector_name.clone(),
             make: ctx.edid.make.clone().unwrap_or_default(),
@@ -182,6 +199,7 @@ fn collect_outputs(state: &PrismState) -> HashMap<String, Output> {
             vrr_supported: ctx.config.vrr,
             vrr_enabled: ctx.config.vrr,
             logical,
+            color,
         };
         map.insert(ctx.connector_name.clone(), info);
     }
@@ -236,9 +254,41 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                 "ipc: set response-curve override"
             );
         }
+        OutputAction::PanelPeakNits {
+            nits_r,
+            nits_g,
+            nits_b,
+        } => {
+            let r = (nits_r as f32).clamp(1.0, 10_000.0);
+            let g = (nits_g as f32).clamp(1.0, 10_000.0);
+            let b = (nits_b as f32).clamp(1.0, 10_000.0);
+            output_ctx.color_override.panel_peak_nits_rgb = Some([r, g, b]);
+            tracing::info!(
+                connector = %name,
+                panel_peak_nits_rgb = ?[r, g, b],
+                "ipc: set panel-peak-nits override"
+            );
+            // Honest mid-session: push a fresh HDR infoframe so the sink
+            // tonemaps against the new ceiling rather than the stale KDL
+            // value. No-op for SDR outputs.
+            if let Err(e) = output_ctx.rebuild_hdr_infoframe() {
+                tracing::warn!(
+                    connector = %name,
+                    "panel-peak-nits applied but HDR infoframe rebuild failed: {e:#}"
+                );
+            }
+        }
         OutputAction::ResetColor => {
             output_ctx.color_override = prism_drm::ColorOverride::default();
             tracing::info!(connector = %name, "ipc: cleared color overrides");
+            // The cleared panel-peak-nits reverts to the bringup KDL
+            // value — push the corresponding infoframe.
+            if let Err(e) = output_ctx.rebuild_hdr_infoframe() {
+                tracing::warn!(
+                    connector = %name,
+                    "color reset applied but HDR infoframe rebuild failed: {e:#}"
+                );
+            }
         }
         other => {
             return Err(format!(
