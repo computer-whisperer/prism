@@ -193,6 +193,45 @@ pub fn set_channel_patch(
     }
 }
 
+/// Drive an arbitrary RGB patch in panel-native units. The 3D-sweep
+/// calibration needs to command independent per-channel values
+/// (cmd_R, cmd_G, cmd_B), which neither `set_channel_patch` (single
+/// channel only) nor `set_white_patch` (locked to D65) covers.
+///
+/// HDR: cmd values are linear cd/m² per channel, handed straight to
+/// the patch surface (which signals PQ-encoded over the wire).
+/// SDR: each channel is normalized against `sdr_reference_nits` and
+/// sRGB-OETF encoded — same convention as `set_channel_patch` /
+/// `set_white_patch` so all three setters produce consistent output
+/// in either mode.
+pub fn set_rgb_patch(
+    patch: &mut PatchSurface,
+    baseline: &OutputBaseline,
+    cmd_rgb: [f64; 3],
+) -> Result<()> {
+    if baseline.hdr_active {
+        patch.set_nits(cmd_rgb).with_context(|| {
+            format!(
+                "set HDR RGB nits ({:.2}, {:.2}, {:.2})",
+                cmd_rgb[0], cmd_rgb[1], cmd_rgb[2],
+            )
+        })
+    } else {
+        let ref_nits = baseline.sdr_reference_nits;
+        let encoded = [
+            srgb_oetf((cmd_rgb[0] / ref_nits).clamp(0.0, 1.0)),
+            srgb_oetf((cmd_rgb[1] / ref_nits).clamp(0.0, 1.0)),
+            srgb_oetf((cmd_rgb[2] / ref_nits).clamp(0.0, 1.0)),
+        ];
+        patch.set_color(encoded).with_context(|| {
+            format!(
+                "set SDR RGB encoded ({:.4}, {:.4}, {:.4})",
+                encoded[0], encoded[1], encoded[2],
+            )
+        })
+    }
+}
+
 /// Render BT.2020 D65 reference white at `target_nits` in the centred
 /// patch. HDR mode: `(R=L, G=L, B=L)` in linear nits — BT.2020 is
 /// defined such that equal R/G/B produces D65 by construction. SDR mode:

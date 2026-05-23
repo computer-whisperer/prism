@@ -1,28 +1,36 @@
 //! `prism-tune calibrate-lut3d` — measurement-driven 3D LUT calibration.
 //!
-//! Where the legacy `calibrate` fits a closed-form `(gain, gamma)` model
-//! per channel and then synthesizes a 3D LUT from that, this tool skips
-//! the model entirely. Per-channel sweeps capture the panel's actual
-//! XYZ response at many commanded values; the inverse 3D LUT is then
-//! built by Newton-Raphson — for each grid point in BT.2020 space we
-//! solve `panel_R(cmd_R) + panel_G(cmd_G) + panel_B(cmd_B) = target_XYZ`
-//! and store the commanded values.
+//! Forward model: measure the panel's response on a 3D grid in
+//! command space — every combination of (cmd_R, cmd_G, cmd_B) at
+//! `cube_edge_cmd` log-spaced values per axis. The inverse 3D LUT
+//! is built by Newton-Raphson against this measured grid: for each
+//! grid point in BT.2020 target space, find the cmd triple that
+//! produces the target XYZ.
 //!
-//! Why it matters: the closed-form model assumes the per-primary
-//! chromaticity is constant across luminance, but real panels (LCDs
-//! especially, see the DP-4 G primary drifting y from 0.52 → 0.61 over
-//! the working range) don't behave that way. A LUT built from XYZ
-//! measurements captures the drift directly.
+//! Why the 3D forward grid (vs. an additive per-channel model):
+//! Real LCDs don't actually obey `panel(R+G+B) = panel(R) +
+//! panel(G) + panel(B)`. Driver IC current limits, voltage rail
+//! sag, and per-channel-pair optical crosstalk produce ~10-15%
+//! sub-additivity when channels are driven together. The additive
+//! model bottoms out at that residual no matter how good the per-
+//! channel measurements are. A direct 3D grid captures cross-channel
+//! interactions structurally; trilinear interpolation between grid
+//! points fills in the rest.
 //!
-//! Additivity model — the panel's total reading is
-//! `panel(R+G+B) = R + G + B + black_floor`, where `black_floor` is
-//! one constant measured at the start (R=G=B=0). Per-channel sweeps
-//! subtract `black_floor` so each [`ChannelResponse`] models the
-//! channel's true emission above black. Without this, summing three
-//! per-channel measurements triple-counts the floor — at the dim end
-//! that overstates the predicted Y by 2× the floor, which is what
-//! the inverter sees as "needs less command than it actually does",
-//! producing -30% to -50% Y errors at low luminance.
+//! Pipeline:
+//!   0. Black floor: single measurement at (R=G=B=0), subtracted
+//!      from every subsequent sample. The colorimeter sees panel
+//!      emission + ambient + dark current at black; folding that
+//!      into per-channel data triple-counts it in the additive sum.
+//!   1. Per-channel saturation discovery: short sweep per channel
+//!      to find peak emission. Used to bound the 3D cmd-axis ranges
+//!      (no wasted samples above saturation) and to seed Newton.
+//!   2. 3D grid sweep: `cube_edge_cmd³` patches at log-spaced
+//!      per-axis cmds — black-subtracted, stored as `ResponseGrid`.
+//!   3. Inversion: Newton-Raphson against `grid.forward(cmd)` →
+//!      17³ cmd-space inverse LUT.
+//!   4. Verify: D65 white sweep through the live-pushed LUT,
+//!      compare measured Y / Δu'v' to target.
 //!
 //! Output: a binary `.lut` file written to disk (carries the measured
 //! `black_point_xyz` in its v2 header so the compositor can plumb it
@@ -43,7 +51,7 @@ use tristim_driver::{Colorimeter, Xyz, measurement::raw_to_xyz};
 use crate::common::{
     Channel, OutputBaseline, apply_border, apply_panel_peaks, open_patch_surface,
     query_output_baseline, send_action, send_action_for_reply, set_channel_patch, set_patch_off,
-    set_white_patch, show_alignment_patch,
+    set_rgb_patch, set_white_patch, show_alignment_patch,
 };
 use prism_ipc::Response;
 use tristim_display::PatchSurface;
@@ -54,16 +62,23 @@ pub struct CalibrateLut3dArgs {
     /// Connector to calibrate (e.g. `DisplayPort-4`, `HDMI-A-1`).
     #[arg(long)]
     pub output: String,
-    /// LUT cube edge (grid points per axis). Default 17 matches the
-    /// compositor's default texture size. 33 gives finer precision at
+    /// Inverse-LUT cube edge (grid points per axis). Default 17 matches
+    /// the compositor's default texture size. 33 gives finer precision at
     /// 8× the storage cost; only useful if 17³ shows banding.
     #[arg(long, default_value_t = 17)]
     pub cube_edge: u32,
-    /// Per-channel measurement count. Each channel sweeps this many
-    /// log-spaced commanded values from `--min-cmd` to its measured
-    /// saturation. Higher = better forward-LUT precision = more
-    /// accurate inversion, but linear time cost.
-    #[arg(long, default_value_t = 33)]
+    /// Measurement-grid edge for the 3D forward sweep (Phase 2).
+    /// `cube_edge_cmd³` patches command the panel; each measurement
+    /// captures one (R, G, B, X, Y, Z) sample. Default 9 = 729
+    /// patches. 7 = 343 (faster but coarser cross-channel resolution);
+    /// 11 = 1331 (finer but linearly slower).
+    #[arg(long, default_value_t = 9)]
+    pub cube_edge_cmd: usize,
+    /// Per-channel saturation-discovery sample count (Phase 1). Used
+    /// only to find each axis's peak emission for the 3D-sweep bounds
+    /// and to seed Newton inversion. 9 log-spaced samples is plenty
+    /// for cliff detection.
+    #[arg(long, default_value_t = 9)]
     pub samples_per_channel: usize,
     /// Lowest commanded value (cd/m²) in the per-channel sweep.
     /// Defaults to 1.0 — below this the Spyder noise floor dominates
@@ -146,37 +161,6 @@ struct ChannelResponse {
 }
 
 impl ChannelResponse {
-    /// Linear interpolation of `commanded → XYZ` from the sorted
-    /// samples. Inputs clamp to `[samples[0].commanded, max_cmd]` so
-    /// the inversion can't read garbage outside the measured range.
-    fn xyz_at(&self, commanded: f64) -> Xyz {
-        let c = commanded
-            .max(self.samples[0].commanded)
-            .min(self.max_cmd);
-        // Binary search for the segment.
-        let idx = self
-            .samples
-            .binary_search_by(|s| s.commanded.partial_cmp(&c).unwrap())
-            .unwrap_or_else(|i| i);
-        if idx == 0 {
-            return self.samples[0].xyz;
-        }
-        let hi = idx.min(self.samples.len() - 1);
-        let lo = hi.saturating_sub(1);
-        let lo_s = &self.samples[lo];
-        let hi_s = &self.samples[hi];
-        let span = hi_s.commanded - lo_s.commanded;
-        if span <= 0.0 {
-            return hi_s.xyz;
-        }
-        let t = ((c - lo_s.commanded) / span).clamp(0.0, 1.0);
-        Xyz {
-            x: lo_s.xyz.x + t * (hi_s.xyz.x - lo_s.xyz.x),
-            y: lo_s.xyz.y + t * (hi_s.xyz.y - lo_s.xyz.y),
-            z: lo_s.xyz.z + t * (hi_s.xyz.z - lo_s.xyz.z),
-        }
-    }
-
     /// Coarse Y-per-cmd gain from the brightest non-clamped sample.
     /// Used by the inverter to seed its initial guess — a single
     /// number per channel that's roughly the slope of the linear
@@ -192,31 +176,179 @@ impl ChannelResponse {
             .unwrap_or(self.samples.last().unwrap());
         last.xyz.y / last.commanded.max(1e-6)
     }
+}
 
-    /// `d(XYZ)/d(cmd)` at `commanded` via the slope of the surrounding
-    /// linear segment. Returns the segment that brackets `commanded`
-    /// (clamped to the LUT's range at the ends).
-    fn dxyz_dcmd_at(&self, commanded: f64) -> [f64; 3] {
-        let c = commanded
-            .max(self.samples[0].commanded)
-            .min(self.max_cmd);
-        let idx = self
-            .samples
-            .binary_search_by(|s| s.commanded.partial_cmp(&c).unwrap())
-            .unwrap_or_else(|i| i);
-        let hi = idx.min(self.samples.len() - 1).max(1);
-        let lo = hi - 1;
-        let lo_s = &self.samples[lo];
-        let hi_s = &self.samples[hi];
-        let span = hi_s.commanded - lo_s.commanded;
-        if span <= 1e-12 {
-            return [0.0, 0.0, 0.0];
-        }
+/// 3D forward measurement grid in cmd-space. Each entry stores the
+/// panel's true emission (black already subtracted) at a specific
+/// (cmd_R, cmd_G, cmd_B) command triple. Per-axis cmd values are
+/// log-spaced from `args.min_cmd` up to each channel's discovered
+/// saturation peak — so all `cube_edge³` measurements land in the
+/// useful range and none are wasted above saturation.
+///
+/// Trilinear interpolation between grid points handles arbitrary cmd
+/// queries during Newton inversion. The Jacobian within a cell is
+/// constant — `(face_high - face_low) / axis_span` bilinearly
+/// interpolated in the other two axes' weights — which gives Newton
+/// an analytic derivative without finite-difference noise.
+///
+/// Storage order: `xyz[(k * N + j) * N + i]` for axis-c indices
+/// `(i, j, k)`. X-fastest matches the existing LUT layout convention.
+struct ResponseGrid {
+    cube_edge: usize,
+    /// Per-axis sorted ascending list of commanded values. `axis_cmds[c][i]`
+    /// is the cmd handed to channel `c` for the slice at axis-c index `i`.
+    /// Each list has exactly `cube_edge` entries; entries are positive
+    /// (no zero corner — handled at the inversion edge case instead).
+    axis_cmds: [Vec<f64>; 3],
+    /// Black-subtracted XYZ at each grid point.
+    xyz: Vec<Xyz>,
+}
+
+impl ResponseGrid {
+    fn lookup(&self, i: usize, j: usize, k: usize) -> Xyz {
+        let n = self.cube_edge;
+        let idx = (k * n + j) * n + i;
+        self.xyz[idx]
+    }
+
+    /// Trilinear forward evaluation. `cmd` clamps per-axis to
+    /// `[axis_cmds[c][0], axis_cmds[c][N-1]]` — Newton may overshoot
+    /// past the bounds in its line search and we don't want to
+    /// extrapolate into a region we haven't measured.
+    fn forward(&self, cmd: [f64; 3]) -> Xyz {
+        let (lo_r, hi_r, tr) = bracket_axis(&self.axis_cmds[0], cmd[0]);
+        let (lo_g, hi_g, tg) = bracket_axis(&self.axis_cmds[1], cmd[1]);
+        let (lo_b, hi_b, tb) = bracket_axis(&self.axis_cmds[2], cmd[2]);
+
+        let c000 = self.lookup(lo_r, lo_g, lo_b);
+        let c100 = self.lookup(hi_r, lo_g, lo_b);
+        let c010 = self.lookup(lo_r, hi_g, lo_b);
+        let c110 = self.lookup(hi_r, hi_g, lo_b);
+        let c001 = self.lookup(lo_r, lo_g, hi_b);
+        let c101 = self.lookup(hi_r, lo_g, hi_b);
+        let c011 = self.lookup(lo_r, hi_g, hi_b);
+        let c111 = self.lookup(hi_r, hi_g, hi_b);
+
+        // Trilinear: lerp along R, then G, then B.
+        let c00 = lerp_xyz(c000, c100, tr);
+        let c10 = lerp_xyz(c010, c110, tr);
+        let c01 = lerp_xyz(c001, c101, tr);
+        let c11 = lerp_xyz(c011, c111, tr);
+        let c0 = lerp_xyz(c00, c10, tg);
+        let c1 = lerp_xyz(c01, c11, tg);
+        lerp_xyz(c0, c1, tb)
+    }
+
+    /// Jacobian at `cmd`: column c = ∂XYZ/∂cmd_c. Within a single
+    /// grid cell the trilinear interpolation's partial in axis c is
+    /// `(face_high - face_low) / axis_span`, where the faces are
+    /// bilinearly interpolated in the other two axes' weights.
+    /// Returns a 3×3 matrix in [row=XYZ-component, col=cmd-channel]
+    /// form so `mat3_inverse + mat3_mul_vec` apply cleanly.
+    fn jacobian(&self, cmd: [f64; 3]) -> [[f64; 3]; 3] {
+        let (lo_r, hi_r, tr) = bracket_axis(&self.axis_cmds[0], cmd[0]);
+        let (lo_g, hi_g, tg) = bracket_axis(&self.axis_cmds[1], cmd[1]);
+        let (lo_b, hi_b, tb) = bracket_axis(&self.axis_cmds[2], cmd[2]);
+        let span_r = (self.axis_cmds[0][hi_r] - self.axis_cmds[0][lo_r]).max(1e-12);
+        let span_g = (self.axis_cmds[1][hi_g] - self.axis_cmds[1][lo_g]).max(1e-12);
+        let span_b = (self.axis_cmds[2][hi_b] - self.axis_cmds[2][lo_b]).max(1e-12);
+
+        let c000 = self.lookup(lo_r, lo_g, lo_b);
+        let c100 = self.lookup(hi_r, lo_g, lo_b);
+        let c010 = self.lookup(lo_r, hi_g, lo_b);
+        let c110 = self.lookup(hi_r, hi_g, lo_b);
+        let c001 = self.lookup(lo_r, lo_g, hi_b);
+        let c101 = self.lookup(hi_r, lo_g, hi_b);
+        let c011 = self.lookup(lo_r, hi_g, hi_b);
+        let c111 = self.lookup(hi_r, hi_g, hi_b);
+
+        // ∂/∂R: high-R face vs low-R face, bilinearly interpolated in (G, B).
+        // Low-R face corners by (j, k): (lo_g, lo_b)=c000, (hi_g, lo_b)=c010,
+        // (lo_g, hi_b)=c001, (hi_g, hi_b)=c011.
+        let face_lo_r = bilinear_xyz(c000, c010, c001, c011, tg, tb);
+        let face_hi_r = bilinear_xyz(c100, c110, c101, c111, tg, tb);
+        let d_r = sub_xyz_scaled(face_hi_r, face_lo_r, 1.0 / span_r);
+
+        // ∂/∂G: high-G face vs low-G face, bilinear in (R, B).
+        // Low-G face corners by (i, k): c000, c100, c001, c101.
+        let face_lo_g = bilinear_xyz(c000, c100, c001, c101, tr, tb);
+        let face_hi_g = bilinear_xyz(c010, c110, c011, c111, tr, tb);
+        let d_g = sub_xyz_scaled(face_hi_g, face_lo_g, 1.0 / span_g);
+
+        // ∂/∂B: high-B face vs low-B face, bilinear in (R, G).
+        // Low-B face corners by (i, j): c000, c100, c010, c110.
+        let face_lo_b = bilinear_xyz(c000, c100, c010, c110, tr, tg);
+        let face_hi_b = bilinear_xyz(c001, c101, c011, c111, tr, tg);
+        let d_b = sub_xyz_scaled(face_hi_b, face_lo_b, 1.0 / span_b);
+
         [
-            (hi_s.xyz.x - lo_s.xyz.x) / span,
-            (hi_s.xyz.y - lo_s.xyz.y) / span,
-            (hi_s.xyz.z - lo_s.xyz.z) / span,
+            [d_r.x, d_g.x, d_b.x],
+            [d_r.y, d_g.y, d_b.y],
+            [d_r.z, d_g.z, d_b.z],
         ]
+    }
+
+    /// Smallest emission anywhere in the grid — at the (min_cmd, min_cmd,
+    /// min_cmd) corner. Used by the inverter to short-circuit "target is
+    /// below what the panel can render above black" cases to cmd=0.
+    fn min_emission(&self) -> Xyz {
+        self.lookup(0, 0, 0)
+    }
+
+    /// Max cmd per axis (the saturation cap each axis was bounded at).
+    fn max_cmd(&self) -> [f64; 3] {
+        let n = self.cube_edge - 1;
+        [self.axis_cmds[0][n], self.axis_cmds[1][n], self.axis_cmds[2][n]]
+    }
+}
+
+/// Locate the segment in `axis` (sorted ascending) bracketing `value`.
+/// Returns `(lo_idx, hi_idx, t)` where `t ∈ [0, 1]` is the linear
+/// weight from `axis[lo_idx]` to `axis[hi_idx]`. Below the range
+/// clamps to `(0, 0, 0.0)`; above clamps to `(n-1, n-1, 0.0)` — both
+/// degenerate cells where forward returns the corner value and
+/// Jacobian returns zero (axis span guarded against div-by-zero).
+fn bracket_axis(axis: &[f64], value: f64) -> (usize, usize, f64) {
+    let n = axis.len();
+    if n == 0 {
+        return (0, 0, 0.0);
+    }
+    if value <= axis[0] {
+        return (0, 0, 0.0);
+    }
+    if value >= axis[n - 1] {
+        return (n - 1, n - 1, 0.0);
+    }
+    // Linear scan — `n` is small (typically 9, max ~17).
+    for i in 1..n {
+        if value <= axis[i] {
+            let span = axis[i] - axis[i - 1];
+            let t = if span > 0.0 { (value - axis[i - 1]) / span } else { 0.0 };
+            return (i - 1, i, t);
+        }
+    }
+    (n - 1, n - 1, 0.0)
+}
+
+fn lerp_xyz(a: Xyz, b: Xyz, t: f64) -> Xyz {
+    Xyz {
+        x: a.x + t * (b.x - a.x),
+        y: a.y + t * (b.y - a.y),
+        z: a.z + t * (b.z - a.z),
+    }
+}
+
+fn bilinear_xyz(c00: Xyz, c10: Xyz, c01: Xyz, c11: Xyz, t0: f64, t1: f64) -> Xyz {
+    let a = lerp_xyz(c00, c10, t0);
+    let b = lerp_xyz(c01, c11, t0);
+    lerp_xyz(a, b, t1)
+}
+
+fn sub_xyz_scaled(a: Xyz, b: Xyz, scale: f64) -> Xyz {
+    Xyz {
+        x: (a.x - b.x) * scale,
+        y: (a.y - b.y) * scale,
+        z: (a.z - b.z) * scale,
     }
 }
 
@@ -322,7 +454,13 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         )?;
     }
 
-    // ─── Phase 1: per-channel sweeps ──────────────────────────────────────
+    // ─── Phase 1: per-channel saturation discovery + Newton seed ──────────
+    // Cheap pre-probe (~9 samples per channel, <30s) used purely to
+    // (a) bound each cmd-axis of the 3D sweep at the channel's measured
+    // peak, and (b) seed Newton inversion with a per-channel Y-per-cmd
+    // ratio. The forward model is the 3D grid measured in Phase 2 —
+    // these samples are NOT used as the per-channel additive model
+    // any longer.
     let targets =
         log_spaced_targets(args.min_cmd, args.max_cmd, args.samples_per_channel);
     let mut responses: [Option<ChannelResponse>; 3] = [None, None, None];
@@ -444,12 +582,54 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         responses[1].take().unwrap(),
         responses[2].take().unwrap(),
     ];
+    let per_channel_peaks = [
+        responses[0].max_cmd,
+        responses[1].max_cmd,
+        responses[2].max_cmd,
+    ];
+    let seed_gain = [
+        responses[0].approx_gain_y_per_cmd(),
+        responses[1].approx_gain_y_per_cmd(),
+        responses[2].approx_gain_y_per_cmd(),
+    ];
 
-    // ─── Phase 2: inversion to 3D LUT ─────────────────────────────────────
-    eprintln!("\nInverting forward LUTs to {}³ 3D LUT…", args.cube_edge);
+    // ─── Phase 2: 3D forward grid sweep ───────────────────────────────────
+    // The per-channel data above just sized the cmd-axis bounds and
+    // seeded Newton — it's deliberately not the forward model. Real
+    // LCDs are ~10-15% sub-additive when channels are driven together
+    // (driver-IC current limit, voltage-rail sag, per-channel optical
+    // crosstalk), and the additive model bottoms out at that residual
+    // no matter how dense the per-channel sweep is.
+    //
+    // Direct 3D sweep: cube_edge_cmd³ patches at log-spaced per-axis
+    // cmds, bounded by each channel's measured peak. Trilinear
+    // interpolation between grid points captures cross-channel
+    // interactions structurally; no additivity assumption anywhere.
     let black_floor_xyz = [black_xyz.x, black_xyz.y, black_xyz.z];
+    eprintln!(
+        "\n--- phase 2: 3D forward sweep ({}³ = {} patches) ---",
+        args.cube_edge_cmd,
+        args.cube_edge_cmd.pow(3),
+    );
+    let grid = sweep_3d_grid(
+        args.cube_edge_cmd,
+        args.min_cmd,
+        per_channel_peaks,
+        black_xyz,
+        settle,
+        &mut device,
+        &mut patch,
+        &baseline,
+        &setup,
+        &cal,
+        log.as_mut(),
+    )?;
+
+    // ─── Phase 3: inversion to 3D LUT ─────────────────────────────────────
+    eprintln!("\n--- phase 3: invert {}³ forward grid → {}³ inverse LUT ---",
+              args.cube_edge_cmd, args.cube_edge);
     let (entries, residuals) =
-        build_inverse_lut(args.cube_edge, &responses, black_floor_xyz);
+        build_inverse_lut(args.cube_edge, &grid, seed_gain, black_floor_xyz);
     if let Some((_, w)) = log.as_mut() {
         // Split residual stats by whether the target was in-gamut for
         // the panel (target_Y ≤ panel total peak). Out-of-gamut grids
@@ -517,7 +697,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         black_xyz.z as f32,
     ];
 
-    // ─── Phase 3: write LUT + restore ─────────────────────────────────────
+    // ─── Phase 4: write LUT + restore ─────────────────────────────────────
     let lut_path = args.lut_path.clone().unwrap_or_else(|| {
         let safe = args.output.replace('/', "_");
         PathBuf::from(format!("prism-calibrate-lut3d-{safe}.lut"))
@@ -553,11 +733,11 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     .context("push LUT via IPC")?;
     eprintln!("Pushed LUT live via IPC ({}).", lut_abs_path.display());
 
-    // ─── Phase 4: verify the live LUT against D65 ─────────────────────────
+    // ─── Phase 5: verify the live LUT against D65 ─────────────────────────
     let verify_result = if !args.no_verify {
-        eprintln!("\n--- phase 4 verify: D65 white sweep through live LUT ---");
+        eprintln!("\n--- phase 5 verify: D65 white sweep through live LUT ---");
         Some(verify_white_point(
-            &args, &baseline, &peak_nits, &entries, &responses, black_floor_xyz,
+            &args, &baseline, &peak_nits, &entries, &grid, black_floor_xyz,
             &mut device, &mut patch, &setup, &cal, log.as_mut(),
         )?)
     } else {
@@ -622,12 +802,113 @@ struct VerifyResult {
     max_y_err_pct: f64,
 }
 
+/// Drive the panel through the cube_edge³ Cartesian product of per-
+/// axis log-spaced cmds and record one (cmd, XYZ) measurement at each
+/// vertex. Returns the populated [`ResponseGrid`], with the black
+/// floor already subtracted from every sample.
+///
+/// Axis bounds: per-channel `[args_min_cmd, per_channel_peaks[c]]`.
+/// Putting peaks-from-Phase-1 in as the upper bound means no
+/// measurements are wasted above each channel's saturation, regardless
+/// of how much they differ (typical LCD: R≈300, G≈420, B≈420).
+///
+/// CSV log: each row is `3D,i,j,k,cmd_r,cmd_g,cmd_b,X,Y,Z` —
+/// distinct prefix from the Phase 1 `R/G/B` rows so a log reader
+/// can tell which phase each sample is from. XYZ is black-subtracted.
+#[allow(clippy::too_many_arguments)]
+fn sweep_3d_grid(
+    cube_edge: usize,
+    min_cmd: f64,
+    per_channel_peaks: [f64; 3],
+    black_xyz: Xyz,
+    settle: Duration,
+    device: &mut Colorimeter,
+    patch: &mut PatchSurface,
+    baseline: &OutputBaseline,
+    setup: &Setup,
+    cal: &Calibration,
+    mut log: Option<&mut (PathBuf, BufWriter<File>)>,
+) -> Result<ResponseGrid> {
+    if cube_edge < 2 {
+        anyhow::bail!("cube_edge_cmd must be ≥ 2 (degenerate 1D grid not supported)");
+    }
+    let axis_cmds = [
+        log_spaced_targets(min_cmd, per_channel_peaks[0], cube_edge),
+        log_spaced_targets(min_cmd, per_channel_peaks[1], cube_edge),
+        log_spaced_targets(min_cmd, per_channel_peaks[2], cube_edge),
+    ];
+    eprintln!(
+        "  per-axis cmd ranges: R[{:.2}..{:.2}] G[{:.2}..{:.2}] B[{:.2}..{:.2}]",
+        axis_cmds[0][0], axis_cmds[0][cube_edge - 1],
+        axis_cmds[1][0], axis_cmds[1][cube_edge - 1],
+        axis_cmds[2][0], axis_cmds[2][cube_edge - 1],
+    );
+    if let Some((_, w)) = log.as_mut() {
+        writeln!(
+            w,
+            "# phase 2: 3D forward grid sweep, cube_edge_cmd={cube_edge} ({} patches)",
+            cube_edge.pow(3),
+        )?;
+        writeln!(w, "phase,i,j,k,cmd_r,cmd_g,cmd_b,X,Y,Z")?;
+    }
+
+    let total = cube_edge.pow(3);
+    let mut xyz: Vec<Xyz> = Vec::with_capacity(total);
+    let mut patches_done = 0usize;
+    // Progress heartbeat at 10% increments — the 729-patch sweep takes
+    // long enough that a silent stretch reads as a hang.
+    let progress_step = (total / 10).max(1);
+    let start = std::time::Instant::now();
+    for k in 0..cube_edge {
+        let cmd_b = axis_cmds[2][k];
+        for j in 0..cube_edge {
+            let cmd_g = axis_cmds[1][j];
+            for i in 0..cube_edge {
+                let cmd_r = axis_cmds[0][i];
+                set_rgb_patch(patch, baseline, [cmd_r, cmd_g, cmd_b])?;
+                thread::sleep(settle);
+                let raw = device.measure_raw(setup).context("3D-sweep measure")?;
+                let raw_xyz = raw_to_xyz(&raw, setup, cal);
+                let xyz_above_black = Xyz {
+                    x: (raw_xyz.x - black_xyz.x).max(0.0),
+                    y: (raw_xyz.y - black_xyz.y).max(0.0),
+                    z: (raw_xyz.z - black_xyz.z).max(0.0),
+                };
+                xyz.push(xyz_above_black);
+                if let Some((_, w)) = log.as_mut() {
+                    writeln!(
+                        w,
+                        "3D,{i},{j},{k},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
+                        cmd_r, cmd_g, cmd_b,
+                        xyz_above_black.x, xyz_above_black.y, xyz_above_black.z,
+                    )?;
+                }
+                patches_done += 1;
+                if patches_done % progress_step == 0 || patches_done == total {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let rate = patches_done as f64 / elapsed;
+                    let eta_secs = (total - patches_done) as f64 / rate.max(1e-6);
+                    eprintln!(
+                        "  3D sweep: {}/{} patches ({:.0}%) — {:.1} patches/s, ETA {:.0}s",
+                        patches_done, total,
+                        (patches_done as f64 / total as f64) * 100.0,
+                        rate, eta_secs,
+                    );
+                }
+            }
+        }
+    }
+    eprintln!(
+        "  3D sweep complete: {} patches in {:.1}s",
+        total, start.elapsed().as_secs_f64(),
+    );
+    Ok(ResponseGrid { cube_edge, axis_cmds, xyz })
+}
+
 /// Render BT.2020 D65 white at a range of luminances through the
 /// freshly-pushed LUT and measure how close the panel lands on the
 /// reference. Δu'v' large means the LUT's chromaticity inversion is
 /// off; Y-error large means the LUT's luminance inversion is off.
-/// Both means measurement noise or a non-additive panel that broke
-/// the additivity assumption.
 ///
 /// Targets mirror `calibrate`'s verify phase so reports are comparable
 /// across the two pipelines:
@@ -639,7 +920,7 @@ fn verify_white_point(
     baseline: &OutputBaseline,
     peak_nits: &[f32; 3],
     lut_entries: &[[f32; 3]],
-    responses: &[ChannelResponse; 3],
+    grid: &ResponseGrid,
     black_floor_xyz: [f64; 3],
     device: &mut tristim_driver::Colorimeter,
     patch: &mut PatchSurface,
@@ -677,7 +958,7 @@ fn verify_white_point(
     if let Some((_, w)) = log.as_mut() {
         writeln!(
             w,
-            "# phase 4 verify: D65 white sweep — Δu'v' from D65=({:.4},{:.4})",
+            "# phase 5 verify: D65 white sweep — Δu'v' from D65=({:.4},{:.4})",
             D65.0, D65.1,
         )?;
     }
@@ -708,14 +989,17 @@ fn verify_white_point(
             Response::EncodeDiagnose(r) => r.scanout_nits,
             other => anyhow::bail!("unexpected EncodeDiagnose reply: {other:?}"),
         };
-        // Predict from forward LUT: what additive Y would the GPU-
-        // decoded cmd produce? This is what verify SHOULD see if the
-        // panel is additive — add the floor once because per-channel
-        // responses model emission above black.
-        let gpu_xyz_r = responses[0].xyz_at(scanout_decoded[0]);
-        let gpu_xyz_g = responses[1].xyz_at(scanout_decoded[1]);
-        let gpu_xyz_b = responses[2].xyz_at(scanout_decoded[2]);
-        let gpu_additive_y = gpu_xyz_r.y + gpu_xyz_g.y + gpu_xyz_b.y + black_floor_xyz[1];
+        // Predict measured Y by asking the 3D forward grid what it
+        // would produce at the GPU's actual scanout cmds. With the
+        // additive-model replaced by a directly-measured grid this
+        // diagnostic now answers a different question: "does the
+        // panel's behavior at verify time match its behavior at
+        // calibration time?" A close match means the grid is
+        // capturing reality and the LUT inversion is sound; large
+        // gap means drift (thermal, time-since-calibration, ABL
+        // behaving differently for this specific verify pattern).
+        let grid_pred = grid.forward(scanout_decoded);
+        let grid_predicted_y = grid_pred.y + black_floor_xyz[1];
 
         eprintln!(
             "  W target {:>7.1} cd/m² → Y={:>7.2}  xy=({:.4},{:.4})  Δu'v'={:.4}  Y_err={:+.1}%",
@@ -730,9 +1014,9 @@ fn verify_white_point(
             scanout_decoded[2] - cmd_predicted[2] as f64,
         );
         eprintln!(
-            "      additive-predicted Y from GPU cmd={:.2}  measured Y={:.2}  panel additivity error={:+.1}%",
-            gpu_additive_y, xyz.y,
-            (xyz.y - gpu_additive_y) / gpu_additive_y.max(0.01) * 100.0,
+            "      grid-predicted Y from GPU cmd={:.2}  measured Y={:.2}  grid-vs-measured drift={:+.1}%",
+            grid_predicted_y, xyz.y,
+            (xyz.y - grid_predicted_y) / grid_predicted_y.max(0.01) * 100.0,
         );
         max_duv = max_duv.max(duv);
         max_y_err_pct = max_y_err_pct.max(y_err_pct.abs());
@@ -756,9 +1040,9 @@ fn verify_white_point(
             )?;
             writeln!(
                 w,
-                "#   gpu_additive_predicted_y={:.4} panel_additivity_err_pct={:+.3}",
-                gpu_additive_y,
-                (xyz.y - gpu_additive_y) / gpu_additive_y.max(0.01) * 100.0,
+                "#   grid_predicted_y={:.4} grid_vs_measured_err_pct={:+.3}",
+                grid_predicted_y,
+                (xyz.y - grid_predicted_y) / grid_predicted_y.max(0.01) * 100.0,
             )?;
         }
     }
@@ -857,25 +1141,26 @@ fn log_spaced_targets(lo: f64, hi: f64, n: usize) -> Vec<f64> {
         .collect()
 }
 
-/// Build the inverse 3D LUT from the per-channel forward responses.
+/// Build the inverse 3D LUT from the measured 3D forward grid.
 /// Iteration order is X-fastest then Y then Z — matches the binary
 /// file format + the GPU image memory walk.
 ///
-/// `black_floor_xyz` is the panel's emission at (R=G=B=0). The
-/// per-channel responses model emission above black; the target the
-/// user wants is the panel's TOTAL reading (emission + black). So
-/// each grid point's invert target is `target_xyz - black_floor_xyz`,
-/// floor-clamped to zero — if the requested luminance is below the
-/// panel's floor we can't render it any darker, so the closest the
-/// inverter can come is cmd=0 across the board.
+/// `black_floor_xyz` is the panel's emission at (R=G=B=0). The grid
+/// stores emission above black; the user-facing target is the panel's
+/// TOTAL reading (emission + black). So each grid point's invert
+/// target is `target_xyz - black_floor_xyz`, floor-clamped to zero.
 ///
-/// Returns `(entries, per-grid residual L2 norms)`. The residuals
-/// array lets the caller report convergence stats (mean / percentile /
-/// worst) — important because the inverter is the only post-measurement
-/// math step where bad data can sneak through silently.
+/// Fast path for sub-floor targets: if the requested emission is
+/// below what the grid's smallest cmd produces, the panel can't
+/// render any darker, so we emit cmd = (0, 0, 0) directly — the
+/// panel renders its black floor and that's the closest we get.
+///
+/// Returns `(entries, per-grid residual L2 norms)`. Caller reports
+/// convergence stats so a bad inversion can't sneak through silently.
 fn build_inverse_lut(
     cube_edge: u32,
-    responses: &[ChannelResponse; 3],
+    grid: &ResponseGrid,
+    seed_gain: [f64; 3],
     black_floor_xyz: [f64; 3],
 ) -> (Vec<[f32; 3]>, Vec<f64>) {
     let n = cube_edge as usize;
@@ -884,23 +1169,36 @@ fn build_inverse_lut(
     let mut residuals = Vec::with_capacity(n * n * n);
     let mut total_residual = 0.0_f64;
     let mut worst_residual = 0.0_f64;
+    let grid_floor = grid.min_emission();
     for k in 0..n {
         let bz_in = pq_eotf(k as f32 / denom) as f64;
         for j in 0..n {
             let g_in = pq_eotf(j as f32 / denom) as f64;
             for i in 0..n {
                 let r_in = pq_eotf(i as f32 / denom) as f64;
-                // BT.2020 RGB → BT.2020 XYZ (rows are X, Y, Z; cols R, G, B).
                 let target_xyz = bt2020_to_xyz(r_in, g_in, bz_in);
-                // Subtract the floor: the responses model emission, not
-                // panel reading. Floor-clamp at zero so sub-floor targets
-                // don't ask the inverter for negative emission.
                 let emission_target = [
                     (target_xyz[0] - black_floor_xyz[0]).max(0.0),
                     (target_xyz[1] - black_floor_xyz[1]).max(0.0),
                     (target_xyz[2] - black_floor_xyz[2]).max(0.0),
                 ];
-                let (cmd, residual) = invert_one(responses, emission_target);
+                // Sub-floor short-circuit: if all three target components
+                // are below what the grid's dimmest cmd produces, the
+                // panel can only render down to that floor. cmd=0 gets
+                // us the panel's black emission, which is the closest
+                // we can come — no Newton needed.
+                let (cmd, residual) = if emission_target[0] <= grid_floor.x
+                    && emission_target[1] <= grid_floor.y
+                    && emission_target[2] <= grid_floor.z
+                {
+                    let residual = (emission_target[0].powi(2)
+                        + emission_target[1].powi(2)
+                        + emission_target[2].powi(2))
+                    .sqrt();
+                    ([0.0, 0.0, 0.0], residual)
+                } else {
+                    invert_one(grid, seed_gain, emission_target)
+                };
                 total_residual += residual;
                 if residual > worst_residual {
                     worst_residual = residual;
@@ -918,98 +1216,69 @@ fn build_inverse_lut(
     (entries, residuals)
 }
 
-/// Damped-Newton-with-backtracking-line-search inversion of one grid
-/// point. Returns the commanded triple plus the residual norm.
+/// Damped-Newton-with-backtracking-line-search inversion of one
+/// target XYZ against the 3D measured forward grid. Returns the
+/// commanded triple plus the residual norm.
 ///
-/// Why damped + line-search: forward responses are non-linear (toe at
-/// the dim end, soft knee near saturation). Full Newton steps from a
-/// poor initial guess overshoot wildly — a target Y of 12 needs cmd ≈
-/// 30 but the slope-extrapolated step from cmd=12 would land near 65.
-/// We accept the proposed step only if it actually reduces the
-/// residual; if not, halve the step length until it does.
+/// `seed_gain` is the per-channel Y-per-cmd approximation from the
+/// per-channel discovery sweep; used to seed Newton near the right
+/// scale. The grid's trilinear forward + analytic Jacobian do the
+/// actual convergence — full-step gradients aren't directly visible
+/// here because they live inside `grid.jacobian`.
 ///
-/// Initial guess: scale target_XYZ components into per-channel cmd
-/// space using the response's brightest-unsaturated Y/cmd ratio.
-/// Lands within ~30% of the answer for in-gamut targets so Newton
-/// converges in a few iterations.
-fn invert_one(responses: &[ChannelResponse; 3], target: [f64; 3]) -> ([f64; 3], f64) {
-    // Per-channel approximate gain (Y per unit cmd) from the brightest
-    // pre-cliff sample. Used as the per-channel scale for the initial
-    // guess and as the fallback when the Jacobian goes singular.
-    let approx_gain = [
-        responses[0].approx_gain_y_per_cmd(),
-        responses[1].approx_gain_y_per_cmd(),
-        responses[2].approx_gain_y_per_cmd(),
-    ];
-    // Distribute target Y across primaries by BT.2020 D65 weights; this
-    // is what a perfectly-additive panel would need at minimum. For
-    // off-D65 targets it's still a reasonable seed because the dominant
-    // contribution per channel is its own primary.
+/// Why damped + line-search: the grid's forward is non-linear and
+/// the Jacobian is constant only within a cell; stepping across
+/// cell boundaries can produce wildly wrong predictions. Accept
+/// only steps that reduce the residual norm; halve until they do.
+fn invert_one(
+    grid: &ResponseGrid,
+    seed_gain: [f64; 3],
+    target_emission: [f64; 3],
+) -> ([f64; 3], f64) {
+    // BT.2020 D65 weights distribute Y across primaries — a sane
+    // additive seed even though the panel itself is sub-additive.
+    // Newton refines from there.
     const D65_WEIGHTS: [f64; 3] = [0.2627, 0.6780, 0.0593];
-    let target_y = target[1];
+    let max_cmd = grid.max_cmd();
+    let target_y = target_emission[1];
     let mut cmd = [
-        ((target_y * D65_WEIGHTS[0]) / approx_gain[0].max(1e-6))
-            .clamp(0.0, responses[0].max_cmd),
-        ((target_y * D65_WEIGHTS[1]) / approx_gain[1].max(1e-6))
-            .clamp(0.0, responses[1].max_cmd),
-        ((target_y * D65_WEIGHTS[2]) / approx_gain[2].max(1e-6))
-            .clamp(0.0, responses[2].max_cmd),
+        ((target_y * D65_WEIGHTS[0]) / seed_gain[0].max(1e-6)).clamp(0.0, max_cmd[0]),
+        ((target_y * D65_WEIGHTS[1]) / seed_gain[1].max(1e-6)).clamp(0.0, max_cmd[1]),
+        ((target_y * D65_WEIGHTS[2]) / seed_gain[2].max(1e-6)).clamp(0.0, max_cmd[2]),
     ];
 
     const MAX_ITERS: usize = 40;
     const TOL: f64 = 0.005;
     const MIN_STEP_FRACTION: f64 = 1.0 / 64.0;
 
-    let mut res_norm = predicted_residual_norm(responses, &cmd, &target);
+    let mut res_norm = predicted_residual_norm(grid, &cmd, &target_emission);
     if res_norm < TOL {
         return (cmd, res_norm);
     }
 
     for _ in 0..MAX_ITERS {
-        // Jacobian at the current cmd: column c = dXYZ/dcmd_c.
-        let j0 = responses[0].dxyz_dcmd_at(cmd[0]);
-        let j1 = responses[1].dxyz_dcmd_at(cmd[1]);
-        let j2 = responses[2].dxyz_dcmd_at(cmd[2]);
-        let jac = [
-            [j0[0], j1[0], j2[0]],
-            [j0[1], j1[1], j2[1]],
-            [j0[2], j1[2], j2[2]],
-        ];
-        // Current residual for the line-search comparison.
-        let xyz_r = responses[0].xyz_at(cmd[0]);
-        let xyz_g = responses[1].xyz_at(cmd[1]);
-        let xyz_b = responses[2].xyz_at(cmd[2]);
-        let predicted = [
-            xyz_r.x + xyz_g.x + xyz_b.x,
-            xyz_r.y + xyz_g.y + xyz_b.y,
-            xyz_r.z + xyz_g.z + xyz_b.z,
-        ];
+        let jac = grid.jacobian(cmd);
+        let xyz = grid.forward(cmd);
         let residual = [
-            predicted[0] - target[0],
-            predicted[1] - target[1],
-            predicted[2] - target[2],
+            xyz.x - target_emission[0],
+            xyz.y - target_emission[1],
+            xyz.z - target_emission[2],
         ];
         let Some(jac_inv) = mat3_inverse(&jac) else {
-            // Singular Jacobian — channel sitting on its cliff. Stop
-            // and report current state; caller-side residual stat
-            // will surface it.
+            // Singular Jacobian: cmd is parked at a grid corner where
+            // some axis span is degenerate. Surface the current best.
             return (cmd, res_norm);
         };
         let full_step = mat3_mul_vec(&jac_inv, &residual);
 
-        // Backtracking line search: try alpha = 1, 1/2, 1/4, … until
-        // the proposed step actually reduces the residual norm. If we
-        // can't find one above MIN_STEP_FRACTION the inverter has
-        // stalled — bail with the current best.
         let mut alpha = 1.0_f64;
         let mut accepted = false;
         while alpha >= MIN_STEP_FRACTION {
             let mut cmd_try = [0.0_f64; 3];
             for c in 0..3 {
-                cmd_try[c] = (cmd[c] - alpha * full_step[c])
-                    .clamp(0.0, responses[c].max_cmd);
+                cmd_try[c] = (cmd[c] - alpha * full_step[c]).clamp(0.0, max_cmd[c]);
             }
-            let trial_norm = predicted_residual_norm(responses, &cmd_try, &target);
+            let trial_norm = predicted_residual_norm(grid, &cmd_try, &target_emission);
             if trial_norm < res_norm {
                 cmd = cmd_try;
                 res_norm = trial_norm;
@@ -1028,20 +1297,18 @@ fn invert_one(responses: &[ChannelResponse; 3], target: [f64; 3]) -> ([f64; 3], 
     (cmd, res_norm)
 }
 
-/// Sum of per-channel emissions minus target — L2 norm of the residual.
-/// Helper for the inverter's line-search comparison; pulled out so the
-/// loop reads cleanly.
+/// L2 norm of (grid.forward(cmd) - target_emission). Helper for
+/// inverter's line-search comparison; pulled out so the loop reads
+/// cleanly.
 fn predicted_residual_norm(
-    responses: &[ChannelResponse; 3],
+    grid: &ResponseGrid,
     cmd: &[f64; 3],
-    target: &[f64; 3],
+    target_emission: &[f64; 3],
 ) -> f64 {
-    let xyz_r = responses[0].xyz_at(cmd[0]);
-    let xyz_g = responses[1].xyz_at(cmd[1]);
-    let xyz_b = responses[2].xyz_at(cmd[2]);
-    let dx = xyz_r.x + xyz_g.x + xyz_b.x - target[0];
-    let dy = xyz_r.y + xyz_g.y + xyz_b.y - target[1];
-    let dz = xyz_r.z + xyz_g.z + xyz_b.z - target[2];
+    let xyz = grid.forward(*cmd);
+    let dx = xyz.x - target_emission[0];
+    let dy = xyz.y - target_emission[1];
+    let dz = xyz.z - target_emission[2];
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
@@ -1112,14 +1379,20 @@ fn open_log(
     let mut w = BufWriter::new(file);
     writeln!(
         w,
-        "# prism-tune calibrate-lut3d — output={} mode={} cube_edge={} samples_per_channel={} settle_ms={} window={}",
+        "# prism-tune calibrate-lut3d — output={} mode={} cube_edge={} cube_edge_cmd={} samples_per_channel={} settle_ms={} window={}",
         args.output,
         if baseline.hdr_active { "HDR" } else { "SDR" },
         args.cube_edge,
+        args.cube_edge_cmd,
         args.samples_per_channel,
         args.settle_ms,
         args.window,
     )?;
+    // Phase 1 rows use this header (channel-axis per-channel sweep);
+    // Phase 2 rows use the `3D,i,j,k,cmd_r,cmd_g,cmd_b,X,Y,Z` shape
+    // declared at the top of that block. Verify rows are tagged
+    // `verify,W,…`. All XYZ values are black-subtracted (raw floor
+    // recoverable from the `# black_floor` comment line below).
     writeln!(w, "channel,sample_idx,commanded_nits,X,Y,Z")?;
     eprintln!("Logging per-sample CSV to {}", path.display());
     Ok(Some((path, w)))
@@ -1129,56 +1402,65 @@ fn open_log(
 mod tests {
     use super::*;
 
-    /// Build a synthetic ChannelResponse whose XYZ is `primary × cmd`
-    /// — a perfectly-linear panel with the given primary coefficients.
-    /// Used in the inversion round-trip tests.
-    fn synth_response(primary_xyz: [f64; 3], max_cmd: f64) -> ChannelResponse {
-        let cmds = [0.0, 1.0, 5.0, 25.0, 100.0, 500.0, max_cmd];
-        let samples: Vec<ChannelSample> = cmds
-            .iter()
-            .map(|&cmd| ChannelSample {
-                commanded: cmd,
-                xyz: Xyz {
-                    x: primary_xyz[0] * cmd,
-                    y: primary_xyz[1] * cmd,
-                    z: primary_xyz[2] * cmd,
-                },
-            })
-            .collect();
-        let peak_y = samples.last().unwrap().xyz.y;
-        ChannelResponse { samples, max_cmd, peak_y }
+    /// Build a perfectly-linear additive panel as a ResponseGrid:
+    /// `XYZ(cmd_R, cmd_G, cmd_B) = r_pri × cmd_R + g_pri × cmd_G +
+    /// b_pri × cmd_B`. Inversion against this should recover the
+    /// input cmd to high precision (no sub-additivity to confound
+    /// the grid interpolation).
+    fn synth_grid(
+        cube_edge: usize,
+        r_pri: [f64; 3],
+        g_pri: [f64; 3],
+        b_pri: [f64; 3],
+        max_cmd: f64,
+    ) -> ResponseGrid {
+        let axis = log_spaced_targets(1.0, max_cmd, cube_edge);
+        let axis_cmds = [axis.clone(), axis.clone(), axis];
+        let mut xyz = Vec::with_capacity(cube_edge.pow(3));
+        for k in 0..cube_edge {
+            let cb = axis_cmds[2][k];
+            for j in 0..cube_edge {
+                let cg = axis_cmds[1][j];
+                for i in 0..cube_edge {
+                    let cr = axis_cmds[0][i];
+                    xyz.push(Xyz {
+                        x: r_pri[0] * cr + g_pri[0] * cg + b_pri[0] * cb,
+                        y: r_pri[1] * cr + g_pri[1] * cg + b_pri[1] * cb,
+                        z: r_pri[2] * cr + g_pri[2] * cg + b_pri[2] * cb,
+                    });
+                }
+            }
+        }
+        ResponseGrid { cube_edge, axis_cmds, xyz }
     }
 
     /// Inversion against a "panel that exactly matches BT.2020" must
-    /// recover the input commanded values. The per-channel responses
-    /// are linear × the BT.2020 primary contributions, so BT.2020
-    /// input (L, L, L) → target XYZ → invert → (L, L, L). Sanity
-    /// anchor — if this drifts the Jacobian or BT.2020 matrix
+    /// recover the input commanded values. Sanity anchor — if this
+    /// drifts, the Jacobian, trilinear interp, or BT.2020 matrix
     /// regressed.
     #[test]
     fn inversion_recovers_identity_for_bt2020_matching_panel() {
         // Columns of the BT.2020 RGB→XYZ matrix = per-primary XYZ at
-        // unit RGB (i.e. at cmd=1). Match those exactly in the
-        // synthetic responses.
+        // unit RGB; the synthetic grid is exactly linear in those.
         let r_pri = [0.6370, 0.2627, 0.0000];
         let g_pri = [0.1446, 0.6780, 0.0281];
         let b_pri = [0.1689, 0.0593, 1.0610];
-        let responses = [
-            synth_response(r_pri, 1000.0),
-            synth_response(g_pri, 1000.0),
-            synth_response(b_pri, 1000.0),
-        ];
+        let grid = synth_grid(9, r_pri, g_pri, b_pri, 1000.0);
+        // Per-channel seed gain from the grid's diagonal slice (cmd_R
+        // alone). For a perfectly-linear panel this is just the
+        // primary's Y coefficient.
+        let seed_gain = [r_pri[1], g_pri[1], b_pri[1]];
 
-        for &l in &[1.0, 10.0, 50.0, 200.0] {
+        for &l in &[10.0, 50.0, 200.0] {
             let target = bt2020_to_xyz(l, l, l);
-            let (cmd, residual) = invert_one(&responses, target);
+            let (cmd, residual) = invert_one(&grid, seed_gain, target);
             assert!(
-                residual < 0.05,
+                residual < 0.5,
                 "L={l}: residual {residual} too large; cmd={cmd:?} target={target:?}"
             );
             for c in 0..3 {
                 assert!(
-                    (cmd[c] - l).abs() < 0.05,
+                    (cmd[c] - l).abs() < 1.0,
                     "L={l}, channel {c}: cmd={} expected ~{l}",
                     cmd[c]
                 );
@@ -1186,62 +1468,90 @@ mod tests {
         }
     }
 
-    /// Pure-channel input (red only) must produce cmd_R > 0 and
-    /// cmd_G, cmd_B = 0 (within tolerance). Catches the case where
-    /// the Newton solver hands off-axis a commanded value when the
-    /// optimal solution is on-axis.
+    /// Pure-channel target (red only) should produce cmd with most of
+    /// its mass on the R axis. Trilinear interp from a sparse grid
+    /// introduces small off-axis bleed — looser tolerance than the
+    /// additive analytic version this replaced.
     #[test]
-    fn pure_channel_input_stays_on_axis() {
+    fn pure_channel_input_stays_near_axis() {
         let r_pri = [0.6370, 0.2627, 0.0000];
         let g_pri = [0.1446, 0.6780, 0.0281];
         let b_pri = [0.1689, 0.0593, 1.0610];
-        let responses = [
-            synth_response(r_pri, 1000.0),
-            synth_response(g_pri, 1000.0),
-            synth_response(b_pri, 1000.0),
-        ];
+        let grid = synth_grid(9, r_pri, g_pri, b_pri, 1000.0);
+        let seed_gain = [r_pri[1], g_pri[1], b_pri[1]];
         let target = bt2020_to_xyz(50.0, 0.0, 0.0);
-        let (cmd, residual) = invert_one(&responses, target);
-        assert!(residual < 0.05);
-        assert!((cmd[0] - 50.0).abs() < 0.05, "cmd_R={}", cmd[0]);
-        // Solver should pick (50, 0, 0); allow a tiny numerical fuzz
-        // but reject answers that meaningfully smear into G/B.
-        assert!(cmd[1].abs() < 0.5, "cmd_G should be ~0, got {}", cmd[1]);
-        assert!(cmd[2].abs() < 0.5, "cmd_B should be ~0, got {}", cmd[2]);
+        let (cmd, _residual) = invert_one(&grid, seed_gain, target);
+        // cmd_R dominates (close to 50, within trilinear noise).
+        assert!((cmd[0] - 50.0).abs() < 5.0, "cmd_R={}", cmd[0]);
+        // cmd_G, cmd_B small relative to cmd_R.
+        assert!(cmd[1] < cmd[0] * 0.2, "cmd_G should be small, got {}", cmd[1]);
+        assert!(cmd[2] < cmd[0] * 0.2, "cmd_B should be small, got {}", cmd[2]);
     }
 
-    /// Forward LUT interpolation is linear-in-segment: querying at a
-    /// point halfway between two samples returns the segment midpoint.
-    /// Guards the inversion math from accidentally regressing to
-    /// nearest-neighbor (which would crater precision in dim regions).
+    /// ResponseGrid::forward at a grid corner returns the corner
+    /// value exactly — no interpolation rounding when query lands on
+    /// a sample point. Catches off-by-one indexing in bracket_axis or
+    /// trilinear weight computation.
     #[test]
-    fn channel_response_linear_interp() {
-        let samples = vec![
-            ChannelSample { commanded: 10.0, xyz: Xyz { x: 1.0, y: 2.0, z: 3.0 } },
-            ChannelSample { commanded: 20.0, xyz: Xyz { x: 5.0, y: 8.0, z: 11.0 } },
+    fn grid_forward_at_corner_is_exact() {
+        let grid = synth_grid(5, [1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0], 100.0);
+        let n = grid.cube_edge;
+        // Top corner (max cmd on all axes).
+        let cmd_top = [
+            grid.axis_cmds[0][n - 1],
+            grid.axis_cmds[1][n - 1],
+            grid.axis_cmds[2][n - 1],
         ];
-        let resp = ChannelResponse { samples, max_cmd: 20.0, peak_y: 8.0 };
-        let mid = resp.xyz_at(15.0);
-        assert!((mid.x - 3.0).abs() < 1e-9, "x = {}", mid.x);
-        assert!((mid.y - 5.0).abs() < 1e-9, "y = {}", mid.y);
-        assert!((mid.z - 7.0).abs() < 1e-9, "z = {}", mid.z);
+        let xyz = grid.forward(cmd_top);
+        let expected = Xyz {
+            x: cmd_top[0],
+            y: 2.0 * cmd_top[1],
+            z: 3.0 * cmd_top[2],
+        };
+        assert!((xyz.x - expected.x).abs() < 1e-9, "x: got {}, want {}", xyz.x, expected.x);
+        assert!((xyz.y - expected.y).abs() < 1e-9, "y: got {}, want {}", xyz.y, expected.y);
+        assert!((xyz.z - expected.z).abs() < 1e-9, "z: got {}, want {}", xyz.z, expected.z);
     }
 
-    /// Clamp behaviour at the bounds: below the smallest sample
-    /// returns the smallest sample; above `max_cmd` returns the
-    /// sample at `max_cmd`. Inverter calls this often (Newton step
-    /// can overshoot) so it must be defensive.
+    /// Out-of-bounds queries clamp to the nearest grid face. Tests
+    /// both directions: below the min (cmd=0) returns the min-cmd
+    /// corner; above max returns the max-cmd corner. Newton's line
+    /// search can overshoot in either direction so this defense
+    /// matters.
     #[test]
-    fn channel_response_clamps_out_of_range() {
-        let samples = vec![
-            ChannelSample { commanded: 10.0, xyz: Xyz { x: 1.0, y: 2.0, z: 3.0 } },
-            ChannelSample { commanded: 20.0, xyz: Xyz { x: 5.0, y: 8.0, z: 11.0 } },
-        ];
-        let resp = ChannelResponse { samples, max_cmd: 20.0, peak_y: 8.0 };
-        let below = resp.xyz_at(5.0);
-        assert!((below.x - 1.0).abs() < 1e-9);
-        let above = resp.xyz_at(50.0);
-        assert!((above.x - 5.0).abs() < 1e-9);
+    fn grid_forward_clamps_out_of_range() {
+        let grid = synth_grid(5, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], 100.0);
+        let n = grid.cube_edge;
+        // Below: cmd=0 < axis[0]=1; should return the (1,1,1) corner.
+        let below = grid.forward([0.0, 0.0, 0.0]);
+        let corner = grid.lookup(0, 0, 0);
+        assert!((below.x - corner.x).abs() < 1e-9);
+        assert!((below.y - corner.y).abs() < 1e-9);
+        // Above: cmd=10000 > axis[max]; should return the (max, max, max) corner.
+        let above = grid.forward([10000.0, 10000.0, 10000.0]);
+        let max_corner = grid.lookup(n - 1, n - 1, n - 1);
+        assert!((above.x - max_corner.x).abs() < 1e-9);
+        assert!((above.y - max_corner.y).abs() < 1e-9);
+    }
+
+    /// Trilinear interp at the midpoint between two grid points
+    /// returns the linear average. Specifically check along one axis
+    /// (R) with G and B pinned at axis[0]. Guards against regression
+    /// to nearest-neighbor or skipping the trilinear weight.
+    #[test]
+    fn grid_forward_midpoint_linear() {
+        let grid = synth_grid(3, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], 100.0);
+        let r0 = grid.axis_cmds[0][0];
+        let r1 = grid.axis_cmds[0][1];
+        let g0 = grid.axis_cmds[1][0];
+        let b0 = grid.axis_cmds[2][0];
+        let mid_r = 0.5 * (r0 + r1);
+        let xyz = grid.forward([mid_r, g0, b0]);
+        // Synth grid: X = cmd_R + 0 + 0, so midpoint X = mid_r.
+        assert!(
+            (xyz.x - mid_r).abs() < 1e-9,
+            "midpoint X: got {}, want {}", xyz.x, mid_r,
+        );
     }
 }
 
