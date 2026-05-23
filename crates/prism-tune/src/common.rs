@@ -56,6 +56,49 @@ pub struct OutputBaseline {
     pub initial_panel_peak_nits: [f64; 3],
     /// Pre-existing response curve, if any. Reported for context.
     pub initial_response_curve: Option<([f64; 3], [f64; 3])>,
+    /// EDID make ("Unknown" if absent). Mirrors `prism_ipc::Output.make`.
+    pub make: Option<String>,
+    /// EDID model ("Unknown" if absent).
+    pub model: Option<String>,
+    /// EDID serial number ("Display Product Serial Number" descriptor).
+    pub serial: Option<String>,
+}
+
+impl OutputBaseline {
+    /// EDID-derived identifier in the same shape `OutputName::matches`
+    /// accepts: `"<Make> <Model> <Serial>"`. Returns `None` when any
+    /// of the three is missing — without all three the identifier
+    /// can't promise to pick out a single physical unit (multiple
+    /// monitors of the same model would all match), and callers
+    /// should fall back to the connector name.
+    pub fn edid_identifier(&self) -> Option<String> {
+        let make = self.make.as_deref()?;
+        let model = self.model.as_deref()?;
+        let serial = self.serial.as_deref()?;
+        Some(format!("{make} {model} {serial}"))
+    }
+
+    /// Filesystem-safe variant of [`Self::edid_identifier`]. Spaces
+    /// become dashes; path-unsafe chars become underscores. Suitable
+    /// as a filename stem across Linux/macOS/Windows. Returns `None`
+    /// when [`Self::edid_identifier`] does.
+    pub fn edid_filename_stem(&self) -> Option<String> {
+        self.edid_identifier().map(|s| sanitize_for_filename(&s))
+    }
+}
+
+/// Replace whitespace with `-` and path-unsafe characters with `_`.
+/// Lossy but predictable — two distinct EDID strings can't collide
+/// unless they were textually identical to begin with.
+pub fn sanitize_for_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            ' ' | '\t' => '-',
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect()
 }
 
 /// Query the prism IPC for the named output's current color state.
@@ -83,11 +126,20 @@ pub fn query_output_baseline(name: &str) -> Result<OutputBaseline> {
         ctm: _,
     } = output.color;
     let initial_response_curve = response_curve.map(|c| (c.gain, c.gamma));
+    // "Unknown" is prism IPC's sentinel for "EDID didn't carry this
+    // field" — strip it out so `edid_identifier` returns None rather
+    // than synthesizing a useless "Unknown Unknown Unknown" string.
+    let make = (output.make != "Unknown").then(|| output.make.clone());
+    let model = (output.model != "Unknown").then(|| output.model.clone());
+    let serial = output.serial.clone();
     Ok(OutputBaseline {
         hdr_active,
         sdr_reference_nits,
         initial_panel_peak_nits: panel_peak_nits,
         initial_response_curve,
+        make,
+        model,
+        serial,
     })
 }
 

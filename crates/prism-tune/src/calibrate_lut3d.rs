@@ -50,8 +50,8 @@ use tristim_driver::{Colorimeter, Xyz, measurement::raw_to_xyz};
 
 use crate::common::{
     Channel, OutputBaseline, apply_border, apply_panel_peaks, open_patch_surface,
-    query_output_baseline, send_action, send_action_for_reply, set_channel_patch, set_patch_off,
-    set_rgb_patch, set_white_patch, show_alignment_patch,
+    query_output_baseline, sanitize_for_filename, send_action, send_action_for_reply,
+    set_channel_patch, set_patch_off, set_rgb_patch, set_white_patch, show_alignment_patch,
 };
 use prism_ipc::Response;
 use tristim_display::PatchSurface;
@@ -699,9 +699,17 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     ];
 
     // ─── Phase 4: write LUT + restore ─────────────────────────────────────
+    // Default filename: derive from EDID (Make-Model-Serial) so the
+    // file follows the physical monitor across port re-plugs.
+    // Re-calibrations of the same unit overwrite cleanly. Fall back
+    // to the connector name when EDID is missing any of make/model/
+    // serial — without all three the identifier can't promise to
+    // pick out a single unit.
     let lut_path = args.lut_path.clone().unwrap_or_else(|| {
-        let safe = args.output.replace('/', "_");
-        PathBuf::from(format!("prism-calibrate-lut3d-{safe}.lut"))
+        let stem = baseline
+            .edid_filename_stem()
+            .unwrap_or_else(|| sanitize_for_filename(&args.output));
+        PathBuf::from(format!("prism-calibrate-lut3d-{stem}.lut"))
     });
     save_lut3d_file(&lut_path, args.cube_edge, peak_nits, black_point_f32, &entries)
         .with_context(|| format!("write LUT file {}", lut_path.display()))?;
@@ -779,7 +787,24 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         eprintln!("        {verdict}");
     }
 
-    print_kdl_block(&args.output, baseline.hdr_active, peak_nits, black_point_f32, &lut_path);
+    // The KDL `output` block name must be one of:
+    //   - the connector (e.g. "DP-4"), OR
+    //   - the EDID-derived `<Make> <Model> <Serial>` triple, which
+    //     `OutputName::matches` accepts on equal terms.
+    // Prefer the EDID form so the calibration follows the monitor
+    // across port changes; fall back to the connector when EDID is
+    // incomplete. Also surface the alternative so the user can pick.
+    let edid_id = baseline.edid_identifier();
+    let kdl_name = edid_id.as_deref().unwrap_or(args.output.as_str());
+    print_kdl_block(
+        kdl_name,
+        &args.output,
+        edid_id.as_deref(),
+        baseline.hdr_active,
+        peak_nits,
+        black_point_f32,
+        &lut_path,
+    );
 
     if !args.keep {
         eprintln!(
@@ -1371,9 +1396,14 @@ fn open_log(
     if args.no_log {
         return Ok(None);
     }
+    // Mirror the LUT filename's EDID-keying so CSV + .lut sit next
+    // to each other with matching stems; fall back to connector name
+    // when EDID is incomplete.
     let path = args.log.clone().unwrap_or_else(|| {
-        let safe = args.output.replace('/', "_");
-        PathBuf::from(format!("prism-calibrate-lut3d-{safe}.csv"))
+        let stem = baseline
+            .edid_filename_stem()
+            .unwrap_or_else(|| sanitize_for_filename(&args.output));
+        PathBuf::from(format!("prism-calibrate-lut3d-{stem}.csv"))
     });
     let file = File::create(&path)
         .with_context(|| format!("create log file {}", path.display()))?;
@@ -1557,7 +1587,9 @@ mod tests {
 }
 
 fn print_kdl_block(
-    output_name: &str,
+    kdl_name: &str,
+    connector: &str,
+    edid_id: Option<&str>,
     hdr_active: bool,
     peaks: [f32; 3],
     black_xyz: [f32; 3],
@@ -1565,14 +1597,26 @@ fn print_kdl_block(
 ) {
     println!();
     println!(
-        "# Measured black floor for {output_name}: X={:.4} Y={:.4} Z={:.4} cd/m²",
+        "# Measured black floor for {connector}: X={:.4} Y={:.4} Z={:.4} cd/m²",
         black_xyz[0], black_xyz[1], black_xyz[2],
     );
     println!(
         "# (carried in the LUT file header; compositor exposes it via OutputContext for tone mapping)",
     );
+    match edid_id {
+        Some(_) => println!(
+            "# Output block keyed by EDID (Make Model Serial) — the calibration\n\
+             # follows the physical monitor if it moves to a different port.\n\
+             # If you prefer port-keyed config, replace the block name with \"{connector}\".",
+        ),
+        None => println!(
+            "# EDID make/model/serial incomplete on this output — block keyed by\n\
+             # connector \"{connector}\". The calibration won't follow the\n\
+             # monitor across port changes; manual update needed if you re-cable.",
+        ),
+    }
     println!("# Paste into the matching output block in your prism config:");
-    println!("output \"{}\" {{", output_name);
+    println!("output \"{}\" {{", kdl_name);
     println!("    color {{");
     if hdr_active {
         println!(
