@@ -25,7 +25,9 @@ pub use encode_synth::{EncodeConfig, EncodeFragment, EncodePushSynth};
 pub use error::{RendererError, Result};
 pub use instance::Instance;
 pub use intermediate::{DEFAULT_INTERMEDIATE_FORMAT, Intermediate, create_view};
-pub use lut3d::{LUT_FORMAT, Lut3dTexture, identity_lut, pq_eotf};
+pub use lut3d::{
+    LUT_FORMAT, Lut3dTexture, identity_lut, pq_eotf, synthesize_lut_from_matrix_curve,
+};
 pub use oneshot::OneshotPool;
 pub use pipeline::decode::{DecodePipeline, DecodePush};
 pub use pipeline::encode::{EncodePipeline, EncodePush};

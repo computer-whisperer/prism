@@ -1149,7 +1149,20 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             }
             breadcrumb(&format!("bringup loop: building OutputContext for {name}"));
             match prism_drm::OutputContext::new(card, device.clone(), pick, &output_config) {
-                Ok(output) => {
+                Ok(mut output) => {
+                    // Bake the KDL `color { ctm … response-curve … }` block
+                    // into the per-output 3D LUT. Failure here means the
+                    // renderer can't accept LUT data (allocator OOM, lost
+                    // device, etc.) — log and continue with whatever the
+                    // identity LUT renders rather than fail the whole
+                    // output, since the bringup just succeeded.
+                    if let Err(e) = output.resynthesize_color_lut() {
+                        tracing::warn!(
+                            connector = %output.connector_name,
+                            "initial color LUT synthesis failed: {e:#} \
+                             (output stays on identity LUT)"
+                        );
+                    }
                     breadcrumb(&format!(
                         "output bringup ok: {} {}x{} on {}",
                         name, output.extent.width, output.extent.height, card.path

@@ -326,16 +326,73 @@ pub fn pq_eotf(v: f32) -> f32 {
 /// `cube_edge = 17` round-trip error peaks near a few percent at very
 /// low luminance; `cube_edge = 33` brings it down to sub-percent.
 pub fn identity_lut(cube_edge: u32) -> Vec<[f32; 3]> {
+    synthesize_lut_from_matrix_curve(cube_edge, None, None)
+}
+
+/// Synthesize a 3D LUT that reproduces the legacy `(CTM, per-channel
+/// gain/gamma curve)` encode chain. The output is what the shader chain
+/// `CalibrationMatrix → PerChannelResponseGainGamma` would have produced
+/// at each grid point, baked once and sampled trilinearly thereafter.
+///
+/// Per grid point `(i, j, k)`:
+/// 1. Decode the PQ coord `(i, j, k) / (N-1)` via [`pq_eotf`] →
+///    `in_nits` (linear BT.2020 nits — the shader's IR domain).
+/// 2. `panel_nits = CTM × in_nits` (CTM stored row-major; identity when
+///    `ctm` is `None`). Per-channel negatives clip to zero — matches
+///    the shader's `max(in, 0)` before the per-channel-response stage.
+/// 3. `commanded = (panel_nits / gain)^(1/gamma)` per channel
+///    (identity when `response_curve` is `None`).
+/// 4. Store `commanded` as the LUT entry.
+///
+/// `None` for both inputs degenerates exactly to [`identity_lut`].
+/// Calibrated LUTs stay in the same units throughout: the encode
+/// pipeline's OutputTransfer fragment is what eventually clamps + PQ-
+/// encodes for scanout, so the LUT output is "commanded nits" in
+/// linear space.
+pub fn synthesize_lut_from_matrix_curve(
+    cube_edge: u32,
+    ctm: Option<[[f32; 3]; 3]>,
+    response_curve: Option<([f32; 3], [f32; 3])>,
+) -> Vec<[f32; 3]> {
     let n = cube_edge as usize;
     let denom = (cube_edge - 1) as f32;
+    let (gain, gamma) = response_curve.unwrap_or(([1.0, 1.0, 1.0], [1.0, 1.0, 1.0]));
+    // Floor matches the shader-side epsilon — guards against gain=0 div
+    // and gamma=0 pow(0).
+    const EPS: f32 = 1.0e-3;
+    let safe_gain = [gain[0].max(EPS), gain[1].max(EPS), gain[2].max(EPS)];
+    let inv_gamma = [
+        1.0 / gamma[0].max(EPS),
+        1.0 / gamma[1].max(EPS),
+        1.0 / gamma[2].max(EPS),
+    ];
+
     let mut out = Vec::with_capacity(n * n * n);
+    // Iteration order is X-fastest then Y then Z — matches how the
+    // Vulkan 3D image walks memory and what Lut3dTexture::upload expects.
     for k in 0..n {
         let bz = pq_eotf(k as f32 / denom);
         for j in 0..n {
             let g = pq_eotf(j as f32 / denom);
             for i in 0..n {
                 let r = pq_eotf(i as f32 / denom);
-                out.push([r, g, bz]);
+                let in_nits = [r, g, bz];
+
+                // CTM: panel_nits = M × in_nits (row-major).
+                let mut panel = match ctm {
+                    Some(m) => [
+                        m[0][0] * in_nits[0] + m[0][1] * in_nits[1] + m[0][2] * in_nits[2],
+                        m[1][0] * in_nits[0] + m[1][1] * in_nits[1] + m[1][2] * in_nits[2],
+                        m[2][0] * in_nits[0] + m[2][1] * in_nits[1] + m[2][2] * in_nits[2],
+                    ],
+                    None => in_nits,
+                };
+                // Per-channel inverse response: commanded = (max(panel,0) / gain)^(1/gamma).
+                for c in 0..3 {
+                    let p = panel[c].max(0.0);
+                    panel[c] = (p / safe_gain[c]).powf(inv_gamma[c]);
+                }
+                out.push(panel);
             }
         }
     }
@@ -431,5 +488,91 @@ mod tests {
             assert!(lut[idx][1].abs() < 1e-3, "y at (i, 0, 0) should be 0");
             assert!(lut[idx][2].abs() < 1e-3, "z at (i, 0, 0) should be 0");
         }
+    }
+
+    /// Synthesis with no calibration is bit-equivalent to the identity
+    /// LUT — both code paths must agree so removing one doesn't break the
+    /// other.
+    #[test]
+    fn synthesis_no_calibration_equals_identity() {
+        let n = 9u32;
+        let synth = synthesize_lut_from_matrix_curve(n, None, None);
+        let ident = identity_lut(n);
+        assert_eq!(synth.len(), ident.len());
+        for (i, (s, idn)) in synth.iter().zip(ident.iter()).enumerate() {
+            for c in 0..3 {
+                assert!(
+                    (s[c] - idn[c]).abs() < 1e-6,
+                    "diff at idx {i} ch {c}: synth={} identity={}",
+                    s[c], idn[c],
+                );
+            }
+        }
+    }
+
+    /// Synthesis matches the legacy shader chain for a sample DP-4
+    /// calibration: at any grid point, the LUT entry equals what
+    /// `(CTM × pq_eotf(coord))_+ then (in/gain)^(1/gamma)` would
+    /// produce. Test point picked to exercise CTM off-diagonals and
+    /// non-identity curve.
+    #[test]
+    fn synthesis_matches_analytical_chain() {
+        // From a recent DP-4 calibration run.
+        let ctm = Some([
+            [0.303636, -0.083659, -0.002953],
+            [-0.040053, 0.774200, -0.042934],
+            [-0.000884, -0.012542, 0.105189],
+        ]);
+        let curve = Some(([0.0781f32, 0.1814, 0.0326], [1.0754f32, 1.0759, 1.0330]));
+        let n = 9u32;
+        let lut = synthesize_lut_from_matrix_curve(n, ctm, curve);
+
+        // Spot-check the (4, 4, 4) grid point — well inside the cube so
+        // all three channels see non-trivial CTM contributions.
+        let denom = (n - 1) as f32;
+        let coord = 4.0 / denom;
+        let in_nits = [pq_eotf(coord); 3];
+        let m = ctm.unwrap();
+        let panel = [
+            m[0][0] * in_nits[0] + m[0][1] * in_nits[1] + m[0][2] * in_nits[2],
+            m[1][0] * in_nits[0] + m[1][1] * in_nits[1] + m[1][2] * in_nits[2],
+            m[2][0] * in_nits[0] + m[2][1] * in_nits[1] + m[2][2] * in_nits[2],
+        ];
+        let (gain, gamma) = curve.unwrap();
+        let expected = [
+            (panel[0].max(0.0) / gain[0]).powf(1.0 / gamma[0]),
+            (panel[1].max(0.0) / gain[1]).powf(1.0 / gamma[1]),
+            (panel[2].max(0.0) / gain[2]).powf(1.0 / gamma[2]),
+        ];
+        let idx = ((4 * n as usize) + 4) * n as usize + 4; // X-fastest
+        for c in 0..3 {
+            assert!(
+                (lut[idx][c] - expected[c]).abs() < 1e-4,
+                "ch {c}: lut={} expected={}",
+                lut[idx][c], expected[c]
+            );
+        }
+    }
+
+    /// Negative CTM outputs clip to zero before the per-channel curve —
+    /// mirrors the shader's `max(in, 0)` clamp. Without this, the curve's
+    /// `pow(negative, fractional)` would produce NaN entries.
+    #[test]
+    fn synthesis_clips_negative_ctm_outputs() {
+        // CTM that maps positive R input to negative G and B (contrived).
+        let ctm = Some([
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+        ]);
+        let curve = Some(([0.5f32, 0.5, 0.5], [1.2f32, 1.2, 1.2]));
+        let lut = synthesize_lut_from_matrix_curve(9, ctm, curve);
+        // Grid point (4, 0, 0): R input > 0, so G/B CTM outputs are negative.
+        let idx = 4; // (i=4, j=0, k=0) with X-fastest
+        // R should be positive (positive CTM diagonal, positive input).
+        assert!(lut[idx][0] > 0.0, "R should not be zero");
+        // G and B clipped to zero before curve → curve(0) = 0.
+        assert!(lut[idx][1].abs() < 1e-6, "G expected 0, got {}", lut[idx][1]);
+        assert!(lut[idx][2].abs() < 1e-6, "B expected 0, got {}", lut[idx][2]);
     }
 }

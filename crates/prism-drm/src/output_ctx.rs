@@ -26,7 +26,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use drm_fourcc::DrmModifier;
 use prism_renderer::{
-    Device, DrmDevId, ElementDraw, EncodePush, ImportedImage, Renderer, vk,
+    Device, DrmDevId, ElementDraw, EncodePush, ImportedImage, Renderer,
+    synthesize_lut_from_matrix_curve, vk,
 };
 use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneState};
 use smithay::reexports::drm::control::{Mode, connector, crtc, framebuffer};
@@ -393,6 +394,30 @@ impl OutputContext {
     /// = identity (no gamut correction in the encode shader).
     pub fn effective_ctm(&self) -> Option<[[f32; 3]; 3]> {
         self.color_override.ctm.or(self.config.ctm)
+    }
+
+    /// Rebuild this output's 3D LUT from the legacy `(CTM, response curve)`
+    /// representation. Called at bringup and whenever an IPC handler
+    /// mutates `color_override`'s CTM / response-curve / panel-peak
+    /// fields. The shader chain reads only the LUT, so this is what
+    /// makes calibration actually visible.
+    ///
+    /// No-op when the renderer's encode chain doesn't include
+    /// `EncodeFragment::Lut3d` (e.g. legacy chains kept for tests) —
+    /// detected via `lut3d_cube_edge() == 0`.
+    pub fn resynthesize_color_lut(&mut self) -> Result<()> {
+        let cube_edge = self.renderer.lut3d_cube_edge();
+        if cube_edge == 0 {
+            return Ok(());
+        }
+        let entries = synthesize_lut_from_matrix_curve(
+            cube_edge,
+            self.effective_ctm(),
+            self.effective_response_curve(),
+        );
+        self.renderer
+            .upload_lut3d(&entries)
+            .context("upload synthesized color LUT")
     }
 
     /// Effective per-channel panel-NATIVE peak nits (i.e. the peak

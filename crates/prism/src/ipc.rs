@@ -234,6 +234,11 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
     };
 
     let output_ctx = state.outputs.get_mut(&output_id).expect("just found above");
+    // Track whether this mutation changed something the per-output 3D LUT
+    // depends on. CTM and response-curve obviously do; SdrReferenceNits +
+    // PanelPeakNits affect the encode pipeline elsewhere (target_peak +
+    // decode clamp) but not LUT *contents*, so they skip the re-synthesis.
+    let mut lut_dirty = false;
     match action {
         OutputAction::SdrReferenceNits { nits } => {
             let v = (nits.clamp(1.0, 10_000.0)) as f32;
@@ -261,6 +266,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                 gamma = ?[y_r, y_g, y_b],
                 "ipc: set response-curve override"
             );
+            lut_dirty = true;
         }
         OutputAction::PanelPeakNits {
             nits_r,
@@ -302,6 +308,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                 ctm = ?m,
                 "ipc: set ctm override"
             );
+            lut_dirty = true;
         }
         OutputAction::ResetColor => {
             output_ctx.color_override = prism_drm::ColorOverride::default();
@@ -314,11 +321,25 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                     "color reset applied but HDR infoframe rebuild failed: {e:#}"
                 );
             }
+            lut_dirty = true;
         }
         other => {
             return Err(format!(
                 "OutputAction {other:?} is not implemented in this build"
             ));
+        }
+    }
+
+    // CTM / response-curve / reset all change what the LUT should hold;
+    // re-synthesize from the new effective values. Failure is logged but
+    // doesn't bubble — keeping the previous LUT is the least-surprising
+    // fallback (calibration just doesn't update this round).
+    if lut_dirty {
+        if let Err(e) = output_ctx.resynthesize_color_lut() {
+            tracing::warn!(
+                connector = %name,
+                "color LUT re-synthesis failed: {e:#} (LUT keeps previous content)"
+            );
         }
     }
 
