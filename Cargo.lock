@@ -1330,6 +1330,7 @@ dependencies = [
  "anyhow",
  "clap",
  "prism-ipc",
+ "prism-renderer",
  "serde_json",
  "tristim-display",
  "tristim-driver",

@@ -25,6 +25,7 @@
 //! ```
 
 mod calibrate;
+mod calibrate_lut3d;
 mod characterize;
 mod common;
 
@@ -53,6 +54,14 @@ enum TopCommand {
     /// (panel-peak-nits for HDR, response-curve always) as a paste-
     /// ready KDL block.
     Calibrate(calibrate::CalibrateArgs),
+    /// Measurement-driven 3D LUT calibration. Sweeps each channel
+    /// independently to capture the panel's actual `commanded → XYZ`
+    /// response (no closed-form fit), then numerically inverts to
+    /// produce a per-output 3D LUT. Writes a binary `.lut` file plus a
+    /// paste-ready KDL snippet referencing it. Use when the closed-form
+    /// `(gain, gamma)` model from `calibrate` doesn't reproduce
+    /// white-point on a panel with intensity-dependent primaries.
+    CalibrateLut3d(calibrate_lut3d::CalibrateLut3dArgs),
     /// Raw response-curve characterization — sweep a channel across a
     /// range of commanded values, log XYZ per sample. Diagnostic
     /// (no fitting, no compositor writes). Use to investigate panel
@@ -86,6 +95,7 @@ fn main() -> Result<()> {
     match cli.command {
         TopCommand::Msg(cmd) => run_msg(cmd),
         TopCommand::Calibrate(args) => calibrate::run(args),
+        TopCommand::CalibrateLut3d(args) => calibrate_lut3d::run(args),
         TopCommand::Characterize(args) => characterize::run(args),
     }
 }
