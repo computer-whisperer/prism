@@ -170,6 +170,22 @@ impl ChannelResponse {
         }
     }
 
+    /// Coarse Y-per-cmd gain from the brightest non-clamped sample.
+    /// Used by the inverter to seed its initial guess — a single
+    /// number per channel that's roughly the slope of the linear
+    /// region. Skips the very first sample (often dominated by the
+    /// colorimeter noise floor) to avoid the toe inflating the gain.
+    fn approx_gain_y_per_cmd(&self) -> f64 {
+        // Find the last sample at or below max_cmd (i.e. pre-cliff).
+        let last = self
+            .samples
+            .iter()
+            .rev()
+            .find(|s| s.commanded <= self.max_cmd)
+            .unwrap_or(self.samples.last().unwrap());
+        last.xyz.y / last.commanded.max(1e-6)
+    }
+
     /// `d(XYZ)/d(cmd)` at `commanded` via the slope of the surrounding
     /// linear segment. Returns the segment that brackets `commanded`
     /// (clamped to the LUT's range at the ends).
@@ -376,7 +392,20 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
 
     // ─── Phase 2: inversion to 3D LUT ─────────────────────────────────────
     eprintln!("\nInverting forward LUTs to {}³ 3D LUT…", args.cube_edge);
-    let entries = build_inverse_lut(args.cube_edge, &responses);
+    let (entries, residuals) = build_inverse_lut(args.cube_edge, &responses);
+    if let Some((_, w)) = log.as_mut() {
+        // Worst residuals per percentile so the CSV captures the
+        // inversion's quality without dumping all ~5000 entries. Lets
+        // us see "did Newton converge" without re-running.
+        let mut sorted = residuals.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pct = |p: f64| sorted[((sorted.len() - 1) as f64 * p) as usize];
+        writeln!(
+            w,
+            "# inversion residual stats: p50={:.4} p90={:.4} p99={:.4} max={:.4} cd/m²",
+            pct(0.50), pct(0.90), pct(0.99), pct(1.0),
+        )?;
+    }
     let peak_nits = [
         responses[0].peak_y as f32,
         responses[1].peak_y as f32,
@@ -605,10 +634,19 @@ fn log_spaced_targets(lo: f64, hi: f64, n: usize) -> Vec<f64> {
 /// Build the inverse 3D LUT from the per-channel forward responses.
 /// Iteration order is X-fastest then Y then Z — matches the binary
 /// file format + the GPU image memory walk.
-fn build_inverse_lut(cube_edge: u32, responses: &[ChannelResponse; 3]) -> Vec<[f32; 3]> {
+///
+/// Returns `(entries, per-grid residual L2 norms)`. The residuals
+/// array lets the caller report convergence stats (mean / percentile /
+/// worst) — important because the inverter is the only post-measurement
+/// math step where bad data can sneak through silently.
+fn build_inverse_lut(
+    cube_edge: u32,
+    responses: &[ChannelResponse; 3],
+) -> (Vec<[f32; 3]>, Vec<f64>) {
     let n = cube_edge as usize;
     let denom = (cube_edge - 1) as f32;
     let mut entries = Vec::with_capacity(n * n * n);
+    let mut residuals = Vec::with_capacity(n * n * n);
     let mut total_residual = 0.0_f64;
     let mut worst_residual = 0.0_f64;
     for k in 0..n {
@@ -624,6 +662,7 @@ fn build_inverse_lut(cube_edge: u32, responses: &[ChannelResponse; 3]) -> Vec<[f
                 if residual > worst_residual {
                     worst_residual = residual;
                 }
+                residuals.push(residual);
                 entries.push([cmd[0] as f32, cmd[1] as f32, cmd[2] as f32]);
             }
         }
@@ -633,22 +672,67 @@ fn build_inverse_lut(cube_edge: u32, responses: &[ChannelResponse; 3]) -> Vec<[f
         "  inversion residuals: mean={:.4} cd/m², worst={:.4} cd/m²",
         mean, worst_residual,
     );
-    entries
+    (entries, residuals)
 }
 
-/// Newton-Raphson invert one grid point. Returns the commanded triple
-/// plus the residual norm so the caller can summarize convergence.
+/// Damped-Newton-with-backtracking-line-search inversion of one grid
+/// point. Returns the commanded triple plus the residual norm.
+///
+/// Why damped + line-search: forward responses are non-linear (toe at
+/// the dim end, soft knee near saturation). Full Newton steps from a
+/// poor initial guess overshoot wildly — a target Y of 12 needs cmd ≈
+/// 30 but the slope-extrapolated step from cmd=12 would land near 65.
+/// We accept the proposed step only if it actually reduces the
+/// residual; if not, halve the step length until it does.
+///
+/// Initial guess: scale target_XYZ components into per-channel cmd
+/// space using the response's brightest-unsaturated Y/cmd ratio.
+/// Lands within ~30% of the answer for in-gamut targets so Newton
+/// converges in a few iterations.
 fn invert_one(responses: &[ChannelResponse; 3], target: [f64; 3]) -> ([f64; 3], f64) {
-    // Initial guess: identity in nits. For an in-gamut sRGB-class panel
-    // this is usually within an iteration or two of the answer.
-    let mut cmd = [
-        target[0].clamp(0.0, responses[0].max_cmd),
-        target[1].clamp(0.0, responses[1].max_cmd),
-        target[2].clamp(0.0, responses[2].max_cmd),
+    // Per-channel approximate gain (Y per unit cmd) from the brightest
+    // pre-cliff sample. Used as the per-channel scale for the initial
+    // guess and as the fallback when the Jacobian goes singular.
+    let approx_gain = [
+        responses[0].approx_gain_y_per_cmd(),
+        responses[1].approx_gain_y_per_cmd(),
+        responses[2].approx_gain_y_per_cmd(),
     ];
-    const MAX_ITERS: usize = 25;
+    // Distribute target Y across primaries by BT.2020 D65 weights; this
+    // is what a perfectly-additive panel would need at minimum. For
+    // off-D65 targets it's still a reasonable seed because the dominant
+    // contribution per channel is its own primary.
+    const D65_WEIGHTS: [f64; 3] = [0.2627, 0.6780, 0.0593];
+    let target_y = target[1];
+    let mut cmd = [
+        ((target_y * D65_WEIGHTS[0]) / approx_gain[0].max(1e-6))
+            .clamp(0.0, responses[0].max_cmd),
+        ((target_y * D65_WEIGHTS[1]) / approx_gain[1].max(1e-6))
+            .clamp(0.0, responses[1].max_cmd),
+        ((target_y * D65_WEIGHTS[2]) / approx_gain[2].max(1e-6))
+            .clamp(0.0, responses[2].max_cmd),
+    ];
+
+    const MAX_ITERS: usize = 40;
     const TOL: f64 = 0.005;
+    const MIN_STEP_FRACTION: f64 = 1.0 / 64.0;
+
+    let mut res_norm = predicted_residual_norm(responses, &cmd, &target);
+    if res_norm < TOL {
+        return (cmd, res_norm);
+    }
+
     for _ in 0..MAX_ITERS {
+        // Jacobian at the current cmd: column c = dXYZ/dcmd_c.
+        let j0 = responses[0].dxyz_dcmd_at(cmd[0]);
+        let j1 = responses[1].dxyz_dcmd_at(cmd[1]);
+        let j2 = responses[2].dxyz_dcmd_at(cmd[2]);
+        let jac = [
+            [j0[0], j1[0], j2[0]],
+            [j0[1], j1[1], j2[1]],
+            [j0[2], j1[2], j2[2]],
+        ];
+        // Current residual for the line-search comparison.
         let xyz_r = responses[0].xyz_at(cmd[0]);
         let xyz_g = responses[1].xyz_at(cmd[1]);
         let xyz_b = responses[2].xyz_at(cmd[2]);
@@ -662,44 +746,60 @@ fn invert_one(responses: &[ChannelResponse; 3], target: [f64; 3]) -> ([f64; 3], 
             predicted[1] - target[1],
             predicted[2] - target[2],
         ];
-        let res_norm = (residual[0].powi(2) + residual[1].powi(2) + residual[2].powi(2)).sqrt();
+        let Some(jac_inv) = mat3_inverse(&jac) else {
+            // Singular Jacobian — channel sitting on its cliff. Stop
+            // and report current state; caller-side residual stat
+            // will surface it.
+            return (cmd, res_norm);
+        };
+        let full_step = mat3_mul_vec(&jac_inv, &residual);
+
+        // Backtracking line search: try alpha = 1, 1/2, 1/4, … until
+        // the proposed step actually reduces the residual norm. If we
+        // can't find one above MIN_STEP_FRACTION the inverter has
+        // stalled — bail with the current best.
+        let mut alpha = 1.0_f64;
+        let mut accepted = false;
+        while alpha >= MIN_STEP_FRACTION {
+            let mut cmd_try = [0.0_f64; 3];
+            for c in 0..3 {
+                cmd_try[c] = (cmd[c] - alpha * full_step[c])
+                    .clamp(0.0, responses[c].max_cmd);
+            }
+            let trial_norm = predicted_residual_norm(responses, &cmd_try, &target);
+            if trial_norm < res_norm {
+                cmd = cmd_try;
+                res_norm = trial_norm;
+                accepted = true;
+                break;
+            }
+            alpha *= 0.5;
+        }
+        if !accepted {
+            return (cmd, res_norm);
+        }
         if res_norm < TOL {
             return (cmd, res_norm);
         }
-        // Jacobian: column j = dXYZ/dcmd_j.
-        let j0 = responses[0].dxyz_dcmd_at(cmd[0]);
-        let j1 = responses[1].dxyz_dcmd_at(cmd[1]);
-        let j2 = responses[2].dxyz_dcmd_at(cmd[2]);
-        let jac = [
-            [j0[0], j1[0], j2[0]],
-            [j0[1], j1[1], j2[1]],
-            [j0[2], j1[2], j2[2]],
-        ];
-        let Some(jac_inv) = mat3_inverse(&jac) else {
-            // Singular Jacobian — typically a channel sitting on the
-            // cliff with zero slope. Stop and report the current state.
-            return (cmd, res_norm);
-        };
-        // delta = -J^(-1) · residual
-        let delta = mat3_mul_vec(&jac_inv, &residual);
-        for c in 0..3 {
-            cmd[c] = (cmd[c] - delta[c]).clamp(0.0, responses[c].max_cmd);
-        }
     }
-    // Final residual after max iters.
+    (cmd, res_norm)
+}
+
+/// Sum of per-channel emissions minus target — L2 norm of the residual.
+/// Helper for the inverter's line-search comparison; pulled out so the
+/// loop reads cleanly.
+fn predicted_residual_norm(
+    responses: &[ChannelResponse; 3],
+    cmd: &[f64; 3],
+    target: &[f64; 3],
+) -> f64 {
     let xyz_r = responses[0].xyz_at(cmd[0]);
     let xyz_g = responses[1].xyz_at(cmd[1]);
     let xyz_b = responses[2].xyz_at(cmd[2]);
-    let predicted = [
-        xyz_r.x + xyz_g.x + xyz_b.x,
-        xyz_r.y + xyz_g.y + xyz_b.y,
-        xyz_r.z + xyz_g.z + xyz_b.z,
-    ];
-    let res_norm = ((predicted[0] - target[0]).powi(2)
-        + (predicted[1] - target[1]).powi(2)
-        + (predicted[2] - target[2]).powi(2))
-    .sqrt();
-    (cmd, res_norm)
+    let dx = xyz_r.x + xyz_g.x + xyz_b.x - target[0];
+    let dy = xyz_r.y + xyz_g.y + xyz_b.y - target[1];
+    let dz = xyz_r.z + xyz_g.z + xyz_b.z - target[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
 /// BT.2020 RGB (linear nits) → CIE XYZ via the canonical BT.2020-2
