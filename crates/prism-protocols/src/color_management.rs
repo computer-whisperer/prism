@@ -44,6 +44,7 @@ use smithay::reexports::wayland_protocols::wp::color_management::v1::server::{
     wp_image_description_creator_params_v1::{
         self, WpImageDescriptionCreatorParamsV1,
     },
+    wp_image_description_info_v1::WpImageDescriptionInfoV1,
     wp_image_description_v1::{self, WpImageDescriptionV1},
 };
 use smithay::reexports::wayland_server::{
@@ -318,6 +319,18 @@ pub struct ColorManagementState {
     output_preferred: std::sync::Mutex<
         std::collections::HashMap<crate::state::OutputId, Arc<ImageDescription>>,
     >,
+    /// `wp_image_description_info_v1` resources whose info events have
+    /// been emitted but whose terminating `done()` is pending.
+    ///
+    /// `done` is a **destructor event** — calling it synchronously
+    /// frees the resource's user data under `wayland-backend`, and
+    /// since the resource was just created in this same dispatch turn
+    /// the dispatcher's post-call code (`mod.rs:1651`) then writes
+    /// into freed memory → use-after-free → SIGSEGV. We avoid the
+    /// race by queuing the resource here from the request handler and
+    /// draining (calling `done()` on each) after the dispatch returns,
+    /// from the main loop (see [`Self::drain_pending_info_done`]).
+    pending_info_done: std::sync::Mutex<Vec<WpImageDescriptionInfoV1>>,
 }
 
 impl ColorManagementState {
@@ -328,6 +341,7 @@ impl ColorManagementState {
         Self {
             next_identity: AtomicU64::new(1),
             output_preferred: std::sync::Mutex::new(Default::default()),
+            pending_info_done: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -357,6 +371,28 @@ impl ColorManagementState {
         id: &crate::state::OutputId,
     ) -> Option<Arc<ImageDescription>> {
         self.output_preferred.lock().unwrap().get(id).cloned()
+    }
+
+    /// Queue a `wp_image_description_info_v1` resource for its
+    /// terminating `done()` event to be sent from the main loop.
+    /// See the field doc on [`Self::pending_info_done`] for why this
+    /// can't be done inline from the request handler.
+    pub fn queue_info_done(&self, info: WpImageDescriptionInfoV1) {
+        self.pending_info_done.lock().unwrap().push(info);
+    }
+
+    /// Send `done()` on every queued info resource and clear the
+    /// queue. Call once per main-loop turn, after wayland dispatch
+    /// returns and before the matching `flush_clients`.
+    pub fn drain_pending_info_done(&self) {
+        // Take the vec while holding the lock briefly, then send
+        // events outside the lock — `done()` calls into libwayland
+        // which may itself dispatch (and re-enter our code), and we
+        // don't want our own lock held across that.
+        let drained = std::mem::take(&mut *self.pending_info_done.lock().unwrap());
+        for info in drained {
+            info.done();
+        }
     }
 }
 
@@ -965,15 +1001,131 @@ fn build_description(
     }))
 }
 
+/// Emit the `wp_image_description_info_v1` event sequence for a
+/// description, per the protocol's `get_information` contract. The
+/// terminating `done()` is NOT sent here — the caller is responsible
+/// for queuing that via [`ColorManagementState::queue_info_done`].
+///
+/// Sends (in spec order):
+///   - `primaries` — always, with explicit chromaticities
+///   - `primaries_named` — when the description used a named set
+///   - `tf_named` — always (we never produce `tf_power` descriptions)
+///   - `luminances` — always, defaulting per the TF when unset
+///   - `target_primaries` — only when mastering primaries differ from
+///     the primary color volume (per spec)
+///   - `target_luminance` — always, defaulting per the TF when unset
+///   - `target_max_cll` / `target_max_fall` — only when set
+fn emit_info_events(info: &WpImageDescriptionInfoV1, desc: &ImageDescription) {
+    let (chroma, named) = match desc.primaries {
+        PrimaryVolume::Named(p) => (chromaticities_for_named(p), Some(p)),
+        PrimaryVolume::Explicit(c) => (c, None),
+    };
+    info.primaries(
+        chroma.r_x, chroma.r_y,
+        chroma.g_x, chroma.g_y,
+        chroma.b_x, chroma.b_y,
+        chroma.w_x, chroma.w_y,
+    );
+    if let Some(p) = named {
+        info.primaries_named(p);
+    }
+
+    info.tf_named(desc.tf);
+
+    let lums = desc
+        .luminances
+        .unwrap_or_else(|| default_luminances_for_tf(desc.tf));
+    info.luminances(lums.min_lum_ticks, lums.max_lum, lums.reference_lum);
+
+    if let Some(target) = desc.mastering_primaries {
+        let equal = target.r_x == chroma.r_x && target.r_y == chroma.r_y
+            && target.g_x == chroma.g_x && target.g_y == chroma.g_y
+            && target.b_x == chroma.b_x && target.b_y == chroma.b_y
+            && target.w_x == chroma.w_x && target.w_y == chroma.w_y;
+        if !equal {
+            info.target_primaries(
+                target.r_x, target.r_y,
+                target.g_x, target.g_y,
+                target.b_x, target.b_y,
+                target.w_x, target.w_y,
+            );
+        }
+    }
+
+    let target_lum = desc.mastering_luminance.unwrap_or_else(|| {
+        let l = default_luminances_for_tf(desc.tf);
+        MasteringLuminance { min_lum_ticks: l.min_lum_ticks, max_lum: l.max_lum }
+    });
+    info.target_luminance(target_lum.min_lum_ticks, target_lum.max_lum);
+
+    if let Some(cll) = desc.max_cll {
+        info.target_max_cll(cll);
+    }
+    if let Some(fall) = desc.max_fall {
+        info.target_max_fall(fall);
+    }
+}
+
+/// CIE 1931 xy chromaticities × 1,000,000 for the named primary sets
+/// we advertise. Values pulled from the standards (BT.709 for sRGB,
+/// BT.2020 for the wide-gamut entry). Unsupported entries fall back
+/// to sRGB — they can't reach here today (only `SUPPORTED_PRIMARIES`
+/// is accepted by the params creator) but the fallback keeps the
+/// helper total for future expansions.
+fn chromaticities_for_named(p: Primaries) -> PrimaryChromaticities {
+    match p {
+        Primaries::Bt2020 => PrimaryChromaticities {
+            r_x: 708_000, r_y: 292_000,
+            g_x: 170_000, g_y: 797_000,
+            b_x: 131_000, b_y: 46_000,
+            w_x: 312_700, w_y: 329_000,
+        },
+        // sRGB / BT.709 + anything we don't have explicit values for.
+        _ => PrimaryChromaticities {
+            r_x: 640_000, r_y: 330_000,
+            g_x: 300_000, g_y: 600_000,
+            b_x: 150_000, b_y: 60_000,
+            w_x: 312_700, w_y: 329_000,
+        },
+    }
+}
+
+/// Spec-defined default luminances for the named TFs we support.
+/// Pulled from the `wp_color_manager_v1.transfer_function` enum and
+/// `set_luminances` request docs in `color-management-v1.xml`.
+fn default_luminances_for_tf(tf: TransferFunction) -> Luminances {
+    match tf {
+        // PQ: 0.005 cd/m² min, 10000 cd/m² max, 203 cd/m² reference.
+        TransferFunction::St2084Pq => Luminances {
+            min_lum_ticks: 50, // 0.005 × 10000
+            max_lum: 10_000,
+            reference_lum: 203,
+        },
+        // BT.1886 per ITU-R BT.2035: 0.01 / 100 / 100.
+        TransferFunction::Bt1886 => Luminances {
+            min_lum_ticks: 100, // 0.01 × 10000
+            max_lum: 100,
+            reference_lum: 100,
+        },
+        // sRGB / Gamma22 / ExtLinear all default to the IEC sRGB
+        // canonical range (0.2 / 80 / 80).
+        _ => Luminances {
+            min_lum_ticks: 2_000, // 0.2 × 10000
+            max_lum: 80,
+            reference_lum: 80,
+        },
+    }
+}
+
 // ─── wp_image_description_v1 ───────────────────────────────────────────────
 
 impl Dispatch<WpImageDescriptionV1, ImageDescriptionData> for PrismState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &WpImageDescriptionV1,
         request: <WpImageDescriptionV1 as Resource>::Request,
-        _data: &ImageDescriptionData,
+        data: &ImageDescriptionData,
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
@@ -981,20 +1133,30 @@ impl Dispatch<WpImageDescriptionV1, ImageDescriptionData> for PrismState {
         match request {
             Request::Destroy => {}
             Request::GetInformation { information } => {
-                // Per spec, descriptions created via the params
-                // creator do NOT allow get_information. Spec doesn't
-                // define a protocol error for this so we init the
-                // resource and immediately send the destructor `done`
-                // (well-behaved clients won't call this).
+                // Per spec, `get_information` MUST emit a defined set
+                // of events followed by `done`. We always init the
+                // info resource (the New<R> can't be dropped) and
+                // emit events when we have a real description backing
+                // this parent. For an inert/failed description we
+                // emit nothing and just enqueue the terminating
+                // `done`, since the protocol object is unusable
+                // anyway and the client shouldn't be querying it.
+                //
+                // `done` is a destructor event and would UAF the
+                // freshly-created resource if sent inline (see
+                // [`ColorManagementState::pending_info_done`]); the
+                // main loop drains the queue after dispatch returns.
                 let info = data_init.init(information, ());
-                info.done();
+                if let Some(desc) = data.description.as_ref() {
+                    emit_info_events(&info, desc);
+                }
+                state.color_management.queue_info_done(info);
             }
             _ => {}
         }
     }
 }
 
-use smithay::reexports::wayland_protocols::wp::color_management::v1::server::wp_image_description_info_v1::WpImageDescriptionInfoV1;
 impl Dispatch<WpImageDescriptionInfoV1, ()> for PrismState {
     fn request(
         _state: &mut Self,

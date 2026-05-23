@@ -266,6 +266,9 @@ fn run_wayland_server() -> Result<()> {
         event_loop
             .dispatch(Some(Duration::from_millis(100)), &mut state)
             .context("event_loop.dispatch")?;
+        // Send deferred destructor events queued during dispatch
+        // (see `ColorManagementState::pending_info_done`).
+        state.color_management.drain_pending_info_done();
         // Flush replies queued during this turn.
         state
             .display_handle
@@ -1493,6 +1496,13 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         event_loop
             .dispatch(Some(Duration::from_millis(100)), &mut state)
             .context("event_loop.dispatch")?;
+
+        // Send the terminating `done()` on any wp_image_description_info_v1
+        // resources whose info events were emitted during dispatch.
+        // `done` is a destructor event and can't be sent inline from
+        // the request handler — see field doc on
+        // `ColorManagementState::pending_info_done`.
+        state.color_management.drain_pending_info_done();
 
         // Advance every running animation (view-offset scrolls,
         // window movement, opening/closing fades, etc.). Without
