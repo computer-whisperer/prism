@@ -285,10 +285,26 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             // Saturation: if Y is no longer increasing meaningfully and
             // we've already taken at least 3 samples, stop early. Catches
             // the cliff without forcing the rest of the sweep through it.
+            //
+            // Guard against false positives at the noise floor: the
+            // Spyder reads ~0.3 cd/m² of ambient even on black, so the
+            // first couple of B samples on a weak-blue panel can show
+            // Y in the [0.3, 0.5] range where consecutive-sample ratios
+            // are pure noise. Requiring BOTH samples to be above 1.0
+            // cd/m² keeps the cliff-detector from triggering on toe-
+            // region wobble — the panel's actual saturation lives well
+            // above 1 nit per channel.
+            const SATURATION_NOISE_FLOOR_Y: f64 = 1.0;
             if let Some(prev) = samples.last() {
                 let ratio = xyz.y / prev.xyz.y.max(0.01);
                 let cmd_ratio = cmd / prev.commanded.max(0.01);
-                if samples.len() >= 3 && cmd_ratio >= 1.2 && ratio < 1.05 {
+                let both_above_floor =
+                    xyz.y > SATURATION_NOISE_FLOOR_Y && prev.xyz.y > SATURATION_NOISE_FLOOR_Y;
+                if samples.len() >= 3
+                    && cmd_ratio >= 1.2
+                    && ratio < 1.05
+                    && both_above_floor
+                {
                     eprintln!(
                         "  {} saturation detected at cmd {:.1} (Y ratio {:.2} vs cmd ratio {:.2}); \
                          stopping sweep early",
