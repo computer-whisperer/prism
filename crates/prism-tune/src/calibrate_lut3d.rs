@@ -394,16 +394,59 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     eprintln!("\nInverting forward LUTs to {}³ 3D LUT…", args.cube_edge);
     let (entries, residuals) = build_inverse_lut(args.cube_edge, &responses);
     if let Some((_, w)) = log.as_mut() {
-        // Worst residuals per percentile so the CSV captures the
-        // inversion's quality without dumping all ~5000 entries. Lets
-        // us see "did Newton converge" without re-running.
-        let mut sorted = residuals.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let pct = |p: f64| sorted[((sorted.len() - 1) as f64 * p) as usize];
+        // Split residual stats by whether the target was in-gamut for
+        // the panel (target_Y ≤ panel total peak). Out-of-gamut grids
+        // always have huge residuals — the inverter clamps cmd to
+        // max_cmd and the panel physically can't reach the target —
+        // so mixing them into the percentile dilutes the signal we
+        // actually care about: "did Newton converge for the points
+        // verify will actually sample?"
+        let panel_total_peak: f64 = responses.iter().map(|r| r.peak_y).sum();
+        let n = args.cube_edge as usize;
+        let denom = (args.cube_edge - 1) as f32;
+        let mut in_gamut: Vec<f64> = Vec::new();
+        let mut out_of_gamut: Vec<f64> = Vec::new();
+        for k in 0..n {
+            let bz_in = pq_eotf(k as f32 / denom) as f64;
+            for j in 0..n {
+                let g_in = pq_eotf(j as f32 / denom) as f64;
+                for i in 0..n {
+                    let r_in = pq_eotf(i as f32 / denom) as f64;
+                    let target_y = bt2020_to_xyz(r_in, g_in, bz_in)[1];
+                    let idx = (k * n + j) * n + i;
+                    if target_y <= panel_total_peak {
+                        in_gamut.push(residuals[idx]);
+                    } else {
+                        out_of_gamut.push(residuals[idx]);
+                    }
+                }
+            }
+        }
+        let pct = |v: &mut Vec<f64>, p: f64| {
+            if v.is_empty() {
+                return f64::NAN;
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v[((v.len() - 1) as f64 * p) as usize]
+        };
         writeln!(
             w,
-            "# inversion residual stats: p50={:.4} p90={:.4} p99={:.4} max={:.4} cd/m²",
-            pct(0.50), pct(0.90), pct(0.99), pct(1.0),
+            "# inversion residuals (in-gamut, target_Y ≤ {:.1} cd/m²): n={} p50={:.4} p90={:.4} p99={:.4} max={:.4} cd/m²",
+            panel_total_peak,
+            in_gamut.len(),
+            pct(&mut in_gamut, 0.50),
+            pct(&mut in_gamut, 0.90),
+            pct(&mut in_gamut, 0.99),
+            pct(&mut in_gamut, 1.0),
+        )?;
+        writeln!(
+            w,
+            "# inversion residuals (out-of-gamut): n={} p50={:.4} p90={:.4} p99={:.4} max={:.4} cd/m² (expected — panel cap'd)",
+            out_of_gamut.len(),
+            pct(&mut out_of_gamut, 0.50),
+            pct(&mut out_of_gamut, 0.90),
+            pct(&mut out_of_gamut, 0.99),
+            pct(&mut out_of_gamut, 1.0),
         )?;
     }
     let peak_nits = [
@@ -449,7 +492,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     let verify_result = if !args.no_verify {
         eprintln!("\n--- phase 4 verify: D65 white sweep through live LUT ---");
         Some(verify_white_point(
-            &args, &baseline, &peak_nits, &mut device, &mut patch, &setup, &cal, log.as_mut(),
+            &args, &baseline, &peak_nits, &entries, &responses, &mut device, &mut patch, &setup, &cal, log.as_mut(),
         )?)
     } else {
         eprintln!("\n(verify skipped — --no-verify)");
@@ -528,6 +571,8 @@ fn verify_white_point(
     args: &CalibrateLut3dArgs,
     baseline: &OutputBaseline,
     peak_nits: &[f32; 3],
+    lut_entries: &[[f32; 3]],
+    responses: &[ChannelResponse; 3],
     device: &mut tristim_driver::Colorimeter,
     patch: &mut PatchSurface,
     setup: &Setup,
@@ -579,9 +624,33 @@ fn verify_white_point(
         let duv = ((up - d65_up).powi(2) + (vp - d65_vp).powi(2)).sqrt();
         let y_err_pct = (xyz.y - t) / t.max(0.01) * 100.0;
 
+        // Diagnostic: mirror the shader's LUT lookup for this verify
+        // patch so we can attribute Y_err. Sample the LUT at the PQ-
+        // encoded input coord (target nits per channel for D65 white),
+        // compute the expected commanded cmd via trilinear interp,
+        // then ask the per-channel forward LUTs what those cmds would
+        // emit (additive sum). Compare to actual measurement:
+        //   - additive_predicted ≈ measured → panel is additive,
+        //     LUT entries are right.
+        //   - additive_predicted ≠ measured → panel non-additive,
+        //     additivity assumption is the source of Y_err.
+        let coord = [pq_oetf_f64(t), pq_oetf_f64(t), pq_oetf_f64(t)];
+        let cmd_predicted = trilinear_sample_lut(lut_entries, args.cube_edge, coord);
+        let xyz_r = responses[0].xyz_at(cmd_predicted[0] as f64);
+        let xyz_g = responses[1].xyz_at(cmd_predicted[1] as f64);
+        let xyz_b = responses[2].xyz_at(cmd_predicted[2] as f64);
+        let additive_y =
+            xyz_r.y + xyz_g.y + xyz_b.y;
+        let additive_y_err_pct = (xyz.y - additive_y) / additive_y.max(0.01) * 100.0;
+
         eprintln!(
             "  W target {:>7.1} cd/m² → Y={:>7.2}  xy=({:.4},{:.4})  Δu'v'={:.4}  Y_err={:+.1}%",
             t, xyz.y, cx, cy, duv, y_err_pct,
+        );
+        eprintln!(
+            "      LUT lookup cmd=({:.2},{:.2},{:.2})  additive-predicted Y={:.2}  measured vs additive: {:+.1}%",
+            cmd_predicted[0], cmd_predicted[1], cmd_predicted[2],
+            additive_y, additive_y_err_pct,
         );
         max_duv = max_duv.max(duv);
         max_y_err_pct = max_y_err_pct.max(y_err_pct.abs());
@@ -597,10 +666,79 @@ fn verify_white_point(
                 "# verify W patch {}: target_nits={:.3} measured_y={:.3} delta_uv={:.5} y_err_pct={:+.3}",
                 patch_idx + 1, t, xyz.y, duv, y_err_pct,
             )?;
+            writeln!(
+                w,
+                "#   lut cmd=({:.3},{:.3},{:.3}) additive_predicted_y={:.4} additive_y_err_pct={:+.3}",
+                cmd_predicted[0], cmd_predicted[1], cmd_predicted[2],
+                additive_y, additive_y_err_pct,
+            )?;
         }
     }
 
     Ok(VerifyResult { max_duv, max_y_err_pct })
+}
+
+/// SMPTE ST 2084 (PQ) OETF: linear nits → encoded `[0, 1]`. CPU mirror
+/// of the encode-shader's PQ shaper, used by verify to compute the
+/// coord the renderer would sample the LUT at for a given input nits.
+fn pq_oetf_f64(nits: f64) -> f64 {
+    const M1: f64 = 0.1593017578125;
+    const M2: f64 = 78.84375;
+    const C1: f64 = 0.8359375;
+    const C2: f64 = 18.8515625;
+    const C3: f64 = 18.6875;
+    let yn = (nits.max(0.0) / 10000.0).powf(M1);
+    let num = C1 + C2 * yn;
+    let den = 1.0 + C3 * yn;
+    (num / den).powf(M2)
+}
+
+/// Trilinear sample the 3D LUT entries at `coord ∈ [0,1]³`. CPU
+/// mirror of the GPU's sampler3D LINEAR filter so verify can compute
+/// "what cmd values the shader would emit" without a roundtrip
+/// through Vulkan. Entries are X-fastest then Y then Z (matches the
+/// upload + binary format).
+fn trilinear_sample_lut(entries: &[[f32; 3]], cube_edge: u32, coord: [f64; 3]) -> [f32; 3] {
+    let n = cube_edge as usize;
+    let denom = (cube_edge - 1) as f64;
+    // Map [0, 1] → [0, N-1] continuous index, then split into integer
+    // base and fractional weight.
+    let cx = coord[0].clamp(0.0, 1.0) * denom;
+    let cy = coord[1].clamp(0.0, 1.0) * denom;
+    let cz = coord[2].clamp(0.0, 1.0) * denom;
+    let i0 = (cx.floor() as usize).min(n - 1);
+    let j0 = (cy.floor() as usize).min(n - 1);
+    let k0 = (cz.floor() as usize).min(n - 1);
+    let i1 = (i0 + 1).min(n - 1);
+    let j1 = (j0 + 1).min(n - 1);
+    let k1 = (k0 + 1).min(n - 1);
+    let tx = (cx - i0 as f64) as f32;
+    let ty = (cy - j0 as f64) as f32;
+    let tz = (cz - k0 as f64) as f32;
+    let idx = |i: usize, j: usize, k: usize| (k * n + j) * n + i;
+    let lerp3 = |a: [f32; 3], b: [f32; 3], t: f32| {
+        [
+            a[0] + t * (b[0] - a[0]),
+            a[1] + t * (b[1] - a[1]),
+            a[2] + t * (b[2] - a[2]),
+        ]
+    };
+    // Trilinear: lerp along x, then y, then z.
+    let c000 = entries[idx(i0, j0, k0)];
+    let c100 = entries[idx(i1, j0, k0)];
+    let c010 = entries[idx(i0, j1, k0)];
+    let c110 = entries[idx(i1, j1, k0)];
+    let c001 = entries[idx(i0, j0, k1)];
+    let c101 = entries[idx(i1, j0, k1)];
+    let c011 = entries[idx(i0, j1, k1)];
+    let c111 = entries[idx(i1, j1, k1)];
+    let c00 = lerp3(c000, c100, tx);
+    let c10 = lerp3(c010, c110, tx);
+    let c01 = lerp3(c001, c101, tx);
+    let c11 = lerp3(c011, c111, tx);
+    let c0 = lerp3(c00, c10, ty);
+    let c1 = lerp3(c01, c11, ty);
+    lerp3(c0, c1, tz)
 }
 
 /// CIE 1976 (u', v') from (x, y). Same math as `calibrate`'s private
