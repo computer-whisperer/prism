@@ -31,6 +31,7 @@
 //! LUT) plus whenever a new calibration is pushed via IPC. We don't need
 //! a persistent staging mapping with batched updates.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use ash::vk;
@@ -399,6 +400,165 @@ pub fn synthesize_lut_from_matrix_curve(
     out
 }
 
+// ── Binary file format ──────────────────────────────────────────────────────
+
+/// File magic (`"PLUT"` little-endian).
+pub const LUT_FILE_MAGIC: u32 = 0x54554C50;
+/// Current file format version.
+pub const LUT_FILE_VERSION: u32 = 1;
+/// `in_tf` enum value for the PQ shaper. The compositor's encode shader
+/// always PQ-encodes its input before sampling the LUT, so files written
+/// for a different shaper would mis-index. Stored explicitly so a future
+/// shaper change can be detected at load.
+pub const LUT_FILE_IN_TF_PQ: u32 = 1;
+
+/// Binary header that precedes the data payload in a `.lut` file. All
+/// fields little-endian. 32 bytes total — the data payload immediately
+/// follows.
+///
+/// Field-by-field:
+/// ```text
+/// magic     u32  must be LUT_FILE_MAGIC
+/// version   u32  must be LUT_FILE_VERSION
+/// cube_edge u32  grid points per axis (typically 17 or 33)
+/// in_tf     u32  shaper TF identifier; must be LUT_FILE_IN_TF_PQ
+/// flags     u32  reserved; must be 0
+/// peak_r    f32  panel-native peak emission, R channel (cd/m²)
+/// peak_g    f32  panel-native peak emission, G channel (cd/m²)
+/// peak_b    f32  panel-native peak emission, B channel (cd/m²)
+/// ```
+///
+/// Data payload: `cube_edge³` RGB triples (3 × f32 each), X-fastest then
+/// Y then Z, in linear nits. Matches the iteration order
+/// [`Lut3dTexture::upload`] expects.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LutFileHeader {
+    pub magic: u32,
+    pub version: u32,
+    pub cube_edge: u32,
+    pub in_tf: u32,
+    pub flags: u32,
+    pub peak_r: f32,
+    pub peak_g: f32,
+    pub peak_b: f32,
+}
+
+/// Header byte size — guaranteed by the file format and verified at load.
+pub const LUT_FILE_HEADER_BYTES: usize = 32;
+
+/// Bytes per data triple (3 × f32, little-endian).
+pub const LUT_FILE_TRIPLE_BYTES: usize = 12;
+
+/// Loaded LUT — entries plus the metadata the header carried alongside
+/// them. The cube edge is what callers need to validate against the
+/// compositor's LUT texture; peaks are informational.
+pub struct LoadedLut {
+    pub cube_edge: u32,
+    pub peak_nits: [f32; 3],
+    pub entries: Vec<[f32; 3]>,
+}
+
+/// Read a binary LUT file from disk. Validates magic / version / shaper
+/// TF / sane cube edge before allocating. Returns `MissingFeature` with
+/// a descriptive context on any of those checks; callers can fall back
+/// to the synthesis path on error.
+pub fn load_lut3d_file(path: &Path) -> Result<LoadedLut> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        tracing::warn!(path = %path.display(), "failed to read LUT file: {e}");
+        RendererError::MissingFeature("Lut3d: file read failed")
+    })?;
+    if bytes.len() < LUT_FILE_HEADER_BYTES {
+        return Err(RendererError::MissingFeature(
+            "Lut3d: file shorter than 32-byte header",
+        ));
+    }
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    if magic != LUT_FILE_MAGIC {
+        return Err(RendererError::MissingFeature(
+            "Lut3d: bad magic (expected \"PLUT\")",
+        ));
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if version != LUT_FILE_VERSION {
+        return Err(RendererError::MissingFeature(
+            "Lut3d: unsupported file version",
+        ));
+    }
+    let cube_edge = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if !(2..=129).contains(&cube_edge) {
+        return Err(RendererError::MissingFeature(
+            "Lut3d: cube_edge out of supported range (2..=129)",
+        ));
+    }
+    let in_tf = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    if in_tf != LUT_FILE_IN_TF_PQ {
+        return Err(RendererError::MissingFeature(
+            "Lut3d: unsupported shaper TF (only PQ is recognized)",
+        ));
+    }
+    let _flags = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    let peak_r = f32::from_le_bytes(bytes[20..24].try_into().unwrap());
+    let peak_g = f32::from_le_bytes(bytes[24..28].try_into().unwrap());
+    let peak_b = f32::from_le_bytes(bytes[28..32].try_into().unwrap());
+
+    let n = cube_edge as usize;
+    let expected_data = n * n * n * LUT_FILE_TRIPLE_BYTES;
+    if bytes.len() < LUT_FILE_HEADER_BYTES + expected_data {
+        return Err(RendererError::MissingFeature(
+            "Lut3d: file payload shorter than cube_edge³ × 12 bytes",
+        ));
+    }
+    let mut entries = Vec::with_capacity(n * n * n);
+    let mut off = LUT_FILE_HEADER_BYTES;
+    for _ in 0..(n * n * n) {
+        let r = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let g = f32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+        let b = f32::from_le_bytes(bytes[off + 8..off + 12].try_into().unwrap());
+        entries.push([r, g, b]);
+        off += LUT_FILE_TRIPLE_BYTES;
+    }
+    Ok(LoadedLut {
+        cube_edge,
+        peak_nits: [peak_r, peak_g, peak_b],
+        entries,
+    })
+}
+
+/// Write the entries + metadata as a binary LUT file. Header values
+/// other than `cube_edge` and `peak_nits` are filled in from the
+/// canonical constants. `entries` must have length `cube_edge³` and be
+/// laid out X-fastest.
+pub fn save_lut3d_file(
+    path: &Path,
+    cube_edge: u32,
+    peak_nits: [f32; 3],
+    entries: &[[f32; 3]],
+) -> std::io::Result<()> {
+    let n = cube_edge as usize;
+    if entries.len() != n * n * n {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Lut3d: entries length mismatches cube_edge³",
+        ));
+    }
+    let mut out = Vec::with_capacity(LUT_FILE_HEADER_BYTES + entries.len() * LUT_FILE_TRIPLE_BYTES);
+    out.extend_from_slice(&LUT_FILE_MAGIC.to_le_bytes());
+    out.extend_from_slice(&LUT_FILE_VERSION.to_le_bytes());
+    out.extend_from_slice(&cube_edge.to_le_bytes());
+    out.extend_from_slice(&LUT_FILE_IN_TF_PQ.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // flags reserved
+    out.extend_from_slice(&peak_nits[0].to_le_bytes());
+    out.extend_from_slice(&peak_nits[1].to_le_bytes());
+    out.extend_from_slice(&peak_nits[2].to_le_bytes());
+    for rgb in entries {
+        out.extend_from_slice(&rgb[0].to_le_bytes());
+        out.extend_from_slice(&rgb[1].to_le_bytes());
+        out.extend_from_slice(&rgb[2].to_le_bytes());
+    }
+    std::fs::write(path, &out)
+}
+
 fn color_subresource_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -552,6 +712,59 @@ mod tests {
                 lut[idx][c], expected[c]
             );
         }
+    }
+
+    /// File save/load is a byte-exact round trip for matching metadata.
+    /// Catches regressions in the header layout or endianness handling.
+    #[test]
+    fn lut_file_roundtrip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("prism-lut-test-{}.lut", std::process::id()));
+        let cube_edge = 5u32;
+        let peak_nits = [38.9, 113.9, 15.7];
+        let entries = synthesize_lut_from_matrix_curve(
+            cube_edge,
+            Some([[0.95, 0.02, -0.01], [-0.03, 0.92, -0.04], [-0.001, -0.01, 0.95]]),
+            Some(([0.5, 0.7, 0.3], [1.05, 1.0, 1.02])),
+        );
+        save_lut3d_file(&path, cube_edge, peak_nits, &entries).expect("save");
+        let loaded = load_lut3d_file(&path).expect("load");
+        assert_eq!(loaded.cube_edge, cube_edge);
+        for c in 0..3 {
+            assert!((loaded.peak_nits[c] - peak_nits[c]).abs() < 1e-6);
+        }
+        assert_eq!(loaded.entries.len(), entries.len());
+        for (i, (orig, got)) in entries.iter().zip(loaded.entries.iter()).enumerate() {
+            for c in 0..3 {
+                assert!(
+                    (orig[c] - got[c]).abs() < 1e-6,
+                    "entry {i} ch {c}: orig={} got={}",
+                    orig[c], got[c],
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Bad magic / version / shaper TF / oversized cube edge all reject
+    /// the file cleanly rather than allocate nonsense.
+    #[test]
+    fn lut_file_validates_header_fields() {
+        let mut buf = Vec::with_capacity(LUT_FILE_HEADER_BYTES);
+        // Wrong magic.
+        buf.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        buf.extend_from_slice(&LUT_FILE_VERSION.to_le_bytes());
+        buf.extend_from_slice(&5u32.to_le_bytes());
+        buf.extend_from_slice(&LUT_FILE_IN_TF_PQ.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&80.0f32.to_le_bytes());
+        buf.extend_from_slice(&80.0f32.to_le_bytes());
+        buf.extend_from_slice(&80.0f32.to_le_bytes());
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("prism-lut-bad-{}.lut", std::process::id()));
+        std::fs::write(&path, &buf).unwrap();
+        assert!(load_lut3d_file(&path).is_err(), "bad magic should reject");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Negative CTM outputs clip to zero before the per-channel curve —

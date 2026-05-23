@@ -1150,8 +1150,50 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             breadcrumb(&format!("bringup loop: building OutputContext for {name}"));
             match prism_drm::OutputContext::new(card, device.clone(), pick, &output_config) {
                 Ok(mut output) => {
-                    // Bake the KDL `color { ctm … response-curve … }` block
-                    // into the per-output 3D LUT. Failure here means the
+                    // KDL `color.lut3d "file"` — load the binary LUT now
+                    // so resynthesize_color_lut sees it as the fallback
+                    // when no IPC override is active. Re-look up the
+                    // per-connector config block; the earlier `cfg` is
+                    // scoped to the `if let` above.
+                    if let Some(lut3d_cfg) = find_connector_config(&name, &config.outputs.0)
+                        .and_then(|c| c.color.as_ref())
+                        .and_then(|c| c.lut3d.as_ref())
+                    {
+                        match prism_renderer::load_lut3d_file(
+                            std::path::Path::new(&lut3d_cfg.path),
+                        ) {
+                            Ok(loaded) => {
+                                let renderer_edge = output.renderer.lut3d_cube_edge();
+                                if loaded.cube_edge != renderer_edge {
+                                    tracing::warn!(
+                                        connector = %output.connector_name,
+                                        path = %lut3d_cfg.path,
+                                        "LUT file cube_edge={} doesn't match renderer cube_edge={}; \
+                                         falling back to synthesis",
+                                        loaded.cube_edge, renderer_edge,
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        connector = %output.connector_name,
+                                        path = %lut3d_cfg.path,
+                                        cube_edge = loaded.cube_edge,
+                                        "loaded color LUT from file"
+                                    );
+                                    output.kdl_lut3d_entries = Some(loaded.entries);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    connector = %output.connector_name,
+                                    path = %lut3d_cfg.path,
+                                    "LUT file load failed ({e:#}); falling back to synthesis"
+                                );
+                            }
+                        }
+                    }
+                    // Bake whichever color representation is current
+                    // (loaded LUT or synthesis from CTM + curve) into the
+                    // renderer's LUT texture. Failure here means the
                     // renderer can't accept LUT data (allocator OOM, lost
                     // device, etc.) — log and continue with whatever the
                     // identity LUT renders rather than fail the whole

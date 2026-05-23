@@ -169,6 +169,29 @@ pub struct ColorConfig {
     /// that the calibration tool replaces with measured values.
     #[knuffel(child)]
     pub panel_peak_nits: Option<PanelPeakNits>,
+    /// Path to a binary 3D LUT file produced by `prism-tune calibrate`.
+    /// When present, the compositor loads the file at bringup and
+    /// pushes the entries directly into the encode pipeline's LUT
+    /// texture — bypasses the (CTM + response-curve) → LUT synthesis
+    /// path. The file is the canonical output of the measurement-driven
+    /// calibration loop and carries per-grid-point precision the
+    /// closed-form (CTM, gain/gamma) model can't represent.
+    ///
+    /// Path is resolved as given: absolute, or relative to prism's CWD.
+    /// File format documented in `prism-renderer::lut3d::LutFileHeader`.
+    /// If both `lut3d` and `(ctm | response-curve)` are configured, the
+    /// LUT file wins; the others stay readable for fallback if the
+    /// file load fails.
+    #[knuffel(child)]
+    pub lut3d: Option<Lut3dFile>,
+}
+
+/// Per-output 3D LUT file reference. See [`ColorConfig::lut3d`].
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct Lut3dFile {
+    /// Path to the `.lut` file. Absolute or relative to prism's CWD.
+    #[knuffel(argument)]
+    pub path: String,
 }
 
 /// Per-channel measured panel peak luminance. See [`ColorConfig::panel_peak_nits`].

@@ -105,6 +105,12 @@ pub struct OutputContext {
     /// or a compositor restart clears them. When set, the render path
     /// uses these values in preference to the equivalents in `config`.
     pub color_override: ColorOverride,
+    /// LUT entries loaded from KDL `color.lut3d` at bringup, if any.
+    /// Used by [`Self::resynthesize_color_lut`] as the fallback when no
+    /// IPC color override is active — bypasses the synthesis path and
+    /// pushes the file content directly. `None` ⇒ no file configured,
+    /// synthesis takes over.
+    pub kdl_lut3d_entries: Option<Vec<[f32; 3]>>,
     /// Set on first present to switch from `commit` (mode-set) to `page_flip`
     /// (just-swap-fb) for subsequent frames.
     mode_set_done: bool,
@@ -364,6 +370,7 @@ impl OutputContext {
             gpu_id,
             config: config.clone(),
             color_override: ColorOverride::default(),
+            kdl_lut3d_entries: None,
             mode_set_done: false,
             frame_pending: false,
             frame_clock,
@@ -425,6 +432,31 @@ impl OutputContext {
         let cube_edge = self.renderer.lut3d_cube_edge();
         if cube_edge == 0 {
             return Ok(());
+        }
+        // Precedence:
+        //   1. IPC override on CTM or response-curve → synthesize from
+        //      effective values (override-wins). Honors calibration
+        //      tools that are actively pushing.
+        //   2. KDL-loaded LUT file → push those entries verbatim.
+        //   3. KDL CTM + response-curve → synthesize.
+        let ipc_override_active = self.color_override.ctm.is_some()
+            || self.color_override.response_curve.is_some();
+        if !ipc_override_active {
+            if let Some(entries) = self.kdl_lut3d_entries.as_ref() {
+                if entries.len() == (cube_edge as usize).pow(3) {
+                    return self
+                        .renderer
+                        .upload_lut3d(entries)
+                        .context("upload KDL-loaded color LUT");
+                }
+                tracing::warn!(
+                    connector = %self.connector_name,
+                    "KDL-loaded LUT entry count {} doesn't match renderer cube_edge {}; \
+                     falling back to synthesis",
+                    entries.len(),
+                    cube_edge,
+                );
+            }
         }
         let response_curve = if self.config.hdr.is_some() {
             self.effective_response_curve()

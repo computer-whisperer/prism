@@ -26,7 +26,9 @@ pub use error::{RendererError, Result};
 pub use instance::Instance;
 pub use intermediate::{DEFAULT_INTERMEDIATE_FORMAT, Intermediate, create_view};
 pub use lut3d::{
-    LUT_FORMAT, Lut3dTexture, identity_lut, pq_eotf, synthesize_lut_from_matrix_curve,
+    LUT_FILE_HEADER_BYTES, LUT_FILE_IN_TF_PQ, LUT_FILE_MAGIC, LUT_FILE_TRIPLE_BYTES,
+    LUT_FILE_VERSION, LUT_FORMAT, LoadedLut, Lut3dTexture, LutFileHeader, identity_lut,
+    load_lut3d_file, pq_eotf, save_lut3d_file, synthesize_lut_from_matrix_curve,
 };
 pub use oneshot::OneshotPool;
 pub use pipeline::decode::{DecodePipeline, DecodePush};
