@@ -405,15 +405,36 @@ impl OutputContext {
     /// No-op when the renderer's encode chain doesn't include
     /// `EncodeFragment::Lut3d` (e.g. legacy chains kept for tests) —
     /// detected via `lut3d_cube_edge() == 0`.
+    ///
+    /// **Per-mode curve handling.** SDR outputs skip the per-channel
+    /// response curve when baking the LUT, mirroring the legacy
+    /// `[CalibrationMatrix, OutputTransferSrgb]` shader chain that never
+    /// included `PerChannelResponseGainGamma`. Applying it would push
+    /// commanded values past `sdr_reference_nits` whenever the panel's
+    /// peak emission is below sdr_white — the inverse-gamma blows up
+    /// commanded to several × the cap, then `OutputTransferSrgb` clamps
+    /// the entire range to byte 0xff and the panel renders pinned-peak
+    /// garbage. The calibrate tool today still writes SDR response
+    /// curves to KDL but those values are derived from a feedback loop
+    /// that didn't actually apply them, so they're not trustworthy; we
+    /// honor the previous shader's "ignore" semantics until the SDR
+    /// calibration path is rebuilt. HDR outputs use the full
+    /// `(CTM, curve)` pair as before — that path is what the LUT
+    /// pipeline was designed around.
     pub fn resynthesize_color_lut(&mut self) -> Result<()> {
         let cube_edge = self.renderer.lut3d_cube_edge();
         if cube_edge == 0 {
             return Ok(());
         }
+        let response_curve = if self.config.hdr.is_some() {
+            self.effective_response_curve()
+        } else {
+            None
+        };
         let entries = synthesize_lut_from_matrix_curve(
             cube_edge,
             self.effective_ctm(),
-            self.effective_response_curve(),
+            response_curve,
         );
         self.renderer
             .upload_lut3d(&entries)
