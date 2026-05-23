@@ -322,6 +322,126 @@ pub fn emit_per_channel_response_gain_gamma(
     ctx.glsl_call_vec3(GLSL_POW, [ratio, inv_gamma])
 }
 
+/// 3D LUT lookup with a per-channel PQ shaper on input.
+///
+/// Replaces the [`CalibrationMatrix`](super::EncodeFragment::CalibrationMatrix)
+/// + [`PerChannelResponseGainGamma`](super::EncodeFragment::PerChannelResponseGainGamma)
+/// pair. The math is:
+///
+/// ```text
+/// coord  = pq_oetf(max(in_nits, 0))         // [0, 10000] nits → [0, 1] LUT coord
+/// out    = texture(u_lut, coord).rgb         // trilinear sample; nits
+/// ```
+///
+/// `pq_oetf` (SMPTE ST 2084 inverse-EOTF) is the same function the
+/// `OutputTransferPq` fragment uses for output encoding — reused here as a
+/// "shaper" so the LUT grid is allocated perceptually. With the shaper, a
+/// 17³ or 33³ LUT puts most of its precision in the dim region where the
+/// eye is sensitive; without it we'd need a much larger LUT to get the same
+/// quality at low luminance.
+///
+/// The LUT itself is calibration data, populated per-output: identity LUT
+/// for uncalibrated displays, synthesized from CTM + per-channel curve
+/// when those are configured, or loaded from a measured binary file. The
+/// shader is agnostic — it just samples.
+///
+/// Sampler filter (LINEAR, set on the pipeline side) gives trilinear
+/// interpolation between the 8 nearest grid points. `CLAMP_TO_EDGE` address
+/// mode means inputs above the highest grid point clip to the LUT's
+/// boundary value rather than wrapping or reading garbage.
+pub fn emit_lut3d(ctx: &mut ShaderCtx, in_nits: spirv::Word) -> spirv::Word {
+    let vec3_t = ctx.types.vec3;
+    let vec4_t = ctx.types.vec4;
+    let f32_t = ctx.types.f32_t;
+    let f_zero = ctx.consts.f_zero;
+    let f_one = ctx.consts.f_one;
+    let sampled_image_3d_t = ctx.types.sampled_image_3d;
+    let u_lut_ptr = ctx
+        .iface
+        .u_lut_ptr
+        .expect("EncodeFragment::Lut3d requires builder to declare u_lut");
+
+    // Shaper: PQ-encode the linear-nits input into [0, 1] coord space.
+    // max(., 0) protects against negative IR values (gamut-clipping from
+    // upstream CTMs that contain negatives, accumulation noise, etc.) —
+    // pow on negative bases is undefined and we'd get NaN coords.
+    let zero_vec = ctx.vec3_splat(f_zero);
+    let in_clamped = ctx.glsl_call_vec3(GLSL_FMAX, [in_nits, zero_vec]);
+
+    let inv_10k = ctx.const_f32(1.0 / 10000.0);
+    let inv_10k_vec = ctx.vec3_splat(inv_10k);
+    let yn = ctx
+        .b
+        .f_mul(vec3_t, None, in_clamped, inv_10k_vec)
+        .expect("yn = clamped/10000");
+
+    // PQ OETF constants (SMPTE ST 2084).
+    let m1 = ctx.const_f32(0.1593017578125);
+    let m2 = ctx.const_f32(78.84375);
+    let c1 = ctx.const_f32(0.8359375);
+    let c2 = ctx.const_f32(18.8515625);
+    let c3 = ctx.const_f32(18.6875);
+    let m1_vec = ctx.vec3_splat(m1);
+    let m2_vec = ctx.vec3_splat(m2);
+    let c1_vec = ctx.vec3_splat(c1);
+    let c2_vec = ctx.vec3_splat(c2);
+    let c3_vec = ctx.vec3_splat(c3);
+    let one_vec = ctx.vec3_splat(f_one);
+
+    let yn_pow = ctx.glsl_call_vec3(GLSL_POW, [yn, m1_vec]);
+    let c2_yn = ctx
+        .b
+        .f_mul(vec3_t, None, yn_pow, c2_vec)
+        .expect("c2 * yn_pow");
+    let num = ctx
+        .b
+        .f_add(vec3_t, None, c1_vec, c2_yn)
+        .expect("c1 + c2*yn_pow");
+    let c3_yn = ctx
+        .b
+        .f_mul(vec3_t, None, yn_pow, c3_vec)
+        .expect("c3 * yn_pow");
+    let den = ctx
+        .b
+        .f_add(vec3_t, None, one_vec, c3_yn)
+        .expect("1 + c3*yn_pow");
+    let ratio = ctx
+        .b
+        .f_div(vec3_t, None, num, den)
+        .expect("num / den");
+    let coord = ctx.glsl_call_vec3(GLSL_POW, [ratio, m2_vec]);
+
+    // Sample the 3D LUT at `coord`. Linear filtering + CLAMP_TO_EDGE
+    // (configured on the sampler at pipeline-create time) gives trilinear
+    // interpolation between adjacent grid points and clamps out-of-range
+    // coords to the boundary.
+    let sampler = ctx
+        .b
+        .load(sampled_image_3d_t, None, u_lut_ptr, None, [])
+        .expect("load u_lut sampler3D");
+    let sampled = ctx
+        .b
+        .image_sample_implicit_lod(vec4_t, None, sampler, coord, None, [])
+        .expect("image_sample_implicit_lod (lut3d)");
+    // Drop alpha — the LUT carries RGB nits in .rgb; .a is unused but
+    // forced to 1.0 at upload so a stray sampler isn't garbage.
+    let r = ctx
+        .b
+        .composite_extract(f32_t, None, sampled, [0])
+        .expect("extract r (lut)");
+    let g = ctx
+        .b
+        .composite_extract(f32_t, None, sampled, [1])
+        .expect("extract g (lut)");
+    let b = ctx
+        .b
+        .composite_extract(f32_t, None, sampled, [2])
+        .expect("extract b (lut)");
+    ctx.b
+        .composite_construct(vec3_t, None, [r, g, b])
+        .expect("composite_construct lut rgb")
+}
+
 /// Helper: load a single f32 push-constant member.
 fn load_push_f32(ctx: &mut ShaderCtx, member_index: u32) -> spirv::Word {
     let idx = ctx.const_u32(member_index);

@@ -9,6 +9,7 @@
 use rspirv::dr::Builder;
 use rspirv::spirv;
 
+use super::EncodeConfig;
 use super::push_constants::*;
 
 /// Cached SPIR-V Word IDs for types we use across the shader.
@@ -25,6 +26,9 @@ pub struct TypeIds {
     /// `OpTypeImage %f32 2D 0 0 0 1 Unknown`.
     pub image: spirv::Word,
     pub sampled_image: spirv::Word,
+    /// `OpTypeImage %f32 3D 0 0 0 1 Unknown` — the 3D LUT texture.
+    pub image_3d: spirv::Word,
+    pub sampled_image_3d: spirv::Word,
 }
 
 /// Pointer types we'll need for load/store / access-chain operations.
@@ -32,6 +36,7 @@ pub struct PointerIds {
     pub input_vec2: spirv::Word,
     pub output_vec4: spirv::Word,
     pub uniform_const_sampled_image: spirv::Word,
+    pub uniform_const_sampled_image_3d: spirv::Word,
     pub push_constant_struct: spirv::Word,
     pub push_constant_mat4: spirv::Word,
     pub push_constant_vec4: spirv::Word,
@@ -58,6 +63,12 @@ pub struct InterfaceIds {
     pub out_color_ptr: spirv::Word,
     /// `layout(set=0, binding=0) uniform sampler2D u_intermediate;` (pointer)
     pub u_intermediate_ptr: spirv::Word,
+    /// `layout(set=0, binding=1) uniform sampler3D u_lut;` (pointer) — the
+    /// per-output 3D color LUT. Declared only when the encode chain
+    /// includes the [`Lut3d`](super::EncodeFragment::Lut3d) fragment; the
+    /// pipeline-layout side mirrors this so binding 1 only exists when the
+    /// shader actually samples it.
+    pub u_lut_ptr: Option<spirv::Word>,
     /// `layout(push_constant) uniform Push { ... } push;` (pointer to struct)
     pub push_ptr: spirv::Word,
     /// `GLSL.std.450` extension import (needed for pow, fclamp, etc.)
@@ -80,7 +91,14 @@ impl ShaderCtx {
     /// (capability, memory model, types, interface vars, push constants
     /// struct, main function with one open block). Fragments then emit
     /// their work into the open block before `finish()` is called.
-    pub fn new() -> Self {
+    ///
+    /// `config` decides which optional interface variables get declared —
+    /// e.g. binding 1 for the per-output 3D LUT is only emitted when the
+    /// chain contains [`EncodeFragment::Lut3d`](super::EncodeFragment::Lut3d).
+    /// This keeps shader interfaces minimal: a configuration that doesn't
+    /// use the LUT doesn't force the pipeline layout to allocate a slot for it.
+    pub fn new(config: &EncodeConfig) -> Self {
+        let needs_lut = config.uses_lut3d();
         let mut b = Builder::new();
         // SPIR-V 1.5 is fine for Vulkan 1.3.
         b.set_version(1, 5);
@@ -110,6 +128,20 @@ impl ShaderCtx {
             None,
         );
         let sampled_image = b.type_sampled_image(image);
+        // Sampled 3D color image for the per-output color LUT — same shape
+        // as the 2D version but `Dim::Dim3D`. Trilinear sampling happens at
+        // sample-time, controlled by the sampler.
+        let image_3d = b.type_image(
+            f32_t,
+            spirv::Dim::Dim3D,
+            0,
+            0,
+            0,
+            1,
+            spirv::ImageFormat::Unknown,
+            None,
+        );
+        let sampled_image_3d = b.type_sampled_image(image_3d);
 
         let types = TypeIds {
             void,
@@ -123,6 +155,8 @@ impl ShaderCtx {
             mat4,
             image,
             sampled_image,
+            image_3d,
+            sampled_image_3d,
         };
 
         // ── Push-constant struct type ──────────────────────────────────────
@@ -186,6 +220,8 @@ impl ShaderCtx {
         let output_vec4 = b.type_pointer(None, spirv::StorageClass::Output, vec4);
         let uniform_const_sampled_image =
             b.type_pointer(None, spirv::StorageClass::UniformConstant, sampled_image);
+        let uniform_const_sampled_image_3d =
+            b.type_pointer(None, spirv::StorageClass::UniformConstant, sampled_image_3d);
         let push_constant_struct =
             b.type_pointer(None, spirv::StorageClass::PushConstant, push_struct);
         let push_constant_mat4 = b.type_pointer(None, spirv::StorageClass::PushConstant, mat4);
@@ -198,6 +234,7 @@ impl ShaderCtx {
             input_vec2,
             output_vec4,
             uniform_const_sampled_image,
+            uniform_const_sampled_image_3d,
             push_constant_struct,
             push_constant_mat4,
             push_constant_vec4,
@@ -231,6 +268,16 @@ impl ShaderCtx {
             spirv::StorageClass::UniformConstant,
             None,
         );
+        let u_lut_ptr = if needs_lut {
+            Some(b.variable(
+                uniform_const_sampled_image_3d,
+                None,
+                spirv::StorageClass::UniformConstant,
+                None,
+            ))
+        } else {
+            None
+        };
         let push_ptr = b.variable(
             push_constant_struct,
             None,
@@ -258,11 +305,24 @@ impl ShaderCtx {
             spirv::Decoration::Binding,
             [rspirv::dr::Operand::LiteralBit32(0)],
         );
+        if let Some(lut_ptr) = u_lut_ptr {
+            b.decorate(
+                lut_ptr,
+                spirv::Decoration::DescriptorSet,
+                [rspirv::dr::Operand::LiteralBit32(0)],
+            );
+            b.decorate(
+                lut_ptr,
+                spirv::Decoration::Binding,
+                [rspirv::dr::Operand::LiteralBit32(1)],
+            );
+        }
 
         let iface = InterfaceIds {
             v_uv_ptr,
             out_color_ptr,
             u_intermediate_ptr,
+            u_lut_ptr,
             push_ptr,
             glsl_ext,
         };
@@ -277,11 +337,19 @@ impl ShaderCtx {
         // Declare the entry point + execution mode now that main_id exists.
         // SPIR-V 1.4+ requires ALL interface variables (Input, Output, AND
         // referenced UniformConstant / PushConstant globals) be listed.
+        // `u_lut_ptr` is included only when the chain references it — the
+        // pipeline-layout side mirrors this conditional so an LUT-less
+        // chain doesn't pay for an unused descriptor binding.
+        let mut iface_list: Vec<spirv::Word> =
+            vec![v_uv_ptr, out_color_ptr, u_intermediate_ptr, push_ptr];
+        if let Some(lut_ptr) = u_lut_ptr {
+            iface_list.push(lut_ptr);
+        }
         b.entry_point(
             spirv::ExecutionModel::Fragment,
             main_id,
             "main",
-            [v_uv_ptr, out_color_ptr, u_intermediate_ptr, push_ptr],
+            iface_list,
         );
         b.execution_mode(main_id, spirv::ExecutionMode::OriginUpperLeft, []);
 
