@@ -36,9 +36,11 @@ use tristim_driver::{Colorimeter, Xyz, measurement::raw_to_xyz};
 
 use crate::common::{
     Channel, OutputBaseline, apply_border, apply_panel_peaks, open_patch_surface,
-    query_output_baseline, send_action, set_channel_patch, set_patch_off,
+    query_output_baseline, send_action, set_channel_patch, set_patch_off, set_white_patch,
     show_alignment_patch,
 };
+use tristim_display::PatchSurface;
+use tristim_driver::{Calibration, Setup};
 
 #[derive(Args)]
 pub struct CalibrateLut3dArgs {
@@ -96,11 +98,19 @@ pub struct CalibrateLut3dArgs {
     /// Skip writing the measurement-log CSV.
     #[arg(long)]
     pub no_log: bool,
-    /// Leave the discovered per-channel panel peaks active on exit
-    /// (HDR mode). Default: ResetColor so the next session re-reads
-    /// from KDL.
+    /// Leave the discovered per-channel panel peaks AND the live-pushed
+    /// LUT active on exit. Default: ResetColor so the next session
+    /// re-reads from KDL (which still points at the file just written).
     #[arg(long)]
     pub keep: bool,
+    /// Skip the post-calibration verification sweep. Default: render
+    /// D65 white at several luminances through the freshly-pushed LUT
+    /// and report Δu'v' from D65 + Y error per patch — the LUT
+    /// pipeline is otherwise feed-forward (measure → invert → write),
+    /// so closing the loop with a measurement is the only way to
+    /// catch math regressions or panel-state surprises.
+    #[arg(long)]
+    pub no_verify: bool,
 }
 
 /// One (commanded, XYZ) measurement from a per-channel sweep.
@@ -383,6 +393,32 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         )?;
     }
 
+    // Push the LUT live so verify (and the user's first impression)
+    // sees the new calibration without a prism restart. The path
+    // resolution happens server-side, so we hand over the absolute
+    // form to be safe regardless of where prism's CWD is.
+    let lut_abs_path = std::fs::canonicalize(&lut_path)
+        .with_context(|| format!("canonicalize {} for IPC", lut_path.display()))?;
+    send_action(
+        &args.output,
+        OutputAction::LoadLut3dFromFile {
+            path: lut_abs_path.to_string_lossy().into_owned(),
+        },
+    )
+    .context("push LUT via IPC")?;
+    eprintln!("Pushed LUT live via IPC ({}).", lut_abs_path.display());
+
+    // ─── Phase 4: verify the live LUT against D65 ─────────────────────────
+    let verify_result = if !args.no_verify {
+        eprintln!("\n--- phase 4 verify: D65 white sweep through live LUT ---");
+        Some(verify_white_point(
+            &args, &baseline, &peak_nits, &mut device, &mut patch, &setup, &cal, log.as_mut(),
+        )?)
+    } else {
+        eprintln!("\n(verify skipped — --no-verify)");
+        None
+    };
+
     set_patch_off(&mut patch, baseline.hdr_active)?;
 
     if let Some((path, mut w)) = log {
@@ -400,20 +436,145 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         eprintln!("Measurement log: {}", path.display());
     }
 
+    if let Some(verify) = verify_result.as_ref() {
+        let verdict = if verify.max_duv < 0.01 && verify.max_y_err_pct < 5.0 {
+            "✓ EXCELLENT — calibration verified within colorimeter noise."
+        } else if verify.max_duv < 0.02 && verify.max_y_err_pct < 10.0 {
+            "✓ ACCEPTABLE — minor drift, usable for general desktop work."
+        } else {
+            "⚠ POOR — investigate forward-LUT measurements + Newton residuals before trusting."
+        };
+        eprintln!(
+            "\nVerify: max Δu'v' from D65 = {:.4}, max Y-error = {:.1}%",
+            verify.max_duv, verify.max_y_err_pct,
+        );
+        eprintln!("        {verdict}");
+    }
+
     print_kdl_block(&args.output, baseline.hdr_active, peak_nits, &lut_path);
 
     if !args.keep {
         eprintln!(
-            "\nRestoring KDL defaults (use --keep to leave the discovered peaks active)."
+            "\nRestoring KDL defaults (use --keep to leave the live-pushed LUT + peaks active)."
         );
         send_action(&args.output, OutputAction::ResetColor)
             .context("final ResetColor")?;
     } else {
         eprintln!(
-            "\n--keep: per-channel panel peaks remain active until prism restart."
+            "\n--keep: live-pushed LUT and per-channel panel peaks remain active until prism restart."
         );
     }
     Ok(())
+}
+
+/// Result of the verify-phase D65 sweep. Same shape as `calibrate`'s
+/// version — max chromaticity drift + max luminance error, used to
+/// pick the verdict line.
+struct VerifyResult {
+    max_duv: f64,
+    max_y_err_pct: f64,
+}
+
+/// Render BT.2020 D65 white at a range of luminances through the
+/// freshly-pushed LUT and measure how close the panel lands on the
+/// reference. Δu'v' large means the LUT's chromaticity inversion is
+/// off; Y-error large means the LUT's luminance inversion is off.
+/// Both means measurement noise or a non-additive panel that broke
+/// the additivity assumption.
+///
+/// Targets mirror `calibrate`'s verify phase so reports are comparable
+/// across the two pipelines:
+/// - HDR: log-space `[0.05 × hi, hi]` with `hi = 0.8 × min(peak_y)`.
+/// - SDR: fixed fractions of `sdr_reference_nits`.
+#[allow(clippy::too_many_arguments)]
+fn verify_white_point(
+    args: &CalibrateLut3dArgs,
+    baseline: &OutputBaseline,
+    peak_nits: &[f32; 3],
+    device: &mut tristim_driver::Colorimeter,
+    patch: &mut PatchSurface,
+    setup: &Setup,
+    cal: &Calibration,
+    mut log: Option<&mut (PathBuf, BufWriter<File>)>,
+) -> Result<VerifyResult> {
+    const D65: (f64, f64) = (0.3127, 0.3290);
+    let (d65_up, d65_vp) = xy_to_uv_prime(D65);
+
+    let targets: Vec<f64> = if baseline.hdr_active {
+        let min_peak_y = peak_nits.iter().copied().fold(f32::INFINITY, f32::min) as f64;
+        let hi = (min_peak_y * 0.8).max(2.0);
+        let lo = (hi * 0.05).max(1.0);
+        let lo_ln = lo.ln();
+        let hi_ln = hi.max(lo * 1.5).ln();
+        (0..5)
+            .map(|i| {
+                let f = i as f64 / 4.0;
+                (lo_ln + f * (hi_ln - lo_ln)).exp()
+            })
+            .collect()
+    } else {
+        let r = baseline.sdr_reference_nits;
+        vec![0.10, 0.25, 0.50, 0.75, 0.95]
+            .into_iter()
+            .map(|f| f * r)
+            .collect()
+    };
+
+    let settle = Duration::from_millis(args.settle_ms);
+    let mut max_duv = 0.0_f64;
+    let mut max_y_err_pct = 0.0_f64;
+
+    if let Some((_, w)) = log.as_mut() {
+        writeln!(
+            w,
+            "# phase 4 verify: D65 white sweep — Δu'v' from D65=({:.4},{:.4})",
+            D65.0, D65.1,
+        )?;
+    }
+
+    for (patch_idx, &t) in targets.iter().enumerate() {
+        set_white_patch(patch, baseline, t)?;
+        thread::sleep(settle);
+        let raw = device.measure_raw(setup).context("measure (verify)")?;
+        let xyz = raw_to_xyz(&raw, setup, cal);
+        let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
+        let (up, vp) = xy_to_uv_prime((cx, cy));
+        let duv = ((up - d65_up).powi(2) + (vp - d65_vp).powi(2)).sqrt();
+        let y_err_pct = (xyz.y - t) / t.max(0.01) * 100.0;
+
+        eprintln!(
+            "  W target {:>7.1} cd/m² → Y={:>7.2}  xy=({:.4},{:.4})  Δu'v'={:.4}  Y_err={:+.1}%",
+            t, xyz.y, cx, cy, duv, y_err_pct,
+        );
+        max_duv = max_duv.max(duv);
+        max_y_err_pct = max_y_err_pct.max(y_err_pct.abs());
+
+        if let Some((_, w)) = log.as_mut() {
+            writeln!(
+                w,
+                "verify,W,{},{:.4},{:.4},{:.4},{:.4}",
+                patch_idx + 1, t, xyz.x, xyz.y, xyz.z,
+            )?;
+            writeln!(
+                w,
+                "# verify W patch {}: target_nits={:.3} measured_y={:.3} delta_uv={:.5} y_err_pct={:+.3}",
+                patch_idx + 1, t, xyz.y, duv, y_err_pct,
+            )?;
+        }
+    }
+
+    Ok(VerifyResult { max_duv, max_y_err_pct })
+}
+
+/// CIE 1976 (u', v') from (x, y). Same math as `calibrate`'s private
+/// helper — duplicated here so the modules stay independent.
+fn xy_to_uv_prime(xy: (f64, f64)) -> (f64, f64) {
+    let (x, y) = xy;
+    let denom = -2.0 * x + 12.0 * y + 3.0;
+    if denom.abs() < 1e-9 {
+        return (0.0, 0.0);
+    }
+    (4.0 * x / denom, 9.0 * y / denom)
 }
 
 /// Log-spaced sample targets in `[lo, hi]`. Used for the per-channel

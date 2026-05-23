@@ -310,6 +310,31 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             );
             lut_dirty = true;
         }
+        OutputAction::LoadLut3dFromFile { path } => {
+            let loaded = match prism_renderer::load_lut3d_file(std::path::Path::new(&path)) {
+                Ok(l) => l,
+                Err(e) => {
+                    return Err(format!(
+                        "load_lut3d_file({path}) failed: {e:#}"
+                    ));
+                }
+            };
+            let renderer_edge = output_ctx.renderer.lut3d_cube_edge();
+            if loaded.cube_edge != renderer_edge {
+                return Err(format!(
+                    "LUT file cube_edge={} doesn't match renderer cube_edge={}",
+                    loaded.cube_edge, renderer_edge,
+                ));
+            }
+            output_ctx.color_override.lut3d_entries = Some(loaded.entries);
+            tracing::info!(
+                connector = %name,
+                path = %path,
+                cube_edge = loaded.cube_edge,
+                "ipc: loaded color LUT from file"
+            );
+            lut_dirty = true;
+        }
         OutputAction::ResetColor => {
             output_ctx.color_override = prism_drm::ColorOverride::default();
             tracing::info!(connector = %name, "ipc: cleared color overrides");

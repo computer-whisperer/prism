@@ -433,15 +433,31 @@ impl OutputContext {
         if cube_edge == 0 {
             return Ok(());
         }
-        // Precedence:
-        //   1. IPC override on CTM or response-curve → synthesize from
-        //      effective values (override-wins). Honors calibration
-        //      tools that are actively pushing.
-        //   2. KDL-loaded LUT file → push those entries verbatim.
-        //   3. KDL CTM + response-curve → synthesize.
-        let ipc_override_active = self.color_override.ctm.is_some()
+        // Precedence (highest to lowest):
+        //   1. IPC LUT override (LoadLut3dFromFile) — measurement-derived
+        //      data pushed live by a calibration tool.
+        //   2. IPC override on CTM or response-curve → synthesize from
+        //      effective values (override-wins).
+        //   3. KDL-loaded LUT file (`color.lut3d "…"`).
+        //   4. KDL CTM + response-curve synthesis.
+        if let Some(entries) = self.color_override.lut3d_entries.as_ref() {
+            if entries.len() == (cube_edge as usize).pow(3) {
+                return self
+                    .renderer
+                    .upload_lut3d(entries)
+                    .context("upload IPC-pushed color LUT");
+            }
+            tracing::warn!(
+                connector = %self.connector_name,
+                "IPC LUT entry count {} doesn't match renderer cube_edge {}; \
+                 falling back to next precedence level",
+                entries.len(),
+                cube_edge,
+            );
+        }
+        let ipc_curve_override_active = self.color_override.ctm.is_some()
             || self.color_override.response_curve.is_some();
-        if !ipc_override_active {
+        if !ipc_curve_override_active {
             if let Some(entries) = self.kdl_lut3d_entries.as_ref() {
                 if entries.len() == (cube_edge as usize).pow(3) {
                     return self
@@ -555,7 +571,7 @@ impl OutputContext {
 /// Runtime color overrides — see [`OutputContext::color_override`].
 /// Each field is `None` until an IPC request sets it; setting any field
 /// shadows the matching `OutputConfig` value in the render path.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ColorOverride {
     pub sdr_reference_nits: Option<f32>,
     pub response_curve: Option<([f32; 3], [f32; 3])>,
@@ -568,6 +584,12 @@ pub struct ColorOverride {
     /// encode shader applies `panel_rgb = M * bt2020_rgb` to map IR
     /// values into the panel's native-primary space.
     pub ctm: Option<[[f32; 3]; 3]>,
+    /// Runtime per-output 3D LUT override — entries in linear nits,
+    /// X-fastest. When `Some`, takes precedence over both the
+    /// (CTM, response-curve) overrides AND the KDL-loaded LUT. Used
+    /// by `calibrate-lut3d` to push a freshly-measured LUT live
+    /// without restarting prism. Set via `OutputAction::LoadLut3dFromFile`.
+    pub lut3d_entries: Option<Vec<[f32; 3]>>,
 }
 
 impl OutputContext {

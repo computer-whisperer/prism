@@ -1188,9 +1188,26 @@ pub enum OutputAction {
         #[cfg_attr(feature = "clap", arg(long))]
         bb: f64,
     },
+    /// Load a binary 3D LUT from the named file and push its entries
+    /// into this output's color pipeline. Takes precedence over both
+    /// the (CTM, response-curve) IPC overrides AND the KDL `color.lut3d`
+    /// file at config time — calibration tools use this to make a
+    /// freshly-measured LUT live without restarting prism.
+    ///
+    /// File format: see `prism_renderer::lut3d::LutFileHeader`. Cube
+    /// edge must match the renderer's allocated texture (17 in current
+    /// builds) or the load is rejected. Sticky until `ResetColor`
+    /// clears it.
+    LoadLut3dFromFile {
+        /// Absolute path to the `.lut` file. The prism daemon opens
+        /// it directly — both ends must see the same filesystem.
+        #[cfg_attr(feature = "clap", arg(long))]
+        path: String,
+    },
     /// Clear all runtime color overrides for this output (sdr
-    /// reference, response curve, panel peak nits, ctm). Subsequent
-    /// rendering reverts to whatever's in the persisted KDL config.
+    /// reference, response curve, panel peak nits, ctm, lut3d).
+    /// Subsequent rendering reverts to whatever's in the persisted
+    /// KDL config.
     ResetColor,
 }
 
