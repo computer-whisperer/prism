@@ -985,6 +985,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         // / explicit panel-peak-nits are known.
         panel_peak_nits_rgb: [80.0, 80.0, 80.0],
         response_curve: None,
+        ctm: None,
     };
 
     // ── Pick connectors + bring up OutputContexts on every card ────────────
@@ -1091,6 +1092,27 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                     panel_peak_nits_rgb = ?output_config.panel_peak_nits_rgb,
                     "per-output panel peak resolved"
                 );
+                if let Some(ctm_cfg) = cfg.color.as_ref().and_then(|c| c.ctm.as_ref()) {
+                    if ctm_cfg.values.len() == 9 {
+                        let v = &ctm_cfg.values;
+                        output_config.ctm = Some([
+                            [v[0] as f32, v[1] as f32, v[2] as f32],
+                            [v[3] as f32, v[4] as f32, v[5] as f32],
+                            [v[6] as f32, v[7] as f32, v[8] as f32],
+                        ]);
+                        tracing::info!(
+                            connector = %name,
+                            ctm = ?output_config.ctm,
+                            "per-output CTM set from KDL"
+                        );
+                    } else {
+                        tracing::warn!(
+                            connector = %name,
+                            got = ctm_cfg.values.len(),
+                            "color.ctm needs exactly 9 row-major values; ignoring"
+                        );
+                    }
+                }
                 if let Some(curve) = cfg.color.as_ref().and_then(|c| c.response_curve.as_ref()) {
                     // Clamp to physically-meaningful ranges. Gain <= 0
                     // would zero-divide; gamma <= 0 would produce
@@ -1748,7 +1770,7 @@ fn render_output_now(
         white_view,
         target_time,
         output_sdr_reference_nits,
-        output_panel_peak_nits_rgb,
+        output_decode_clamp_bt2020_rgb,
     ) = {
         let output = state
             .outputs
@@ -1759,7 +1781,7 @@ fn render_output_now(
             output.renderer.white_view(),
             output.frame_clock.next_presentation_time(),
             output.effective_sdr_reference_nits(),
-            output.effective_panel_peak_nits_rgb(),
+            output.effective_decode_clamp_bt2020_rgb(),
         )
     };
 
@@ -1908,7 +1930,7 @@ fn render_output_now(
     // clamp lands at the right value for each output.
     let mut elements: Vec<ElementDraw> = Vec::with_capacity(render_els.len());
     for el in &render_els {
-        el.lower(white_view, output_panel_peak_nits_rgb, &mut elements);
+        el.lower(white_view, output_decode_clamp_bt2020_rgb, &mut elements);
     }
 
     // Once per output, the first present that actually carries tiles —
@@ -1959,6 +1981,9 @@ fn render_output_now(
         };
         if let Some((gain, gamma)) = output.effective_response_curve() {
             p.set_response_gain_gamma(gain, gamma);
+        }
+        if let Some(m) = output.effective_ctm() {
+            p.set_ctm(m);
         }
         p
     };

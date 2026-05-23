@@ -181,11 +181,19 @@ fn collect_outputs(state: &PrismState) -> HashMap<String, Output> {
                 gamma: [gamma[0] as f64, gamma[1] as f64, gamma[2] as f64],
             }
         });
+        let ctm = ctx.effective_ctm().map(|m| {
+            [
+                [m[0][0] as f64, m[0][1] as f64, m[0][2] as f64],
+                [m[1][0] as f64, m[1][1] as f64, m[1][2] as f64],
+                [m[2][0] as f64, m[2][1] as f64, m[2][2] as f64],
+            ]
+        });
         let color = ColorState {
             hdr_active: ctx.config.hdr.is_some(),
             panel_peak_nits: [peaks[0] as f64, peaks[1] as f64, peaks[2] as f64],
             sdr_reference_nits: ctx.effective_sdr_reference_nits() as f64,
             response_curve: curve,
+            ctm,
         };
         let info = Output {
             name: ctx.connector_name.clone(),
@@ -277,6 +285,23 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                     "panel-peak-nits applied but HDR infoframe rebuild failed: {e:#}"
                 );
             }
+        }
+        OutputAction::Ctm {
+            rr, rg, rb,
+            gr, gg, gb,
+            br, bg, bb,
+        } => {
+            let m = [
+                [rr as f32, rg as f32, rb as f32],
+                [gr as f32, gg as f32, gb as f32],
+                [br as f32, bg as f32, bb as f32],
+            ];
+            output_ctx.color_override.ctm = Some(m);
+            tracing::info!(
+                connector = %name,
+                ctm = ?m,
+                "ipc: set ctm override"
+            );
         }
         OutputAction::ResetColor => {
             output_ctx.color_override = prism_drm::ColorOverride::default();

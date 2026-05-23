@@ -34,6 +34,18 @@ use smithay::reexports::drm::control::{Mode, connector, crtc, framebuffer};
 use crate::frame_clock::FrameClock;
 use smithay::utils::{Rectangle, Transform};
 
+/// Headroom multiplier on the derived per-channel BT.2020 decode clamp.
+/// The clamp's purpose is to keep the BT.2020 fp16 intermediate honest
+/// — bound to "panel-realizable as BT.2020 content" — not to be the
+/// final tone-map. Going slightly above the panel's physical limit is
+/// fine: the encoder's response inverse + PQ OETF clamp soft-clip the
+/// excess at the panel ceiling. With margin, the buffer absorbs minor
+/// color-management drift (e.g. fp roundoff pushing a 100%-channel value
+/// to 1.0001 × sdr_white) without hard-clipping content authored in good
+/// faith. 1.5× chosen as a conservative default; the precision of the
+/// underlying panel-peak fit doesn't need to be tight at this margin.
+const BT2020_DECODE_CAP_MARGIN: f32 = 1.5;
+
 use crate::{
     CursorPlane, DrmCardContext, OutputConfig, OutputPick, add_framebuffer_for_bo,
     breadcrumb::{breadcrumb, flip_trace},
@@ -377,16 +389,25 @@ impl OutputContext {
             .or(self.config.response_curve)
     }
 
-    /// Effective per-channel panel-peak ceiling (the value the decoder
-    /// clamps to, per channel). Resolution order:
+    /// Effective 3×3 calibration matrix, override-then-config. `None`
+    /// = identity (no gamut correction in the encode shader).
+    pub fn effective_ctm(&self) -> Option<[[f32; 3]; 3]> {
+        self.color_override.ctm.or(self.config.ctm)
+    }
+
+    /// Effective per-channel panel-NATIVE peak nits (i.e. the peak
+    /// emission of each physical primary on the panel itself).
+    /// Resolution order:
     ///   1. Runtime IPC override (set by calibration tools)
     ///   2. KDL config `panel-peak-nits-r/-g/-b` (from prior calibration)
     ///   3. Broadcast of HDR `max_luminance` (HDR-mode outputs) or
     ///      effective `sdr_reference_nits` (SDR-mode outputs)
     ///
-    /// The broadcast fallback is a conservative all-channels-equal
-    /// guess; once a calibration pass has run, (1) or (2) carries the
-    /// true per-subpixel ceiling.
+    /// **Do not feed this directly to the decoder clamp.** The decoder
+    /// clamps in the BT.2020 domain; use [`Self::effective_decode_clamp_bt2020_rgb`]
+    /// instead, which translates panel-native peaks through the CTM.
+    /// This getter is for tooling (telemetry, calibrate's curve fit)
+    /// and for the BT.2020 derivation itself.
     pub fn effective_panel_peak_nits_rgb(&self) -> [f32; 3] {
         if let Some(rgb) = self.color_override.panel_peak_nits_rgb {
             return rgb;
@@ -397,51 +418,56 @@ impl OutputContext {
         self.config.panel_peak_nits_rgb
     }
 
-    /// Push a fresh `HDR_OUTPUT_METADATA` infoframe to the connector
-    /// reflecting the current effective per-channel panel peak.
+    /// Per-channel BT.2020-domain clamp the decoder applies to the fp16
+    /// intermediate. See [`derive_bt2020_decode_clamp`] for the math;
+    /// this is a thin getter that plumbs in the effective panel peak,
+    /// effective CTM, and standard margin.
+    pub fn effective_decode_clamp_bt2020_rgb(&self) -> [f32; 3] {
+        derive_bt2020_decode_clamp(
+            self.effective_panel_peak_nits_rgb(),
+            self.effective_ctm(),
+            BT2020_DECODE_CAP_MARGIN,
+        )
+    }
+
+    /// Re-push the bringup `HDR_OUTPUT_METADATA` infoframe to the
+    /// connector. Used after runtime color overrides change, mostly
+    /// as a no-op safety re-push — the actual signaling values come
+    /// from the KDL `hdr { … }` block and do NOT track per-channel
+    /// panel peaks.
     ///
-    /// The infoframe's `max_display_mastering_luminance` field is a
-    /// single value — the highest mastering luminance the sink should
-    /// expect from our content — so we project the per-channel peaks
-    /// to `max(r, g, b)`. `max_cll` and `max_fall` are clamped down
-    /// to the new ceiling so the sink's tonemap targets a self-
-    /// consistent envelope. The mastering primaries / min luminance /
-    /// EOTF stay as the bringup config left them (they describe the
-    /// content's color volume, not the panel's calibrated peak).
+    /// **History (2026-05-22 fix):** an earlier version projected
+    /// the IPC-set `panel_peak_nits_rgb` into the infoframe's
+    /// `max_display_mastering_luminance`, on the theory that a
+    /// calibration pass discovering tighter per-channel peaks should
+    /// tell the sink to tonemap against measured reality. That was
+    /// based on the wrong meaning of the field: CTA-861's
+    /// `max_display_mastering_luminance` is "what reference display
+    /// was the **content** authored for", not "what can this panel
+    /// physically emit". Empirically, advertising a low mastering
+    /// peak (e.g. 112 nits, derived from per-channel emission) made
+    /// the DP-4 Samsung HDR400 panel apply aggressive dim-content
+    /// boost — verify-phase D65 sweeps emitted ~8× the requested
+    /// luminance. The metadata blob now stays at whatever the user
+    /// set in KDL `hdr { max-luminance … }` (typically the panel's
+    /// HDR class peak: 400, 600, 1000), regardless of per-channel
+    /// calibration measurements. The IR clamp at `probe_peak_y` is
+    /// the only thing that downscales emission — keep that internal.
     ///
     /// No-op on non-HDR outputs (no `config.hdr` block) or connectors
     /// that don't expose HDR signaling (no `hdr_props`).
-    ///
-    /// Call this from any path that mutates `color_override
-    /// .panel_peak_nits_rgb` — the IPC `PanelPeakNits` handler is the
-    /// primary caller. Honest mid-session is the goal: a calibration
-    /// pass that discovers a tighter ceiling should immediately push
-    /// the new metadata so the sink tonemaps against measured reality
-    /// rather than the stale KDL value.
     pub fn rebuild_hdr_infoframe(&mut self) -> Result<()> {
-        let Some(base) = self.config.hdr else {
+        let Some(signaling) = self.config.hdr else {
             return Ok(()); // non-HDR output — nothing to push
         };
-        let peaks = self.effective_panel_peak_nits_rgb();
-        let new_max_lum = peaks
-            .iter()
-            .copied()
-            .fold(0.0_f32, f32::max)
-            .clamp(0.0, u16::MAX as f32) as u16;
-        let mut signaling = base;
-        signaling.max_luminance = new_max_lum;
-        signaling.max_cll = signaling.max_cll.min(new_max_lum);
-        signaling.max_fall = signaling.max_fall.min(new_max_lum);
         if let Some(props) = self.hdr_props.as_mut() {
             props
                 .set_hdr(&self.surface, &signaling)
-                .context("rebuild HDR_OUTPUT_METADATA from current panel peak")?;
-            tracing::info!(
+                .context("re-push HDR_OUTPUT_METADATA from bringup config")?;
+            tracing::debug!(
                 connector = %self.connector_name,
-                max_luminance = new_max_lum,
-                max_cll = signaling.max_cll,
-                max_fall = signaling.max_fall,
-                "HDR infoframe rebuilt from effective panel peak"
+                ?signaling,
+                "HDR infoframe re-pushed (bringup config, no per-peak override)"
             );
         }
         Ok(())
@@ -459,6 +485,11 @@ pub struct ColorOverride {
     /// calibration tools after the per-channel saturation discovery
     /// phase produces measured per-subpixel maxima.
     pub panel_peak_nits_rgb: Option<[f32; 3]>,
+    /// Per-output 3×3 gamut-correction matrix override. Set by
+    /// calibration tools after measured primaries are known; the
+    /// encode shader applies `panel_rgb = M * bt2020_rgb` to map IR
+    /// values into the panel's native-primary space.
+    pub ctm: Option<[[f32; 3]; 3]>,
 }
 
 impl OutputContext {
@@ -722,5 +753,142 @@ impl Drop for OutputContext {
         // output X in Yms" breadcrumb wraps the entire chain, so if it
         // doesn't fire after our "clear returned" breadcrumb the hang
         // is in one of those implicit drops.
+    }
+}
+
+/// Derive the per-channel BT.2020-domain clamp from panel-native peaks
+/// and the calibration matrix.
+///
+/// Math: for each BT.2020 channel `c`, the panel-native commanded value
+/// for panel-native channel `p` is `CTM[p][c] * bt2020[c]`. The largest
+/// `bt2020[c]` we can pass through without driving any panel-native
+/// channel past its peak is `min over p of (panel[p] / CTM[p][c])` —
+/// restricted to entries where `CTM[p][c] > 0`, because negative entries
+/// gamut-clip to zero in the encoder and don't constrain the cap.
+///
+/// `margin` is multiplied on top of the derived value to give the buffer
+/// soft-clip headroom (see [`BT2020_DECODE_CAP_MARGIN`]).
+///
+/// `ctm = None` (un-calibrated identity) returns `panel` unchanged.
+///
+/// Defensive against pathological CTMs (all-negative column): falls back
+/// to the matching panel-native value so we don't accidentally clamp the
+/// buffer to zero.
+pub fn derive_bt2020_decode_clamp(
+    panel: [f32; 3],
+    ctm: Option<[[f32; 3]; 3]>,
+    margin: f32,
+) -> [f32; 3] {
+    let Some(ctm) = ctm else {
+        return panel;
+    };
+    let mut cap = [0.0f32; 3];
+    for c in 0..3 {
+        let mut min_cap = f32::INFINITY;
+        for p in 0..3 {
+            if ctm[p][c] > 0.0 {
+                let cap_p = panel[p] / ctm[p][c];
+                if cap_p < min_cap {
+                    min_cap = cap_p;
+                }
+            }
+        }
+        cap[c] = if min_cap.is_finite() {
+            min_cap * margin
+        } else {
+            panel[c]
+        };
+    }
+    cap
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Identity CTM (un-calibrated path) returns panel-native peaks
+    /// unchanged. BT.2020 ≡ panel-native when no transform applies.
+    #[test]
+    fn identity_ctm_passes_panel_peaks_through() {
+        let panel = [100.0, 200.0, 50.0];
+        let cap = derive_bt2020_decode_clamp(panel, None, 1.5);
+        assert_eq!(cap, panel);
+    }
+
+    /// Real DP-4 darker calibration data. Panel native peaks
+    /// (37.842, 109.423, 15.256). CTM diagonal entries dominate, so the
+    /// per-channel cap collapses to `panel[c] / ctm[c][c] * margin`.
+    /// Before this fix, blue clamped to 15.256 nits and crushed any
+    /// blue-rich content; with derivation the BT.2020-B cap is ~220 nits.
+    #[test]
+    fn dp4_darker_clamp_derivation() {
+        let panel = [37.842, 109.423, 15.256];
+        let ctm = Some([
+            [0.307197, -0.086296, -0.001263],
+            [-0.043766, 0.776906, -0.043953],
+            [-0.000731, -0.012612, 0.104517],
+        ]);
+        let cap = derive_bt2020_decode_clamp(panel, ctm, 1.5);
+        // Diagonal-only contributors (off-diagonals all negative for
+        // this CTM, so they're clipped out of the cap derivation).
+        let expect_r = 37.842 / 0.307197 * 1.5;
+        let expect_g = 109.423 / 0.776906 * 1.5;
+        let expect_b = 15.256 / 0.104517 * 1.5;
+        assert!((cap[0] - expect_r).abs() < 1e-3, "R: {} vs {}", cap[0], expect_r);
+        assert!((cap[1] - expect_g).abs() < 1e-3, "G: {} vs {}", cap[1], expect_g);
+        assert!((cap[2] - expect_b).abs() < 1e-3, "B: {} vs {}", cap[2], expect_b);
+        // Sanity: blue cap is ~10× the panel-native blue peak.
+        assert!(cap[2] > 200.0, "blue cap should be far above panel-native peak, got {}", cap[2]);
+    }
+
+    /// When a CTM column has multiple positive entries, the tightest
+    /// constraint wins (binding panel-native primary is whichever
+    /// saturates first). Constructed example: column 0 has positive
+    /// contributions to both panel R and panel G; R hits its peak first.
+    #[test]
+    fn min_constraint_wins_on_positive_columns() {
+        let panel = [100.0, 50.0, 200.0];
+        let ctm = Some([
+            [2.0, 0.0, 0.0], // panel R = 2 * bt2020 R; cap_r_from_R = 100/2 = 50
+            [1.0, 1.0, 0.0], // panel G = 1 * bt2020 R; cap_r_from_G = 50/1 = 50
+            [0.0, 0.0, 1.0],
+        ]);
+        let cap = derive_bt2020_decode_clamp(panel, ctm, 1.0);
+        // Tightest: both rows give cap_r = 50; either way result = 50.
+        assert!((cap[0] - 50.0).abs() < 1e-4);
+    }
+
+    /// Margin is applied as a simple multiplier.
+    #[test]
+    fn margin_scales_output() {
+        let panel = [100.0, 100.0, 100.0];
+        let ctm = Some([
+            [0.5, 0.0, 0.0],
+            [0.0, 0.5, 0.0],
+            [0.0, 0.0, 0.5],
+        ]);
+        let cap_no_margin = derive_bt2020_decode_clamp(panel, ctm, 1.0);
+        let cap_margined = derive_bt2020_decode_clamp(panel, ctm, 2.0);
+        for c in 0..3 {
+            assert!((cap_no_margin[c] - 200.0).abs() < 1e-4);
+            assert!((cap_margined[c] - 400.0).abs() < 1e-4);
+        }
+    }
+
+    /// Pathological CTM (all-zero or all-negative column): fall back to
+    /// the matching panel-native value rather than clamp the buffer to
+    /// zero. Margin is intentionally NOT applied in the fallback path —
+    /// the derivation couldn't constrain anything, so report the
+    /// conservative panel-native value as-is.
+    #[test]
+    fn no_positive_column_falls_back_to_panel() {
+        let panel = [42.0, 99.0, 7.0];
+        let ctm = Some([
+            [-1.0, 0.0, 0.0], // column 0: no positive entries
+            [-1.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]);
+        let cap = derive_bt2020_decode_clamp(panel, ctm, 1.5);
+        assert!((cap[0] - 42.0).abs() < 1e-4, "fallback R: {}", cap[0]);
     }
 }

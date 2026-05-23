@@ -204,10 +204,14 @@ pub struct ResponseCurve {
     pub gamma_b: f64,
 }
 
-/// 3x3 calibration matrix in row-major order (`r0c0 r0c1 r0c2  r1c0 r1c1 r1c2  r2c0 r2c1 r2c2`).
+/// 3×3 gamut-correction matrix in row-major order
+/// (`r0c0 r0c1 r0c2  r1c0 r1c1 r1c2  r2c0 r2c1 r2c2`).
 ///
-/// Applied by the display engine after blending: `out = CTM * in`. Identity is
-/// `1 0 0  0 1 0  0 0 1`.
+/// Applied in the encode shader as `panel_rgb = CTM * bt2020_rgb`, before
+/// the per-channel response curve and OETF. Maps BT.2020 IR values into the
+/// panel's native-primary linear nits — derived by calibration from
+/// measured panel primaries plus the BT.2020 reference (D65) white point.
+/// Identity is `1 0 0  0 1 0  0 0 1` (no gamut correction).
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub struct Ctm {
     #[knuffel(arguments)]

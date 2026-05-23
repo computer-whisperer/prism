@@ -15,16 +15,18 @@
 //! ```text
 //! prism-tune msg version
 //! prism-tune msg outputs
-//! prism-tune msg output DP-4 sdr-reference-nits 100
-//! prism-tune msg output DP-4 response-curve \
+//! prism-tune msg output DisplayPort-4 sdr-reference-nits 100
+//! prism-tune msg output DisplayPort-4 response-curve \
 //!     --gain-r 0.45 --gain-g 0.46 --gain-b 0.43 \
 //!     --gamma-r 1.08 --gamma-g 1.07 --gamma-b 1.10
-//! prism-tune msg output DP-4 reset-color
+//! prism-tune msg output DisplayPort-4 reset-color
 //!
-//! prism-tune calibrate --output DP-4 --peak-nits 400 --window 0.10
+//! prism-tune calibrate --output DisplayPort-4 --window 0.10
 //! ```
 
 mod calibrate;
+mod characterize;
+mod common;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -51,6 +53,11 @@ enum TopCommand {
     /// (panel-peak-nits for HDR, response-curve always) as a paste-
     /// ready KDL block.
     Calibrate(calibrate::CalibrateArgs),
+    /// Raw response-curve characterization — sweep a channel across a
+    /// range of commanded values, log XYZ per sample. Diagnostic
+    /// (no fitting, no compositor writes). Use to investigate panel
+    /// behaviour that doesn't fit `calibrate`'s simple model.
+    Characterize(characterize::CharacterizeArgs),
 }
 
 #[derive(Subcommand)]
@@ -64,7 +71,10 @@ enum MsgCommand {
     /// Apply a per-output action (color overrides, mode, etc.). See
     /// `--help` on the subcommand for the available actions.
     Output {
-        /// Output connector name (e.g. `DP-4`, `HDMI-A-1`).
+        /// Output connector name (e.g. `DisplayPort-4`, `HDMI-A-1`).
+        /// Use the long form — recent prism builds match the
+        /// connector-driver name verbatim, not the `DP-N` shorthand.
+        /// Run `prism-tune msg outputs` to list available names.
         output: String,
         #[command(subcommand)]
         action: OutputAction,
@@ -76,6 +86,7 @@ fn main() -> Result<()> {
     match cli.command {
         TopCommand::Msg(cmd) => run_msg(cmd),
         TopCommand::Calibrate(args) => calibrate::run(args),
+        TopCommand::Characterize(args) => characterize::run(args),
     }
 }
 

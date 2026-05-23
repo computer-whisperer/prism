@@ -92,6 +92,20 @@ impl EncodePushSynth {
         self.response_gain = [gain[0], gain[1], gain[2], 0.0];
         self.response_gamma = [gamma[0], gamma[1], gamma[2], 0.0];
     }
+
+    /// Set the 3×3 calibration matrix from row-major rows. The shader
+    /// applies `panel_rgb = M * bt2020_rgb` — i.e., row R of `m` is the
+    /// coefficients `[in_R, in_G, in_B]` that contribute to output R.
+    /// Stored as a mat4 in column-major order with the 4th row/column
+    /// zeroed (the shader uses `mat3(cal_matrix)`).
+    pub fn set_ctm(&mut self, m: [[f32; 3]; 3]) {
+        self.cal_matrix = [
+            m[0][0], m[1][0], m[2][0], 0.0, // col 0
+            m[0][1], m[1][1], m[2][1], 0.0, // col 1
+            m[0][2], m[1][2], m[2][2], 0.0, // col 2
+            0.0,     0.0,     0.0,     1.0, // col 3 (unused; identity for safety)
+        ];
+    }
 }
 
 fn mat4_identity() -> [f32; 16] {

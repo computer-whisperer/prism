@@ -151,4 +151,12 @@ pub struct OutputConfig {
     /// `emitted = gain * commanded^gamma` response. `None` =
     /// identity (no correction).
     pub response_curve: Option<([f32; 3], [f32; 3])>,
+    /// Per-output 3×3 calibration matrix in row-major order, applied
+    /// in the encode shader as `panel_rgb = M * bt2020_rgb`. Derived
+    /// from measured panel primaries — maps BT.2020 IR values to the
+    /// panel's native-primary linear nits so the per-channel response
+    /// curve (which characterises the panel in its own primaries)
+    /// works against panel-native input. `None` = identity (no gamut
+    /// correction, panel emits its native primaries directly).
+    pub ctm: Option<[[f32; 3]; 3]>,
 }

@@ -1150,8 +1150,46 @@ pub enum OutputAction {
         #[cfg_attr(feature = "clap", arg(long))]
         nits_b: f64,
     },
+    /// Set the per-output 3×3 gamut-correction matrix. The encode
+    /// shader applies `panel_rgb = M * bt2020_rgb` to map BT.2020 IR
+    /// values into the panel's native-primary linear nits before the
+    /// per-channel response curve and OETF. Derived from measured
+    /// primaries: `M = panel_RGB_to_XYZ⁻¹ · BT2020_RGB_to_XYZ`. Field
+    /// names are row-major: `rg` means "row R, column G" = how much
+    /// input G contributes to output R. Identity matrix (1 on the
+    /// diagonal, 0 elsewhere) is a no-op. Sticky until `reset-color`
+    /// or restart.
+    Ctm {
+        /// Row R column R coefficient (input R contribution to output R).
+        #[cfg_attr(feature = "clap", arg(long))]
+        rr: f64,
+        /// Row R column G coefficient (input G contribution to output R).
+        #[cfg_attr(feature = "clap", arg(long))]
+        rg: f64,
+        /// Row R column B coefficient (input B contribution to output R).
+        #[cfg_attr(feature = "clap", arg(long))]
+        rb: f64,
+        /// Row G column R coefficient (input R contribution to output G).
+        #[cfg_attr(feature = "clap", arg(long))]
+        gr: f64,
+        /// Row G column G coefficient (input G contribution to output G).
+        #[cfg_attr(feature = "clap", arg(long))]
+        gg: f64,
+        /// Row G column B coefficient (input B contribution to output G).
+        #[cfg_attr(feature = "clap", arg(long))]
+        gb: f64,
+        /// Row B column R coefficient (input R contribution to output B).
+        #[cfg_attr(feature = "clap", arg(long))]
+        br: f64,
+        /// Row B column G coefficient (input G contribution to output B).
+        #[cfg_attr(feature = "clap", arg(long))]
+        bg: f64,
+        /// Row B column B coefficient (input B contribution to output B).
+        #[cfg_attr(feature = "clap", arg(long))]
+        bb: f64,
+    },
     /// Clear all runtime color overrides for this output (sdr
-    /// reference, response curve, panel peak nits). Subsequent
+    /// reference, response curve, panel peak nits, ctm). Subsequent
     /// rendering reverts to whatever's in the persisted KDL config.
     ResetColor,
 }
@@ -1313,6 +1351,10 @@ pub struct ColorState {
     /// Effective per-channel response correction. `None` = identity
     /// (no correction applied).
     pub response_curve: Option<ResponseCurveState>,
+    /// Effective 3×3 gamut-correction matrix, row-major. `None` =
+    /// identity (no matrix applied; BT.2020 IR drives panel primaries
+    /// directly without gamut correction).
+    pub ctm: Option<[[f64; 3]; 3]>,
 }
 
 /// Per-channel response correction snapshot. See [`ColorState::response_curve`].
