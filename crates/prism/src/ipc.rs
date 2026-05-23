@@ -389,7 +389,18 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             let result = output_ctx
                 .renderer
                 .encode_diagnose([r, g, b], &p)
-                .map_err(|e| format!("encode_diagnose failed: {e:#}"))?;
+                .map_err(|e| {
+                    // Mirror to tracing as well as the IPC reply so the
+                    // error is recoverable from prism.log alone when the
+                    // client's stderr wasn't captured (which is the
+                    // common case for interactive prism-tune runs).
+                    tracing::warn!(
+                        connector = %name,
+                        input = ?[r, g, b],
+                        "ipc: encode_diagnose failed: {e:#}"
+                    );
+                    format!("encode_diagnose failed: {e:#}")
+                })?;
             tracing::info!(
                 connector = %name,
                 input = ?[r, g, b],
