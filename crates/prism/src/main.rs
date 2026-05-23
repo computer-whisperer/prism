@@ -1173,13 +1173,23 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                                         loaded.cube_edge, renderer_edge,
                                     );
                                 } else {
+                                    let bp = loaded.black_point_xyz;
                                     tracing::info!(
                                         connector = %output.connector_name,
                                         path = %lut3d_cfg.path,
                                         cube_edge = loaded.cube_edge,
+                                        black_point_xyz = ?bp,
                                         "loaded color LUT from file"
                                     );
                                     output.kdl_lut3d_entries = Some(loaded.entries);
+                                    // All-zero ⇒ unmeasured (pre-v2 measurement
+                                    // or calibrate skipped the floor). Leave
+                                    // unset so effective_black_point_xyz returns
+                                    // None and downstream consumers can fall
+                                    // back to "no min-luminance signal."
+                                    if bp[0] != 0.0 || bp[1] != 0.0 || bp[2] != 0.0 {
+                                        output.kdl_black_point_xyz = Some(bp);
+                                    }
                                 }
                             }
                             Err(e) => {

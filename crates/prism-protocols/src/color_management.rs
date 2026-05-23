@@ -381,7 +381,17 @@ pub fn build_output_preferred(
         // narrower ones via EDID — matches what build_hdr_metadata_blob
         // ships in the HDR_OUTPUT_METADATA infoframe.
         let max_lum = hdr.max_luminance as u32;
-        let min_lum_ticks = hdr.min_luminance_ticks as u32;
+        // Prefer the measured panel floor (calibrate-lut3d writes it
+        // to the .lut header, OutputContext exposes it via
+        // effective_black_point_xyz) over the KDL-configured min
+        // luminance. The measurement is what the colorimeter
+        // actually read at (R=G=B=0); the KDL value is a guess or
+        // a copy of an EDID claim. Convert cd/m² → 1/10000-cd/m²
+        // ticks for the protocol.
+        let min_lum_ticks = match ctx.effective_black_point_xyz() {
+            Some(black) => (black[1] * 10_000.0).round().clamp(0.0, u32::MAX as f32) as u32,
+            None => hdr.min_luminance_ticks as u32,
+        };
         Arc::new(ImageDescription {
             identity,
             tf: TransferFunction::St2084Pq,

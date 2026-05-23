@@ -111,6 +111,13 @@ pub struct OutputContext {
     /// pushes the file content directly. `None` ⇒ no file configured,
     /// synthesis takes over.
     pub kdl_lut3d_entries: Option<Vec<[f32; 3]>>,
+    /// Panel black-point measurement (X, Y, Z in cd/m²) parsed out of
+    /// the KDL-loaded LUT file's v2 header at bringup. `None` ⇒ no
+    /// KDL LUT, or the file's `black_point_xyz` was all zeros (the
+    /// "unknown" sentinel — calibrate-lut3d always writes a real
+    /// measurement). Read via [`Self::effective_black_point_xyz`],
+    /// which prefers the IPC override.
+    pub kdl_black_point_xyz: Option<[f32; 3]>,
     /// Set on first present to switch from `commit` (mode-set) to `page_flip`
     /// (just-swap-fb) for subsequent frames.
     mode_set_done: bool,
@@ -371,6 +378,7 @@ impl OutputContext {
             config: config.clone(),
             color_override: ColorOverride::default(),
             kdl_lut3d_entries: None,
+            kdl_black_point_xyz: None,
             mode_set_done: false,
             frame_pending: false,
             frame_clock,
@@ -401,6 +409,30 @@ impl OutputContext {
     /// = identity (no gamut correction in the encode shader).
     pub fn effective_ctm(&self) -> Option<[[f32; 3]; 3]> {
         self.color_override.ctm.or(self.config.ctm)
+    }
+
+    /// Effective measured panel black-point in CIE XYZ (cd/m²) —
+    /// what the colorimeter reads at (R=G=B=0). Precedence:
+    /// IPC override > KDL-loaded LUT header > `None` (unmeasured).
+    ///
+    /// Consumers:
+    /// - `wp_color_management_v1` feedback `min_luminance` event,
+    ///   which standardizes on the Y component (the only one HDR
+    ///   metadata transports treat as load-bearing).
+    /// - Future tone mapping: PQ-encoded content authored at "0 nits"
+    ///   should map to the panel's actual floor rather than absolute
+    ///   zero, so the toe doesn't crush.
+    /// - Cross-display matching (future): lifting the OLED's floor
+    ///   to match the brightest LCD's would let same-grey patches
+    ///   read consistently across the 6-monitor setup.
+    ///
+    /// Returns `None` when no calibration has measured it. Callers
+    /// MUST handle that — there's no sensible default (EDID min-lum
+    /// is essentially fictional on consumer panels).
+    pub fn effective_black_point_xyz(&self) -> Option<[f32; 3]> {
+        self.color_override
+            .black_point_xyz
+            .or(self.kdl_black_point_xyz)
     }
 
     /// Rebuild this output's 3D LUT from the legacy `(CTM, response curve)`
@@ -590,6 +622,11 @@ pub struct ColorOverride {
     /// by `calibrate-lut3d` to push a freshly-measured LUT live
     /// without restarting prism. Set via `OutputAction::LoadLut3dFromFile`.
     pub lut3d_entries: Option<Vec<[f32; 3]>>,
+    /// Panel black-point measurement that came in alongside `lut3d_entries`
+    /// (or, separately, was set by some future IPC action). Same
+    /// XYZ units as the LUT file header. Overrides `kdl_black_point_xyz`
+    /// when present.
+    pub black_point_xyz: Option<[f32; 3]>,
 }
 
 impl OutputContext {

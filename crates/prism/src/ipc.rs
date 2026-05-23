@@ -327,10 +327,21 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                 ));
             }
             output_ctx.color_override.lut3d_entries = Some(loaded.entries);
+            // Carry the measured black-point alongside — the v2 file
+            // format pairs them and the compositor uses the floor for
+            // tone-map decisions + wp_color_management feedback. All-
+            // zero ⇒ unmeasured; we treat that as "leave the override
+            // unset" so the KDL-loaded value (if any) still shows
+            // through via effective_black_point_xyz.
+            let bp = loaded.black_point_xyz;
+            if bp[0] != 0.0 || bp[1] != 0.0 || bp[2] != 0.0 {
+                output_ctx.color_override.black_point_xyz = Some(bp);
+            }
             tracing::info!(
                 connector = %name,
                 path = %path,
                 cube_edge = loaded.cube_edge,
+                black_point_xyz = ?bp,
                 "ipc: loaded color LUT from file"
             );
             lut_dirty = true;
