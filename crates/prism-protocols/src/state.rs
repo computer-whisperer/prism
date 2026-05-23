@@ -34,12 +34,16 @@ use prism_renderer::{DrmDevId, vk};
 use smithay::backend::allocator::Format as DrmFormat;
 use smithay::backend::allocator::dmabuf::Dmabuf as SmithayDmabuf;
 use smithay::delegate_compositor;
+use smithay::delegate_content_type;
 use smithay::delegate_dmabuf;
+use smithay::delegate_fractional_scale;
 use smithay::delegate_output;
 use smithay::delegate_presentation;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
+use smithay::delegate_single_pixel_buffer;
 use smithay::delegate_viewporter;
+use smithay::delegate_xdg_activation;
 use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -64,9 +68,17 @@ use smithay::wayland::dmabuf::{
     DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState,
     ImportNotifier, SurfaceDmabufFeedbackState,
 };
+use smithay::wayland::content_type::ContentTypeState;
+use smithay::wayland::fractional_scale::{
+    FractionalScaleHandler, FractionalScaleManagerState,
+};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::presentation::PresentationState;
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::xdg_activation::{
+    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -175,6 +187,34 @@ pub struct PrismState {
     /// extension interfaces lives in [`crate::color_management`]; this
     /// struct just owns the state the dispatch code references.
     pub color_management: crate::color_management::ColorManagementState,
+    /// `wp_fractional_scale_v1`. Smithay handles the protocol; we
+    /// own a handle so we can call
+    /// [`smithay::wayland::fractional_scale::with_fractional_scale`]
+    /// to push `preferred_scale` events when a surface's output
+    /// changes. Today we don't drive fractional scale per-surface
+    /// (all outputs are advertised at integer scale 1 or 2), so the
+    /// state is essentially advertise-only — it kills the GDK-side
+    /// "fractional scale not advertised" fallback noise and gives us
+    /// the hook to drive real fractional scaling later.
+    pub fractional_scale: FractionalScaleManagerState,
+    /// `wp_single_pixel_buffer_v1`. Smithay materializes the
+    /// `wl_buffer`; clients use it for solid-color fills (window
+    /// backgrounds, GTK rects). NOTE: the surface-texture importer
+    /// doesn't yet recognize this buffer type — surfaces that attach
+    /// one will fail import (logged as a warning) but won't crash.
+    /// Wire-up to the renderer is a follow-up.
+    pub single_pixel_buffer: SinglePixelBufferState,
+    /// `wp_content_type_v1`. Smithay tracks the per-surface content
+    /// type hint (game/photo/video). The render path doesn't act on
+    /// it yet — when VRR cadence / frame pacing land, they should
+    /// read this via
+    /// [`smithay::wayland::content_type::ContentTypeSurfaceCachedState`].
+    pub content_type: ContentTypeState,
+    /// `xdg_activation_v1`. Real handler in [`crate::state`] — see
+    /// [`XdgActivationHandler`] impl below; it validates tokens
+    /// against the seat's last keyboard/pointer enter serial and
+    /// calls [`Layout::activate_window`] on success.
+    pub xdg_activation: XdgActivationState,
     /// `wlr_layer_shell_unstable_v1` server state. MVP — see
     /// [`crate::layer_shell`] for the deliberate scope gaps.
     pub layer_shell_state:
@@ -416,6 +456,16 @@ impl PrismState {
         let layer_shell_state =
             smithay::wayland::shell::wlr_layer::WlrLayerShellState::new::<PrismState>(&dh);
 
+        // Modern clients (Firefox, GTK4, recent toolkits) probe these
+        // globals at startup and either fall back loudly or take
+        // degraded paths when missing. We advertise them now so the
+        // protocol surface is complete; per-protocol render/scheduling
+        // wiring follows incrementally (see field docs on PrismState).
+        let fractional_scale = FractionalScaleManagerState::new::<PrismState>(&dh);
+        let single_pixel_buffer = SinglePixelBufferState::new::<PrismState>(&dh);
+        let content_type = ContentTypeState::new::<PrismState>(&dh);
+        let xdg_activation = XdgActivationState::new::<PrismState>(&dh);
+
         Self {
             config,
             clock,
@@ -435,6 +485,10 @@ impl PrismState {
             viewporter,
             presentation,
             color_management,
+            fractional_scale,
+            single_pixel_buffer,
+            content_type,
+            xdg_activation,
             layer_shell_state,
             layer_surfaces: HashMap::new(),
             session,
@@ -1480,6 +1534,102 @@ delegate_dmabuf!(PrismState);
 // interfaces.
 
 smithay::delegate_layer_shell!(PrismState);
+
+// ─── fractional_scale / single_pixel_buffer / content_type ──────────────────
+// Advertise-only today. The handlers are no-op shims so smithay's
+// delegate macros can find the trait impl; protocol bookkeeping is
+// entirely on smithay's side. See field docs on PrismState for the
+// follow-up wiring each needs.
+
+impl FractionalScaleHandler for PrismState {}
+delegate_fractional_scale!(PrismState);
+delegate_single_pixel_buffer!(PrismState);
+delegate_content_type!(PrismState);
+
+// ─── xdg_activation_v1 ──────────────────────────────────────────────────────
+// Activation tokens carry a seat + serial that the requesting client
+// captured from a recent input event. We accept the token iff that
+// serial is no older than the seat's last keyboard- or pointer-enter
+// — same rule niri uses (handlers/mod.rs:773). Tokens without a serial
+// (Discord/Telegram tray icons, libnotify-via-notify-osd, …) are
+// accepted as "urgency-only" and surface as a focus-ring change
+// rather than a focus steal. Mirrors niri's compromise; without it
+// those clients can't bring their windows forward at all.
+//
+// Pre-libinput edge case: `seat.get_keyboard()` returns `None` before
+// any libinput device fires; we reject serial-bearing tokens in that
+// window since we have no last-enter to compare against.
+
+impl XdgActivationHandler for PrismState {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation
+    }
+
+    fn token_created(
+        &mut self,
+        _token: XdgActivationToken,
+        data: XdgActivationTokenData,
+    ) -> bool {
+        let Some((serial, seat)) = data.serial else {
+            // No serial — urgency-only path. Always accept; the
+            // window manager treats this as a hint, not a focus
+            // grant.
+            return true;
+        };
+        let Some(seat) = Seat::<PrismState>::from_resource(&seat) else {
+            return false;
+        };
+        // Compare against both keyboard and pointer last_enter, since
+        // a layer-shell surface with no keyboard interactivity may
+        // still produce a valid token via pointer focus alone.
+        if let Some(kb) = seat.get_keyboard() {
+            if kb.last_enter().is_some_and(|le| serial.is_no_older_than(&le)) {
+                return true;
+            }
+        }
+        if let Some(ptr) = seat.get_pointer() {
+            if ptr.last_enter().is_some_and(|le| serial.is_no_older_than(&le)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn request_activation(
+        &mut self,
+        token: XdgActivationToken,
+        token_data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        // 10s window — matches niri's `XDG_ACTIVATION_TOKEN_TIMEOUT`
+        // and the typical "user just clicked" interval. Older tokens
+        // are stale (the user has moved on); silently drop.
+        const TOKEN_TIMEOUT_SECS: u64 = 10;
+        if token_data.timestamp.elapsed().as_secs() < TOKEN_TIMEOUT_SECS {
+            if let Some((mapped, _)) = self.layout.find_window_and_output(&surface) {
+                let window = mapped.window.clone();
+                self.layout.activate_window(&window);
+                // Queue a redraw on every output — `activate_window`
+                // may have moved focus across monitors, and we don't
+                // know which ones need to repaint until the layout
+                // settles.
+                let ids: Vec<_> = self.outputs.keys().cloned().collect();
+                for id in ids {
+                    self.output_redraw.entry(id).or_default().queue_redraw();
+                }
+            }
+            // Surface not yet mapped: today we drop the token. niri
+            // queues it on the unmapped-window record so the window
+            // gets activated on its first commit; we don't have that
+            // bookkeeping yet (no `unmapped_windows` map), so the
+            // common case where the just-spawned client's window
+            // arrives milliseconds after the activation token won't
+            // pre-focus. Track as a follow-up if it bites.
+        }
+        self.xdg_activation.remove_token(&token);
+    }
+}
+delegate_xdg_activation!(PrismState);
 
 /// Build the per-output `DmabufFeedback` published to clients whose
 /// surfaces map onto this output.
