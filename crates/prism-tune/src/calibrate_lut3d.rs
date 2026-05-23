@@ -217,6 +217,14 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     if baseline.hdr_active {
         apply_panel_peaks(&args.output, [10_000.0, 10_000.0, 10_000.0])?;
     }
+    // ResetColor only clears IPC overrides; KDL `color { ctm …
+    // response-curve … }` stays active and the encode shader's LUT
+    // gets re-synthesized from those values. That would silently
+    // pre-transform every commanded value the sweep sends — measuring
+    // panel response through the existing calibration instead of raw.
+    // IdentityLut3d forces the LUT to identity regardless of KDL.
+    send_action(&args.output, OutputAction::IdentityLut3d)
+        .context("force identity LUT for raw-cmd sweep")?;
 
     let mut device = Colorimeter::open_any().context("open colorimeter")?;
     let info = device.get_info().context("read colorimeter info")?;

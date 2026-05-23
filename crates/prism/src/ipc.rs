@@ -335,6 +335,22 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             );
             lut_dirty = true;
         }
+        OutputAction::IdentityLut3d => {
+            let cube_edge = output_ctx.renderer.lut3d_cube_edge();
+            if cube_edge == 0 {
+                return Err(
+                    "IdentityLut3d: encode chain has no LUT slot (legacy CTM+curve path)".to_owned(),
+                );
+            }
+            let entries = prism_renderer::identity_lut(cube_edge);
+            output_ctx.color_override.lut3d_entries = Some(entries);
+            tracing::info!(
+                connector = %name,
+                cube_edge,
+                "ipc: forced LUT to identity (raw-cmd mode)"
+            );
+            lut_dirty = true;
+        }
         OutputAction::ResetColor => {
             output_ctx.color_override = prism_drm::ColorOverride::default();
             tracing::info!(connector = %name, "ipc: cleared color overrides");

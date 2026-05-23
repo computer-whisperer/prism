@@ -1204,6 +1204,17 @@ pub enum OutputAction {
         #[cfg_attr(feature = "clap", arg(long))]
         path: String,
     },
+    /// Force this output's 3D LUT to identity, ignoring whatever the
+    /// KDL config says. The panel renders raw commanded values — what
+    /// `calibrate-lut3d`'s per-channel sweep needs so the measurements
+    /// aren't pre-transformed by an already-active calibration.
+    ///
+    /// Without this, `ResetColor` only clears IPC overrides; KDL
+    /// `color { ctm … response-curve … }` stays active and the encode
+    /// shader's LUT is whatever those values synthesize to —
+    /// silently mislabeling sweep measurements. Sticky until
+    /// `ResetColor` clears the override.
+    IdentityLut3d,
     /// Clear all runtime color overrides for this output (sdr
     /// reference, response curve, panel peak nits, ctm, lut3d).
     /// Subsequent rendering reverts to whatever's in the persisted
