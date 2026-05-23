@@ -4,6 +4,7 @@
 //! produces scanout buffers for `prism_drm` to submit.
 
 pub mod device;
+pub mod diagnose;
 pub mod dmabuf;
 pub mod element;
 pub mod encode_synth;
@@ -17,6 +18,7 @@ pub mod renderer;
 pub mod upload;
 
 pub use device::{Device, DrmDevId, DrmFormatModifierInfo, PhysicalDeviceInfo};
+pub use diagnose::{DiagnosedNits, EncodeDiagnoseProbe, decode_scanout_texel};
 pub use dmabuf::ImportedImage;
 pub use element::{
     BorderEl, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl, srgb_to_bt2020_nits,

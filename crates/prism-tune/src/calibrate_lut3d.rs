@@ -36,9 +36,10 @@ use tristim_driver::{Colorimeter, Xyz, measurement::raw_to_xyz};
 
 use crate::common::{
     Channel, OutputBaseline, apply_border, apply_panel_peaks, open_patch_surface,
-    query_output_baseline, send_action, set_channel_patch, set_patch_off, set_white_patch,
-    show_alignment_patch,
+    query_output_baseline, send_action, send_action_for_reply, set_channel_patch, set_patch_off,
+    set_white_patch, show_alignment_patch,
 };
+use prism_ipc::Response;
 use tristim_display::PatchSurface;
 use tristim_driver::{Calibration, Setup};
 
@@ -624,7 +625,7 @@ fn verify_white_point(
         let duv = ((up - d65_up).powi(2) + (vp - d65_vp).powi(2)).sqrt();
         let y_err_pct = (xyz.y - t) / t.max(0.01) * 100.0;
 
-        // Diagnostic: mirror the shader's LUT lookup for this verify
+        // Diagnostic 1: mirror the shader's LUT lookup for this verify
         // patch so we can attribute Y_err. Sample the LUT at the PQ-
         // encoded input coord (target nits per channel for D65 white),
         // compute the expected commanded cmd via trilinear interp,
@@ -643,15 +644,50 @@ fn verify_white_point(
             xyz_r.y + xyz_g.y + xyz_b.y;
         let additive_y_err_pct = (xyz.y - additive_y) / additive_y.max(0.01) * 100.0;
 
+        // Diagnostic 2: ask the compositor what its encode pipeline
+        // actually emits for this input. Compares the CPU prediction
+        // above against the GPU's real output — isolates shader-side
+        // bugs (wrong LUT upload, wrong trilinear, wrong push constants)
+        // from the additivity assumption. CPU `cmd_predicted` vs GPU
+        // `scanout_decoded` should be ≈ identical if the LUT path is
+        // correct; any drift is a bug in the renderer.
+        let gpu_diag = send_action_for_reply(
+            &args.output,
+            OutputAction::EncodeDiagnose { r: t, g: t, b: t },
+        )
+        .context("EncodeDiagnose IPC")?;
+        let scanout_decoded = match gpu_diag {
+            Response::EncodeDiagnose(r) => r.scanout_nits,
+            other => anyhow::bail!("unexpected EncodeDiagnose reply: {other:?}"),
+        };
+        // Predict from forward LUT: what additive Y would the GPU-
+        // decoded cmd produce? This is what verify SHOULD see if the
+        // panel is additive (separate from the CPU-cmd prediction
+        // above, which depends on accurate trilinear).
+        let gpu_xyz_r = responses[0].xyz_at(scanout_decoded[0]);
+        let gpu_xyz_g = responses[1].xyz_at(scanout_decoded[1]);
+        let gpu_xyz_b = responses[2].xyz_at(scanout_decoded[2]);
+        let gpu_additive_y = gpu_xyz_r.y + gpu_xyz_g.y + gpu_xyz_b.y;
+
         eprintln!(
             "  W target {:>7.1} cd/m² → Y={:>7.2}  xy=({:.4},{:.4})  Δu'v'={:.4}  Y_err={:+.1}%",
             t, xyz.y, cx, cy, duv, y_err_pct,
         );
         eprintln!(
-            "      LUT lookup cmd=({:.2},{:.2},{:.2})  additive-predicted Y={:.2}  measured vs additive: {:+.1}%",
+            "      CPU lut cmd=({:.2},{:.2},{:.2})  GPU scanout cmd=({:.2},{:.2},{:.2})  CPU vs GPU drift R/G/B={:+.2}/{:+.2}/{:+.2}",
             cmd_predicted[0], cmd_predicted[1], cmd_predicted[2],
-            additive_y, additive_y_err_pct,
+            scanout_decoded[0], scanout_decoded[1], scanout_decoded[2],
+            scanout_decoded[0] - cmd_predicted[0] as f64,
+            scanout_decoded[1] - cmd_predicted[1] as f64,
+            scanout_decoded[2] - cmd_predicted[2] as f64,
         );
+        eprintln!(
+            "      additive-predicted Y from GPU cmd={:.2}  measured Y={:.2}  panel additivity error={:+.1}%",
+            gpu_additive_y, xyz.y,
+            (xyz.y - gpu_additive_y) / gpu_additive_y.max(0.01) * 100.0,
+        );
+        let _ = additive_y;
+        let _ = additive_y_err_pct;
         max_duv = max_duv.max(duv);
         max_y_err_pct = max_y_err_pct.max(y_err_pct.abs());
 
@@ -668,9 +704,15 @@ fn verify_white_point(
             )?;
             writeln!(
                 w,
-                "#   lut cmd=({:.3},{:.3},{:.3}) additive_predicted_y={:.4} additive_y_err_pct={:+.3}",
+                "#   cpu_lut_cmd=({:.3},{:.3},{:.3}) gpu_scanout_cmd=({:.3},{:.3},{:.3})",
                 cmd_predicted[0], cmd_predicted[1], cmd_predicted[2],
-                additive_y, additive_y_err_pct,
+                scanout_decoded[0], scanout_decoded[1], scanout_decoded[2],
+            )?;
+            writeln!(
+                w,
+                "#   gpu_additive_predicted_y={:.4} panel_additivity_err_pct={:+.3}",
+                gpu_additive_y,
+                (xyz.y - gpu_additive_y) / gpu_additive_y.max(0.01) * 100.0,
             )?;
         }
     }

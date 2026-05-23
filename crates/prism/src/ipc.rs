@@ -351,6 +351,44 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             );
             lut_dirty = true;
         }
+        OutputAction::EncodeDiagnose { r, g, b } => {
+            // Build the encode push the live render path would use for
+            // this output — target_peak_nits + sdr_white_nits both
+            // influence the OutputTransfer stage, so the diagnose must
+            // mirror them or it'd test a different shader configuration
+            // than what the panel sees.
+            let mut p = match output_ctx.config.hdr {
+                Some(hdr) => {
+                    let mut p = prism_renderer::EncodePushSynth::pq_identity();
+                    p.target_peak_nits = hdr.max_luminance as f32;
+                    p
+                }
+                None => prism_renderer::EncodePushSynth::sdr_identity(),
+            };
+            p.sdr_white_nits = output_ctx.effective_sdr_reference_nits();
+            // CTM + per-channel curve are no longer read by the
+            // Lut3d-only encode chain, but mirror them anyway so any
+            // legacy-chain output stays equivalent.
+            if let Some((gain, gamma)) = output_ctx.effective_response_curve() {
+                p.set_response_gain_gamma(gain, gamma);
+            }
+            if let Some(m) = output_ctx.effective_ctm() {
+                p.set_ctm(m);
+            }
+            let result = output_ctx
+                .renderer
+                .encode_diagnose([r, g, b], &p)
+                .map_err(|e| format!("encode_diagnose failed: {e:#}"))?;
+            tracing::info!(
+                connector = %name,
+                input = ?[r, g, b],
+                scanout = ?result,
+                "ipc: encode_diagnose"
+            );
+            return Ok(Response::EncodeDiagnose(prism_ipc::EncodeDiagnoseResult {
+                scanout_nits: result,
+            }));
+        }
         OutputAction::ResetColor => {
             output_ctx.color_override = prism_drm::ColorOverride::default();
             tracing::info!(connector = %name, "ipc: cleared color overrides");

@@ -165,6 +165,23 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+    /// Result of an `OutputAction::EncodeDiagnose` request. The
+    /// scanout-format output of the encode pipeline, decoded back to
+    /// linear cd/m². Lets a calibration tool compare against an
+    /// independently-computed prediction (e.g.
+    /// `trilinear_sample_lut(entries, pq_oetf(input))`) to localize
+    /// shader/LUT bugs vs. panel non-additivity.
+    EncodeDiagnose(EncodeDiagnoseResult),
+}
+
+/// Per-channel decoded scanout nits returned by `OutputAction::EncodeDiagnose`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct EncodeDiagnoseResult {
+    /// What the compositor's encode pipeline + LUT actually emitted
+    /// for the requested input, decoded from the scanout format back
+    /// to linear cd/m².
+    pub scanout_nits: [f64; 3],
 }
 
 /// Overview information.
@@ -1215,6 +1232,26 @@ pub enum OutputAction {
     /// silently mislabeling sweep measurements. Sticky until
     /// `ResetColor` clears the override.
     IdentityLut3d,
+    /// Run the per-output encode pipeline once against a 1×1 scratch
+    /// with `input_nits` as the synthetic intermediate value. The
+    /// compositor reads back the scanout-format output, decodes it
+    /// back to linear cd/m², and returns the result as
+    /// `Response::EncodeDiagnose`. Lets calibration tools verify the
+    /// LUT path produces what they think it does — closes the
+    /// otherwise-feed-forward calibration loop independent of the
+    /// colorimeter.
+    EncodeDiagnose {
+        /// Red-channel input to push into the diagnostic intermediate
+        /// (linear cd/m², BT.2020 domain).
+        #[cfg_attr(feature = "clap", arg(long))]
+        r: f64,
+        /// Green-channel input (linear cd/m², BT.2020).
+        #[cfg_attr(feature = "clap", arg(long))]
+        g: f64,
+        /// Blue-channel input (linear cd/m², BT.2020).
+        #[cfg_attr(feature = "clap", arg(long))]
+        b: f64,
+    },
     /// Clear all runtime color overrides for this output (sdr
     /// reference, response curve, panel peak nits, ctm, lut3d).
     /// Subsequent rendering reverts to whatever's in the persisted

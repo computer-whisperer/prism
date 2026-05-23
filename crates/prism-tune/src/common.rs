@@ -258,3 +258,20 @@ pub fn send_action(output: &str, action: OutputAction) -> Result<()> {
         Err(e) => anyhow::bail!("prism returned error: {e}"),
     }
 }
+
+/// Like [`send_action`] but returns the full `Response` to the caller.
+/// Used by actions that ship measurement data back (e.g.
+/// `OutputAction::EncodeDiagnose`).
+pub fn send_action_for_reply(output: &str, action: OutputAction) -> Result<Response> {
+    let mut socket = Socket::connect().context("connect to PRISM_SOCKET")?;
+    let reply = socket
+        .send(Request::Output {
+            output: output.to_string(),
+            action,
+        })
+        .context("send request / read reply")?;
+    match reply {
+        Ok(response) => Ok(response),
+        Err(e) => anyhow::bail!("prism returned error: {e}"),
+    }
+}

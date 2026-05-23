@@ -21,6 +21,7 @@ use crate::device::Device;
 use crate::dmabuf::ImportedImage;
 use crate::encode_synth::EncodeConfig;
 use crate::error::{RendererError, Result, VkResultExt};
+use crate::diagnose::{DiagnosedNits, EncodeDiagnoseProbe};
 use crate::intermediate::Intermediate;
 use crate::lut3d::{Lut3dTexture, identity_lut};
 use crate::pipeline::decode::{DecodePipeline, DecodePush};
@@ -81,6 +82,11 @@ pub struct Renderer {
     /// binding 1 at every draw. Identity content at construction; replaced
     /// by [`Self::upload_lut3d`] when calibration changes.
     lut3d: Option<Lut3dTexture>,
+    /// 1×1 offscreen scratch for `encode_diagnose` — runs the encode
+    /// pipeline against a known input, reads back the scanout-format
+    /// output. Allocated lazily on first diagnose call so non-
+    /// calibration sessions don't pay for it.
+    diagnose: Option<EncodeDiagnoseProbe>,
     scanout_format: vk::Format,
     intermediate_format: vk::Format,
     command_pool: vk::CommandPool,
@@ -172,6 +178,7 @@ impl Renderer {
             intermediate: None,
             white_tex,
             lut3d,
+            diagnose: None,
             scanout_format,
             intermediate_format,
             command_pool,
@@ -179,6 +186,31 @@ impl Renderer {
             next_slot: 0,
             semaphore_fd_loader,
         })
+    }
+
+    /// Run the encode pipeline against a 1×1 scratch with `input_nits`
+    /// as the synthetic intermediate value, read back the scanout-format
+    /// output, and decode to linear cd/m². Lets calibration tools
+    /// verify the LUT path end-to-end (shader emission + LUT contents
+    /// + output transfer) against an independently-computed prediction
+    /// — closes the loop the colorimeter alone can't close.
+    ///
+    /// Lazy-allocates the probe on first call so non-calibration
+    /// sessions don't pay for the scratch images.
+    pub fn encode_diagnose(
+        &mut self,
+        input_nits: [f64; 3],
+        encode_push: &EncodePush,
+    ) -> Result<DiagnosedNits> {
+        if self.diagnose.is_none() {
+            self.diagnose = Some(EncodeDiagnoseProbe::new(
+                self.device.clone(),
+                self.intermediate_format,
+                self.scanout_format,
+            )?);
+        }
+        let probe = self.diagnose.as_mut().unwrap();
+        probe.diagnose(&self.encode, encode_push, self.lut3d.as_ref(), input_nits)
     }
 
     /// Replace this output's 3D LUT content. No-op (and returns Ok) when
