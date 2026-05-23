@@ -896,28 +896,51 @@ impl Drop for OutputContext {
 /// Derive the per-channel BT.2020-domain clamp from panel-native peaks
 /// and the calibration matrix.
 ///
-/// Math: for each BT.2020 channel `c`, the panel-native commanded value
-/// for panel-native channel `p` is `CTM[p][c] * bt2020[c]`. The largest
-/// `bt2020[c]` we can pass through without driving any panel-native
-/// channel past its peak is `min over p of (panel[p] / CTM[p][c])` —
-/// restricted to entries where `CTM[p][c] > 0`, because negative entries
-/// gamut-clip to zero in the encoder and don't constrain the cap.
+/// **CTM-active case** (`ctm = Some(_)`): for each BT.2020 channel
+/// `c`, the panel-native commanded value for panel-native channel
+/// `p` is `CTM[p][c] * bt2020[c]`. The largest `bt2020[c]` we can
+/// pass through without driving any panel-native channel past its
+/// peak is `min over p of (panel[p] / CTM[p][c])` — restricted to
+/// entries where `CTM[p][c] > 0`, because negative entries gamut-
+/// clip to zero in the encoder and don't constrain the cap.
 ///
-/// `margin` is multiplied on top of the derived value to give the buffer
-/// soft-clip headroom (see [`BT2020_DECODE_CAP_MARGIN`]).
+/// `margin` is multiplied on top of the derived value to give the
+/// buffer soft-clip headroom (see [`BT2020_DECODE_CAP_MARGIN`]).
+/// Defensive against pathological CTMs (all-negative column): falls
+/// back to the matching panel-native value so we don't accidentally
+/// clamp the buffer to zero.
 ///
-/// `ctm = None` (un-calibrated identity) returns `panel` unchanged.
+/// **3D-LUT case** (`ctm = None`): the LUT carries the gamut
+/// transform end-to-end — including the BT.2020→panel-native
+/// chromaticity remap that CTM used to do. In this mode the decode
+/// clamp's only job is keeping the fp32 intermediate from
+/// overflowing on adversarial content; gamut/range mapping happens
+/// inside the LUT. Returns a uniform PQ-peak cap (10000 cd/m² per
+/// channel) — no realistic content goes above that, and the LUT
+/// handles whatever the panel can actually emit.
 ///
-/// Defensive against pathological CTMs (all-negative column): falls back
-/// to the matching panel-native value so we don't accidentally clamp the
-/// buffer to zero.
+/// **Why this matters** (history): pre-3D-LUT, this function
+/// returned `panel` directly for the `None` case under the
+/// assumption "BT.2020 ≡ panel-native when no transform applies".
+/// That assumption is false on every consumer panel — BT.2020 has
+/// wider primaries than any LCD/OLED actually ships, so panel-
+/// native B-peak (e.g. 15 cd/m² on a Samsung HDR400 LCD) is much
+/// smaller than the BT.2020 B-value a typical blue pixel translates
+/// to (~75 cd/m² for full sRGB blue through the sRGB→BT.2020
+/// matrix). Per-channel clamping at panel-native peaks aggressively
+/// truncated the blue channel, leaving G dominant — visible as
+/// "blue UI accents render green" on calibrated HDR outputs.
 pub fn derive_bt2020_decode_clamp(
     panel: [f32; 3],
     ctm: Option<[[f32; 3]; 3]>,
     margin: f32,
 ) -> [f32; 3] {
     let Some(ctm) = ctm else {
-        return panel;
+        // PQ peak: 10000 nits per channel. The LUT does the gamut /
+        // range mapping; this just stops fp32 garbage from getting
+        // through. `panel` is intentionally unused here.
+        let _ = panel;
+        return [10_000.0; 3];
     };
     let mut cap = [0.0f32; 3];
     for c in 0..3 {
@@ -943,13 +966,33 @@ pub fn derive_bt2020_decode_clamp(
 mod tests {
     use super::*;
 
-    /// Identity CTM (un-calibrated path) returns panel-native peaks
-    /// unchanged. BT.2020 ≡ panel-native when no transform applies.
+    /// `ctm = None` is the 3D-LUT pipeline (the LUT carries the
+    /// chromaticity transform). The clamp is loose — PQ peak (10000
+    /// nits per channel) — because the LUT handles the actual gamut
+    /// / range mapping and this clamp only exists to prevent fp32
+    /// overflow on adversarial input.
+    ///
+    /// Regression guard for the "blue renders green" bug: before this
+    /// fix, the None branch returned `panel` unchanged, which was
+    /// fine for a fictional BT.2020-primary panel but wildly wrong
+    /// for every real consumer panel (panel-native B-peak << BT.2020
+    /// B-value of a typical sRGB blue pixel → blue got truncated to
+    /// the panel's tiny B headroom → green dominated).
     #[test]
-    fn identity_ctm_passes_panel_peaks_through() {
+    fn no_ctm_returns_pq_peak() {
         let panel = [100.0, 200.0, 50.0];
         let cap = derive_bt2020_decode_clamp(panel, None, 1.5);
-        assert_eq!(cap, panel);
+        // panel intentionally unused in the None branch; cap is the
+        // uniform PQ peak regardless of per-channel headroom.
+        assert_eq!(cap, [10_000.0; 3]);
+
+        // Even pathologically tiny panel B (the DP-4 HDR LCD case
+        // that triggered the original bug at 15.3 cd/m²) gets the
+        // same uniform cap — the LUT, not this clamp, decides how
+        // to map blue content into the panel's capabilities.
+        let dp4 = [37.3, 112.1, 15.3];
+        let cap_dp4 = derive_bt2020_decode_clamp(dp4, None, 1.5);
+        assert_eq!(cap_dp4, [10_000.0; 3]);
     }
 
     /// Real DP-4 darker calibration data. Panel native peaks
