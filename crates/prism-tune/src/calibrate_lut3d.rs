@@ -14,14 +14,20 @@
 //! the working range) don't behave that way. A LUT built from XYZ
 //! measurements captures the drift directly.
 //!
-//! Additivity assumption: we measure each channel alone, then assume
-//! `panel(R+G+B) = panel(R) + panel(G) + panel(B)`. Reasonable for the
-//! small-window patches the colorimeter sees with a constant-luminance
-//! border around them — APL stays roughly constant so ABL doesn't
-//! cross-couple. A direct-3D-sweep variant could verify this; not yet.
+//! Additivity model — the panel's total reading is
+//! `panel(R+G+B) = R + G + B + black_floor`, where `black_floor` is
+//! one constant measured at the start (R=G=B=0). Per-channel sweeps
+//! subtract `black_floor` so each [`ChannelResponse`] models the
+//! channel's true emission above black. Without this, summing three
+//! per-channel measurements triple-counts the floor — at the dim end
+//! that overstates the predicted Y by 2× the floor, which is what
+//! the inverter sees as "needs less command than it actually does",
+//! producing -30% to -50% Y errors at low luminance.
 //!
-//! Output: a binary `.lut` file written to disk plus a paste-ready KDL
-//! snippet pointing the output's config at it.
+//! Output: a binary `.lut` file written to disk (carries the measured
+//! `black_point_xyz` in its v2 header so the compositor can plumb it
+//! into tone mapping + wp_color_management feedback) plus a paste-
+//! ready KDL snippet pointing the output's config at it.
 
 use anyhow::{Context, Result};
 use clap::Args;
@@ -281,8 +287,42 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
 
     set_patch_off(&mut patch, baseline.hdr_active)?;
 
-    // ─── Phase 1: per-channel sweeps ──────────────────────────────────────
+    // ─── Phase 0: black-floor measurement ─────────────────────────────────
+    // The colorimeter sees panel_emission + ambient + Spyder dark current
+    // at (R=G=B=0). Per-channel measurements below pick this up too —
+    // each "cmd=1 nit" sample is really (true_emission + black_floor).
+    // If we don't subtract it, the additive prediction
+    // `panel(R+G+B) ≈ R + G + B` triple-counts the floor and the
+    // inverter under-commands at the dim end.
+    //
+    // 4× normal settle: OLEDs (esp. QD-OLED) take a moment to fully
+    // gate off subpixels after the patch swap, and the floor reading
+    // is the noise-sensitive one — better to over-settle here than
+    // bake measurement-transient junk into every downstream sample.
     let settle = Duration::from_millis(args.settle_ms);
+    let settle_black = settle * 4;
+    eprintln!("\n--- phase 0: black-floor measurement ---");
+    // Patch was already driven off by the prep-countdown setup above —
+    // just give the panel the extra settle window before measuring.
+    thread::sleep(settle_black);
+    let raw_black = device.measure_raw(&setup).context("measure black floor")?;
+    let black_xyz = raw_to_xyz(&raw_black, &setup, &cal);
+    eprintln!(
+        "  black floor: X={:.4}  Y={:.4}  Z={:.4} cd/m²",
+        black_xyz.x, black_xyz.y, black_xyz.z,
+    );
+    if let Some((_, w)) = log.as_mut() {
+        // Header line first so any reader scanning for "# black_floor"
+        // gets it before the per-channel sample rows. Raw values
+        // (pre-subtraction) — only place the raw floor is preserved.
+        writeln!(
+            w,
+            "# black_floor (raw, pre-subtract): X={:.4} Y={:.4} Z={:.4} cd/m²",
+            black_xyz.x, black_xyz.y, black_xyz.z,
+        )?;
+    }
+
+    // ─── Phase 1: per-channel sweeps ──────────────────────────────────────
     let targets =
         log_spaced_targets(args.min_cmd, args.max_cmd, args.samples_per_channel);
     let mut responses: [Option<ChannelResponse>; 3] = [None, None, None];
@@ -296,16 +336,30 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             set_channel_patch(&mut patch, &baseline, channel, cmd)?;
             thread::sleep(settle);
             let raw = device.measure_raw(&setup).context("measure")?;
-            let xyz = raw_to_xyz(&raw, &setup, &cal);
+            let raw_xyz = raw_to_xyz(&raw, &setup, &cal);
+            // True emission above the black floor. Clamp to zero so the
+            // toe can't go negative from measurement noise — the inverter
+            // assumes non-negative XYZ for its line search.
+            let xyz = Xyz {
+                x: (raw_xyz.x - black_xyz.x).max(0.0),
+                y: (raw_xyz.y - black_xyz.y).max(0.0),
+                z: (raw_xyz.z - black_xyz.z).max(0.0),
+            };
             eprintln!(
-                "  {} cmd {:>8.2} → X={:>8.3}  Y={:>8.3}  Z={:>8.3}",
+                "  {} cmd {:>8.2} → X={:>8.3}  Y={:>8.3}  Z={:>8.3}  (raw Y={:.3}, less black {:.3})",
                 channel.label(),
                 cmd,
                 xyz.x,
                 xyz.y,
                 xyz.z,
+                raw_xyz.y,
+                black_xyz.y,
             );
             if let Some((_, w)) = log.as_mut() {
+                // Log the BLACK-SUBTRACTED values — that's the model
+                // the rest of the pipeline operates on. Raw values
+                // are still recoverable as (logged + black_xyz from
+                // the header line written above).
                 writeln!(
                     w,
                     "{},{},{:.4},{:.4},{:.4},{:.4}",
@@ -393,7 +447,9 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
 
     // ─── Phase 2: inversion to 3D LUT ─────────────────────────────────────
     eprintln!("\nInverting forward LUTs to {}³ 3D LUT…", args.cube_edge);
-    let (entries, residuals) = build_inverse_lut(args.cube_edge, &responses);
+    let black_floor_xyz = [black_xyz.x, black_xyz.y, black_xyz.z];
+    let (entries, residuals) =
+        build_inverse_lut(args.cube_edge, &responses, black_floor_xyz);
     if let Some((_, w)) = log.as_mut() {
         // Split residual stats by whether the target was in-gamut for
         // the panel (target_Y ≤ panel total peak). Out-of-gamut grids
@@ -455,15 +511,23 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         responses[1].peak_y as f32,
         responses[2].peak_y as f32,
     ];
+    let black_point_f32 = [
+        black_xyz.x as f32,
+        black_xyz.y as f32,
+        black_xyz.z as f32,
+    ];
 
     // ─── Phase 3: write LUT + restore ─────────────────────────────────────
     let lut_path = args.lut_path.clone().unwrap_or_else(|| {
         let safe = args.output.replace('/', "_");
         PathBuf::from(format!("prism-calibrate-lut3d-{safe}.lut"))
     });
-    save_lut3d_file(&lut_path, args.cube_edge, peak_nits, &entries)
+    save_lut3d_file(&lut_path, args.cube_edge, peak_nits, black_point_f32, &entries)
         .with_context(|| format!("write LUT file {}", lut_path.display()))?;
-    eprintln!("\nWrote {} (cube_edge={}, peaks={:?})", lut_path.display(), args.cube_edge, peak_nits);
+    eprintln!(
+        "\nWrote {} (cube_edge={}, peaks={:?}, black_xyz={:?})",
+        lut_path.display(), args.cube_edge, peak_nits, black_point_f32,
+    );
 
     // Apply discovered peaks (HDR mode only) so the IR clamp matches
     // measured reality. SDR keeps its policy-driven peak (sdr_reference_nits).
@@ -493,7 +557,8 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     let verify_result = if !args.no_verify {
         eprintln!("\n--- phase 4 verify: D65 white sweep through live LUT ---");
         Some(verify_white_point(
-            &args, &baseline, &peak_nits, &entries, &responses, &mut device, &mut patch, &setup, &cal, log.as_mut(),
+            &args, &baseline, &peak_nits, &entries, &responses, black_floor_xyz,
+            &mut device, &mut patch, &setup, &cal, log.as_mut(),
         )?)
     } else {
         eprintln!("\n(verify skipped — --no-verify)");
@@ -505,13 +570,14 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     if let Some((path, mut w)) = log {
         writeln!(
             w,
-            "# inverse LUT written to {} (cube_edge={}, in_tf={}, peaks=R={:.3} G={:.3} B={:.3})",
+            "# inverse LUT written to {} (cube_edge={}, in_tf={}, peaks=R={:.3} G={:.3} B={:.3}, black_xyz=({:.4},{:.4},{:.4}))",
             lut_path.display(),
             args.cube_edge,
             LUT_FILE_IN_TF_PQ,
             peak_nits[0],
             peak_nits[1],
             peak_nits[2],
+            black_point_f32[0], black_point_f32[1], black_point_f32[2],
         )?;
         w.flush().ok();
         eprintln!("Measurement log: {}", path.display());
@@ -532,7 +598,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         eprintln!("        {verdict}");
     }
 
-    print_kdl_block(&args.output, baseline.hdr_active, peak_nits, &lut_path);
+    print_kdl_block(&args.output, baseline.hdr_active, peak_nits, black_point_f32, &lut_path);
 
     if !args.keep {
         eprintln!(
@@ -574,6 +640,7 @@ fn verify_white_point(
     peak_nits: &[f32; 3],
     lut_entries: &[[f32; 3]],
     responses: &[ChannelResponse; 3],
+    black_floor_xyz: [f64; 3],
     device: &mut tristim_driver::Colorimeter,
     patch: &mut PatchSurface,
     setup: &Setup,
@@ -625,32 +692,13 @@ fn verify_white_point(
         let duv = ((up - d65_up).powi(2) + (vp - d65_vp).powi(2)).sqrt();
         let y_err_pct = (xyz.y - t) / t.max(0.01) * 100.0;
 
-        // Diagnostic 1: mirror the shader's LUT lookup for this verify
-        // patch so we can attribute Y_err. Sample the LUT at the PQ-
-        // encoded input coord (target nits per channel for D65 white),
-        // compute the expected commanded cmd via trilinear interp,
-        // then ask the per-channel forward LUTs what those cmds would
-        // emit (additive sum). Compare to actual measurement:
-        //   - additive_predicted ≈ measured → panel is additive,
-        //     LUT entries are right.
-        //   - additive_predicted ≠ measured → panel non-additive,
-        //     additivity assumption is the source of Y_err.
+        // Diagnostic: mirror the shader's LUT lookup for this verify
+        // patch so we can compare CPU prediction vs GPU actual.
+        // CPU `cmd_predicted` vs GPU `scanout_decoded` should be ≈
+        // identical (within f16 quantization) post-texel-center fix;
+        // any drift means the renderer or upload path regressed.
         let coord = [pq_oetf_f64(t), pq_oetf_f64(t), pq_oetf_f64(t)];
         let cmd_predicted = trilinear_sample_lut(lut_entries, args.cube_edge, coord);
-        let xyz_r = responses[0].xyz_at(cmd_predicted[0] as f64);
-        let xyz_g = responses[1].xyz_at(cmd_predicted[1] as f64);
-        let xyz_b = responses[2].xyz_at(cmd_predicted[2] as f64);
-        let additive_y =
-            xyz_r.y + xyz_g.y + xyz_b.y;
-        let additive_y_err_pct = (xyz.y - additive_y) / additive_y.max(0.01) * 100.0;
-
-        // Diagnostic 2: ask the compositor what its encode pipeline
-        // actually emits for this input. Compares the CPU prediction
-        // above against the GPU's real output — isolates shader-side
-        // bugs (wrong LUT upload, wrong trilinear, wrong push constants)
-        // from the additivity assumption. CPU `cmd_predicted` vs GPU
-        // `scanout_decoded` should be ≈ identical if the LUT path is
-        // correct; any drift is a bug in the renderer.
         let gpu_diag = send_action_for_reply(
             &args.output,
             OutputAction::EncodeDiagnose { r: t, g: t, b: t },
@@ -662,12 +710,12 @@ fn verify_white_point(
         };
         // Predict from forward LUT: what additive Y would the GPU-
         // decoded cmd produce? This is what verify SHOULD see if the
-        // panel is additive (separate from the CPU-cmd prediction
-        // above, which depends on accurate trilinear).
+        // panel is additive — add the floor once because per-channel
+        // responses model emission above black.
         let gpu_xyz_r = responses[0].xyz_at(scanout_decoded[0]);
         let gpu_xyz_g = responses[1].xyz_at(scanout_decoded[1]);
         let gpu_xyz_b = responses[2].xyz_at(scanout_decoded[2]);
-        let gpu_additive_y = gpu_xyz_r.y + gpu_xyz_g.y + gpu_xyz_b.y;
+        let gpu_additive_y = gpu_xyz_r.y + gpu_xyz_g.y + gpu_xyz_b.y + black_floor_xyz[1];
 
         eprintln!(
             "  W target {:>7.1} cd/m² → Y={:>7.2}  xy=({:.4},{:.4})  Δu'v'={:.4}  Y_err={:+.1}%",
@@ -686,8 +734,6 @@ fn verify_white_point(
             gpu_additive_y, xyz.y,
             (xyz.y - gpu_additive_y) / gpu_additive_y.max(0.01) * 100.0,
         );
-        let _ = additive_y;
-        let _ = additive_y_err_pct;
         max_duv = max_duv.max(duv);
         max_y_err_pct = max_y_err_pct.max(y_err_pct.abs());
 
@@ -815,6 +861,14 @@ fn log_spaced_targets(lo: f64, hi: f64, n: usize) -> Vec<f64> {
 /// Iteration order is X-fastest then Y then Z — matches the binary
 /// file format + the GPU image memory walk.
 ///
+/// `black_floor_xyz` is the panel's emission at (R=G=B=0). The
+/// per-channel responses model emission above black; the target the
+/// user wants is the panel's TOTAL reading (emission + black). So
+/// each grid point's invert target is `target_xyz - black_floor_xyz`,
+/// floor-clamped to zero — if the requested luminance is below the
+/// panel's floor we can't render it any darker, so the closest the
+/// inverter can come is cmd=0 across the board.
+///
 /// Returns `(entries, per-grid residual L2 norms)`. The residuals
 /// array lets the caller report convergence stats (mean / percentile /
 /// worst) — important because the inverter is the only post-measurement
@@ -822,6 +876,7 @@ fn log_spaced_targets(lo: f64, hi: f64, n: usize) -> Vec<f64> {
 fn build_inverse_lut(
     cube_edge: u32,
     responses: &[ChannelResponse; 3],
+    black_floor_xyz: [f64; 3],
 ) -> (Vec<[f32; 3]>, Vec<f64>) {
     let n = cube_edge as usize;
     let denom = (cube_edge - 1) as f32;
@@ -837,7 +892,15 @@ fn build_inverse_lut(
                 let r_in = pq_eotf(i as f32 / denom) as f64;
                 // BT.2020 RGB → BT.2020 XYZ (rows are X, Y, Z; cols R, G, B).
                 let target_xyz = bt2020_to_xyz(r_in, g_in, bz_in);
-                let (cmd, residual) = invert_one(responses, target_xyz);
+                // Subtract the floor: the responses model emission, not
+                // panel reading. Floor-clamp at zero so sub-floor targets
+                // don't ask the inverter for negative emission.
+                let emission_target = [
+                    (target_xyz[0] - black_floor_xyz[0]).max(0.0),
+                    (target_xyz[1] - black_floor_xyz[1]).max(0.0),
+                    (target_xyz[2] - black_floor_xyz[2]).max(0.0),
+                ];
+                let (cmd, residual) = invert_one(responses, emission_target);
                 total_residual += residual;
                 if residual > worst_residual {
                     worst_residual = residual;
@@ -1182,8 +1245,21 @@ mod tests {
     }
 }
 
-fn print_kdl_block(output_name: &str, hdr_active: bool, peaks: [f32; 3], lut_path: &std::path::Path) {
+fn print_kdl_block(
+    output_name: &str,
+    hdr_active: bool,
+    peaks: [f32; 3],
+    black_xyz: [f32; 3],
+    lut_path: &std::path::Path,
+) {
     println!();
+    println!(
+        "# Measured black floor for {output_name}: X={:.4} Y={:.4} Z={:.4} cd/m²",
+        black_xyz[0], black_xyz[1], black_xyz[2],
+    );
+    println!(
+        "# (carried in the LUT file header; compositor exposes it via OutputContext for tone mapping)",
+    );
     println!("# Paste into the matching output block in your prism config:");
     println!("output \"{}\" {{", output_name);
     println!("    color {{");

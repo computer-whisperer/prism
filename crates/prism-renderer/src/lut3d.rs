@@ -412,8 +412,12 @@ pub fn synthesize_lut_from_matrix_curve(
 
 /// File magic (`"PLUT"` little-endian).
 pub const LUT_FILE_MAGIC: u32 = 0x54554C50;
-/// Current file format version.
-pub const LUT_FILE_VERSION: u32 = 1;
+/// Current file format version. v2 added the `black_point_xyz` field so
+/// the panel's measured floor is carried alongside the LUT — needed for
+/// honest tone mapping and accurate wp_color_management `min_luminance`
+/// signaling. v1 had no way to express "the panel can't render below
+/// X" so the compositor pretended the floor was zero.
+pub const LUT_FILE_VERSION: u32 = 2;
 /// `in_tf` enum value for the PQ shaper. The compositor's encode shader
 /// always PQ-encodes its input before sampling the LUT, so files written
 /// for a different shaper would mis-index. Stored explicitly so a future
@@ -421,7 +425,7 @@ pub const LUT_FILE_VERSION: u32 = 1;
 pub const LUT_FILE_IN_TF_PQ: u32 = 1;
 
 /// Binary header that precedes the data payload in a `.lut` file. All
-/// fields little-endian. 32 bytes total — the data payload immediately
+/// fields little-endian. 44 bytes total — the data payload immediately
 /// follows.
 ///
 /// Field-by-field:
@@ -434,11 +438,22 @@ pub const LUT_FILE_IN_TF_PQ: u32 = 1;
 /// peak_r    f32  panel-native peak emission, R channel (cd/m²)
 /// peak_g    f32  panel-native peak emission, G channel (cd/m²)
 /// peak_b    f32  panel-native peak emission, B channel (cd/m²)
+/// black_x   f32  panel black-point CIE X (cd/m²)
+/// black_y   f32  panel black-point CIE Y (cd/m²)  ← min luminance
+/// black_z   f32  panel black-point CIE Z (cd/m²)
 /// ```
 ///
 /// Data payload: `cube_edge³` RGB triples (3 × f32 each), X-fastest then
 /// Y then Z, in linear nits. Matches the iteration order
 /// [`Lut3dTexture::upload`] expects.
+///
+/// The black-point fields capture what the colorimeter reads at
+/// (R=G=B=0) — i.e. panel emission below which no command can drive the
+/// output. Three components (not just Y) because LCD backlight bleed
+/// has chromaticity; an OLED's floor is nearly neutral but LCDs often
+/// read visibly blue or magenta at "black". `effective_black_point()`
+/// on `OutputContext` exposes this to tone mapping + wp_color_management
+/// feedback events.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LutFileHeader {
@@ -450,20 +465,28 @@ pub struct LutFileHeader {
     pub peak_r: f32,
     pub peak_g: f32,
     pub peak_b: f32,
+    pub black_x: f32,
+    pub black_y: f32,
+    pub black_z: f32,
 }
 
 /// Header byte size — guaranteed by the file format and verified at load.
-pub const LUT_FILE_HEADER_BYTES: usize = 32;
+pub const LUT_FILE_HEADER_BYTES: usize = 44;
 
 /// Bytes per data triple (3 × f32, little-endian).
 pub const LUT_FILE_TRIPLE_BYTES: usize = 12;
 
 /// Loaded LUT — entries plus the metadata the header carried alongside
 /// them. The cube edge is what callers need to validate against the
-/// compositor's LUT texture; peaks are informational.
+/// compositor's LUT texture; peaks and black-point are display
+/// properties downstream code (tone mapping, wp_color_management
+/// feedback) consumes.
 pub struct LoadedLut {
     pub cube_edge: u32,
     pub peak_nits: [f32; 3],
+    /// Measured panel black emission (X, Y, Z in cd/m²). All-zero if
+    /// the calibration tool didn't have a meaningful measurement.
+    pub black_point_xyz: [f32; 3],
     pub entries: Vec<[f32; 3]>,
 }
 
@@ -509,6 +532,9 @@ pub fn load_lut3d_file(path: &Path) -> Result<LoadedLut> {
     let peak_r = f32::from_le_bytes(bytes[20..24].try_into().unwrap());
     let peak_g = f32::from_le_bytes(bytes[24..28].try_into().unwrap());
     let peak_b = f32::from_le_bytes(bytes[28..32].try_into().unwrap());
+    let black_x = f32::from_le_bytes(bytes[32..36].try_into().unwrap());
+    let black_y = f32::from_le_bytes(bytes[36..40].try_into().unwrap());
+    let black_z = f32::from_le_bytes(bytes[40..44].try_into().unwrap());
 
     let n = cube_edge as usize;
     let expected_data = n * n * n * LUT_FILE_TRIPLE_BYTES;
@@ -529,18 +555,23 @@ pub fn load_lut3d_file(path: &Path) -> Result<LoadedLut> {
     Ok(LoadedLut {
         cube_edge,
         peak_nits: [peak_r, peak_g, peak_b],
+        black_point_xyz: [black_x, black_y, black_z],
         entries,
     })
 }
 
 /// Write the entries + metadata as a binary LUT file. Header values
-/// other than `cube_edge` and `peak_nits` are filled in from the
-/// canonical constants. `entries` must have length `cube_edge³` and be
-/// laid out X-fastest.
+/// other than `cube_edge`, `peak_nits`, and `black_point_xyz` are
+/// filled in from the canonical constants. `entries` must have length
+/// `cube_edge³` and be laid out X-fastest. Pass all-zero
+/// `black_point_xyz` if the calibration tool didn't have a
+/// measurement; downstream consumers treat that as "unknown / assume
+/// zero floor".
 pub fn save_lut3d_file(
     path: &Path,
     cube_edge: u32,
     peak_nits: [f32; 3],
+    black_point_xyz: [f32; 3],
     entries: &[[f32; 3]],
 ) -> std::io::Result<()> {
     let n = cube_edge as usize;
@@ -559,6 +590,9 @@ pub fn save_lut3d_file(
     out.extend_from_slice(&peak_nits[0].to_le_bytes());
     out.extend_from_slice(&peak_nits[1].to_le_bytes());
     out.extend_from_slice(&peak_nits[2].to_le_bytes());
+    out.extend_from_slice(&black_point_xyz[0].to_le_bytes());
+    out.extend_from_slice(&black_point_xyz[1].to_le_bytes());
+    out.extend_from_slice(&black_point_xyz[2].to_le_bytes());
     for rgb in entries {
         out.extend_from_slice(&rgb[0].to_le_bytes());
         out.extend_from_slice(&rgb[1].to_le_bytes());
@@ -724,22 +758,31 @@ mod tests {
 
     /// File save/load is a byte-exact round trip for matching metadata.
     /// Catches regressions in the header layout or endianness handling.
+    /// Black-point round-trips alongside peaks — added in v2 specifically
+    /// so display-floor information survives compositor restarts.
     #[test]
     fn lut_file_roundtrip() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("prism-lut-test-{}.lut", std::process::id()));
         let cube_edge = 5u32;
         let peak_nits = [38.9, 113.9, 15.7];
+        // LCD-shaped black: small Y, slight blue tint (Z > X).
+        let black_point = [0.21f32, 0.18, 0.34];
         let entries = synthesize_lut_from_matrix_curve(
             cube_edge,
             Some([[0.95, 0.02, -0.01], [-0.03, 0.92, -0.04], [-0.001, -0.01, 0.95]]),
             Some(([0.5, 0.7, 0.3], [1.05, 1.0, 1.02])),
         );
-        save_lut3d_file(&path, cube_edge, peak_nits, &entries).expect("save");
+        save_lut3d_file(&path, cube_edge, peak_nits, black_point, &entries).expect("save");
         let loaded = load_lut3d_file(&path).expect("load");
         assert_eq!(loaded.cube_edge, cube_edge);
         for c in 0..3 {
             assert!((loaded.peak_nits[c] - peak_nits[c]).abs() < 1e-6);
+            assert!(
+                (loaded.black_point_xyz[c] - black_point[c]).abs() < 1e-6,
+                "black ch {c}: orig={} got={}",
+                black_point[c], loaded.black_point_xyz[c],
+            );
         }
         assert_eq!(loaded.entries.len(), entries.len());
         for (i, (orig, got)) in entries.iter().zip(loaded.entries.iter()).enumerate() {
@@ -759,7 +802,8 @@ mod tests {
     #[test]
     fn lut_file_validates_header_fields() {
         let mut buf = Vec::with_capacity(LUT_FILE_HEADER_BYTES);
-        // Wrong magic.
+        // Wrong magic. Header layout still has to match LUT_FILE_HEADER_BYTES
+        // (44) or we'd reject for the wrong reason.
         buf.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
         buf.extend_from_slice(&LUT_FILE_VERSION.to_le_bytes());
         buf.extend_from_slice(&5u32.to_le_bytes());
@@ -768,10 +812,34 @@ mod tests {
         buf.extend_from_slice(&80.0f32.to_le_bytes());
         buf.extend_from_slice(&80.0f32.to_le_bytes());
         buf.extend_from_slice(&80.0f32.to_le_bytes());
+        buf.extend_from_slice(&0.0f32.to_le_bytes());
+        buf.extend_from_slice(&0.0f32.to_le_bytes());
+        buf.extend_from_slice(&0.0f32.to_le_bytes());
         let dir = std::env::temp_dir();
         let path = dir.join(format!("prism-lut-bad-{}.lut", std::process::id()));
         std::fs::write(&path, &buf).unwrap();
         assert!(load_lut3d_file(&path).is_err(), "bad magic should reject");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// v1 files (pre-black-point format) are rejected with the version
+    /// check, not silently mis-parsed. The format only just landed so
+    /// there's no migration path — calibrate-lut3d must be re-run.
+    #[test]
+    fn lut_file_rejects_v1() {
+        let mut buf = Vec::with_capacity(32);
+        buf.extend_from_slice(&LUT_FILE_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // v1
+        buf.extend_from_slice(&5u32.to_le_bytes());
+        buf.extend_from_slice(&LUT_FILE_IN_TF_PQ.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&80.0f32.to_le_bytes());
+        buf.extend_from_slice(&80.0f32.to_le_bytes());
+        buf.extend_from_slice(&80.0f32.to_le_bytes());
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("prism-lut-v1-{}.lut", std::process::id()));
+        std::fs::write(&path, &buf).unwrap();
+        assert!(load_lut3d_file(&path).is_err(), "v1 file should reject");
         let _ = std::fs::remove_file(&path);
     }
 
