@@ -161,7 +161,12 @@ impl EncodeDiagnoseProbe {
         self.run_encode(encode, encode_push, lut3d)?;
 
         // 3) Copy the offscreen → readback buffer + read on CPU.
-        self.readback_and_decode()
+        // SDR formats need `sdr_white_nits` for the scanout-to-nits
+        // inverse (sRGB EOTF returns [0,1] linear, then ×nits); HDR
+        // PQ formats decode straight to nits and ignore the param.
+        // Source it from the encode_push the live render path uses
+        // so the decode matches what the shader actually emitted.
+        self.readback_and_decode(encode_push.sdr_white_nits as f64)
     }
 
     /// Push `input_nits` into the 1×1 intermediate image. The
@@ -384,8 +389,9 @@ impl EncodeDiagnoseProbe {
     }
 
     /// Copy the 1×1 offscreen to the readback buffer, read it on CPU,
-    /// decode the format back to linear nits.
-    fn readback_and_decode(&mut self) -> Result<DiagnosedNits> {
+    /// decode the format back to linear cd/m². See
+    /// [`decode_scanout_texel`] for the `sdr_white_nits` semantics.
+    fn readback_and_decode(&mut self, sdr_white_nits: f64) -> Result<DiagnosedNits> {
         let offscreen_image = self.offscreen_image;
         let readback_buffer = self.readback_buffer;
         self.oneshot.record_and_submit(|raw, cb| unsafe {
@@ -410,7 +416,7 @@ impl EncodeDiagnoseProbe {
         // SAFETY: HOST_COHERENT readback memory, just submitted-and-
         // waited copy into it. Read texel and decode.
         let raw = unsafe { std::slice::from_raw_parts(self.readback_ptr, self.readback_size as usize) };
-        let nits = decode_scanout_texel(self.scanout_format, raw)?;
+        let nits = decode_scanout_texel(self.scanout_format, raw, sdr_white_nits)?;
         let _ = self.readback_size;
         Ok(nits)
     }
@@ -438,15 +444,34 @@ impl Drop for EncodeDiagnoseProbe {
 
 // ── Format decode ───────────────────────────────────────────────────────────
 
-/// CPU-side decode of one scanout texel back to linear cd/m². The
+/// CPU-side decode of one scanout texel back to absolute cd/m². The
 /// encode shader's `OutputTransfer*` fragment is the producer; this
-/// is its inverse.
+/// is its inverse, so what comes back is in the same "commanded
+/// nits" units as the LUT entries the verify path compares against.
 ///
-/// Supported today: `R16G16B16A16_SFLOAT` (HDR PQ — the only HDR
-/// scanout format we ship), `R8G8B8A8_UNORM` / `B8G8R8A8_UNORM`
-/// (SDR sRGB-encoded). Add new arms as the renderer grows scanout
-/// formats.
-pub fn decode_scanout_texel(format: vk::Format, bytes: &[u8]) -> Result<DiagnosedNits> {
+/// Mode-aware scaling: HDR PQ formats decode straight to linear nits
+/// (PQ EOTF is absolute by construction). SDR sRGB formats decode
+/// to linear `[0, 1]`, which then needs `× sdr_white_nits` to land
+/// in absolute cd/m². The caller passes `sdr_white_nits` from the
+/// EncodePush they handed to `diagnose`; for HDR formats the value
+/// is ignored.
+///
+/// Supported today:
+///   - `R16G16B16A16_SFLOAT` — HDR PQ fp16 scanout (DP-4 HDR mode)
+///   - `R8G8B8A8_UNORM` / `R8G8B8A8_SRGB`,
+///     `B8G8R8A8_UNORM` / `B8G8R8A8_SRGB` — 8bpc SDR scanout
+///   - `A2R10G10B10_UNORM_PACK32` — 10bpc SDR scanout (default for
+///     `depth=Bpc10`, which is prism's default when no `--depth`
+///     CLI flag is given AND the output isn't in HDR mode)
+///
+/// Add new arms as the renderer grows scanout formats; missing
+/// support manifests as a `MissingFeature` error on the first
+/// `EncodeDiagnose` IPC call for that output.
+pub fn decode_scanout_texel(
+    format: vk::Format,
+    bytes: &[u8],
+    sdr_white_nits: f64,
+) -> Result<DiagnosedNits> {
     match format {
         vk::Format::R16G16B16A16_SFLOAT => {
             // PQ-encoded half-floats in [0, 1]. Inverse: f16 → f32 →
@@ -468,9 +493,9 @@ pub fn decode_scanout_texel(format: vk::Format, bytes: &[u8]) -> Result<Diagnose
                 ));
             }
             Ok([
-                srgb_eotf(bytes[0] as f64 / 255.0),
-                srgb_eotf(bytes[1] as f64 / 255.0),
-                srgb_eotf(bytes[2] as f64 / 255.0),
+                srgb_eotf(bytes[0] as f64 / 255.0) * sdr_white_nits,
+                srgb_eotf(bytes[1] as f64 / 255.0) * sdr_white_nits,
+                srgb_eotf(bytes[2] as f64 / 255.0) * sdr_white_nits,
             ])
         }
         vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => {
@@ -480,9 +505,29 @@ pub fn decode_scanout_texel(format: vk::Format, bytes: &[u8]) -> Result<Diagnose
                 ));
             }
             Ok([
-                srgb_eotf(bytes[2] as f64 / 255.0),
-                srgb_eotf(bytes[1] as f64 / 255.0),
-                srgb_eotf(bytes[0] as f64 / 255.0),
+                srgb_eotf(bytes[2] as f64 / 255.0) * sdr_white_nits,
+                srgb_eotf(bytes[1] as f64 / 255.0) * sdr_white_nits,
+                srgb_eotf(bytes[0] as f64 / 255.0) * sdr_white_nits,
+            ])
+        }
+        vk::Format::A2R10G10B10_UNORM_PACK32 => {
+            // Single 32-bit little-endian word. Channel layout
+            // (MSB→LSB): A[31:30] R[29:20] G[19:10] B[9:0].
+            // Vulkan/DRM packed-format convention. Normalize each
+            // 10-bit channel to [0, 1] then sRGB-decode.
+            if bytes.len() < 4 {
+                return Err(RendererError::MissingFeature(
+                    "decode_scanout_texel: A2R10G10B10 needs ≥4 bytes",
+                ));
+            }
+            let pack = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let r10 = ((pack >> 20) & 0x3FF) as f64;
+            let g10 = ((pack >> 10) & 0x3FF) as f64;
+            let b10 = (pack & 0x3FF) as f64;
+            Ok([
+                srgb_eotf(r10 / 1023.0) * sdr_white_nits,
+                srgb_eotf(g10 / 1023.0) * sdr_white_nits,
+                srgb_eotf(b10 / 1023.0) * sdr_white_nits,
             ])
         }
         _ => Err(RendererError::MissingFeature(
@@ -511,7 +556,8 @@ fn format_texel_bytes(format: vk::Format) -> Result<usize> {
         vk::Format::R8G8B8A8_UNORM
         | vk::Format::R8G8B8A8_SRGB
         | vk::Format::B8G8R8A8_UNORM
-        | vk::Format::B8G8R8A8_SRGB => 4,
+        | vk::Format::B8G8R8A8_SRGB
+        | vk::Format::A2R10G10B10_UNORM_PACK32 => 4,
         _ => {
             return Err(RendererError::MissingFeature(
                 "EncodeDiagnoseProbe: unsupported format (intermediate or scanout)",
@@ -633,7 +679,7 @@ mod tests {
 
     /// PQ EOTF round-trip via decode_scanout_texel. Pack a known PQ-
     /// encoded f16 value (anchor: 0.5083 ≈ 100 nits) and verify we
-    /// decode back to ~100.
+    /// decode back to ~100. sdr_white_nits is unused for HDR formats.
     #[test]
     fn decode_pq_anchor() {
         let v = half::f16::from_f32(0.5083);
@@ -642,7 +688,7 @@ mod tests {
         buf[0..2].copy_from_slice(&bytes_per);
         buf[2..4].copy_from_slice(&bytes_per);
         buf[4..6].copy_from_slice(&bytes_per);
-        let decoded = decode_scanout_texel(vk::Format::R16G16B16A16_SFLOAT, &buf).unwrap();
+        let decoded = decode_scanout_texel(vk::Format::R16G16B16A16_SFLOAT, &buf, 80.0).unwrap();
         for c in 0..3 {
             assert!(
                 (decoded[c] - 100.0).abs() < 2.0,
@@ -652,13 +698,53 @@ mod tests {
         }
     }
 
-    /// sRGB byte 255 → linear 1.0 (then × sdr_white_nits externally).
+    /// sRGB white (255, 255, 255) at sdr_white_nits=80 should decode
+    /// to ~80 cd/m² per channel. Anchors the SDR nits-scaling path
+    /// (which was missing before — used to return [0, 1] linear).
     #[test]
-    fn decode_srgb_white() {
+    fn decode_srgb_white_at_80_nits() {
         let buf = [255u8, 255, 255, 255];
-        let decoded = decode_scanout_texel(vk::Format::R8G8B8A8_UNORM, &buf).unwrap();
+        let decoded = decode_scanout_texel(vk::Format::R8G8B8A8_UNORM, &buf, 80.0).unwrap();
         for c in 0..3 {
-            assert!((decoded[c] - 1.0).abs() < 1e-6);
+            assert!(
+                (decoded[c] - 80.0).abs() < 1e-6,
+                "ch {c} decoded {} vs ~80",
+                decoded[c]
+            );
         }
+    }
+
+    /// A2R10G10B10 packed: full white (R=G=B=1023, A=3) at
+    /// sdr_white_nits=80 decodes to ~80 cd/m² per channel. Exercises
+    /// the packed-10-bit channel extraction that DP-8 SDR scanout
+    /// hits (depth=Bpc10 default whenever no `--depth` CLI flag is
+    /// given AND output isn't HDR).
+    #[test]
+    fn decode_a2r10g10b10_white_at_80_nits() {
+        let pack: u32 = (3 << 30) | (1023 << 20) | (1023 << 10) | 1023;
+        let buf = pack.to_le_bytes();
+        let decoded =
+            decode_scanout_texel(vk::Format::A2R10G10B10_UNORM_PACK32, &buf, 80.0).unwrap();
+        for c in 0..3 {
+            assert!(
+                (decoded[c] - 80.0).abs() < 1e-6,
+                "ch {c} decoded {} vs ~80",
+                decoded[c]
+            );
+        }
+    }
+
+    /// A2R10G10B10 channel order: pack distinct values into R/G/B and
+    /// confirm we don't transpose. R=512 > G=256 > B=128 must round-
+    /// trip into monotonically-decreasing decoded values — catches an
+    /// off-by-one or swapped-shift mistake in the packed unpacker.
+    #[test]
+    fn decode_a2r10g10b10_channel_order() {
+        let pack: u32 = (512 << 20) | (256 << 10) | 128;
+        let buf = pack.to_le_bytes();
+        let decoded =
+            decode_scanout_texel(vk::Format::A2R10G10B10_UNORM_PACK32, &buf, 100.0).unwrap();
+        assert!(decoded[0] > decoded[1], "R={} should > G={}", decoded[0], decoded[1]);
+        assert!(decoded[1] > decoded[2], "G={} should > B={}", decoded[1], decoded[2]);
     }
 }
