@@ -22,9 +22,16 @@ use crate::dmabuf::ImportedImage;
 use crate::encode_synth::EncodeConfig;
 use crate::error::{RendererError, Result, VkResultExt};
 use crate::intermediate::Intermediate;
+use crate::lut3d::{Lut3dTexture, identity_lut};
 use crate::pipeline::decode::{DecodePipeline, DecodePush};
 use crate::pipeline::encode::{EncodePipeline, EncodePush};
 use crate::upload::ShmTexture;
+
+/// Default 3D LUT cube edge. 17 = 4913 grid points × 8 bytes = 39 KB per
+/// output, which gives roughly sub-percent error end-to-end with a PQ
+/// shaper. Bumping to 33 (~280 KB) is a knob for panels where round-trip
+/// banding shows up; configurable in a later stage if we need it.
+const DEFAULT_LUT_CUBE_EDGE: u32 = 17;
 
 /// Number of frames the renderer keeps in flight. Matches the scanout BO
 /// count in `prism-drm::OutputContext`; the kernel only ever has one flip
@@ -69,6 +76,11 @@ pub struct Renderer {
     /// and the actual color baked into `DecodePush::tint`. Lives for the
     /// renderer's full lifetime so the view handle is stable across frames.
     white_tex: ShmTexture,
+    /// Per-output 3D color LUT. `Some` whenever the encode pipeline's
+    /// chain includes `EncodeFragment::Lut3d`; bound at descriptor set 0 /
+    /// binding 1 at every draw. Identity content at construction; replaced
+    /// by [`Self::upload_lut3d`] when calibration changes.
+    lut3d: Option<Lut3dTexture>,
     scanout_format: vk::Format,
     intermediate_format: vk::Format,
     command_pool: vk::CommandPool,
@@ -141,12 +153,25 @@ impl Renderer {
         )?;
         white_tex.upload_bytes(&[255, 255, 255, 255], 4)?;
 
+        // Per-output 3D LUT — only allocate when the configured encode
+        // chain actually samples it. Identity content at construction so
+        // an uncalibrated output renders pq_oetf → sample → pq_eotf as a
+        // visual no-op; calibration data arrives later via upload_lut3d.
+        let lut3d = if encode.uses_lut3d {
+            let mut tex = Lut3dTexture::new(device.clone(), DEFAULT_LUT_CUBE_EDGE)?;
+            tex.upload(&identity_lut(DEFAULT_LUT_CUBE_EDGE))?;
+            Some(tex)
+        } else {
+            None
+        };
+
         Ok(Self {
             device,
             decode,
             encode,
             intermediate: None,
             white_tex,
+            lut3d,
             scanout_format,
             intermediate_format,
             command_pool,
@@ -154,6 +179,24 @@ impl Renderer {
             next_slot: 0,
             semaphore_fd_loader,
         })
+    }
+
+    /// Replace this output's 3D LUT content. No-op (and returns Ok) when
+    /// the encode chain doesn't include `EncodeFragment::Lut3d`. `entries`
+    /// must be `cube_edge³` RGB triples in linear nits, X-fastest
+    /// (see [`crate::lut3d::Lut3dTexture::upload`]).
+    pub fn upload_lut3d(&mut self, entries: &[[f32; 3]]) -> Result<()> {
+        if let Some(lut) = self.lut3d.as_mut() {
+            lut.upload(entries)?;
+        }
+        Ok(())
+    }
+
+    /// Cube edge length of this renderer's 3D LUT, or 0 when none is
+    /// allocated. Calibration callers need this to size the entries
+    /// vector they pass to [`Self::upload_lut3d`].
+    pub fn lut3d_cube_edge(&self) -> u32 {
+        self.lut3d.as_ref().map(|l| l.cube_edge()).unwrap_or(0)
     }
 
     /// View of the 1×1 RGBA white texture solid-color elements sample.
@@ -395,11 +438,24 @@ impl Renderer {
                 .raw
                 .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.encode.pipeline);
 
-            let image_info = [vk::DescriptorImageInfo::default()
+            let intermediate_info = [vk::DescriptorImageInfo::default()
                 .sampler(self.encode.sampler)
                 .image_view(intermediate.view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let writes = [self.encode.write_intermediate_binding(&image_info)];
+            // Binding 1 (LUT) is conditional on the encode chain
+            // including `EncodeFragment::Lut3d`. We stage the LUT
+            // descriptor info outside the optional so its lifetime
+            // covers the push_descriptor call.
+            let lut_info = self.lut3d.as_ref().map(|lut| {
+                [vk::DescriptorImageInfo::default()
+                    .sampler(self.encode.sampler)
+                    .image_view(lut.view())
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
+            });
+            let mut writes = vec![self.encode.write_intermediate_binding(&intermediate_info)];
+            if let Some(ref info) = lut_info {
+                writes.push(self.encode.write_lut3d_binding(info));
+            }
             self.encode.push_loader.cmd_push_descriptor_set(
                 cb,
                 vk::PipelineBindPoint::GRAPHICS,

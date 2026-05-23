@@ -26,6 +26,10 @@ pub struct EncodePipeline {
     pub pipeline: vk::Pipeline,
     pub sampler: vk::Sampler,
     pub push_loader: ash::khr::push_descriptor::Device,
+    /// True when the descriptor-set layout includes binding 1 (the 3D LUT).
+    /// Mirrors [`EncodeConfig::uses_lut3d`] at construction so the draw
+    /// path knows whether to push an LUT descriptor.
+    pub uses_lut3d: bool,
 }
 
 impl EncodePipeline {
@@ -34,11 +38,23 @@ impl EncodePipeline {
         scanout_format: vk::Format,
         encode_config: &EncodeConfig,
     ) -> Result<Self> {
-        let bindings = [vk::DescriptorSetLayoutBinding::default()
+        let uses_lut3d = encode_config.uses_lut3d();
+        // Binding 0 is always the 2D intermediate; binding 1 is the 3D
+        // LUT, present only when the fragment chain samples it.
+        let mut bindings = vec![vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        if uses_lut3d {
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            );
+        }
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::default()
             .bindings(&bindings)
             .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
@@ -92,6 +108,7 @@ impl EncodePipeline {
             pipeline,
             sampler,
             push_loader,
+            uses_lut3d,
         })
     }
 
@@ -103,6 +120,19 @@ impl EncodePipeline {
     ) -> vk::WriteDescriptorSet<'a> {
         vk::WriteDescriptorSet::default()
             .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(image_info)
+    }
+
+    /// Build the `WriteDescriptorSet` for the per-output 3D LUT binding
+    /// (binding 1). Only valid when [`Self::uses_lut3d`] is true — the
+    /// pipeline layout only declares binding 1 in that case.
+    pub fn write_lut3d_binding<'a>(
+        &self,
+        image_info: &'a [vk::DescriptorImageInfo; 1],
+    ) -> vk::WriteDescriptorSet<'a> {
+        vk::WriteDescriptorSet::default()
+            .dst_binding(1)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(image_info)
     }

@@ -68,42 +68,33 @@ pub enum EncodeFragment {
 }
 
 impl EncodeConfig {
-    /// Today's SDR default: identity calibration + sRGB OETF. Matches the
-    /// pre-synthesis hard-coded encode shader.
+    /// SDR default: 3D LUT (identity unless calibrated) + sRGB OETF.
+    /// The LUT subsumes what was previously a separate `CalibrationMatrix`
+    /// stage — calibration data flows through the LUT path uniformly with
+    /// HDR. Identity LUT content gives the same output as the old
+    /// identity-CTM chain modulo trilinear interpolation error.
     pub fn default_srgb() -> Self {
         Self {
-            fragments: vec![
-                EncodeFragment::CalibrationMatrix,
-                EncodeFragment::OutputTransferSrgb,
-            ],
+            fragments: vec![EncodeFragment::Lut3d, EncodeFragment::OutputTransferSrgb],
         }
     }
 
-    /// HDR PQ default: identity calibration + identity response
-    /// correction + PQ OETF. The response correction stage is always
-    /// included for HDR outputs (even when no per-output calibration
-    /// is configured) so runtime IPC can flip on a panel-specific
-    /// curve without rebuilding the encode pipeline. Identity gain
-    /// and gamma values make the stage a no-op; cost is one extra
-    /// `pow` per pixel that the shader compiler can sometimes
-    /// optimize away.
+    /// HDR PQ default: 3D LUT + PQ OETF. The LUT replaces the old
+    /// `CalibrationMatrix` + `PerChannelResponseGainGamma` pair — a single
+    /// trilinear sample captures both gamut correction AND per-channel
+    /// response without assuming either is a closed-form function. The
+    /// uniform LUT-only path also means HDR-mode calibration tools have
+    /// one knob (LUT contents) instead of two (CTM + curve).
     pub fn default_pq() -> Self {
         Self {
-            fragments: vec![
-                EncodeFragment::CalibrationMatrix,
-                EncodeFragment::PerChannelResponseGainGamma,
-                EncodeFragment::OutputTransferPq,
-            ],
+            fragments: vec![EncodeFragment::Lut3d, EncodeFragment::OutputTransferPq],
         }
     }
 
-    /// fp16-scanout default: identity calibration + linear pass-through.
+    /// fp16-scanout default: 3D LUT + linear pass-through.
     pub fn default_linear() -> Self {
         Self {
-            fragments: vec![
-                EncodeFragment::CalibrationMatrix,
-                EncodeFragment::OutputTransferLinear,
-            ],
+            fragments: vec![EncodeFragment::Lut3d, EncodeFragment::OutputTransferLinear],
         }
     }
 
@@ -158,40 +149,47 @@ pub fn synthesize_fragment_shader(config: &EncodeConfig) -> Result<Vec<u32>> {
 mod tests {
     use super::*;
 
-    /// `uses_lut3d` reports the LUT presence honestly across the built-in
-    /// configs. Drives whether `ShaderCtx` declares binding 1 and whether
-    /// the pipeline layout will need to provide an LUT descriptor.
+    /// `uses_lut3d` reports the LUT presence honestly. All built-in
+    /// default chains now route calibration through the LUT, so they all
+    /// answer `true`; the negative case is a synthetic config without
+    /// `Lut3d` (used for testing the matrix+curve fragments directly).
     #[test]
     fn uses_lut3d_matches_chain_contents() {
-        assert!(!EncodeConfig::default_srgb().uses_lut3d());
-        assert!(!EncodeConfig::default_pq().uses_lut3d());
-        assert!(!EncodeConfig::default_linear().uses_lut3d());
-        let with_lut = EncodeConfig {
-            fragments: vec![EncodeFragment::Lut3d, EncodeFragment::OutputTransferPq],
+        assert!(EncodeConfig::default_srgb().uses_lut3d());
+        assert!(EncodeConfig::default_pq().uses_lut3d());
+        assert!(EncodeConfig::default_linear().uses_lut3d());
+        let no_lut = EncodeConfig {
+            fragments: vec![
+                EncodeFragment::CalibrationMatrix,
+                EncodeFragment::OutputTransferPq,
+            ],
         };
-        assert!(with_lut.uses_lut3d());
+        assert!(!no_lut.uses_lut3d());
     }
 
-    /// A Lut3d-bearing chain emits a non-empty SPIR-V module without
-    /// panicking. Real validation needs vulkan or spirv-val (not in our
-    /// dep tree); smoke-test that emission gets through end-to-end.
+    /// Default PQ chain emits a non-empty, magic-headered SPIR-V module.
+    /// Catches regressions in the conditional-binding emission path the
+    /// LUT-aware ShaderCtx::new takes when `uses_lut3d` is true.
     #[test]
-    fn lut3d_chain_synthesizes() {
-        let config = EncodeConfig {
-            fragments: vec![EncodeFragment::Lut3d, EncodeFragment::OutputTransferPq],
-        };
-        let spv = synthesize_fragment_shader(&config).expect("synthesize");
-        // SPIR-V starts with magic 0x07230203 and isn't empty.
+    fn default_pq_chain_synthesizes() {
+        let spv = synthesize_fragment_shader(&EncodeConfig::default_pq()).expect("synthesize");
         assert!(!spv.is_empty(), "empty SPIR-V");
         assert_eq!(spv[0], 0x07230203, "missing SPIR-V magic");
     }
 
-    /// Existing chains (no LUT) keep emitting valid SPIR-V — verifies that
-    /// the conditional `u_lut_ptr` declaration in `ShaderCtx::new` doesn't
-    /// regress configs that never reference the LUT.
+    /// Synthetic chain that omits Lut3d still synthesizes — exercises the
+    /// no-LUT branch of `ShaderCtx::new` so a future refactor doesn't
+    /// silently regress the matrix+curve path.
     #[test]
-    fn pq_chain_without_lut_still_synthesizes() {
-        let spv = synthesize_fragment_shader(&EncodeConfig::default_pq()).expect("synthesize");
+    fn no_lut_chain_still_synthesizes() {
+        let config = EncodeConfig {
+            fragments: vec![
+                EncodeFragment::CalibrationMatrix,
+                EncodeFragment::PerChannelResponseGainGamma,
+                EncodeFragment::OutputTransferPq,
+            ],
+        };
+        let spv = synthesize_fragment_shader(&config).expect("synthesize");
         assert!(!spv.is_empty());
         assert_eq!(spv[0], 0x07230203);
     }
