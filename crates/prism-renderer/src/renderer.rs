@@ -23,16 +23,16 @@ use crate::encode_synth::EncodeConfig;
 use crate::error::{RendererError, Result, VkResultExt};
 use crate::diagnose::{DiagnosedNits, EncodeDiagnoseProbe};
 use crate::intermediate::Intermediate;
-use crate::lut3d::{Lut3dTexture, identity_lut};
+use crate::lut3d::{LUT_CUBE_EDGE, Lut3dTexture, identity_lut};
 use crate::pipeline::decode::{DecodePipeline, DecodePush};
 use crate::pipeline::encode::{EncodePipeline, EncodePush};
 use crate::upload::ShmTexture;
 
-/// Default 3D LUT cube edge. 17 = 4913 grid points × 8 bytes = 39 KB per
-/// output, which gives roughly sub-percent error end-to-end with a PQ
-/// shaper. Bumping to 33 (~280 KB) is a knob for panels where round-trip
-/// banding shows up; configurable in a later stage if we need it.
-const DEFAULT_LUT_CUBE_EDGE: u32 = 17;
+/// Default 3D LUT cube edge. See `lut3d::LUT_CUBE_EDGE` for the
+/// renderer-wide constant; this is the per-output binding that mirrors
+/// it. Must stay in sync with the value the encode shader bakes into
+/// its texel-center adjustment.
+const DEFAULT_LUT_CUBE_EDGE: u32 = LUT_CUBE_EDGE;
 
 /// Number of frames the renderer keeps in flight. Matches the scanout BO
 /// count in `prism-drm::OutputContext`; the kernel only ever has one flip

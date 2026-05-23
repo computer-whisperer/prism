@@ -44,6 +44,14 @@ use crate::oneshot::OneshotPool;
 /// uploaded as 1.0 and unread by the encode fragment.
 pub const LUT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+/// Cube edge length of every per-output 3D LUT prism allocates. The
+/// encode shader's `Lut3d` fragment bakes this in as the divisor for
+/// its `texture_coord = c × (N-1)/N + 0.5/N` texel-center adjustment;
+/// the renderer uses it when allocating `Lut3dTexture`. Keep these
+/// two consumers in lockstep — a mismatch silently mis-indexes the
+/// LUT.
+pub const LUT_CUBE_EDGE: u32 = 17;
+
 /// Bytes per LUT texel (half-float RGBA).
 const TEXEL_BYTES: usize = 8;
 

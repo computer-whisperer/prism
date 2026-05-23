@@ -409,7 +409,35 @@ pub fn emit_lut3d(ctx: &mut ShaderCtx, in_nits: spirv::Word) -> spirv::Word {
         .b
         .f_div(vec3_t, None, num, den)
         .expect("num / den");
-    let coord = ctx.glsl_call_vec3(GLSL_POW, [ratio, m2_vec]);
+    let logical_coord = ctx.glsl_call_vec3(GLSL_POW, [ratio, m2_vec]);
+
+    // ── Texel-center adjustment ───────────────────────────────────────
+    // LUT entries are stored at integer indices `i ∈ [0, N-1]`. The
+    // GPU sampler's default convention puts texel `i`'s center at
+    // texture coord `(i+0.5)/N` — so sampling at the "logical"
+    // coord `i/(N-1)` would land between texel `i-1` and texel `i`
+    // for most `i`, dragging in the wrong neighbours. The standard
+    // 3D-LUT remedy:
+    //     texture_coord = logical_coord × (N-1)/N + 0.5/N
+    // which maps `logical_coord = i/(N-1) → texture_coord = (i+0.5)/N`
+    // (i.e. exact texel `i` center) for every `i` and interpolates
+    // linearly between adjacent entries in between. `N` is baked in
+    // from `lut3d::LUT_CUBE_EDGE` at shader synthesis time; if that
+    // ever needs to vary per-output we'd thread it through
+    // `EncodeConfig`.
+    let n = crate::lut3d::LUT_CUBE_EDGE as f32;
+    let scale = ctx.const_f32((n - 1.0) / n);
+    let bias = ctx.const_f32(0.5 / n);
+    let scale_vec = ctx.vec3_splat(scale);
+    let bias_vec = ctx.vec3_splat(bias);
+    let scaled = ctx
+        .b
+        .f_mul(vec3_t, None, logical_coord, scale_vec)
+        .expect("coord * (N-1)/N");
+    let coord = ctx
+        .b
+        .f_add(vec3_t, None, scaled, bias_vec)
+        .expect("coord * (N-1)/N + 0.5/N");
 
     // Sample the 3D LUT at `coord`. Linear filtering + CLAMP_TO_EDGE
     // (configured on the sampler at pipeline-create time) gives trilinear
