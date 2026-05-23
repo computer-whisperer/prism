@@ -48,6 +48,7 @@ drm-fourcc = "2.2.0"
 gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 glam = "0.30"
 gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+half = { version = "2.6", features = ["bytemuck"] }
 libc = "0.2"
 rspirv = "0.13"
 rustix = { version = "1.0.7", features = ["fs"] }

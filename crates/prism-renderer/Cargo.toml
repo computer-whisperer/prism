@@ -12,6 +12,7 @@ ash.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
 gpu-allocator.workspace = true
+half.workspace = true
 libc.workspace = true
 prism-frame.workspace = true
 rspirv.workspace = true
