@@ -314,12 +314,50 @@ impl FromIterator<Output> for Outputs {
 
 impl Outputs {
     pub fn find(&self, name: &OutputName) -> Option<&Output> {
-        self.0.iter().find(|o| name.matches(&o.name))
+        self.0.iter().find(|o| block_matches_output(&o.name, name))
     }
 
     pub fn find_mut(&mut self, name: &OutputName) -> Option<&mut Output> {
-        self.0.iter_mut().find(|o| name.matches(&o.name))
+        self.0.iter_mut().find(|o| block_matches_output(&o.name, name))
     }
+}
+
+/// Whether the KDL `output "..."` block named `block_name` should
+/// apply to the connector described by `output_name`. Single source
+/// of truth for the three subsystems that needed to do this matching
+/// before (bringup output_config, scanout pick, wl_output positioning),
+/// each of which previously duplicated a connector-only variant of
+/// this logic.
+///
+/// Tried in order:
+///   1. Exact case-insensitive connector match OR EDID `<Make> <Model>
+///      <Serial>` match (delegated to [`OutputName::matches`]).
+///   2. Short-form alias expansion: `output "DP-4"` matches connector
+///      `DisplayPort-4`; `output "HDMI-1"` matches `HDMI-A-1`. This
+///      catches legacy configs written before the long kernel-name
+///      convention; modern configs would use `DisplayPort-4` or the
+///      EDID triple directly.
+///
+/// Returns false if `block_name` is in short-alias form for an
+/// interface (`dp-`, `hdmi-`) that doesn't match the connector AND
+/// no EDID match succeeds — i.e. the alias check is additive, never
+/// substitutive for failed EDID checks.
+pub fn block_matches_output(block_name: &str, output_name: &OutputName) -> bool {
+    if output_name.matches(block_name) {
+        return true;
+    }
+    // Alias expansion only matters for the short forms `DP-N` and
+    // `HDMI-N` that legacy configs use. Anything else falls through
+    // to "no match" — we already tried the full set above.
+    let lc = block_name.to_lowercase();
+    let expanded = if let Some(rest) = lc.strip_prefix("dp-") {
+        format!("displayport-{rest}")
+    } else if let Some(rest) = lc.strip_prefix("hdmi-") {
+        format!("hdmi-a-{rest}")
+    } else {
+        return false;
+    };
+    output_name.matches(&expanded)
 }
 
 impl OutputName {
@@ -770,6 +808,65 @@ mod tests {
             Some("Serial")
         ));
         assert!(!check("unknown unknown unknown", "DP-2", None, None, None));
+    }
+
+    /// `block_matches_output` is the superset matcher used by every
+    /// bringup/scanout/protocol output-config lookup. Three behaviors:
+    /// long-form connector match, short-alias expansion (legacy
+    /// `output "DP-4"` ⇒ kernel `DisplayPort-4`), and EDID
+    /// `Make Model Serial` match for portable per-monitor calibration.
+    #[test]
+    fn block_matches_long_short_and_edid() {
+        let lu28r55 = make_output_name(
+            "DisplayPort-4",
+            Some("Samsung Electric Company"),
+            Some("LU28R55"),
+            Some("HCJT603937"),
+        );
+
+        // Long-form connector (kernel name verbatim).
+        assert!(block_matches_output("DisplayPort-4", &lu28r55));
+        assert!(block_matches_output("displayport-4", &lu28r55));
+
+        // Short alias — legacy convenience for `output "DP-4"`.
+        assert!(block_matches_output("DP-4", &lu28r55));
+        assert!(block_matches_output("dp-4", &lu28r55));
+
+        // EDID-keyed (the form `prism-tune calibrate-lut3d` writes).
+        assert!(block_matches_output(
+            "Samsung Electric Company LU28R55 HCJT603937",
+            &lu28r55,
+        ));
+        assert!(block_matches_output(
+            "samsung electric company lu28r55 hcjt603937",
+            &lu28r55,
+        ));
+
+        // Different connector + different serial: no match. Catches
+        // accidentally too-loose matching that would smear calibration
+        // across same-model units.
+        assert!(!block_matches_output("DisplayPort-6", &lu28r55));
+        assert!(!block_matches_output(
+            "Samsung Electric Company LU28R55 HCJT507693",
+            &lu28r55,
+        ));
+
+        // Unrelated block name: not matched.
+        assert!(!block_matches_output("HDMI-1", &lu28r55));
+        assert!(!block_matches_output("eDP-1", &lu28r55));
+    }
+
+    /// EDID-incomplete output (e.g., a dock without an EDID block):
+    /// only the connector paths can fire, EDID is never used. Make
+    /// sure the matcher doesn't accidentally produce false positives
+    /// when EDID fields are None.
+    #[test]
+    fn block_matches_without_edid() {
+        let no_edid = make_output_name("DisplayPort-2", None, None, None);
+        assert!(block_matches_output("DisplayPort-2", &no_edid));
+        assert!(block_matches_output("DP-2", &no_edid));
+        assert!(!block_matches_output("Samsung X Y", &no_edid));
+        assert!(!block_matches_output("unknown unknown unknown", &no_edid));
     }
 
     #[test]

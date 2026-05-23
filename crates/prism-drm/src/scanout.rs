@@ -132,7 +132,8 @@ where
         if !matches(&name) {
             continue;
         }
-        let cfg = match_config_for_connector(&name, outputs_cfg);
+        let edid = crate::EdidInfo::read(drm, conn_h);
+        let cfg = match_config_for_connector(&name, &edid, outputs_cfg);
         let Some((mode, fallback)) = pick_mode(&info, cfg) else {
             continue;
         };
@@ -193,7 +194,8 @@ pub fn pick_all_connected_with_config(
         }
         let name = format!("{:?}-{}", info.interface(), info.interface_id());
 
-        let cfg = match_config_for_connector(&name, outputs_cfg);
+        let edid = crate::EdidInfo::read(drm, conn_h);
+        let cfg = match_config_for_connector(&name, &edid, outputs_cfg);
         if cfg.is_some_and(|c| c.off) {
             tracing::info!("{name}: config `off`; skipping");
             continue;
@@ -267,23 +269,27 @@ fn collect_other_session_crtcs(
 /// case-insensitively and accepts both the kernel-long form and the
 /// short alias (e.g. `DP-4`).
 ///
-/// Today match is purely by connector. Once EDID parsing lands the
-/// `make model serial` form will be matched here too (see
-/// [`prism_config::output::OutputName::matches`] for the target shape).
+/// Match a KDL `output "..."` block to a connector. Supports the
+/// long kernel name (`DisplayPort-4`), short alias (`DP-4`), and the
+/// EDID `<Make> <Model> <Serial>` triple — see
+/// [`prism_config::output::block_matches_output`] for the matcher.
+/// `edid` is `EdidInfo::default()` when the connector has no EDID
+/// (rare; some virtual / dock outputs), in which case only the
+/// connector-based paths can fire.
 fn match_config_for_connector<'a>(
     connector_name: &str,
+    edid: &crate::EdidInfo,
     outputs_cfg: &'a [OutputCfg],
 ) -> Option<&'a OutputCfg> {
-    let kernel_lc = connector_name.to_lowercase();
-    outputs_cfg.iter().find(|o| {
-        let user_lc = o.name.to_lowercase();
-        if user_lc == kernel_lc {
-            return true;
-        }
-        // User typed `DP-4`, kernel name is `DisplayPort-4` — expand the
-        // user side and retry.
-        expand_alias(&user_lc) == kernel_lc
-    })
+    let output_name = prism_config::output::OutputName {
+        connector: connector_name.to_string(),
+        make: edid.make.clone(),
+        model: edid.model.clone(),
+        serial: edid.serial.clone(),
+    };
+    outputs_cfg
+        .iter()
+        .find(|o| prism_config::output::block_matches_output(&o.name, &output_name))
 }
 
 /// Pick a mode for `info`, honoring the config's optional `mode` override.

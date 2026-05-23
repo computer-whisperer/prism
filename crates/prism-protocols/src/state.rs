@@ -560,7 +560,17 @@ impl PrismState {
             // smithay::output::Mode::refresh is in milli-Hz.
             refresh: (ctx.mode.vrefresh() as i32) * 1000,
         };
-        let (scale, transform) = self.resolve_output_scale_transform(&ctx.connector_name);
+        // OutputContext carries EDID directly — use it so EDID-keyed
+        // `output "Make Model Serial"` blocks resolve here. Without this
+        // the resolution falls back to defaults (scale=1, no rotation)
+        // for any EDID-keyed config.
+        let scale_xfrm_name = prism_config::output::OutputName {
+            connector: ctx.connector_name.clone(),
+            make: ctx.edid.make.clone(),
+            model: ctx.edid.model.clone(),
+            serial: ctx.edid.serial.clone(),
+        };
+        let (scale, transform) = self.resolve_output_scale_transform(&scale_xfrm_name);
         let size_mm = ctx
             .edid
             .size_mm
@@ -772,9 +782,12 @@ impl PrismState {
     /// Falls back to `(Scale::Integer(1), Transform::Normal)` when there's
     /// no matching `output "..."` block. Transform != Normal logs a
     /// warning and is downgraded to Normal — see [`advertise_output`].
-    fn resolve_output_scale_transform(&self, connector_name: &str) -> (Scale, Transform) {
+    fn resolve_output_scale_transform(
+        &self,
+        output_name: &prism_config::output::OutputName,
+    ) -> (Scale, Transform) {
         let cfg = self.config.borrow();
-        let Some(out) = find_output_cfg(connector_name, &cfg.outputs.0) else {
+        let Some(out) = find_output_cfg(output_name, &cfg.outputs.0) else {
             return (Scale::Integer(1), Transform::Normal);
         };
         let scale = match out.scale {
@@ -791,7 +804,7 @@ impl PrismState {
         let cfg_transform = out.transform;
         if !matches!(cfg_transform, prism_ipc::Transform::Normal) {
             tracing::warn!(
-                connector = %connector_name,
+                connector = %output_name.connector,
                 transform = ?cfg_transform,
                 "output `transform` configured but render path does not yet rotate; \
                  advertising Normal — config ignored"
@@ -819,10 +832,16 @@ impl PrismState {
         // self.config, but cleaner this way).
         let positions: HashMap<OutputId, Option<prism_config::output::Position>> = {
             let cfg = self.config.borrow();
+            // Iterate values (smithay Outputs) so we can pull EDID
+            // make/model/serial out of physical_properties and build an
+            // OutputName for the matcher — purely connector-keyed lookup
+            // misses EDID-keyed `output "Make Model Serial"` blocks.
             self.wl_outputs
-                .keys()
-                .map(|name| {
-                    let pos = find_output_cfg(name, &cfg.outputs.0).and_then(|o| o.position);
+                .iter()
+                .map(|(name, output)| {
+                    let output_name = output_name_from_smithay(name, output);
+                    let pos = find_output_cfg(&output_name, &cfg.outputs.0)
+                        .and_then(|o| o.position);
                     (name.clone(), pos)
                 })
                 .collect()
@@ -2087,33 +2106,38 @@ pub(crate) fn output_logical_size(output: &Output) -> Option<(i32, i32)> {
 }
 
 /// Find the `output "..."` config block for a kernel connector name (e.g.
-/// `DisplayPort-4`). Accepts the short alias the user is more likely to
-/// type (`DP-4`) by walking the same alias-expansion table used at pick
-/// time. Returns `None` for connectors with no matching block.
+/// `DisplayPort-4`), the short alias (`DP-4`), OR the EDID
+/// `<Make> <Model> <Serial>` triple. The unified matcher lives in
+/// [`prism_config::output::block_matches_output`].
+///
+/// `OutputName` carries the connector + EDID fields — callers in
+/// state.rs build it from either an [`OutputContext`] (which holds
+/// EDID directly) or a smithay [`Output`] (where the physical_properties
+/// were populated from EDID at advertise time).
 pub(crate) fn find_output_cfg<'a>(
-    connector_name: &str,
+    output_name: &prism_config::output::OutputName,
     outputs_cfg: &'a [prism_config::output::Output],
 ) -> Option<&'a prism_config::output::Output> {
-    let kernel_lc = connector_name.to_lowercase();
-    outputs_cfg.iter().find(|o| {
-        let user_lc = o.name.to_lowercase();
-        if user_lc == kernel_lc {
-            return true;
-        }
-        expand_connector_alias(&user_lc) == kernel_lc
-    })
+    outputs_cfg
+        .iter()
+        .find(|o| prism_config::output::block_matches_output(&o.name, output_name))
 }
 
-/// Mirror of `prism_drm::scanout::expand_alias` — kept here to avoid a
-/// re-export. Cheap one-liner; the two crates have different module
-/// shapes so duplicating is simpler than weaving a pub helper through.
-fn expand_connector_alias(input: &str) -> String {
-    if let Some(rest) = input.strip_prefix("dp-") {
-        format!("displayport-{rest}")
-    } else if let Some(rest) = input.strip_prefix("hdmi-") {
-        format!("hdmi-a-{rest}")
-    } else {
-        input.to_string()
+/// Build an [`OutputName`] from a smithay output's physical properties.
+/// Treats the "Unknown" / empty sentinels the same way
+/// [`OutputName::from_ipc_output`] does — those fields drop to `None`
+/// so the EDID-matcher doesn't fire on partial-EDID outputs (which
+/// can't uniquely identify a physical unit anyway).
+pub(crate) fn output_name_from_smithay(
+    connector_name: &str,
+    output: &Output,
+) -> prism_config::output::OutputName {
+    let phys = output.physical_properties();
+    prism_config::output::OutputName {
+        connector: connector_name.to_string(),
+        make: (phys.make != "Unknown").then(|| phys.make.clone()),
+        model: (phys.model != "Unknown").then(|| phys.model.clone()),
+        serial: (!phys.serial_number.is_empty()).then(|| phys.serial_number.clone()),
     }
 }
 

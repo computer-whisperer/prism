@@ -105,27 +105,32 @@ fn load_config() -> prism_config::Config {
 /// Find the `output "..."` config block for a kernel connector name (e.g.
 /// `DisplayPort-4`). Accepts the short alias (`DP-4`) by expanding both
 /// sides. Same logic as `prism_drm::scanout::match_config_for_connector`
-/// and `prism_protocols::find_output_cfg` — local copy to avoid plumbing
-/// it across crate boundaries for this one call site.
+/// Look up the per-connector KDL `output "..."` block. Matches by:
+///   - Exact case-insensitive connector name (`output "DisplayPort-4"`)
+///   - Short alias (`output "DP-4"`, expanded to `DisplayPort-4`)
+///   - EDID `<Make> <Model> <Serial>` triple, when `edid` carries
+///     all three fields — this is the form `prism-tune calibrate-lut3d`
+///     writes for portable per-monitor calibration
+///
+/// The shared matcher lives in [`prism_config::output::block_matches_output`];
+/// this is just the bringup-side wrapper that builds an `OutputName`
+/// from the connector + EDID. Pre-EDID call sites pass `EdidInfo::default()`
+/// (everything `None`); they get connector-only matching identical to the
+/// pre-EDID behavior.
 fn find_connector_config<'a>(
     connector_name: &str,
+    edid: &prism_drm::EdidInfo,
     outputs_cfg: &'a [prism_config::output::Output],
 ) -> Option<&'a prism_config::output::Output> {
-    let kernel_lc = connector_name.to_lowercase();
-    outputs_cfg.iter().find(|o| {
-        let user_lc = o.name.to_lowercase();
-        if user_lc == kernel_lc {
-            return true;
-        }
-        let expanded = if let Some(rest) = user_lc.strip_prefix("dp-") {
-            format!("displayport-{rest}")
-        } else if let Some(rest) = user_lc.strip_prefix("hdmi-") {
-            format!("hdmi-a-{rest}")
-        } else {
-            user_lc
-        };
-        expanded == kernel_lc
-    })
+    let output_name = prism_config::output::OutputName {
+        connector: connector_name.to_string(),
+        make: edid.make.clone(),
+        model: edid.model.clone(),
+        serial: edid.serial.clone(),
+    };
+    outputs_cfg
+        .iter()
+        .find(|o| prism_config::output::block_matches_output(&o.name, &output_name))
 }
 
 /// Resolve a parsed `HdrConfig` (KDL) into a kernel-ready
@@ -1027,8 +1032,14 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             let name = pick.connector_name.clone();
             // Per-output config: start from the CLI default, then apply
             // any per-connector overrides from the KDL `output "…"` block.
+            // EDID is what makes EDID-keyed `output "Make Model Serial"`
+            // blocks resolvable — read it here so find_connector_config
+            // can match them. OutputContext::new re-reads inside, but
+            // EDID is a single DRM property read so the double-read is
+            // negligible compared to bringup cost.
+            let edid = prism_drm::EdidInfo::read(&card.drm, pick.connector);
             let mut output_config = default_output_config.clone();
-            if let Some(cfg) = find_connector_config(&name, &config.outputs.0) {
+            if let Some(cfg) = find_connector_config(&name, &edid, &config.outputs.0) {
                 if let Some(color) = cfg.color.as_ref() {
                     // HDR-on overrides max_bpc to 10 + flips depth to
                     // fp16 + flips encode chain to PQ. Done before
@@ -1154,8 +1165,11 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                     // so resynthesize_color_lut sees it as the fallback
                     // when no IPC override is active. Re-look up the
                     // per-connector config block; the earlier `cfg` is
-                    // scoped to the `if let` above.
-                    if let Some(lut3d_cfg) = find_connector_config(&name, &config.outputs.0)
+                    // scoped to the `if let` above. Use the OutputContext's
+                    // already-populated EDID so EDID-keyed blocks resolve
+                    // here too (the bringup-side `edid` above is out of
+                    // scope after OutputContext takes ownership).
+                    if let Some(lut3d_cfg) = find_connector_config(&name, &output.edid, &config.outputs.0)
                         .and_then(|c| c.color.as_ref())
                         .and_then(|c| c.lut3d.as_ref())
                     {
