@@ -97,6 +97,17 @@ fn load_config() -> prism_config::Config {
             breadcrumb(&msg);
             tracing::error!("{msg}");
             tracing::error!("falling back to default config — fix the file and restart");
+            // The default config has no user binds, which used to mean
+            // "user is now trapped on this VT with no way to quit
+            // prism short of sshing in to pkill". Hard-coded escape
+            // hatches in prism-input::dispatch::on_keyboard cover
+            // this — surface them in the log so the user knows the
+            // escape sequences exist when they hit this path.
+            tracing::error!(
+                "emergency exits (hard-coded, always work): \
+                 Ctrl+Alt+Backspace = quit prism, \
+                 Ctrl+Alt+F1..F12 = switch VT"
+            );
             prism_config::Config::default()
         }
     }

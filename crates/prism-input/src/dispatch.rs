@@ -168,6 +168,51 @@ fn on_keyboard<I: PrismInputBackend>(state: &mut PrismState, event: I::KeyboardK
                 return FilterResult::Forward;
             };
 
+            // Hard-coded escape hatches — handled before the user's
+            // bind table so they're available no matter what (broken
+            // config that fell back to defaults, missing `quit` bind,
+            // anything else that would normally leave the user
+            // trapped on the prism VT with no working keybindings).
+            //
+            // Ctrl+Alt+Fn → VT switch via libseat. xkbcommon's TTY
+            // layout maps this combo to the contiguous
+            // `XF86_Switch_VT_1..XF86_Switch_VT_12` keysym range
+            // (0x1008FE01..0x1008FE0C). Routed before the configurable
+            // bind lookup so a user bind on `F1` (rare) can't shadow
+            // it. We never want a config to be able to disable VT
+            // switch — it's the OS-level escape hatch.
+            const VT_KEYSYM_BASE: u32 = 0x1008_FE01;
+            const VT_KEYSYM_LAST: u32 = 0x1008_FE0C;
+            let raw_u32 = raw.raw();
+            if (VT_KEYSYM_BASE..=VT_KEYSYM_LAST).contains(&raw_u32) {
+                let vt = (raw_u32 - VT_KEYSYM_BASE + 1) as i32;
+                match this.session.as_ref() {
+                    Some(session) => match session.change_vt(vt) {
+                        Ok(()) => tracing::info!("VT switch to {vt} requested"),
+                        Err(e) => tracing::warn!("VT switch to {vt} failed: {e:#}"),
+                    },
+                    None => tracing::warn!(
+                        "VT switch to {vt} requested but no SeatSession bound \
+                         (wayland-only / headless mode)"
+                    ),
+                }
+                this.suppressed_keys.insert(key_code);
+                return FilterResult::Intercept(None);
+            }
+
+            // Ctrl+Alt+Backspace → emergency quit. Niri/X.org
+            // convention. Hardcoded so a typo'd KDL config or a
+            // missing `quit` bind can never leave the user with no
+            // way out short of ssh + pkill. `KEY_BackSpace` keysym
+            // is 0xFF08.
+            const KEY_BACKSPACE: u32 = 0xFF08;
+            if mods.ctrl && mods.alt && raw_u32 == KEY_BACKSPACE {
+                tracing::warn!("Ctrl+Alt+Backspace pressed — emergency quit");
+                this.should_stop = true;
+                this.suppressed_keys.insert(key_code);
+                return FilterResult::Intercept(None);
+            }
+
             match find_bind(&snapshot, mod_key, Trigger::Keysym(raw), *mods) {
                 Some(bind) => {
                     this.suppressed_keys.insert(key_code);

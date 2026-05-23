@@ -63,6 +63,28 @@ impl SeatSession {
         self.session.is_active()
     }
 
+    /// Request a VT switch via libseat. The compositor's input
+    /// dispatcher routes `Ctrl+Alt+Fn` (xkbcommon emits
+    /// `XF86_Switch_VT_N` keysyms for these on TTY) here so users can
+    /// jump to another VT without ssh-ing in to pkill prism. Returns
+    /// an `io::Result` so the call site can `tracing::warn` failures
+    /// without dragging the `smithay::backend::session::Error` type
+    /// across the crate boundary.
+    ///
+    /// `&self`, not `&mut self`: clones the underlying
+    /// `LibSeatSession` (cheap, Arc-backed) and calls
+    /// `Session::change_vt` on the clone. The clone is necessary
+    /// because `Session::change_vt` takes `&mut self` but the input
+    /// dispatcher only has a `&` on its `Option<SeatSession>` field.
+    pub fn change_vt(&self, vt: i32) -> std::io::Result<()> {
+        let mut session = self.session.clone();
+        session
+            .change_vt(vt)
+            .map_err(|e| {
+                std::io::Error::other(format!("libseat change_vt({vt}): {e:?}"))
+            })
+    }
+
     /// Open a DRM device through the seat. The returned fd is master-capable
     /// when the session is active (i.e. when we're on the foreground VT).
     pub fn open_drm(&mut self, path: impl AsRef<Path>) -> Result<DrmDeviceFd> {
