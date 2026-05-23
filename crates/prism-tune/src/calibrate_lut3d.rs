@@ -462,8 +462,23 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     // ratio. The forward model is the 3D grid measured in Phase 2 —
     // these samples are NOT used as the per-channel additive model
     // any longer.
+    //
+    // SDR sweep cap: SDR's encode pipeline clamps `cmd /
+    // sdr_reference_nits` to [0, 1] before sRGB-OETF encoding for
+    // scanout. Cmds above `sdr_reference_nits` all produce the same
+    // panel output (post-clip). Sampling that flat region would put
+    // degenerate data into the 3D grid — Newton could converge to
+    // phantom cmds the encode pipeline can't actually deliver. Cap
+    // the sweep at sdr_reference_nits so the per_channel_peaks (and
+    // therefore the 3D sweep axis bounds) stay in the unclipped
+    // regime. HDR has no equivalent clamp; full args.max_cmd applies.
+    let effective_max_cmd = if baseline.hdr_active {
+        args.max_cmd
+    } else {
+        args.max_cmd.min(baseline.sdr_reference_nits)
+    };
     let targets =
-        log_spaced_targets(args.min_cmd, args.max_cmd, args.samples_per_channel);
+        log_spaced_targets(args.min_cmd, effective_max_cmd, args.samples_per_channel);
     let mut responses: [Option<ChannelResponse>; 3] = [None, None, None];
 
     for channel in Channel::ALL {
