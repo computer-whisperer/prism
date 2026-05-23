@@ -50,7 +50,18 @@ pub const LUT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// the renderer uses it when allocating `Lut3dTexture`. Keep these
 /// two consumers in lockstep — a mismatch silently mis-indexes the
 /// LUT.
-pub const LUT_CUBE_EDGE: u32 = 17;
+///
+/// Picked 33 over the natural 17: at 17, the LUT-grid spacing near
+/// the toe of the panel response straddles the (sub-floor → above-
+/// floor) discontinuity over a wide PQ-coord range, and trilinear
+/// interpolation between the (cmd=0) sub-floor cells and the (real
+/// cmd) above-floor cells produces wrong intermediate cmds whose
+/// emission overshoots the target by 15-20% near 1 cd/m². 33 packs
+/// more grid points in the toe and shrinks each interpolation
+/// segment, which collapses that error to single digits at the
+/// boundary patches. Cost: 8× LUT texture storage (~287 KB per
+/// output at f16 RGBA) — negligible on any GPU we care about.
+pub const LUT_CUBE_EDGE: u32 = 33;
 
 /// Bytes per LUT texel (half-float RGBA).
 const TEXEL_BYTES: usize = 8;

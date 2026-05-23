@@ -62,10 +62,11 @@ pub struct CalibrateLut3dArgs {
     /// Connector to calibrate (e.g. `DisplayPort-4`, `HDMI-A-1`).
     #[arg(long)]
     pub output: String,
-    /// Inverse-LUT cube edge (grid points per axis). Default 17 matches
-    /// the compositor's default texture size. 33 gives finer precision at
-    /// 8× the storage cost; only useful if 17³ shows banding.
-    #[arg(long, default_value_t = 17)]
+    /// Inverse-LUT cube edge (grid points per axis). Default 33
+    /// matches the compositor's `LUT_CUBE_EDGE` const — the
+    /// compositor rejects files whose `cube_edge` doesn't match its
+    /// compiled texture size. If you change one, change both.
+    #[arg(long, default_value_t = 33)]
     pub cube_edge: u32,
     /// Measurement-grid edge for the 3D forward sweep (Phase 2).
     /// `cube_edge_cmd³` patches command the panel; each measurement
