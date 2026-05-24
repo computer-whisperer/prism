@@ -413,20 +413,27 @@ impl PrismState {
             ],
         );
 
-        // Hardcoded minimal dmabuf format set for now: XRGB8888 / ARGB8888
-        // with LINEAR modifier. Both map to vk::Format::B8G8R8A8_UNORM. Tiled
-        // modifiers will be added once we query the Vulkan device for
-        // VK_EXT_image_drm_format_modifier support.
-        let supported_formats = [
-            DrmFormat {
-                code: DrmFourcc::Xrgb8888,
-                modifier: DrmModifier::Linear,
-            },
-            DrmFormat {
-                code: DrmFourcc::Argb8888,
-                modifier: DrmModifier::Linear,
-            },
-        ];
+        // Dmabuf format/modifier set, queried from the primary GPU's
+        // Vulkan driver: the 8-bit BGRA formats plus HDR-capable 10-bit
+        // and fp16, each paired with the tiled modifiers the driver
+        // reports as SAMPLED-capable (plus LINEAR). Advertising the real
+        // modifier set is what stops HDR clients (Firefox, mpv) from
+        // allocating implementation-defined layouts we can't import —
+        // see build_advertised_dmabuf_formats. Falls back to LINEAR
+        // 8-bit when no primary GPU is registered.
+        let supported_formats: Vec<DrmFormat> = match primary_gpu.and_then(|id| gpus.get(&id)) {
+            Some(device) => build_advertised_dmabuf_formats(device),
+            None => vec![
+                DrmFormat {
+                    code: DrmFourcc::Xrgb8888,
+                    modifier: DrmModifier::Linear,
+                },
+                DrmFormat {
+                    code: DrmFourcc::Argb8888,
+                    modifier: DrmModifier::Linear,
+                },
+            ],
+        };
         let mut dmabuf_state = DmabufState::new();
         // dmabuf v4 + DmabufFeedback when we know the primary GPU's
         // render node. Without that we'd fall back to v3 (no feedback),
@@ -452,11 +459,17 @@ impl PrismState {
                 .build()
                 .expect("DmabufFeedbackBuilder::build");
                 tracing::info!(
-                    "dmabuf v4 advertised with main_device {}:{} ({} formats)",
+                    "dmabuf v4 advertised with main_device {}:{} ({} format/modifier pairs)",
                     node.major,
                     node.minor,
                     supported_formats.len()
                 );
+                // Log the distinct fourccs so HDR client support is
+                // verifiable at a glance (10-bit / fp16 present?).
+                let mut codes: Vec<DrmFourcc> =
+                    supported_formats.iter().map(|f| f.code).collect();
+                codes.dedup();
+                tracing::info!(?codes, "dmabuf advertised fourccs");
                 dmabuf_state.create_global_with_default_feedback::<PrismState>(&dh, &feedback)
             }
             None => {
@@ -1858,6 +1871,39 @@ fn import_dmabuf(
     let vk_format = vk_format_for(dmabuf.format).with_context(|| {
         format!("no Vulkan format mapping for {:?}", dmabuf.format)
     })?;
+
+    // Guard: only import a (format, modifier) the driver actually
+    // supports for single-plane SAMPLED use. This is the backstop that
+    // keeps a bad buffer off the GPU entirely.
+    //
+    // The case that matters most is `modifier == DRM_FORMAT_MOD_INVALID`
+    // (u64::MAX): a client that allocated without an explicit modifier
+    // (legacy GBM). On modern AMD the real layout is tiled, but
+    // `ImageDrmFormatModifierExplicitCreateInfoEXT` would take u64::MAX
+    // at face value, build a garbage-tiled image, and page-fault the GPU
+    // on first sample — a *hard* recovery that takes down every Vulkan
+    // context on the card (and leaves the GPU wedged for other
+    // compositors until reboot). Invalid is never in the driver's
+    // reported modifier list, so this check rejects it. Now that we
+    // advertise real modifiers (build_advertised_dmabuf_formats), modern
+    // clients negotiate a supported one and never hit this path.
+    let modifier = u64::from(dmabuf.modifier);
+    let supported = device.supported_drm_format_modifiers(vk_format);
+    let ok = supported.iter().any(|m| {
+        m.modifier == modifier
+            && m.plane_count == 1
+            && m.tiling_features
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+    });
+    if !ok {
+        anyhow::bail!(
+            "refusing dmabuf import: format {:?} modifier {:#x} not in the \
+             driver's single-plane SAMPLED modifier set (would risk a GPU fault)",
+            dmabuf.format,
+            modifier,
+        );
+    }
+
     let image = prism_renderer::ImportedImage::import(
         device.clone(),
         &dmabuf,
@@ -2374,8 +2420,86 @@ fn vk_format_for(fourcc: DrmFourcc) -> Option<vk::Format> {
         // DRM is little-endian-byte-order, so XRGB8888 in memory is B,G,R,X.
         // Vulkan's B8G8R8A8 reads exactly that byte order.
         DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => vk::Format::B8G8R8A8_UNORM,
+        // 10-bit: DRM AB30/XB30 pack [A:30][B:20][G:10][R:0] in a LE u32,
+        // which is exactly Vulkan's A2B10G10R10_UNORM_PACK32. HDR10 clients
+        // (Firefox with HDR on, mpv PQ passthrough) allocate these.
+        DrmFourcc::Xbgr2101010 | DrmFourcc::Abgr2101010 => {
+            vk::Format::A2B10G10R10_UNORM_PACK32
+        }
+        // fp16: DRM ABGR16161616F is R,G,B,A 16-bit floats in memory order,
+        // matching Vulkan R16G16B16A16_SFLOAT. scRGB / fp16 HDR clients use
+        // this; values can exceed 1.0.
+        DrmFourcc::Xbgr16161616f | DrmFourcc::Abgr16161616f => {
+            vk::Format::R16G16B16A16_SFLOAT
+        }
         _ => return None,
     })
+}
+
+/// DRM fourccs prism can import as a sampled texture, in rough
+/// preference order (8-bit first, then HDR-capable 10-bit + fp16).
+/// Each MUST have a [`vk_format_for`] mapping. The 10-bit and fp16
+/// entries are what HDR clients allocate; advertising them with the
+/// real tiled modifiers the GPU supports keeps Mesa from falling
+/// back to an implementation-defined layout (`modifier=Invalid`),
+/// which we can't import without a GPU page fault — see
+/// [`build_advertised_dmabuf_formats`] and the import-time guard in
+/// [`import_dmabuf`].
+const DMABUF_CANDIDATE_FOURCCS: &[DrmFourcc] = &[
+    DrmFourcc::Xrgb8888,
+    DrmFourcc::Argb8888,
+    DrmFourcc::Xbgr2101010,
+    DrmFourcc::Abgr2101010,
+    DrmFourcc::Xbgr16161616f,
+    DrmFourcc::Abgr16161616f,
+];
+
+/// Build the dmabuf format/modifier set to advertise, by intersecting
+/// [`DMABUF_CANDIDATE_FOURCCS`] with the modifiers `device` actually
+/// supports for single-plane SAMPLED import. Every client buffer is
+/// composited as a texture, so SAMPLED (not COLOR_ATTACHMENT, which is
+/// the scanout side's filter) is the right capability bit.
+///
+/// An empty result (driver advertises no modifiers for any candidate)
+/// falls back to LINEAR 8-bit, which every driver supports — keeps
+/// basic clients working even on a minimal driver.
+fn build_advertised_dmabuf_formats(device: &prism_renderer::Device) -> Vec<DrmFormat> {
+    let mut out = Vec::new();
+    for &fourcc in DMABUF_CANDIDATE_FOURCCS {
+        let Some(vk_format) = vk_format_for(fourcc) else {
+            continue;
+        };
+        for m in device.supported_drm_format_modifiers(vk_format) {
+            // Our importer is single-plane only; multi-plane modifiers
+            // (DCC/CCS metadata planes) need separate memory imports.
+            if m.plane_count != 1 {
+                continue;
+            }
+            if !m
+                .tiling_features
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+            {
+                continue;
+            }
+            out.push(DrmFormat {
+                code: fourcc,
+                modifier: DrmModifier::from(m.modifier),
+            });
+        }
+    }
+    if out.is_empty() {
+        out.extend([
+            DrmFormat {
+                code: DrmFourcc::Xrgb8888,
+                modifier: DrmModifier::Linear,
+            },
+            DrmFormat {
+                code: DrmFourcc::Argb8888,
+                modifier: DrmModifier::Linear,
+            },
+        ]);
+    }
+    out
 }
 
 // ─── Per-output config helpers ──────────────────────────────────────────────
