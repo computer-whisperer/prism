@@ -339,3 +339,41 @@ pub fn get_credentials_for_surface(
     // lands; see niri/src/utils::get_credentials_for_surface.
     None
 }
+
+/// Normalized texture UV rect `[u_min, v_min, u_max, v_max]` for the decode
+/// shader, honoring a surface's `wp_viewport` source crop.
+///
+/// `view.src` is the crop rectangle in logical surface coordinates — set by
+/// `wp_viewport.set_source`, and defaulting to the whole surface when unset.
+/// `buffer_size` is the buffer's logical size
+/// ([`RendererSurfaceState::buffer_size`]), the *same* coordinate space
+/// `view.src` lives in (both are `buffer_dimensions.to_logical(scale,
+/// transform)`-derived), so `src / buffer_size` lands in `[0, 1]`. When no
+/// viewport source is set the source equals the full surface and this yields
+/// the identity `[0, 0, 1, 1]`.
+///
+/// Returns the full-texture rect when the buffer size is unknown or
+/// degenerate. Assumes an identity buffer transform — the only case prism's
+/// sampler handles; a rotated/flipped buffer would need the transform applied
+/// to the UV corners (prism doesn't honor buffer transform anywhere yet).
+///
+/// [`RendererSurfaceState::buffer_size`]: smithay::backend::renderer::utils::RendererSurfaceState::buffer_size
+pub fn src_rect_uv_from_view(
+    view: &smithay::backend::renderer::utils::SurfaceView,
+    buffer_size: Option<smithay::utils::Size<i32, smithay::utils::Logical>>,
+) -> [f32; 4] {
+    let Some(size) = buffer_size else {
+        return [0.0, 0.0, 1.0, 1.0];
+    };
+    if size.w <= 0 || size.h <= 0 {
+        return [0.0, 0.0, 1.0, 1.0];
+    }
+    let (w, h) = (size.w as f64, size.h as f64);
+    let src = view.src;
+    [
+        (src.loc.x / w) as f32,
+        (src.loc.y / h) as f32,
+        ((src.loc.x + src.size.w) / w) as f32,
+        ((src.loc.y + src.size.h) / h) as f32,
+    ]
+}

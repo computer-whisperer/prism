@@ -674,15 +674,21 @@ impl LayoutElement for Mapped {
                     );
                     return;
                 };
-                let view = match data.lock().unwrap().view() {
-                    Some(v) => v,
-                    None => {
-                        trace!(
-                            target: "render_walk",
-                            id = ?surf.id(), role = ?states.role,
-                            "skip: no view (no buffer committed)"
-                        );
-                        return;
+                // Grab the view and the buffer's logical size under one lock
+                // (both Copy) — buffer_size is the normalization basis for the
+                // wp_viewport source crop below.
+                let (view, buffer_size) = {
+                    let guard = data.lock().unwrap();
+                    match guard.view() {
+                        Some(v) => (v, guard.buffer_size()),
+                        None => {
+                            trace!(
+                                target: "render_walk",
+                                id = ?surf.id(), role = ?states.role,
+                                "skip: no view (no buffer committed)"
+                            );
+                            return;
+                        }
                     }
                 };
                 // texture_for reads from `states` directly — DO NOT call
@@ -728,7 +734,7 @@ impl LayoutElement for Mapped {
                     chroma_view,
                     yuv,
                     dst_rect_clip,
-                    src_rect_uv: [0.0, 0.0, 1.0, 1.0],
+                    src_rect_uv: crate::utils::src_rect_uv_from_view(&view, buffer_size),
                     color: ctx.color_for(states),
                 }));
             },

@@ -2119,16 +2119,28 @@ fn render_output_now(
         let dst_rect_clip = project(dst);
         // Use RenderCtx::color_for so layer-shell surfaces share the
         // same per-output sdr_reference_nits fallback as toplevels.
-        let (color, (chroma_view, yuv)) =
+        // src_rect_uv honors any wp_viewport source crop (full texture when
+        // unset), read from the same RendererSurfaceState the walk uses.
+        let (color, (chroma_view, yuv), src_rect_uv) =
             smithay::wayland::compositor::with_states(wl_surface, |states| {
-                (ctx.color_for(states), ctx.yuv_for(states))
+                let src_rect_uv = states
+                    .data_map
+                    .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+                    .and_then(|d| {
+                        let guard = d.lock().unwrap();
+                        guard.view().map(|v| {
+                            prism_layout::utils::src_rect_uv_from_view(&v, guard.buffer_size())
+                        })
+                    })
+                    .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+                (ctx.color_for(states), ctx.yuv_for(states), src_rect_uv)
             });
         render_els.push(RenderEl::Surface(prism_renderer::SurfaceEl {
             texture_view,
             chroma_view,
             yuv,
             dst_rect_clip,
-            src_rect_uv: [0.0, 0.0, 1.0, 1.0],
+            src_rect_uv,
             color,
         }));
     }
