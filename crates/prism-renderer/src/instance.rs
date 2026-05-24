@@ -44,8 +44,20 @@ impl Instance {
                 .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == name)
         };
 
+        // Validation runs in debug builds, or in any build when
+        // `PRISM_VK_VALIDATION` is set to a non-empty, non-"0" value — the
+        // release-build escape hatch for debugging on real hardware (the DRM
+        // scanout path only exists outside `cargo test`, so synchronization
+        // hazards there can't be caught by a debug unit-test run).
+        let force_validation = std::env::var("PRISM_VK_VALIDATION")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        let want_validation = cfg!(debug_assertions) || force_validation;
+
         let mut enable_exts: Vec<*const i8> = Vec::new();
-        let want_debug_utils = cfg!(debug_assertions);
+        // Need the debug-utils messenger whenever validation runs so its
+        // output routes through our tracing callback instead of stderr.
+        let want_debug_utils = want_validation;
         let have_debug_utils = has_ext(debug_utils::NAME);
         if want_debug_utils {
             if have_debug_utils {
@@ -61,7 +73,7 @@ impl Instance {
             .iter()
             .any(|l| unsafe { CStr::from_ptr(l.layer_name.as_ptr()) } == VALIDATION_LAYER);
         let mut enable_layers: Vec<*const i8> = Vec::new();
-        if cfg!(debug_assertions) {
+        if want_validation {
             if have_validation {
                 enable_layers.push(VALIDATION_LAYER.as_ptr());
             } else {
@@ -72,10 +84,22 @@ impl Instance {
             }
         }
 
-        let create_info = vk::InstanceCreateInfo::default()
+        // Synchronization validation is off by default even when the layer is
+        // loaded. It statically analyzes the barrier / semaphore / fence graph
+        // for missing-synchronization hazards — the class of bug behind
+        // intermittent, timing-dependent corruption — so it flags a latent
+        // missing barrier even in a run where the corruption doesn't surface.
+        let sync_features = [vk::ValidationFeatureEnableEXT::SYNCHRONIZATION_VALIDATION];
+        let mut validation_features =
+            vk::ValidationFeaturesEXT::default().enabled_validation_features(&sync_features);
+
+        let mut create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(&enable_exts)
             .enabled_layer_names(&enable_layers);
+        if want_validation && have_validation {
+            create_info = create_info.push_next(&mut validation_features);
+        }
 
         let raw = unsafe { entry.create_instance(&create_info, None) }.vk_ctx("create_instance")?;
 
@@ -84,7 +108,7 @@ impl Instance {
             vk::api_version_major(api_version),
             vk::api_version_minor(api_version),
             vk::api_version_patch(api_version),
-            have_validation && cfg!(debug_assertions),
+            want_validation && have_validation,
             want_debug_utils && have_debug_utils,
         );
 
