@@ -1876,7 +1876,6 @@ fn render_output_now(
     use prism_protocols::PendingFeedback;
     use prism_renderer::{ElementDraw, EncodePush, RenderEl, vk};
     use smithay::utils::{Logical, Rectangle};
-    use smithay::wayland::compositor::with_states;
 
     // Snapshot identity bits without holding any borrow into
     // state.outputs (we'll re-borrow mutably at present() time below).
@@ -2141,6 +2140,56 @@ fn render_output_now(
     let mut frame_cbs = Vec::new();
     let mut presentation_cbs = Vec::new();
     let mut release_trackers = Vec::new();
+
+    // Walks a surface tree from `root` downward, harvesting
+    // frame_callbacks, presentation_feedback callbacks, and
+    // drm_syncobj release trackers from every wl_surface in the
+    // tree. Iterating only the toplevel root misses callbacks
+    // registered on subsurfaces — GTK4 / Firefox / Mesa register
+    // them on subsurface-backed content, and skipping those
+    // freezes their animation loops until something else nudges
+    // the output (e.g. cursor motion).
+    //
+    // CAREFUL: the visit callback runs *inside* smithay's
+    // per-surface data_map lock. Anything that would re-enter
+    // `with_states` on the same surface (e.g. the public
+    // `drm_syncobj::tracker_for_render` helper) self-deadlocks
+    // here. Read SurfaceReleaseSlot directly off the `states`
+    // we already have instead.
+    let mut harvest = |root: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| {
+        use prism_protocols::drm_syncobj::SurfaceReleaseSlot;
+        use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
+        with_surface_tree_downward(
+            root,
+            (),
+            |_, _, &()| TraversalAction::DoChildren(()),
+            |_surface, states, &()| {
+                frame_cbs.append(&mut std::mem::take(
+                    &mut states
+                        .cached_state
+                        .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                        .current()
+                        .frame_callbacks,
+                ));
+                presentation_cbs.append(&mut std::mem::take(
+                    &mut states
+                        .cached_state
+                        .get::<smithay::wayland::presentation::PresentationFeedbackCachedState>()
+                        .current()
+                        .callbacks,
+                ));
+                if let Some(t) = states
+                    .data_map
+                    .get::<SurfaceReleaseSlot>()
+                    .and_then(|slot| slot.current())
+                {
+                    release_trackers.push(t);
+                }
+            },
+            |_, _, &()| true,
+        );
+    };
+
     for surface in &surfaces {
         let belongs_here = state
             .layout
@@ -2151,25 +2200,7 @@ fn render_output_now(
         if !belongs_here {
             continue;
         }
-        with_states(surface, |states| {
-            frame_cbs.append(&mut std::mem::take(
-                &mut states
-                    .cached_state
-                    .get::<smithay::wayland::compositor::SurfaceAttributes>()
-                    .current()
-                    .frame_callbacks,
-            ));
-            presentation_cbs.append(&mut std::mem::take(
-                &mut states
-                    .cached_state
-                    .get::<smithay::wayland::presentation::PresentationFeedbackCachedState>()
-                    .current()
-                    .callbacks,
-            ));
-        });
-        if let Some(t) = prism_protocols::drm_syncobj::tracker_for_render(surface) {
-            release_trackers.push(t);
-        }
+        harvest(surface);
     }
     // Same harvest for Overlay layer-shell surfaces we just rendered.
     // Bottom/Top layers aren't yet composited (see crate::layer_shell
@@ -2179,9 +2210,7 @@ fn render_output_now(
         if !matches!(layer, smithay::wayland::shell::wlr_layer::Layer::Overlay) {
             continue;
         }
-        if let Some(t) = prism_protocols::drm_syncobj::tracker_for_render(wl_surface) {
-            release_trackers.push(t);
-        }
+        harvest(wl_surface);
     }
 
     if let Some(loop_handle) = state.loop_handle.as_ref() {

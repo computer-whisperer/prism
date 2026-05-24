@@ -61,8 +61,8 @@ use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource};
 use smithay::utils::{Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    add_pre_commit_hook, CompositorClientState, CompositorHandler, CompositorState, get_role,
-    with_states,
+    add_pre_commit_hook, CompositorClientState, CompositorHandler, CompositorState, get_parent,
+    get_role, with_states,
 };
 use smithay::backend::renderer::utils::{on_commit_buffer_handler, RendererSurfaceStateUserData};
 use smithay::desktop::Window;
@@ -1918,11 +1918,11 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
                 // No buffer currently attached — either initial (never had
                 // one) or just unmapped (BufferAssignment::Removed arrived
                 // this commit and on_commit_buffer_handler cleared the
-                // state). Drop our texture too.
+                // state). Drop our texture; smithay's `InnerBuffer::Drop`
+                // already fired `wl_buffer.release` when it cleared its
+                // own state — don't release again here.
                 let mut guard = slot.0.lock().unwrap();
-                if let Some(SurfaceTexture::Dmabuf { buffer, .. }) = guard.take() {
-                    buffer.release();
-                }
+                let _ = guard.take();
             }
             Some(buffer) => {
                 // `buffer` derefs to &WlBuffer. Check whether it's the
@@ -2045,31 +2045,33 @@ fn dispatch_surface_output_from_layout(state: &mut PrismState, surface: &WlSurfa
 /// Outputs nobody committed to stay Idle, so they don't burn vblanks
 /// on a no-op page-flip.
 ///
-/// Today the only surface→output binding we track is via the layout's
-/// `find_window_and_output` (xdg toplevels). Layer-shell surfaces will
-/// need their own resolver when those land. Sub-surfaces inherit their
-/// parent's output via the same layout query (their parent toplevel is
-/// what the layout knows about).
+/// Subsurfaces commit *independently* of their parent in the default
+/// `desync` mode (and that's what GTK4 / Firefox / Mesa use). The
+/// layout only knows about the toplevel's root wl_surface, so we walk
+/// up the parent chain to find the root before querying the layout.
+/// Without this, every subsurface commit silently skips redraw
+/// queueing — animations on subsurface-backed content (Firefox web
+/// content, GTK4 decorations) freeze until something else nudges the
+/// output (e.g. cursor motion).
 fn queue_redraw_for_surface(state: &mut PrismState, surface: &WlSurface) {
-    // Resolve the surface (or its toplevel parent) to an output.
-    // First the layout (xdg toplevels), then the layer-shell
-    // tracking (wlr_layer_shell surfaces don't live in the layout).
+    // Walk up the parent chain to the root of the surface tree. For a
+    // toplevel root surface this is a single None-check.
+    let mut root = surface.clone();
+    while let Some(parent) = get_parent(&root) {
+        root = parent;
+    }
+
+    // Resolve the root surface to an output via the layout (xdg
+    // toplevels) then layer-shell tracking. Surfaces with no layout
+    // binding yet (initial commit before add_window) silently skip —
+    // the subsequent add_window path queues the redraw itself.
     let output_name = state
         .layout
-        .find_window_and_output(surface)
+        .find_window_and_output(&root)
         .and_then(|(_, out)| out.map(|o| o.name()))
-        .or_else(|| layer_surface_output(state, surface));
+        .or_else(|| layer_surface_output(state, &root));
 
     let Some(output_id) = output_name else {
-        // No layout-tracked binding. Subsurfaces of a mapped toplevel
-        // are commited via their root surface's commit handler call
-        // path, so this branch is mostly initial commits before
-        // add_window has run — that path queues a redraw implicitly
-        // because `bootstrap` queued every output on startup and
-        // on_vblank re-queues. Once we stop re-queueing on vblank
-        // (i.e., once this whole module is the redraw driver), we'll
-        // need a fallback (queue every output) for un-resolvable
-        // surfaces. For now: silent skip is fine.
         return;
     };
 
@@ -2230,27 +2232,24 @@ fn build_surface_texture(
 ) -> Result<()> {
     // dmabuf path: clone the per-GPU import map directly into the slot —
     // any output's render path can pick its GPU's view at sample time.
+    //
+    // We do NOT call `old.release()` when swapping — smithay's
+    // `RendererSurfaceState` wraps every `WlBuffer` in an
+    // `Arc<InnerBuffer>` whose `Drop` already invokes
+    // `wl_buffer.release()` (and signals the syncobj release point if
+    // one was attached). Doing it ourselves additionally yields a
+    // double-release that crashes GTK4 clients on their next frame
+    // (cairo's `CAIRO_REFERENCE_COUNT_HAS_REFERENCE` assertion fires
+    // when the second release callback hits a freed cairo_surface).
     if let Some(per_gpu) = state.dmabuf_textures.get(&buffer.id()) {
         if per_gpu.is_empty() {
             anyhow::bail!("dmabuf buffer has no imports on any GPU");
         }
-        // Atomic swap: release the OLD buffer (if any) as we install the
-        // new one. Doing this on commit (rather than on present-done) is
-        // racy if we're still GPU-reading the BO — see SurfaceTexture
-        // doc — but works fine for video clients with a buffer pool ≥ 2,
-        // because the client keeps the next buffer free until release.
         let mut guard = slot.0.lock().unwrap();
-        let previous = guard.replace(SurfaceTexture::Dmabuf {
+        let _previous = guard.replace(SurfaceTexture::Dmabuf {
             by_gpu: per_gpu.clone(),
             buffer: buffer.clone(),
         });
-        drop(guard);
-        if let Some(SurfaceTexture::Dmabuf { buffer: old, .. }) = previous {
-            // Different proxy → release sends the event; same proxy
-            // (re-committing the same buffer) is allowed but wasteful,
-            // release is a no-op in that case.
-            old.release();
-        }
         return Ok(());
     }
 
@@ -2263,9 +2262,11 @@ fn build_surface_texture(
     })
     .context("with_buffer_contents")?;
     upload_result?;
-    // Bytes have been copied into our staging buffers — safe to let the
-    // client reuse this wl_buffer.
-    buffer.release();
+    // Bytes are copied; smithay's `InnerBuffer::Drop` will send
+    // `wl_buffer.release` when this buffer is replaced on the next
+    // commit (or when the surface state resets). Calling it here
+    // ourselves was a double-release bug — see comment in the dmabuf
+    // branch above.
     Ok(())
 }
 
