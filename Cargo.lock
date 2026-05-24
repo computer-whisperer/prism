@@ -1404,6 +1404,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "prism-config",
+ "prism-input",
+ "prism-ipc",
  "prism-protocols",
  "prism-renderer",
  "smithay",

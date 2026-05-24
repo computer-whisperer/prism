@@ -18,6 +18,7 @@ use smithay::reexports::calloop::channel::{Channel, Event as ChannelEvent};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Client;
+use smithay::utils::{Logical, Point};
 
 use prism_protocols::PrismState;
 
@@ -183,27 +184,27 @@ fn handle_event(event: WlcsEvent, state: &mut PrismState, clients: &Clients, run
             client_id,
             surface_id,
             location,
-        } => {
-            // TODO(task 6): resolve (client_id, surface_id) -> prism window,
-            // mark it floating and set its floating position to `location`
-            // (prism-layout FloatingSpace). Stubbed until the input +
-            // positioning work lands.
-            let _ = (client_id, surface_id, location);
-            tracing::debug!(
-                client_id,
-                surface_id,
-                ?location,
-                "WLCS: PositionWindow (TODO)"
-            );
+        } => position_window(state, clients, client_id, surface_id, location),
+        WlcsEvent::PointerMoveAbsolute { location, .. } => {
+            let time = now_ms(state);
+            prism_input::pointer::wlcs_pointer_motion_absolute(state, location, time);
         }
-        // TODO(task 6): synthesize pointer/touch into state.seat, computing
-        // the surface-under via prism-input. No-ops for now so the harness
-        // builds and runs the protocol-only tests.
+        WlcsEvent::PointerMoveRelative { delta, .. } => {
+            let time = now_ms(state);
+            prism_input::pointer::wlcs_pointer_motion_relative(state, delta, time);
+        }
+        WlcsEvent::PointerButtonDown { button_id, .. } => {
+            let time = now_ms(state);
+            prism_input::pointer::wlcs_pointer_button(state, button_id as u32, true, time);
+        }
+        WlcsEvent::PointerButtonUp { button_id, .. } => {
+            let time = now_ms(state);
+            prism_input::pointer::wlcs_pointer_button(state, button_id as u32, false, time);
+        }
+        // Device add/remove is bookkeeping only — prism has no per-device
+        // pointer state to track. Touch isn't wired yet (prism doesn't
+        // advertise wl_touch); WLCS touch tests skip/fail until it is.
         WlcsEvent::NewPointer { .. }
-        | WlcsEvent::PointerMoveAbsolute { .. }
-        | WlcsEvent::PointerMoveRelative { .. }
-        | WlcsEvent::PointerButtonDown { .. }
-        | WlcsEvent::PointerButtonUp { .. }
         | WlcsEvent::PointerRemoved { .. }
         | WlcsEvent::NewTouch { .. }
         | WlcsEvent::TouchDown { .. }
@@ -211,4 +212,59 @@ fn handle_event(event: WlcsEvent, state: &mut PrismState, clients: &Clients, run
         | WlcsEvent::TouchUp { .. }
         | WlcsEvent::TouchRemoved { .. } => {}
     }
+}
+
+fn now_ms(state: &PrismState) -> u32 {
+    state.clock.now().as_millis() as u32
+}
+
+/// Resolve a WLCS (client, surface) pair to a mapped toplevel and place it
+/// floating at `location`. WLCS uses absolute global coordinates; with our
+/// single virtual output at the origin, the floating `SetFixed` coordinate
+/// (which is relative to the output working area) coincides with global —
+/// revisit if we ever advertise multiple / offset outputs.
+fn position_window(
+    state: &mut PrismState,
+    clients: &Clients,
+    client_id: i32,
+    surface_id: u32,
+    location: Point<i32, Logical>,
+) {
+    use smithay::reexports::wayland_server::Resource;
+
+    let Some(client) = clients.borrow().get(&client_id).cloned() else {
+        return;
+    };
+
+    // Match anvil: scan mapped toplevels for the one owned by this client
+    // whose wl_surface carries the given protocol id.
+    let toplevels: Vec<_> = state
+        .xdg_shell
+        .toplevel_surfaces()
+        .iter()
+        .map(|t| t.wl_surface().clone())
+        .collect();
+    let surface = toplevels.into_iter().find(|s| {
+        let same_client = state.display_handle.get_client(s.id()).ok().as_ref() == Some(&client);
+        same_client && s.id().protocol_id() == surface_id
+    });
+    let Some(surface) = surface else {
+        return;
+    };
+
+    let Some(window) = state
+        .layout
+        .find_window_and_output(&surface)
+        .map(|(m, _)| m.window.clone())
+    else {
+        return;
+    };
+
+    state.layout.set_window_floating(Some(&window), true);
+    state.layout.move_floating_window(
+        Some(&window),
+        prism_ipc::PositionChange::SetFixed(location.x as f64),
+        prism_ipc::PositionChange::SetFixed(location.y as f64),
+        false,
+    );
 }

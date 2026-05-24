@@ -430,3 +430,90 @@ fn set_keyboard_focus(
         kb.set_focus(state, surface, serial);
     }
 }
+
+// ─── WLCS test-harness entry points ──────────────────────────────
+//
+// The handlers above are generic over the libinput backend
+// (`I::PointerMotionEvent`, …). WLCS has no libinput events — only
+// already-decoded coordinates and button codes — so these thin entry
+// points drive the same `state.pointer_pos` → `surface_under_pointer` →
+// seat path. That makes WLCS observe exactly prism's real pointer
+// behavior, including its current toplevel-only / output-origin hit-test
+// approximation. Used only by the prism-wlcs harness.
+
+/// Warp the pointer to an absolute global logical position and deliver the
+/// resulting motion (and any enter/leave) to clients.
+pub fn wlcs_pointer_motion_absolute(
+    state: &mut PrismState,
+    location: Point<f64, Logical>,
+    time: u32,
+) {
+    state.pointer_pos = location;
+    wlcs_pointer_reposition(state, time);
+}
+
+/// Move the pointer by a relative delta and deliver the resulting motion.
+pub fn wlcs_pointer_motion_relative(state: &mut PrismState, delta: Point<f64, Logical>, time: u32) {
+    state.pointer_pos.x += delta.x;
+    state.pointer_pos.y += delta.y;
+    wlcs_pointer_reposition(state, time);
+}
+
+fn wlcs_pointer_reposition(state: &mut PrismState, time: u32) {
+    let serial = SERIAL_COUNTER.next_serial();
+    clamp_pointer_to_outputs(state);
+    let focus = surface_under_pointer(state);
+    let new_pos = state.pointer_pos;
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
+    pointer.motion(
+        state,
+        focus,
+        &MotionEvent {
+            location: new_pos,
+            serial,
+            time,
+        },
+    );
+    pointer.frame(state);
+    maybe_focus_follows_mouse(state, serial);
+    prism_protocols::state::update_output_cursors(state);
+}
+
+/// Press or release a pointer button by raw linux event code (e.g.
+/// `BTN_LEFT = 0x110`). On press, focus follows to the surface under the
+/// pointer, mirroring [`on_pointer_button`] minus the Mod+click grab
+/// triggers (WLCS never sends modifiers).
+pub fn wlcs_pointer_button(state: &mut PrismState, button: u32, pressed: bool, time: u32) {
+    let serial = SERIAL_COUNTER.next_serial();
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
+    if pressed && !pointer.is_grabbed() {
+        if let Some((surface, _)) = surface_under_pointer(state) {
+            let output_for_focus = state
+                .layout
+                .find_window_and_output(&surface)
+                .and_then(|(_, out)| out.cloned());
+            set_keyboard_focus(state, Some(surface), serial);
+            if let Some(out) = output_for_focus {
+                state.layout.focus_output(&out);
+            }
+        }
+    }
+    pointer.button(
+        state,
+        &ButtonEvent {
+            button,
+            state: if pressed {
+                ButtonState::Pressed
+            } else {
+                ButtonState::Released
+            },
+            serial,
+            time,
+        },
+    );
+    pointer.frame(state);
+}
