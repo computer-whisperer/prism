@@ -1146,7 +1146,7 @@ fn verify_white_point(
 /// SMPTE ST 2084 (PQ) OETF: linear nits → encoded `[0, 1]`. CPU mirror
 /// of the encode-shader's PQ shaper, used by verify to compute the
 /// coord the renderer would sample the LUT at for a given input nits.
-fn pq_oetf_f64(nits: f64) -> f64 {
+pub(crate) fn pq_oetf_f64(nits: f64) -> f64 {
     const M1: f64 = 0.1593017578125;
     const M2: f64 = 78.84375;
     const C1: f64 = 0.8359375;
@@ -1163,7 +1163,7 @@ fn pq_oetf_f64(nits: f64) -> f64 {
 /// "what cmd values the shader would emit" without a roundtrip
 /// through Vulkan. Entries are X-fastest then Y then Z (matches the
 /// upload + binary format).
-fn trilinear_sample_lut(entries: &[[f32; 3]], cube_edge: u32, coord: [f64; 3]) -> [f32; 3] {
+pub(crate) fn trilinear_sample_lut(entries: &[[f32; 3]], cube_edge: u32, coord: [f64; 3]) -> [f32; 3] {
     let n = cube_edge as usize;
     let denom = (cube_edge - 1) as f64;
     // Map [0, 1] → [0, N-1] continuous index, then split into integer

@@ -28,6 +28,7 @@ mod calibrate;
 mod calibrate_lut3d;
 mod characterize;
 mod common;
+mod validate_lut3d;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -71,6 +72,13 @@ enum TopCommand {
     /// (no fitting, no compositor writes). Use to investigate panel
     /// behaviour that doesn't fit `calibrate`'s simple model.
     Characterize(characterize::CharacterizeArgs),
+    /// Validate the live color pipeline via the `EncodeDiagnose` 1-pixel
+    /// IPC — no colorimeter. Sweeps a neutral ramp (and optionally each
+    /// primary) through the compositor's real encode path and reports
+    /// what it emits into the display, flagging where neutral input is
+    /// driven off-neutral (the "bright whites tint" class of bug) and,
+    /// with `--lut`, whether the GPU matches the LUT file's own prediction.
+    ValidateLut3d(validate_lut3d::ValidateLut3dArgs),
 }
 
 #[derive(Subcommand)]
@@ -101,6 +109,7 @@ fn main() -> Result<()> {
         TopCommand::Calibrate(args) => calibrate::run(args),
         TopCommand::CalibrateLut3d(args) => calibrate_lut3d::run(args),
         TopCommand::Characterize(args) => characterize::run(args),
+        TopCommand::ValidateLut3d(args) => validate_lut3d::run(args),
     }
 }
 
