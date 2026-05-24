@@ -98,6 +98,11 @@ impl ImportedImage {
     pub fn chroma_view(&self) -> Option<vk::ImageView> {
         self.chroma.as_ref().map(|c| c.view)
     }
+    /// The chroma plane's `VkImage`, for YUV imports. `None` for RGB.
+    /// Used as the copy source when mirroring a YUV surface cross-GPU.
+    pub fn chroma_image(&self) -> Option<vk::Image> {
+        self.chroma.as_ref().map(|c| c.image)
+    }
     /// `Some(kind)` iff this is a YUV import.
     pub fn yuv_kind(&self) -> Option<YuvKind> {
         self.yuv_kind

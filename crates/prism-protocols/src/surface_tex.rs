@@ -101,9 +101,24 @@ pub enum GpuTex {
         home_src_buffer: ObjectId,
         scratch: ExportableImage,
         target: Arc<ImportedImage>,
+        /// Chroma plane for a YUV mirror (NV12/P010): a second, half-res
+        /// scratch+target carrying the interleaved chroma. `None` for an
+        /// RGB mirror. When set, `scratch`/`target` hold the luma plane and
+        /// the consumer's decode shader recombines the two — the same path
+        /// a native YUV import takes, just fed from mirrored memory.
+        chroma: Option<MirrorChroma>,
     },
     /// Client bytes uploaded into an image on this GPU.
     Shm(ShmTexture),
+}
+
+/// The chroma half of a cross-GPU YUV mirror (see [`GpuTex::Mirror`]).
+/// Mirrors the luma plane's `scratch`/`target` pair at half resolution;
+/// `kind` selects the decode path (NV12 vs P010).
+pub struct MirrorChroma {
+    pub scratch: ExportableImage,
+    pub target: Arc<ImportedImage>,
+    pub kind: YuvKind,
 }
 
 impl GpuTex {
@@ -116,16 +131,22 @@ impl GpuTex {
     }
 
     /// Chroma plane view + YUV kind code (matching `DecodePush::yuv`:
-    /// 1 = NV12, 2 = P010) for a native YUV import. `(None, 0)` for RGB
-    /// native imports, mirrors, and shm — only the zero-copy native path
-    /// carries YUV today (the mirror/shm paths are RGB-only).
+    /// 1 = NV12, 2 = P010) for a YUV surface. `(None, 0)` for RGB native
+    /// imports, RGB mirrors, and shm. Both the zero-copy native path and
+    /// the cross-GPU mirror carry YUV; shm is RGB-only.
     pub fn yuv(&self) -> (Option<vk::ImageView>, i32) {
+        let code = |kind| match kind {
+            YuvKind::Nv12 => 1,
+            YuvKind::P010 => 2,
+        };
         match self {
             Self::Native(img) => match img.yuv_kind() {
-                Some(YuvKind::Nv12) => (img.chroma_view(), 1),
-                Some(YuvKind::P010) => (img.chroma_view(), 2),
+                Some(kind) => (img.chroma_view(), code(kind)),
                 None => (None, 0),
             },
+            Self::Mirror {
+                chroma: Some(c), ..
+            } => (Some(c.target.view()), code(c.kind)),
             _ => (None, 0),
         }
     }

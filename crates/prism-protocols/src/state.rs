@@ -91,7 +91,9 @@ use smithay::wayland::xdg_activation::{
 
 use crate::client::PrismClient;
 use crate::input_state::{KeyboardFocus, PointerVisibility};
-use crate::surface_tex::{GpuTex, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture, TexSource};
+use crate::surface_tex::{
+    GpuTex, MirrorChroma, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture, TexSource,
+};
 
 /// Stable per-output id. Today we key by the connector name (e.g. `"DP-4"`,
 /// `"HDMI-A-1"`). amdgpu's connector names are globally unique across cards
@@ -2600,17 +2602,27 @@ pub fn prepare_mirror_waits(
                 home,
                 home_src,
                 scratch,
+                chroma,
                 ..
             }) = tex.by_gpu.get(&target_gpu)
             {
-                by_home
-                    .entry(*home)
-                    .or_default()
-                    .push(prism_renderer::MirrorCopyOp {
-                        src: home_src.image(),
-                        dst: scratch.image(),
-                        extent: scratch.extent(),
-                    });
+                let ops = by_home.entry(*home).or_default();
+                ops.push(prism_renderer::MirrorCopyOp {
+                    src: home_src.image(),
+                    dst: scratch.image(),
+                    extent: scratch.extent(),
+                });
+                // YUV mirror: copy the chroma plane too. The home_src is a
+                // two-plane YUV import, so its chroma image is the source.
+                if let Some(chroma) = chroma {
+                    if let Some(chroma_src) = home_src.chroma_image() {
+                        ops.push(prism_renderer::MirrorCopyOp {
+                            src: chroma_src,
+                            dst: chroma.scratch.image(),
+                            extent: chroma.scratch.extent(),
+                        });
+                    }
+                }
             }
         });
     }
@@ -2686,24 +2698,79 @@ fn materialize_dmabuf_for_gpu(
         height: dmabuf.height,
     };
     // The scratch is LINEAR (modifier 0) — a safe, universally-defined
-    // layout (unlike DRM_FORMAT_MOD_INVALID, which faulted the GPU). Still
-    // confirm this GPU can sample LINEAR for the format before building the
-    // mirror, so an unsupported pairing fails cleanly rather than at import.
+    // layout (unlike DRM_FORMAT_MOD_INVALID, which faulted the GPU).
     const DRM_FORMAT_MOD_LINEAR: u64 = 0;
-    if !gpu_supports_dmabuf(&device_g, format, DRM_FORMAT_MOD_LINEAR) {
-        anyhow::bail!("consumer GPU can't sample LINEAR for {format:?}; no mirror");
-    }
-    let scratch = prism_renderer::ExportableImage::new(device_home, extent, format, dmabuf.format)
-        .context("ExportableImage::new (mirror scratch)")?;
-    // No copy here: the scratch is filled at render time by the async
-    // copy (prepare_mirror_waits), GPU-synchronized against the target's
-    // render submit. The target import just sets up the sampleable image;
-    // its first sample is gated behind that copy's semaphore.
-    let target = import_dmabuf(&device_g, scratch.exported_dmabuf(), true)
+
+    // Build one LINEAR scratch on the home GPU plus its sampleable import on
+    // the consumer GPU, for a single plane. No copy happens here: the scratch
+    // is filled at render time by the async copy (prepare_mirror_waits),
+    // GPU-synchronized against the target's render submit; this import just
+    // sets up the sampleable image, gated behind that copy's semaphore on its
+    // first sample. We confirm the consumer can sample LINEAR for the format
+    // up front so an unsupported pairing fails cleanly rather than at import,
+    // and import with the known vk::Format directly (the scratch is always
+    // single-plane, so no fourcc round-trip is needed).
+    let make_plane = |plane_extent: vk::Extent2D, vk_fmt: vk::Format, fourcc: DrmFourcc| -> Result<(
+        prism_renderer::ExportableImage,
+        Arc<prism_renderer::ImportedImage>,
+    )> {
+        if !gpu_supports_dmabuf(&device_g, vk_fmt, DRM_FORMAT_MOD_LINEAR) {
+            anyhow::bail!("consumer GPU can't sample LINEAR for {vk_fmt:?}; no mirror");
+        }
+        let scratch =
+            prism_renderer::ExportableImage::new(device_home.clone(), plane_extent, vk_fmt, fourcc)
+                .context("ExportableImage::new (mirror scratch)")?;
+        let target = prism_renderer::ImportedImage::import(
+            device_g.clone(),
+            scratch.exported_dmabuf(),
+            vk_fmt,
+            vk::ImageUsageFlags::SAMPLED,
+        )
         .context("import mirror scratch on consumer GPU")?;
+        target
+            .transition_for_sampling()
+            .context("transition mirror scratch for sampling")?;
+        Ok((scratch, Arc::new(target)))
+    };
+
+    let yuv = yuv_kind_for(dmabuf.format);
+    // Luma plane (or the whole RGB image). `format` is already the luma
+    // vk::Format for YUV (set in build_tex_source) and the RGB format
+    // otherwise; the fourcc is descriptive only since we import by vk::Format.
+    let luma_fourcc = match yuv {
+        Some(prism_renderer::YuvKind::Nv12) => DrmFourcc::R8,
+        Some(prism_renderer::YuvKind::P010) => DrmFourcc::R16,
+        None => dmabuf.format,
+    };
+    let (scratch, target) = make_plane(extent, format, luma_fourcc)?;
+
+    // Chroma plane for YUV: interleaved Cb/Cr at half res in both axes
+    // (4:2:0), recombined with luma by the consumer's decode shader.
+    let chroma = match yuv {
+        Some(kind) => {
+            let (_, chroma_fmt) = kind.plane_formats();
+            let chroma_fourcc = match kind {
+                prism_renderer::YuvKind::Nv12 => DrmFourcc::Gr88,
+                prism_renderer::YuvKind::P010 => DrmFourcc::Gr1616,
+            };
+            let chroma_extent = vk::Extent2D {
+                width: extent.width.div_ceil(2),
+                height: extent.height.div_ceil(2),
+            };
+            let (scratch, target) = make_plane(chroma_extent, chroma_fmt, chroma_fourcc)?;
+            Some(MirrorChroma {
+                scratch,
+                target,
+                kind,
+            })
+        }
+        None => None,
+    };
+
     tracing::debug!(
         target = ?g,
         home = ?home_id,
+        yuv = ?yuv,
         "built cross-GPU mirror for surface ({}x{})",
         extent.width,
         extent.height
@@ -2715,7 +2782,8 @@ fn materialize_dmabuf_for_gpu(
             home_src,
             home_src_buffer: buffer_id,
             scratch,
-            target: Arc::new(target),
+            target,
+            chroma,
         },
     );
     Ok(())
