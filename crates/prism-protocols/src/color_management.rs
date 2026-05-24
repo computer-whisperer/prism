@@ -269,10 +269,18 @@ pub fn description_to_params(desc: &ImageDescription) -> prism_renderer::Surface
         PrimaryVolume::Named(p) => frame_chromaticities(chromaticities_for_named(p)),
         PrimaryVolume::Explicit(c) => frame_chromaticities(c),
     };
+    // YUV→RGB coefficients for YUV-sampled surfaces follow the primaries:
+    // BT.2020 → the BT.2020 NCL matrix; everything else (sRGB/BT.709, the
+    // SDR-video default) → BT.709. Ignored unless the surface is YUV.
+    let yuv_matrix = match desc.primaries {
+        PrimaryVolume::Named(Primaries::Bt2020) => 1,
+        _ => 0,
+    };
     prism_renderer::SurfaceColorParams {
         transfer,
         sdr_white_nits,
         primaries_to_bt2020: prism_frame::primaries_to_bt2020(&chroma),
+        yuv_matrix,
     }
 }
 

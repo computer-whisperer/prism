@@ -530,6 +530,7 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     // Single element covering the whole output.
     let element = ElementDraw {
         texture_view: texture.view,
+        chroma_view: None,
         push: DecodePush::identity_srgb([-1.0, -1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
     };
     let encode_push = EncodePush::sdr_identity();
@@ -2106,6 +2107,9 @@ fn render_output_now(
             smithay::wayland::compositor::with_states(wl_surface, |states| ctx.color_for(states));
         render_els.push(RenderEl::Surface(prism_renderer::SurfaceEl {
             texture_view,
+            // YUV feed not yet threaded through the layer-shell path — RGB.
+            chroma_view: None,
+            yuv: 0,
             dst_rect_clip,
             src_rect_uv: [0.0, 0.0, 1.0, 1.0],
             color,
@@ -2417,6 +2421,7 @@ fn run_gradient_scanout(output_name: Option<&str>, depth: prism_drm::ScanoutDept
 
     let element = ElementDraw {
         texture_view: texture.view,
+        chroma_view: None,
         push: DecodePush::identity_srgb([-1.0, -1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
     };
     let encode_push = EncodePush::sdr_identity();

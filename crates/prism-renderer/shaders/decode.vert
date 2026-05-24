@@ -20,8 +20,8 @@ layout(push_constant) uniform Push {
     // Scalar parameters.
     float sdr_white_nits;
     int transfer;         // see decode.frag
-    int _pad0;
-    int _pad1;
+    int yuv;              // see decode.frag (unused here)
+    int yuv_matrix;       // see decode.frag (unused here)
 } push;
 
 layout(location = 0) out vec2 v_uv;

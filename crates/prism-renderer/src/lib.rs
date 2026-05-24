@@ -21,7 +21,7 @@ pub mod upload;
 pub use cross_gpu::{ExportableImage, MirrorCopier, MirrorCopyOp};
 pub use device::{Device, DrmDevId, DrmFormatModifierInfo, PhysicalDeviceInfo};
 pub use diagnose::{decode_scanout_texel, DiagnosedNits, EncodeDiagnoseProbe};
-pub use dmabuf::ImportedImage;
+pub use dmabuf::{ImportedImage, YuvKind};
 pub use element::{
     srgb_to_bt2020_nits, BorderEl, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl,
 };

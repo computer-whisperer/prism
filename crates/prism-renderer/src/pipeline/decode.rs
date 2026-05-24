@@ -35,8 +35,14 @@ pub struct DecodePush {
     pub tint: [f32; 4],
     pub sdr_white_nits: f32,
     pub transfer: i32,
-    pub _pad1: i32,
-    pub _pad2: i32,
+    /// YUV plane layout of the bound texture: 0 = RGB (binding 1 unused),
+    /// 1 = NV12 (8-bit), 2 = P010 (10-bit). When non-zero the shader
+    /// samples the chroma plane at binding 1, range-expands, and applies
+    /// `yuv_matrix` to recover nonlinear R′G′B′ before the transfer decode.
+    pub yuv: i32,
+    /// YUV→RGB coefficient set, by the source's primaries: 0 = BT.709
+    /// (also sRGB-primaries SDR video), 1 = BT.2020. Ignored when `yuv == 0`.
+    pub yuv_matrix: i32,
     /// Per-output, per-channel panel luminance ceiling, in nits. The
     /// intermediate is display-referred: post-decode values get
     /// clamped per-channel to this. `.a` is unused (vec4 only because
@@ -59,8 +65,8 @@ impl DecodePush {
             // 0 = Linear (no decode). The smoke test feeds an already-linear
             // RGBA16_SFLOAT texture, so this is the right choice for #48.
             transfer: 0,
-            _pad1: 0,
-            _pad2: 0,
+            yuv: 0,
+            yuv_matrix: 0,
             output_peak_nits_rgba: [10_000.0, 10_000.0, 10_000.0, 0.0],
         }
     }
@@ -76,8 +82,8 @@ impl DecodePush {
             tint: color_bt2020_nits,
             sdr_white_nits: 1.0,
             transfer: 0,
-            _pad1: 0,
-            _pad2: 0,
+            yuv: 0,
+            yuv_matrix: 0,
             output_peak_nits_rgba: [10_000.0, 10_000.0, 10_000.0, 0.0],
         }
     }
@@ -102,13 +108,23 @@ pub struct DecodePipeline {
 
 impl DecodePipeline {
     pub fn new(device: Arc<Device>, intermediate_format: vk::Format) -> Result<Self> {
-        // Descriptor set layout — combined image-sampler at binding 0. The
-        // PUSH_DESCRIPTOR_KHR flag is what lets us bypass the pool.
-        let bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        // Descriptor set layout — combined image-samplers at binding 0 (the
+        // primary/luma texture) and binding 1 (the chroma plane for YUV
+        // imports; bound to the same view as binding 0 for RGB draws since
+        // the shader references it statically). The PUSH_DESCRIPTOR_KHR flag
+        // is what lets us bypass the pool.
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
         let dsl_info = vk::DescriptorSetLayoutCreateInfo::default()
             .bindings(&bindings)
             .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
@@ -162,14 +178,15 @@ impl DecodePipeline {
     }
 
     /// Build the `WriteDescriptorSet` to push for a texture binding.
-    /// Caller writes via `cmd_push_descriptor_set`. Useful as a helper
-    /// to keep the per-draw recording terse.
+    /// Caller writes via `cmd_push_descriptor_set`. `binding` is 0 for the
+    /// primary/luma texture, 1 for the chroma plane.
     pub fn write_texture_binding<'a>(
         &self,
+        binding: u32,
         image_info: &'a [vk::DescriptorImageInfo; 1],
     ) -> vk::WriteDescriptorSet<'a> {
         vk::WriteDescriptorSet::default()
-            .dst_binding(0)
+            .dst_binding(binding)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(image_info)
     }

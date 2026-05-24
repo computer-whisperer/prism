@@ -18,7 +18,11 @@
 
 #version 450
 
+// binding 0 = primary texture (RGB), or the luma plane for YUV (yuv != 0).
 layout(set = 0, binding = 0) uniform sampler2D u_texture;
+// binding 1 = chroma plane for YUV (half-res, interleaved Cb/Cr). For RGB
+// draws this is bound to the same view as binding 0 and never sampled.
+layout(set = 0, binding = 1) uniform sampler2D u_chroma;
 
 layout(push_constant) uniform Push {
     vec4 dst_rect_clip;
@@ -32,8 +36,12 @@ layout(push_constant) uniform Push {
     vec4 tint;
     float sdr_white_nits;
     int transfer;
-    int _pad1;
-    int _pad2;
+    // YUV plane layout: 0 = RGB (sample u_texture directly), 1 = NV12 (8-bit),
+    // 2 = P010 (10-bit in the high bits of 16). Non-zero → sample luma+chroma
+    // and convert to nonlinear R'G'B' before the transfer decode below.
+    int yuv;
+    // YUV→RGB coefficients: 0 = BT.709, 1 = BT.2020. Ignored when yuv == 0.
+    int yuv_matrix;
     // Per-output, per-channel panel luminance ceiling, in nits. The
     // intermediate is display-referred: post-decode values are clamped
     // to this peak so downstream compositing operates entirely within
@@ -78,8 +86,55 @@ vec3 pq_eotf(vec3 v) {
     return y * 10000.0;
 }
 
+// Recover nonlinear R'G'B' from a limited-range Y'CbCr buffer. Luma is in
+// u_texture.r, interleaved chroma in u_chroma.rg (bilinearly upsampled by the
+// LINEAR sampler). Range-expansion constants are in the *sampled* domain:
+// UNORM8 = code/255 for NV12; UNORM16 = (code10 << 6)/65535 for P010, so its
+// limited-range endpoints scale by 64. Coefficients are the BT.709 / BT.2020
+// non-constant-luminance inverse matrices for full-range Y in [0,1],
+// Cb/Cr in [-0.5, 0.5]. The result is still transfer-encoded (PQ/gamma) —
+// main()'s transfer decode runs on it afterwards.
+vec3 ycbcr_to_nonlinear_rgb() {
+    float y_black, y_scale, c_mid, c_scale;
+    if (push.yuv == 2) {
+        // P010: 10-bit limited (Y 64..940, C 64..960) in the high bits of 16.
+        y_black = 4096.0 / 65535.0;          // 64 << 6
+        y_scale = 65535.0 / 56064.0;         // 1 / ((940-64) << 6)
+        c_mid   = 32768.0 / 65535.0;         // 512 << 6
+        c_scale = 65535.0 / 57344.0;         // 1 / ((960-64) << 6)
+    } else {
+        // NV12: 8-bit limited (Y 16..235, C 16..240).
+        y_black = 16.0 / 255.0;
+        y_scale = 255.0 / 219.0;
+        c_mid   = 128.0 / 255.0;
+        c_scale = 255.0 / 224.0;
+    }
+
+    float Y  = (texture(u_texture, v_uv).r - y_black) * y_scale;
+    vec2  C  = texture(u_chroma, v_uv).rg;
+    float Cb = (C.x - c_mid) * c_scale;
+    float Cr = (C.y - c_mid) * c_scale;
+
+    if (push.yuv_matrix == 1) {
+        // BT.2020 NCL (Kr=0.2627, Kb=0.0593).
+        return vec3(
+            Y + 1.4746 * Cr,
+            Y - 0.16455 * Cb - 0.57135 * Cr,
+            Y + 1.8814 * Cb);
+    }
+    // BT.709 (Kr=0.2126, Kb=0.0722) — also used for sRGB-primaries SDR video.
+    return vec3(
+        Y + 1.5748 * Cr,
+        Y - 0.1873 * Cb - 0.4681 * Cr,
+        Y + 1.8556 * Cb);
+}
+
 void main() {
-    vec4 sampled = texture(u_texture, v_uv);
+    // YUV surfaces reconstruct nonlinear R'G'B' (alpha = opaque); RGB surfaces
+    // sample straight. Either way `sampled` is transfer-encoded RGBA from here.
+    vec4 sampled = push.yuv != 0
+        ? vec4(ycbcr_to_nonlinear_rgb(), 1.0)
+        : texture(u_texture, v_uv);
 
     // Decode transfer → linear-light. Linear path leaves alpha-unmultiplied
     // values where they are.

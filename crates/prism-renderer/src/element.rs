@@ -52,6 +52,11 @@ pub struct SurfaceColorParams {
     /// already in BT.2020. `to_draw` lowers this into the decode shader's
     /// `decode_matrix`.
     pub primaries_to_bt2020: prism_frame::Mat3,
+    /// YUV→RGB coefficient set for YUV-sampled surfaces, by the source's
+    /// primaries: 0 = BT.709 (and sRGB-primaries SDR video), 1 = BT.2020.
+    /// Lowered into `DecodePush::yuv_matrix`; ignored unless the surface's
+    /// texture is YUV (`SurfaceEl::yuv != 0`).
+    pub yuv_matrix: i32,
 }
 
 impl Default for SurfaceColorParams {
@@ -64,6 +69,7 @@ impl Default for SurfaceColorParams {
             transfer: 1,
             sdr_white_nits: 80.0,
             primaries_to_bt2020: prism_frame::srgb_to_bt2020_matrix(),
+            yuv_matrix: 0,
         }
     }
 }
@@ -73,7 +79,14 @@ impl Default for SurfaceColorParams {
 /// One per surface tree node; produced by walking the surface tree at
 /// frame-build time.
 pub struct SurfaceEl {
+    /// Sampled texture. For YUV surfaces (`yuv != 0`) this is the luma plane.
     pub texture_view: vk::ImageView,
+    /// Chroma plane for YUV surfaces; `None` for RGB. Pairs with `yuv`.
+    pub chroma_view: Option<vk::ImageView>,
+    /// YUV plane layout: 0 = RGB, 1 = NV12 (8-bit), 2 = P010 (10-bit).
+    /// Set from the imported texture's `YuvKind`; lowered into
+    /// `DecodePush::yuv`.
+    pub yuv: i32,
     pub dst_rect_clip: [f32; 4],
     pub src_rect_uv: [f32; 4],
     pub color: SurfaceColorParams,
@@ -85,10 +98,13 @@ impl SurfaceEl {
         push.transfer = self.color.transfer;
         push.sdr_white_nits = self.color.sdr_white_nits;
         push.decode_matrix = mat3_to_mat4_colmajor(self.color.primaries_to_bt2020);
+        push.yuv = self.yuv;
+        push.yuv_matrix = self.color.yuv_matrix;
         let [r, g, b] = output_peak_nits_rgb;
         push.output_peak_nits_rgba = [r, g, b, 0.0];
         ElementDraw {
             texture_view: self.texture_view,
+            chroma_view: self.chroma_view,
             push,
         }
     }
@@ -127,6 +143,7 @@ impl SolidColorEl {
         push.output_peak_nits_rgba = [r, g, b, 0.0];
         ElementDraw {
             texture_view: white_view,
+            chroma_view: None,
             push,
         }
     }

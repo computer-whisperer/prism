@@ -42,8 +42,13 @@ pub const FRAMES_IN_FLIGHT: usize = 2;
 
 /// One element to draw in the decode pass.
 pub struct ElementDraw {
-    /// Sampled texture (must be in SHADER_READ_ONLY_OPTIMAL layout).
+    /// Sampled texture (must be in SHADER_READ_ONLY_OPTIMAL layout). For YUV
+    /// elements this is the luma plane.
     pub texture_view: vk::ImageView,
+    /// Chroma plane for YUV elements (`push.yuv != 0`); `None` for RGB. When
+    /// `None`, binding 1 is bound to `texture_view` so it stays valid (the
+    /// shader references it statically but ignores it when `yuv == 0`).
+    pub chroma_view: Option<vk::ImageView>,
     pub push: DecodePush,
 }
 
@@ -394,11 +399,20 @@ impl Renderer {
             );
 
             for el in elements {
-                let image_info = [vk::DescriptorImageInfo::default()
+                let luma_info = [vk::DescriptorImageInfo::default()
                     .sampler(self.decode.sampler)
                     .image_view(el.texture_view)
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-                let writes = [self.decode.write_texture_binding(&image_info)];
+                // Binding 1 = chroma for YUV; for RGB bind the same view as
+                // binding 0 so the statically-referenced sampler stays valid.
+                let chroma_info = [vk::DescriptorImageInfo::default()
+                    .sampler(self.decode.sampler)
+                    .image_view(el.chroma_view.unwrap_or(el.texture_view))
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let writes = [
+                    self.decode.write_texture_binding(0, &luma_info),
+                    self.decode.write_texture_binding(1, &chroma_info),
+                ];
                 self.decode.push_loader.cmd_push_descriptor_set(
                     cb,
                     vk::PipelineBindPoint::GRAPHICS,

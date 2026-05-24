@@ -724,6 +724,10 @@ impl LayoutElement for Mapped {
 
                 out.push(RenderEl::Surface(SurfaceEl {
                     texture_view,
+                    // YUV (chroma plane + kind) not yet threaded through the
+                    // RenderCtx texture lookup — RGB for now. Wired next.
+                    chroma_view: None,
+                    yuv: 0,
                     dst_rect_clip,
                     src_rect_uv: [0.0, 0.0, 1.0, 1.0],
                     color: ctx.color_for(states),
