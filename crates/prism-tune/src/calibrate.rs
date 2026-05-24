@@ -1022,7 +1022,7 @@ fn refine_per_channel_curve(
                 if !cabl && xyz.y >= NOISE_FLOOR_Y && xyz.y <= y_sat_check {
                     let target_y = probe_peak_y[c.idx()] * PRIMARY_SAMPLE_Y_FRAC;
                     let dist = (xyz.y - target_y).abs();
-                    if iter_primary[c.idx()].map_or(true, |(prev_dist, _, _)| dist < prev_dist) {
+                    if iter_primary[c.idx()].is_none_or(|(prev_dist, _, _)| dist < prev_dist) {
                         iter_primary[c.idx()] = Some((dist, cx, cy));
                     }
                 }
@@ -1739,6 +1739,106 @@ fn mat3_mul_vec(m: &[[f64; 3]; 3], v: &[f64; 3]) -> [f64; 3] {
     ]
 }
 
+// ─── CSV log glue ──────────────────────────────────────────────────────────
+
+fn open_log(
+    args: &CalibrateArgs,
+    baseline: &OutputBaseline,
+) -> Result<Option<(PathBuf, BufWriter<File>)>> {
+    if args.no_log {
+        return Ok(None);
+    }
+    let path = args.log.clone().unwrap_or_else(|| {
+        // Substitute slashes in the connector name so a hypothetical
+        // "DP-0/1" doesn't escape into a subdirectory.
+        let safe = args.output.replace('/', "_");
+        PathBuf::from(format!("prism-tune-calibrate-{safe}.csv"))
+    });
+    if path.as_os_str() == "/dev/null" {
+        return Ok(None);
+    }
+    let file =
+        File::create(&path).with_context(|| format!("create log file {}", path.display()))?;
+    let mut w = BufWriter::new(file);
+    writeln!(
+        w,
+        "# prism-tune calibrate — output={} mode={} iterations={} settle_ms={} window={}",
+        args.output,
+        if baseline.hdr_active { "HDR" } else { "SDR" },
+        args.iterations,
+        args.settle_ms,
+        args.window,
+    )?;
+    writeln!(
+        w,
+        "# baseline: panel_peak_nits={:?} sdr_reference_nits={} prior_response_curve={:?}",
+        baseline.initial_panel_peak_nits,
+        baseline.sdr_reference_nits,
+        baseline.initial_response_curve,
+    )?;
+    writeln!(
+        w,
+        "phase,channel,iter,patch_idx,target_nits,applied_gain_r,applied_gain_g,applied_gain_b,applied_gamma_r,applied_gamma_g,applied_gamma_b,X,Y,Z,x,y"
+    )?;
+    eprintln!("Logging per-measurement CSV to {}", path.display());
+    Ok(Some((path, w)))
+}
+
+// ─── KDL output ────────────────────────────────────────────────────────────
+
+/// Print a `output { color { … } }` block for paste-in. `peaks` here is
+/// per-channel measured EMITTED peak luminance (cd/m²) — i.e.
+/// `probe_peak_y`, not the commanded-nits saturation cliff. That's the
+/// number the compositor's IR clamp wants.
+fn print_kdl_block(
+    output_name: &str,
+    hdr_active: bool,
+    peaks: [f64; 3],
+    curve: PerChannelCurve,
+    ctm: Option<[[f64; 3]; 3]>,
+) {
+    println!();
+    println!("# Paste into the matching output block in your prism config:");
+    println!("output \"{}\" {{", output_name);
+    println!("    color {{");
+    if hdr_active {
+        // Per-channel panel peak is the calibration's headline output
+        // in HDR mode — it's what aligns the f32 IR clamp with measured
+        // reality and what the HDR_OUTPUT_METADATA infoframe carries.
+        println!(
+            "        panel-peak-nits r={:.1} g={:.1} b={:.1}",
+            peaks[0], peaks[1], peaks[2]
+        );
+    }
+    println!(
+        "        response-curve gain-r={:.4} gain-g={:.4} gain-b={:.4} gamma-r={:.4} gamma-g={:.4} gamma-b={:.4}",
+        curve.gain[0], curve.gain[1], curve.gain[2],
+        curve.gamma[0], curve.gamma[1], curve.gamma[2],
+    );
+    if let Some(m) = ctm {
+        // 9 positional values in row-major order — matches the Ctm
+        // knuffel struct (`#[knuffel(arguments)] values: Vec<f64>`).
+        println!(
+            "        ctm {:.6} {:.6} {:.6}  {:.6} {:.6} {:.6}  {:.6} {:.6} {:.6}",
+            m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+        );
+    }
+    println!("    }}");
+    println!("}}");
+    if !hdr_active {
+        // For SDR-only panels the per-channel peaks are diagnostic, not
+        // applied. Print them as a commented note so the reader can spot
+        // panels that can't reach sdr_reference_nits.
+        println!(
+            "# Measured per-channel SDR peaks (not auto-applied; sdr-reference-nits is policy):"
+        );
+        println!(
+            "#   R={:.1} G={:.1} B={:.1} cd/m²",
+            peaks[0], peaks[1], peaks[2]
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1889,105 +1989,5 @@ mod tests {
                 );
             }
         }
-    }
-}
-
-// ─── CSV log glue ──────────────────────────────────────────────────────────
-
-fn open_log(
-    args: &CalibrateArgs,
-    baseline: &OutputBaseline,
-) -> Result<Option<(PathBuf, BufWriter<File>)>> {
-    if args.no_log {
-        return Ok(None);
-    }
-    let path = args.log.clone().unwrap_or_else(|| {
-        // Substitute slashes in the connector name so a hypothetical
-        // "DP-0/1" doesn't escape into a subdirectory.
-        let safe = args.output.replace('/', "_");
-        PathBuf::from(format!("prism-tune-calibrate-{safe}.csv"))
-    });
-    if path.as_os_str() == "/dev/null" {
-        return Ok(None);
-    }
-    let file =
-        File::create(&path).with_context(|| format!("create log file {}", path.display()))?;
-    let mut w = BufWriter::new(file);
-    writeln!(
-        w,
-        "# prism-tune calibrate — output={} mode={} iterations={} settle_ms={} window={}",
-        args.output,
-        if baseline.hdr_active { "HDR" } else { "SDR" },
-        args.iterations,
-        args.settle_ms,
-        args.window,
-    )?;
-    writeln!(
-        w,
-        "# baseline: panel_peak_nits={:?} sdr_reference_nits={} prior_response_curve={:?}",
-        baseline.initial_panel_peak_nits,
-        baseline.sdr_reference_nits,
-        baseline.initial_response_curve,
-    )?;
-    writeln!(
-        w,
-        "phase,channel,iter,patch_idx,target_nits,applied_gain_r,applied_gain_g,applied_gain_b,applied_gamma_r,applied_gamma_g,applied_gamma_b,X,Y,Z,x,y"
-    )?;
-    eprintln!("Logging per-measurement CSV to {}", path.display());
-    Ok(Some((path, w)))
-}
-
-// ─── KDL output ────────────────────────────────────────────────────────────
-
-/// Print a `output { color { … } }` block for paste-in. `peaks` here is
-/// per-channel measured EMITTED peak luminance (cd/m²) — i.e.
-/// `probe_peak_y`, not the commanded-nits saturation cliff. That's the
-/// number the compositor's IR clamp wants.
-fn print_kdl_block(
-    output_name: &str,
-    hdr_active: bool,
-    peaks: [f64; 3],
-    curve: PerChannelCurve,
-    ctm: Option<[[f64; 3]; 3]>,
-) {
-    println!();
-    println!("# Paste into the matching output block in your prism config:");
-    println!("output \"{}\" {{", output_name);
-    println!("    color {{");
-    if hdr_active {
-        // Per-channel panel peak is the calibration's headline output
-        // in HDR mode — it's what aligns the f32 IR clamp with measured
-        // reality and what the HDR_OUTPUT_METADATA infoframe carries.
-        println!(
-            "        panel-peak-nits r={:.1} g={:.1} b={:.1}",
-            peaks[0], peaks[1], peaks[2]
-        );
-    }
-    println!(
-        "        response-curve gain-r={:.4} gain-g={:.4} gain-b={:.4} gamma-r={:.4} gamma-g={:.4} gamma-b={:.4}",
-        curve.gain[0], curve.gain[1], curve.gain[2],
-        curve.gamma[0], curve.gamma[1], curve.gamma[2],
-    );
-    if let Some(m) = ctm {
-        // 9 positional values in row-major order — matches the Ctm
-        // knuffel struct (`#[knuffel(arguments)] values: Vec<f64>`).
-        println!(
-            "        ctm {:.6} {:.6} {:.6}  {:.6} {:.6} {:.6}  {:.6} {:.6} {:.6}",
-            m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
-        );
-    }
-    println!("    }}");
-    println!("}}");
-    if !hdr_active {
-        // For SDR-only panels the per-channel peaks are diagnostic, not
-        // applied. Print them as a commented note so the reader can spot
-        // panels that can't reach sdr_reference_nits.
-        println!(
-            "# Measured per-channel SDR peaks (not auto-applied; sdr-reference-nits is policy):"
-        );
-        println!(
-            "#   R={:.1} G={:.1} B={:.1} cd/m²",
-            peaks[0], peaks[1], peaks[2]
-        );
     }
 }

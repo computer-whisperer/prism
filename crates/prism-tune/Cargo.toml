@@ -27,3 +27,13 @@ prism-renderer.workspace = true
 serde_json.workspace = true
 tristim-driver = { git = "https://github.com/computer-whisperer/tristim.git", rev = "17a4966" }
 tristim-display = { git = "https://github.com/computer-whisperer/tristim.git", rev = "17a4966" }
+
+# prism-tune is numerical calibration code. Matrix and 3D-LUT-cube loops
+# read clearer with explicit indices, and the calibration entry points
+# legitimately take many measured-parameter inputs and return multi-
+# component tuples. Relax the clippy lints that fight that shape rather
+# than contort the math into iterator chains / parameter structs.
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+needless_range_loop = "allow"

@@ -1492,6 +1492,49 @@ fn open_log(
     Ok(Some((path, w)))
 }
 
+fn print_kdl_block(
+    kdl_name: &str,
+    connector: &str,
+    edid_id: Option<&str>,
+    hdr_active: bool,
+    peaks: [f32; 3],
+    black_xyz: [f32; 3],
+    lut_path: &std::path::Path,
+) {
+    println!();
+    println!(
+        "# Measured black floor for {connector}: X={:.4} Y={:.4} Z={:.4} cd/m²",
+        black_xyz[0], black_xyz[1], black_xyz[2],
+    );
+    println!(
+        "# (carried in the LUT file header; compositor exposes it via OutputContext for tone mapping)",
+    );
+    match edid_id {
+        Some(_) => println!(
+            "# Output block keyed by EDID (Make Model Serial) — the calibration\n\
+             # follows the physical monitor if it moves to a different port.\n\
+             # If you prefer port-keyed config, replace the block name with \"{connector}\".",
+        ),
+        None => println!(
+            "# EDID make/model/serial incomplete on this output — block keyed by\n\
+             # connector \"{connector}\". The calibration won't follow the\n\
+             # monitor across port changes; manual update needed if you re-cable.",
+        ),
+    }
+    println!("# Paste into the matching output block in your prism config:");
+    println!("output \"{}\" {{", kdl_name);
+    println!("    color {{");
+    if hdr_active {
+        println!(
+            "        panel-peak-nits r={:.1} g={:.1} b={:.1}",
+            peaks[0], peaks[1], peaks[2]
+        );
+    }
+    println!("        lut3d \"{}\"", lut_path.display());
+    println!("    }}");
+    println!("}}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1676,47 +1719,4 @@ mod tests {
             mid_r,
         );
     }
-}
-
-fn print_kdl_block(
-    kdl_name: &str,
-    connector: &str,
-    edid_id: Option<&str>,
-    hdr_active: bool,
-    peaks: [f32; 3],
-    black_xyz: [f32; 3],
-    lut_path: &std::path::Path,
-) {
-    println!();
-    println!(
-        "# Measured black floor for {connector}: X={:.4} Y={:.4} Z={:.4} cd/m²",
-        black_xyz[0], black_xyz[1], black_xyz[2],
-    );
-    println!(
-        "# (carried in the LUT file header; compositor exposes it via OutputContext for tone mapping)",
-    );
-    match edid_id {
-        Some(_) => println!(
-            "# Output block keyed by EDID (Make Model Serial) — the calibration\n\
-             # follows the physical monitor if it moves to a different port.\n\
-             # If you prefer port-keyed config, replace the block name with \"{connector}\".",
-        ),
-        None => println!(
-            "# EDID make/model/serial incomplete on this output — block keyed by\n\
-             # connector \"{connector}\". The calibration won't follow the\n\
-             # monitor across port changes; manual update needed if you re-cable.",
-        ),
-    }
-    println!("# Paste into the matching output block in your prism config:");
-    println!("output \"{}\" {{", kdl_name);
-    println!("    color {{");
-    if hdr_active {
-        println!(
-            "        panel-peak-nits r={:.1} g={:.1} b={:.1}",
-            peaks[0], peaks[1], peaks[2]
-        );
-    }
-    println!("        lut3d \"{}\"", lut_path.display());
-    println!("    }}");
-    println!("}}");
 }
