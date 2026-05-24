@@ -17,3 +17,11 @@ prism.log
 prism.crumbs
 prism-client.log
 tty-test.log
+
+# Calibration / tuning run outputs (prism-tune writes these to the CWD)
+/prism-tune-*.csv
+/prism-calibrate-*.csv
+/prism-calibrate-*.lut
+
+# Scratch screen captures
+/mpv-shot*.jpg
