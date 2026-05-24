@@ -13,6 +13,7 @@ members = [
     "crates/prism-renderer",
     "crates/prism-shmtest",
     "crates/prism-tune",
+    "crates/prism-wlcs",
 ]
 
 [workspace.package]

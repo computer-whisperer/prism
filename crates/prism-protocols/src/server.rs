@@ -52,6 +52,21 @@ pub fn insert_wayland_sources(
         })
         .map_err(|e| anyhow::anyhow!("insert listening source: {e}"))?;
 
+    insert_display_source(handle, display)?;
+
+    tracing::info!(socket = %socket_name, "wayland server listening");
+    Ok(socket_name)
+}
+
+/// Insert the display's client-dispatch source — a `Generic` on the display
+/// poll fd that fires whenever a connected client has pending requests, and
+/// drives `dispatch_clients`. Split out of [`insert_wayland_sources`] so
+/// headless callers that inject client fds directly (the WLCS test harness)
+/// can reuse it without opening an AF_UNIX listening socket.
+pub fn insert_display_source(
+    handle: &LoopHandle<'static, PrismState>,
+    display: Display<PrismState>,
+) -> Result<()> {
     handle
         .insert_source(
             Generic::new(display, Interest::READ, Mode::Level),
@@ -68,7 +83,5 @@ pub fn insert_wayland_sources(
             },
         )
         .map_err(|e| anyhow::anyhow!("insert display source: {e}"))?;
-
-    tracing::info!(socket = %socket_name, "wayland server listening");
-    Ok(socket_name)
+    Ok(())
 }

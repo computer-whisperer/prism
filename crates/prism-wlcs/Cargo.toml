@@ -1,0 +1,29 @@
+[package]
+name = "prism-wlcs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "WLCS (Wayland Conformance Test Suite) integration shim for prism"
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# WLCS dlopen's this as an integration module: `wlcs libprism_wlcs.so`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+prism-protocols.workspace = true
+prism-config.workspace = true
+prism-renderer.workspace = true
+smithay.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+# The Rust bindings to the WLCS C ABI (Wlcs/Pointer/Touch traits +
+# wlcs_server_integration! macro). Same crate smithay's wlcs_anvil uses.
+wlcs = "0.1"
+# Raw wl_display / wl_proxy access for position_window_absolute. Pinned to
+# match the wayland-sys that `wlcs` resolves to so the pointer types unify.
+wayland-sys = { version = "0.31", features = ["client", "server"] }

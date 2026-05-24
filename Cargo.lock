@@ -223,7 +223,7 @@ checksum = "4dbf9978365bac10f54d1d4b04f7ce4427e51f71d61f2fe15e3fed5166474df7"
 dependencies = [
  "async-task",
  "bitflags",
- "nix",
+ "nix 0.31.3",
  "polling",
  "rustix 1.1.4",
  "slab",
@@ -357,6 +357,15 @@ dependencies = [
  "encode_unicode",
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "container_of"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89f5bbeb86761f66a87f8e327265ea0111f82f1928a84037b9abedab9f79472b"
+dependencies = [
+ "memoffset 0.6.5",
 ]
 
 [[package]]
@@ -977,6 +986,15 @@ dependencies = [
 
 [[package]]
 name = "memoffset"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aa361d4faea93603064a027415f07bd8e1d5c88c9fbf68bf56a285428fd79ce"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
+name = "memoffset"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
@@ -1012,6 +1030,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "nix"
+version = "0.27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2eb04e9c688eff1c89d72b407f168cf79bb9e867a9d3323ed6c01519eb9cc053"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]
@@ -1367,6 +1396,20 @@ dependencies = [
  "serde_json",
  "tristim-display",
  "tristim-driver",
+]
+
+[[package]]
+name = "prism-wlcs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "prism-config",
+ "prism-protocols",
+ "prism-renderer",
+ "smithay",
+ "tracing",
+ "wayland-sys",
+ "wlcs",
 ]
 
 [[package]]
@@ -2464,7 +2507,7 @@ dependencies = [
  "dlib",
  "libc",
  "log",
- "memoffset",
+ "memoffset 0.9.1",
  "pkg-config",
 ]
 
@@ -2742,6 +2785,18 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "wlcs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d99c305ce368db32f0c675a3a17abbfd4123a59f4a1c56c0ee70b372cb7609e"
+dependencies = [
+ "container_of",
+ "memoffset 0.9.1",
+ "nix 0.27.1",
+ "wayland-sys",
 ]
 
 [[package]]
