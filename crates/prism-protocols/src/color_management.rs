@@ -8,26 +8,27 @@
 //! **Scope:** parametric image descriptions only. We deliberately defer:
 //! - ICC profiles (`wp_image_description_creator_icc_v1`) — needs file
 //!   I/O + ICC parser; calibration use case doesn't need it.
-//! - `wp_color_management_output_v1` — per-output description advertising;
-//!   surface_feedback (Step 3) is what clients actually use.
-//! - `wp_color_management_surface_feedback_v1` — Step 3 of the plan.
 //! - `create_windows_scrgb` — niche; can add when needed.
-//! - `wp_image_description_info_v1` (`get_information` events) — only
-//!   needed for descriptions obtained via the upcoming `get_image_description`
-//!   path; descriptions created via the params creator can't be queried.
+//!
+//! Output color advertising (`wp_color_management_output_v1`) and surface
+//! feedback (`wp_color_management_surface_feedback_v1`) are implemented:
+//! clients can query an output's preferred description (Firefox uses the
+//! output path to decide whether to drive HDR).
 //!
 //! **What this gives us today:** clients can declare the color encoding
 //! of their surface contents (e.g. "PQ-encoded BT.2020 mastered to 400
-//! nits"). The compositor stores the description on the surface but
-//! does **not yet** consume it in the render path — that's Step 4.
-//! Until then, treating a colour-managed surface as sRGB is the
-//! existing behaviour; the protocol surface lands first so subsequent
-//! work can light up incrementally.
+//! nits"). The render path consumes it: a surface's committed
+//! description is mapped to [`prism_renderer::SurfaceColorParams`] via
+//! [`description_to_params`] and lowered into the decode shader's push
+//! constants (transfer fn + primaries→BT.2020 matrix). Surfaces with no
+//! description fall back to the sRGB default. The remaining gap for HDR
+//! *video* clients (e.g. Firefox) is YUV dmabuf import (NV12/P010), not
+//! the color decode — once a YUV sampler yields nonlinear RGB, this same
+//! per-surface decode applies.
 //!
 //! **Identity policy:** descriptions get a monotonically-increasing 64-bit
 //! ID assigned at creation. Identity is opaque to clients today
-//! (only used by `preferred_changed2` in Step 3). Step 3 may revisit
-//! to content-hash so the same parametric description gets a stable ID.
+//! (only used by `preferred_changed2`).
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -47,6 +48,7 @@ use smithay::reexports::wayland_server::{
     backend::ClientId, protocol::wl_surface::WlSurface, Client, DataInit, Dispatch, DisplayHandle,
     GlobalDispatch, New, Resource,
 };
+use smithay::output::Output;
 use smithay::wayland::compositor::{self, SurfaceData};
 
 use crate::state::PrismState;
@@ -514,6 +516,15 @@ pub struct ColorSurfaceFeedbackData {
     pub surface: smithay::reexports::wayland_server::Weak<WlSurface>,
 }
 
+/// User data for `WpColorManagementOutputV1`. Holds the `OutputId`
+/// (connector name) resolved from the `wl_output` passed to
+/// `get_output`, so `get_image_description` can look up that output's
+/// preferred description. `None` ⇔ the wl_output was foreign or already
+/// dead → the resource is inert and `get_image_description` sends `failed`.
+pub struct ColorOutputData {
+    pub output_id: Option<crate::state::OutputId>,
+}
+
 // ─── wp_color_manager_v1 ───────────────────────────────────────────────────
 
 impl GlobalDispatch<WpColorManagerV1, ()> for PrismState {
@@ -557,17 +568,15 @@ impl Dispatch<WpColorManagerV1, ()> for PrismState {
         use wp_color_manager_v1::Request;
         match request {
             Request::Destroy => {}
-            Request::GetOutput { id, output: _ } => {
-                // Spec: posts a protocol error if we don't support it,
-                // but we *do* need to construct *something* — for now
-                // create the resource and let it be inert (its
-                // get_image_description sends `failed`). Step 3 wires
-                // this up properly.
-                let _ = data_init.init(id, ());
-                tracing::debug!(
-                    "wp_color_manager_v1.get_output: not yet implemented; \
-                     resource will be inert"
-                );
+            Request::GetOutput { id, output } => {
+                // Resolve the wl_output to our OutputId (connector name)
+                // and stash it on the resource, so the resulting
+                // wp_color_management_output_v1.get_image_description can
+                // hand back that output's preferred description. A
+                // foreign / dead wl_output yields `None` → inert (its
+                // get_image_description sends `failed`).
+                let output_id = Output::from_resource(&output).map(|o| o.name());
+                let _ = data_init.init(id, ColorOutputData { output_id });
             }
             Request::GetSurface { id, surface } => {
                 let data = ColorSurfaceData {
@@ -650,21 +659,16 @@ impl Dispatch<WpColorManagerV1, ()> for PrismState {
     }
 }
 
-// Inert placeholders for resources we initialize but don't (yet)
-// fully implement. They satisfy the wayland-server dispatch
-// requirement; their requests are no-ops or, where the spec
-// mandates a response, send the appropriate inert/failed signal.
-
 use smithay::reexports::wayland_protocols::wp::color_management::v1::server::wp_color_management_output_v1::{
     self, WpColorManagementOutputV1,
 };
-impl Dispatch<WpColorManagementOutputV1, ()> for PrismState {
+impl Dispatch<WpColorManagementOutputV1, ColorOutputData> for PrismState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         _resource: &WpColorManagementOutputV1,
         request: <WpColorManagementOutputV1 as Resource>::Request,
-        _data: &(),
+        data: &ColorOutputData,
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
@@ -672,16 +676,49 @@ impl Dispatch<WpColorManagementOutputV1, ()> for PrismState {
         match request {
             Request::Destroy => {}
             Request::GetImageDescription { image_description } => {
-                let desc = data_init.init(
+                // Hand back the output's preferred description (same one
+                // surface_feedback advertises). Mirrors the get_preferred
+                // path: init with the description + `ready`, or `failed`
+                // if we don't know this output.
+                //
+                // We don't emit `image_description_changed` because an
+                // output's color description is static for prism's
+                // lifetime today (HDR config is fixed at startup); wire
+                // it up here if runtime HDR toggling lands.
+                let preferred = data
+                    .output_id
+                    .as_ref()
+                    .and_then(|id| state.color_management.output_preferred(id));
+                let Some(desc) = preferred else {
+                    tracing::debug!(
+                        output = ?data.output_id,
+                        "color-mgmt: output get_image_description → failed (no description)"
+                    );
+                    let d = data_init.init(
+                        image_description,
+                        ImageDescriptionData { description: None },
+                    );
+                    d.failed(
+                        wp_image_description_v1::Cause::NoOutput,
+                        "no color description for this output".to_string(),
+                    );
+                    return;
+                };
+                let identity = desc.identity;
+                tracing::debug!(
+                    output = ?data.output_id,
+                    tf = ?desc.tf,
+                    identity,
+                    "color-mgmt: output get_image_description → ready"
+                );
+                let d = data_init.init(
                     image_description,
-                    ImageDescriptionData { description: None },
+                    ImageDescriptionData {
+                        description: Some(desc),
+                    },
                 );
-                // Per spec for an inert protocol object: immediately
-                // deliver `failed`.
-                desc.failed(
-                    wp_image_description_v1::Cause::NoOutput,
-                    "wp_color_management_output_v1 not implemented".to_string(),
-                );
+                let lo = (identity & 0xffff_ffff) as u32;
+                d.ready(lo);
             }
             _ => {}
         }

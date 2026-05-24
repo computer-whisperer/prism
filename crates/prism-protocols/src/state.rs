@@ -538,7 +538,8 @@ impl PrismState {
 
         // wp_color_management_v1 global. See module doc for scope —
         // accepts parametric image descriptions, surfaces them via
-        // `SurfaceColorSlot`, render path consumption is Step 4.
+        // `SurfaceColorSlot`, and the render path decodes per-surface
+        // from them (description_to_params → decode shader push).
         let color_management = crate::color_management::ColorManagementState::new(&dh);
 
         // wlr_layer_shell global. MVP scope — see crate::layer_shell.
