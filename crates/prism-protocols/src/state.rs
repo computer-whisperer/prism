@@ -1672,26 +1672,39 @@ impl DmabufHandler for PrismState {
             }
         };
 
-        // Validate up front: a Vulkan format mapping must exist, and at
-        // least one GPU must be able to import this (format, modifier)
-        // natively (it becomes the mirror's "home" for the others).
-        // Otherwise the buffer is unusable — reject so the client falls
-        // back instead of rendering blank forever.
-        let Some(vk_format) = vk_format_for(src.format) else {
-            tracing::warn!(fmt = ?src.format, "dmabuf rejected: no Vulkan format mapping");
-            notifier.failed();
-            return;
-        };
+        // Validate up front: at least one GPU must be able to import this
+        // (format, modifier). Otherwise the buffer is unusable — reject so the
+        // client falls back instead of rendering blank forever.
+        //
+        // CRITICAL: this must accept everything `build_advertised_dmabuf_formats`
+        // advertised, or a client using `create_immed` (Firefox does) gets a
+        // fatal `invalid_wl_buffer` protocol error and crashes. YUV (NV12/P010)
+        // is multi-planar — it has no single `vk_format_for` mapping — so we
+        // validate its luma+chroma plane formats; `import_dmabuf` then does the
+        // real two-plane import via `import_yuv`. Without this, prism advertised
+        // NV12 but rejected every NV12 buffer here → Firefox crash / green.
         let modifier = u64::from(src.modifier);
-        let importable = self
-            .gpus
-            .values()
-            .any(|d| gpu_supports_dmabuf(d, vk_format, modifier));
+        let importable = if let Some(kind) = yuv_kind_for(src.format) {
+            let (luma_fmt, chroma_fmt) = kind.plane_formats();
+            self.gpus.values().any(|d| {
+                gpu_supports_dmabuf(d, luma_fmt, modifier)
+                    && gpu_supports_dmabuf(d, chroma_fmt, modifier)
+            })
+        } else {
+            let Some(vk_format) = vk_format_for(src.format) else {
+                tracing::warn!(fmt = ?src.format, "dmabuf rejected: no Vulkan format mapping");
+                notifier.failed();
+                return;
+            };
+            self.gpus
+                .values()
+                .any(|d| gpu_supports_dmabuf(d, vk_format, modifier))
+        };
         if !importable {
             tracing::warn!(
                 fmt = ?src.format,
                 modifier = format!("{modifier:#x}"),
-                "dmabuf rejected: no GPU supports this format+modifier for single-plane SAMPLED"
+                "dmabuf rejected: no GPU supports this format+modifier for SAMPLED"
             );
             notifier.failed();
             return;
@@ -2396,8 +2409,16 @@ fn hide_all_cursors(state: &mut PrismState) {
 /// the buffer). No GPU work.
 fn build_tex_source(state: &PrismState, buffer: &WlBuffer) -> Result<TexSource> {
     if let Some(dmabuf) = state.dmabuf_sources.get(&buffer.id()) {
-        let format = vk_format_for(dmabuf.format)
-            .with_context(|| format!("no Vulkan format mapping for {:?}", dmabuf.format))?;
+        // For YUV (NV12/P010), `format` is the luma-plane format (R8/R16) — a
+        // proxy used only by the per-GPU native-vs-mirror gate in
+        // `materialize_dmabuf_for_gpu`. The real two-plane import keys off
+        // `yuv_kind_for(dmabuf.format)` in `import_dmabuf`. vk_format_for has no
+        // single mapping for multi-planar YUV, so don't route it through there.
+        let format = match yuv_kind_for(dmabuf.format) {
+            Some(kind) => kind.plane_formats().0,
+            None => vk_format_for(dmabuf.format)
+                .with_context(|| format!("no Vulkan format mapping for {:?}", dmabuf.format))?,
+        };
         return Ok(TexSource::Dmabuf {
             dmabuf: dmabuf.clone(),
             format,

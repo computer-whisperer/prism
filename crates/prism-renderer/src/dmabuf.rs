@@ -45,7 +45,7 @@ pub enum YuvKind {
 
 impl YuvKind {
     /// `(luma format, chroma format)` for the two single-plane images.
-    fn plane_formats(self) -> (vk::Format, vk::Format) {
+    pub fn plane_formats(self) -> (vk::Format, vk::Format) {
         match self {
             YuvKind::Nv12 => (vk::Format::R8_UNORM, vk::Format::R8G8_UNORM),
             YuvKind::P010 => (vk::Format::R16_UNORM, vk::Format::R16G16_UNORM),
