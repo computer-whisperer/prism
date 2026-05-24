@@ -423,6 +423,12 @@ impl PrismState {
         let shm = ShmState::new::<PrismState>(
             &dh,
             [
+                // RGBA byte order (R8G8B8A8) — the natural shm format for many
+                // GL/GLES clients; mandatory ARGB8888/XRGB8888 are always
+                // advertised by wl_shm core. Keep this list in sync with
+                // vk_format_for_shm.
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Xbgr8888,
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Abgr8888,
                 smithay::reexports::wayland_server::protocol::wl_shm::Format::Xbgr16161616f,
                 smithay::reexports::wayland_server::protocol::wl_shm::Format::Abgr16161616f,
             ],
@@ -2925,6 +2931,8 @@ fn vk_format_for_shm(fmt: wl_shm::Format) -> Option<vk::Format> {
         // wl_shm formats are byte-order in memory the same way DRM fourcc
         // is: Argb8888 == B,G,R,A bytes == vk::Format::B8G8R8A8_UNORM.
         wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 => vk::Format::B8G8R8A8_UNORM,
+        // RGBA byte order (R,G,B,A) == vk::Format::R8G8B8A8_UNORM.
+        wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888 => vk::Format::R8G8B8A8_UNORM,
         // fp16. wl_shm `Abgr16161616f` is R,G,B,A half-floats in
         // memory order — that's Vulkan's R16G16B16A16_SFLOAT. `Xbgr`
         // is the alpha-undefined variant; Vulkan has no Xbgr float
@@ -2955,10 +2963,20 @@ fn vk_format_for(fourcc: DrmFourcc) -> Option<vk::Format> {
         // DRM is little-endian-byte-order, so XRGB8888 in memory is B,G,R,X.
         // Vulkan's B8G8R8A8 reads exactly that byte order.
         DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => vk::Format::B8G8R8A8_UNORM,
+        // RGBA byte order: DRM ABGR8888 is R,G,B,A in memory (LE u32
+        // [A:24][B:16][G:8][R:0]), matching Vulkan R8G8B8A8. The natural
+        // format for many GL/GLES/Vulkan clients (Mesa's EGL default), so
+        // accepting it avoids a hard reject on buffers we can sample fine.
+        DrmFourcc::Xbgr8888 | DrmFourcc::Abgr8888 => vk::Format::R8G8B8A8_UNORM,
         // 10-bit: DRM AB30/XB30 pack [A:30][B:20][G:10][R:0] in a LE u32,
         // which is exactly Vulkan's A2B10G10R10_UNORM_PACK32. HDR10 clients
         // (Firefox with HDR on, mpv PQ passthrough) allocate these.
         DrmFourcc::Xbgr2101010 | DrmFourcc::Abgr2101010 => vk::Format::A2B10G10R10_UNORM_PACK32,
+        // 10-bit, BGRA component order: DRM AR30/XR30 pack [A:30][R:20][G:10]
+        // [B:0], which is Vulkan's A2R10G10B10_UNORM_PACK32. The less common
+        // 10-bit variant (HDR10 clients usually pick AB30 above), accepted
+        // for the same reason as ABGR8888.
+        DrmFourcc::Xrgb2101010 | DrmFourcc::Argb2101010 => vk::Format::A2R10G10B10_UNORM_PACK32,
         // fp16: DRM ABGR16161616F is R,G,B,A 16-bit floats in memory order,
         // matching Vulkan R16G16B16A16_SFLOAT. scRGB / fp16 HDR clients use
         // this; values can exceed 1.0.
@@ -2979,8 +2997,12 @@ fn vk_format_for(fourcc: DrmFourcc) -> Option<vk::Format> {
 const DMABUF_CANDIDATE_FOURCCS: &[DrmFourcc] = &[
     DrmFourcc::Xrgb8888,
     DrmFourcc::Argb8888,
+    DrmFourcc::Xbgr8888,
+    DrmFourcc::Abgr8888,
     DrmFourcc::Xbgr2101010,
     DrmFourcc::Abgr2101010,
+    DrmFourcc::Xrgb2101010,
+    DrmFourcc::Argb2101010,
     DrmFourcc::Xbgr16161616f,
     DrmFourcc::Abgr16161616f,
 ];
