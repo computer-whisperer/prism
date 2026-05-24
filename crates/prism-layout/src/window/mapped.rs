@@ -318,6 +318,54 @@ impl Mapped {
         self.window.toplevel().expect("no X11 support")
     }
 
+    /// The window's logical geometry, used to anchor the window in its tile
+    /// and to map pointer coordinates into surface-local space.
+    ///
+    /// When the client sets an explicit xdg window geometry we honor it
+    /// (clamped to the bounding box, as smithay does). When it does *not*,
+    /// we anchor on the main (toplevel) surface — origin `(0,0)`, sized to
+    /// the main surface itself — rather than smithay's
+    /// `Window::geometry()`, whose fallback is the subsurface-inclusive
+    /// bounding box.
+    ///
+    /// This is a deliberate divergence from niri (which uses
+    /// `Window::geometry()` directly). With the bbox fallback, a subsurface
+    /// positioned at negative coordinates grows the bounding box up/left,
+    /// pushing `geometry().loc` negative, so `buf_loc = -geometry().loc`
+    /// drags the whole toplevel down/right by the same amount — the window
+    /// chases its own bbox and a subsurface can never appear to move
+    /// relative to the toplevel (WLCS `subsurface_moves_under_input_device`).
+    /// Anchoring on the main surface keeps the toplevel fixed; subsurfaces
+    /// extending past it simply draw outside the geometry, like CSD shadows.
+    fn window_geometry(&self) -> Rectangle<i32, Logical> {
+        let bbox = self.window.bbox();
+        let root = self.toplevel().wl_surface();
+
+        let explicit = with_states(root, |states| {
+            states
+                .cached_state
+                .get::<SurfaceCachedState>()
+                .current()
+                .geometry
+        });
+        if let Some(geo) = explicit {
+            return geo.intersection(bbox).unwrap_or(bbox);
+        }
+
+        // No explicit geometry: anchor at the main surface origin, sized to
+        // the main surface's own buffer (its `SurfaceView::dst`), not the
+        // bounding box. Falls back to the bbox size only if the root has no
+        // committed buffer yet (shouldn't happen for a mapped window).
+        let main_size = with_states(root, |states| {
+            states
+                .data_map
+                .get::<RendererSurfaceStateUserData>()
+                .and_then(|d| d.lock().unwrap().view().map(|v| v.dst))
+        })
+        .unwrap_or(bbox.size);
+        Rectangle::new(Point::from((0, 0)), main_size)
+    }
+
     /// Recomputes the resolved window rules and returns whether they changed.
     pub fn recompute_window_rules(&mut self, rules: &[WindowRule], is_at_startup: bool) -> bool {
         self.need_to_recompute_rules = false;
@@ -554,15 +602,15 @@ impl LayoutElement for Mapped {
     }
 
     fn size(&self) -> Size<i32, Logical> {
-        self.window.geometry().size
+        self.window_geometry().size
     }
 
     fn buf_loc(&self) -> Point<i32, Logical> {
-        Point::from((0, 0)) - self.window.geometry().loc
+        Point::from((0, 0)) - self.window_geometry().loc
     }
 
     fn is_in_input_region(&self, point: Point<f64, Logical>) -> bool {
-        let surface_local = point + self.window.geometry().loc.to_f64();
+        let surface_local = point + self.window_geometry().loc.to_f64();
         self.window.is_in_input_region(&surface_local)
     }
 
@@ -586,12 +634,14 @@ impl LayoutElement for Mapped {
         // the protocol layer — if it's absent, the surface has no
         // buffer yet (no draw).
         //
-        // Subtract `self.window.geometry().loc` to convert from
-        // "place the window CONTENT origin here" (what the layout
-        // gives us) to "place the surface BUFFER origin here" — niri
-        // does this exact subtraction. Defaults to (0,0) for clients
-        // that don't set explicit window geometry.
-        let buf_origin = location - self.window.geometry().loc.to_f64();
+        // Subtract `window_geometry().loc` to convert from "place the
+        // window CONTENT origin here" (what the layout gives us) to "place
+        // the surface BUFFER origin here". niri subtracts
+        // `window.geometry().loc`; we subtract our own geometry, which is
+        // (0,0) for clients without explicit window geometry (see
+        // `window_geometry`), so the main surface buffer is placed exactly
+        // at the layout location.
+        let buf_origin = location - self.window_geometry().loc.to_f64();
         let surface = self.toplevel().wl_surface();
 
         with_surface_tree_downward(
@@ -1013,7 +1063,7 @@ impl LayoutElement for Mapped {
         if has_pending_changes {
             // If needed, replace the pending size with the current window size.
             if let Some(RequestSizeOnce::UseWindowSize) = self.request_size_once {
-                let size = self.window.geometry().size;
+                let size = self.window_geometry().size;
                 toplevel.with_pending_state(|state| {
                     state.size = Some(size);
                 });
@@ -1142,7 +1192,7 @@ impl LayoutElement for Mapped {
 
     fn expected_size(&self) -> Option<Size<i32, Logical>> {
         // We can only use current size if it's not maximized or fullscreen.
-        let current_size = (self.sizing_mode().is_normal()).then(|| self.window.geometry().size);
+        let current_size = (self.sizing_mode().is_normal()).then(|| self.window_geometry().size);
 
         // Check if we should be using the current window size.
         //
