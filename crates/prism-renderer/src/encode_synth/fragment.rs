@@ -200,10 +200,10 @@ pub fn emit_output_transfer_pq(ctx: &mut ShaderCtx, in_nits: spirv::Word) -> spi
         .f_mul(vec3_t, None, clamped, inv_10k_vec)
         .expect("yn = clamped/10000");
 
-    let m1 = ctx.const_f32(0.1593017578125);
+    let m1 = ctx.const_f32(0.159_301_76);
     let m2 = ctx.const_f32(78.84375);
     let c1 = ctx.const_f32(0.8359375);
-    let c2 = ctx.const_f32(18.8515625);
+    let c2 = ctx.const_f32(18.851_563);
     let c3 = ctx.const_f32(18.6875);
     let m1_vec = ctx.vec3_splat(m1);
     let m2_vec = ctx.vec3_splat(m2);
@@ -321,8 +321,8 @@ pub fn emit_per_channel_response_gain_gamma(
 
 /// 3D LUT lookup with a per-channel PQ shaper on input.
 ///
-/// Replaces the [`CalibrationMatrix`](super::EncodeFragment::CalibrationMatrix)
-/// + [`PerChannelResponseGainGamma`](super::EncodeFragment::PerChannelResponseGainGamma)
+/// Replaces the [`CalibrationMatrix`](super::EncodeFragment::CalibrationMatrix) +
+/// [`PerChannelResponseGainGamma`](super::EncodeFragment::PerChannelResponseGainGamma)
 /// pair. The math is:
 ///
 /// ```text
@@ -373,10 +373,10 @@ pub fn emit_lut3d(ctx: &mut ShaderCtx, in_nits: spirv::Word) -> spirv::Word {
         .expect("yn = clamped/10000");
 
     // PQ OETF constants (SMPTE ST 2084).
-    let m1 = ctx.const_f32(0.1593017578125);
+    let m1 = ctx.const_f32(0.159_301_76);
     let m2 = ctx.const_f32(78.84375);
     let c1 = ctx.const_f32(0.8359375);
-    let c2 = ctx.const_f32(18.8515625);
+    let c2 = ctx.const_f32(18.851_563);
     let c3 = ctx.const_f32(18.6875);
     let m1_vec = ctx.vec3_splat(m1);
     let m2_vec = ctx.vec3_splat(m2);

@@ -140,7 +140,7 @@ where
         if fallback {
             tracing::warn!("{name}: configured mode not available; falling back to preferred",);
         }
-        let pick = match resolve_pick(
+        let pick = resolve_pick(
             drm,
             &resources,
             conn_h,
@@ -149,10 +149,7 @@ where
             mode,
             &occupied_by_other,
             &[],
-        ) {
-            Ok(p) => p,
-            Err(e) => return Err(e),
-        };
+        )?;
         return Ok(pick);
     }
     Err(anyhow!("no connected connector with a usable mode + CRTC"))
@@ -395,6 +392,7 @@ fn pick_mode(info: &connector::Info, cfg: Option<&OutputCfg>) -> Option<(Mode, b
 /// the current bringup pass (multi-output uses this to avoid collisions).
 /// A CRTC currently bound to *this* connector by another session is
 /// still acceptable (we'll grab master and rebind it).
+#[allow(clippy::too_many_arguments)] // CRTC resolution genuinely needs all of these
 fn resolve_pick(
     drm: &DrmDevice,
     resources: &smithay::reexports::drm::control::ResourceHandles,

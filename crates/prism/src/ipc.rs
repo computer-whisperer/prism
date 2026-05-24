@@ -32,7 +32,7 @@ use prism_ipc::{
     self, ColorState, LogicalOutput, Output, OutputAction, OutputConfigChanged, Reply, Request,
     Response, ResponseCurveState, Transform,
 };
-use prism_protocols::{OutputRedrawState, PrismState};
+use prism_protocols::PrismState;
 use smithay::utils::Size;
 
 /// Insert the IPC `UnixListener` calloop source. Binds a fresh socket
@@ -157,7 +157,7 @@ fn collect_outputs(state: &PrismState) -> HashMap<String, Output> {
         let modes = vec![prism_ipc::Mode {
             width: mw,
             height: mh,
-            refresh_rate: mode.vrefresh() as u32 * 1000,
+            refresh_rate: mode.vrefresh() * 1000,
             is_preferred: true,
         }];
         let logical = state
@@ -460,7 +460,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
     state
         .output_redraw
         .entry(output_id)
-        .or_insert_with(OutputRedrawState::default)
+        .or_default()
         .queue_redraw();
 
     Ok(Response::OutputConfigChanged(OutputConfigChanged::Applied))

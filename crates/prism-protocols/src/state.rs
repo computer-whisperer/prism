@@ -370,6 +370,7 @@ impl PrismState {
     ///   `gpus: {one GPU}` for dmabuf import validation. No scanout.
     /// - **truly headless** (tracer self-tests): `session: None`,
     ///   `gpus: {}`. dmabuf imports rejected.
+    ///
     /// Build a `PrismState`.
     ///
     /// `primary_gpu` is the GPU advertised to clients via
@@ -1313,7 +1314,7 @@ impl CompositorHandler for PrismState {
                             let w = config.layout.default_column_width;
                             (m, w)
                         };
-                        let id = mapped.id().clone();
+                        let id = mapped.id();
                         // Place the new window on the output that
                         // currently hosts the pointer (rather than
                         // always falling back to the layout's active
@@ -2298,7 +2299,7 @@ pub fn update_output_cursors(state: &mut PrismState) {
                 continue;
             }
         };
-        let is_owner = owning_output.as_ref().map_or(false, |o| o == id);
+        let is_owner = owning_output.as_ref() == Some(id);
         let was_visible = cursor.visible();
         let prev_pos = cursor.position();
 
@@ -2476,8 +2477,8 @@ fn ensure_surface_textures(state: &PrismState, surface: &WlSurface) {
 /// for it yet (a (surface, GPU) pair the commit-time, placement-driven
 /// `ensure_surface_textures` didn't cover — spanning windows, surfaces that
 /// committed before their toplevel was placed, layer surfaces). Called by
-/// the integrator *after* the surface-tree walk, never inside it (GPU work
-/// + `with_states` would re-enter the surface lock and deadlock). A no-op
+/// the integrator *after* the surface-tree walk, never inside it (GPU work +
+/// `with_states` would re-enter the surface lock and deadlock). A no-op
 /// if the texture already exists on `gpu` by the time we run.
 pub fn materialize_surface_on_gpu(state: &PrismState, surface: &WlSurface, gpu: DrmDevId) {
     if state.gpus.is_empty() {
@@ -2715,15 +2716,14 @@ fn refresh_dmabuf_mirrors(state: &PrismState, tex: &mut SurfaceTexture, _extent:
         if *home_src_buffer == buffer_id {
             continue; // same buffer — home_src still valid (damage re-copied at render)
         }
-        match state.gpus.get(home) {
-            Some(home_dev) => match import_dmabuf(home_dev, &dmabuf, false) {
+        if let Some(home_dev) = state.gpus.get(home) {
+            match import_dmabuf(home_dev, &dmabuf, false) {
                 Ok(img) => {
                     *home_src = Arc::new(img);
                     *home_src_buffer = buffer_id.clone();
                 }
                 Err(e) => tracing::warn!(home = ?home, "mirror home_src re-import failed: {e:#}"),
-            },
-            None => {}
+            }
         }
     }
 }

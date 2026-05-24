@@ -18,6 +18,7 @@
 //!   - `float target_peak_nits` at offset 116
 //!   - `float dither_strength` at offset 120
 //!   - `float _pad` at offset 124
+//!
 //! Total 128 bytes — at the Vulkan minimum push-constant size, intentionally,
 //! so any conformant driver accepts this layout.
 

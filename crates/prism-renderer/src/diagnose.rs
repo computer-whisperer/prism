@@ -699,12 +699,8 @@ mod tests {
         buf[2..4].copy_from_slice(&bytes_per);
         buf[4..6].copy_from_slice(&bytes_per);
         let decoded = decode_scanout_texel(vk::Format::R16G16B16A16_SFLOAT, &buf, 80.0).unwrap();
-        for c in 0..3 {
-            assert!(
-                (decoded[c] - 100.0).abs() < 2.0,
-                "ch {c} decoded {} vs ~100",
-                decoded[c]
-            );
+        for (c, &val) in decoded.iter().take(3).enumerate() {
+            assert!((val - 100.0).abs() < 2.0, "ch {c} decoded {val} vs ~100");
         }
     }
 
@@ -715,12 +711,8 @@ mod tests {
     fn decode_srgb_white_at_80_nits() {
         let buf = [255u8, 255, 255, 255];
         let decoded = decode_scanout_texel(vk::Format::R8G8B8A8_UNORM, &buf, 80.0).unwrap();
-        for c in 0..3 {
-            assert!(
-                (decoded[c] - 80.0).abs() < 1e-6,
-                "ch {c} decoded {} vs ~80",
-                decoded[c]
-            );
+        for (c, &val) in decoded.iter().take(3).enumerate() {
+            assert!((val - 80.0).abs() < 1e-6, "ch {c} decoded {val} vs ~80");
         }
     }
 
@@ -735,12 +727,8 @@ mod tests {
         let buf = pack.to_le_bytes();
         let decoded =
             decode_scanout_texel(vk::Format::A2R10G10B10_UNORM_PACK32, &buf, 80.0).unwrap();
-        for c in 0..3 {
-            assert!(
-                (decoded[c] - 80.0).abs() < 1e-6,
-                "ch {c} decoded {} vs ~80",
-                decoded[c]
-            );
+        for (c, &val) in decoded.iter().take(3).enumerate() {
+            assert!((val - 80.0).abs() < 1e-6, "ch {c} decoded {val} vs ~80");
         }
     }
 

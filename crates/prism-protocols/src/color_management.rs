@@ -304,8 +304,8 @@ impl SurfaceColorSlot {
 pub struct ColorManagementState {
     next_identity: AtomicU64,
     /// Per-output preferred image description. Built once at output
-    /// bringup via [`Self::set_output_preferred`] from the HDR config
-    /// + EDID. Cleared when an output drops. Identity is stable for
+    /// bringup via [`Self::set_output_preferred`] from the HDR config +
+    /// EDID. Cleared when an output drops. Identity is stable for
     /// the lifetime of the cached `Arc` (re-derivation only happens
     /// when HDR config changes, which today is bringup-static).
     output_preferred:

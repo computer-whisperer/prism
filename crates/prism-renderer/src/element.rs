@@ -29,12 +29,13 @@ use ash::vk;
 /// management behavior (sRGB with 80-nit white).
 ///
 /// Transfer codes match `decode.frag`:
-///   - 0 = Linear (already-linear pixels, e.g. ext_linear)
-///   - 1 = sRGB piecewise EOTF (default for unmanaged surfaces)
-///   - 2 = PQ (SMPTE ST 2084) — `sdr_white_nits` ignored, pixels
-///         already in absolute nits after decode
-///   - 4 = Gamma 2.2 (modern SDR default per wp_color_management v2)
-///   - 5 = BT.1886 (with default Lw/Lb → pure pow 2.4)
+///
+/// - 0 = Linear (already-linear pixels, e.g. ext_linear)
+/// - 1 = sRGB piecewise EOTF (default for unmanaged surfaces)
+/// - 2 = PQ (SMPTE ST 2084) — `sdr_white_nits` ignored, pixels
+///   already in absolute nits after decode
+/// - 4 = Gamma 2.2 (modern SDR default per wp_color_management v2)
+/// - 5 = BT.1886 (with default Lw/Lb → pure pow 2.4)
 #[derive(Clone, Copy, Debug)]
 pub struct SurfaceColorParams {
     pub transfer: i32,

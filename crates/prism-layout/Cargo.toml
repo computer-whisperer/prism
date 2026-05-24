@@ -47,3 +47,8 @@ xcursor = "0.3.10"
 approx = "0.5.1"
 insta = "1.47.2"
 proptest = "1.11.0"
+
+# Mirror niri's clippy posture for this directly-ported crate, so the
+# upstream layout code lints the same here as it does there.
+[lints.clippy]
+collapsible_match = "allow"

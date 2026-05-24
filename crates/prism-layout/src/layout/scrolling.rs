@@ -2907,8 +2907,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     /// logical rects to renderer clip space.
     ///
     /// Simplified vs niri's render — niri's path threaded a
-    /// `RenderCtx<R>` (so render-helpers shaders could read a target
-    /// + xray state) and produced a `ScrollingSpaceRenderElement<R>`
+    /// `RenderCtx<R>` (so render-helpers shaders could read a target +
+    /// xray state) and produced a `ScrollingSpaceRenderElement<R>`
     /// enum (Tile / ClosingWindow / TabIndicator variants); prism
     /// emits a flat `Vec<RenderEl>` from each `Tile::render`. The
     /// per-tile traversal logic (column reorder, render offsets,

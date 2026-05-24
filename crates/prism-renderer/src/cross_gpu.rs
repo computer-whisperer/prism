@@ -169,9 +169,7 @@ impl ExportableImage {
             extent,
             exported,
         };
-        if let Err(e) = img.transition_to_general() {
-            return Err(e);
-        }
+        img.transition_to_general()?;
 
         tracing::debug!(
             "created exportable mirror {}x{} format={:?} stride={} offset={} size={}",

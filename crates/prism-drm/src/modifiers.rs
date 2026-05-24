@@ -53,7 +53,7 @@ pub fn pick_scanout_modifiers(renderer_modifiers: &[DrmFormatModifierInfo]) -> V
         .collect();
 
     // Stable partition: tiled first (in driver order), LINEAR at the end.
-    let linear_present = picked.iter().any(|m| *m == DrmModifier::Linear);
+    let linear_present = picked.contains(&DrmModifier::Linear);
     picked.retain(|m| *m != DrmModifier::Linear);
     if linear_present {
         picked.push(DrmModifier::Linear);

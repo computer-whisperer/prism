@@ -57,7 +57,7 @@ struct CachedGeometry {
 
 impl FocusRing {
     pub fn new(config: prism_config::FocusRing) -> Self {
-        let width = config.width.into();
+        let width = config.width;
         Self {
             config,
             width,
@@ -66,7 +66,7 @@ impl FocusRing {
     }
 
     pub fn update_config(&mut self, config: prism_config::FocusRing) {
-        self.width = config.width.into();
+        self.width = config.width;
         self.config = config;
     }
 
@@ -93,6 +93,7 @@ impl FocusRing {
     /// `view_rect` and `radius` are accepted to match niri's signature
     /// (for future rounded-corner / gradient support) but currently
     /// ignored.
+    #[allow(clippy::too_many_arguments)] // mirrors niri's signature
     pub fn update_render_elements(
         &mut self,
         win_size: Size<f64, Logical>,

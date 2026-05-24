@@ -1822,7 +1822,8 @@ fn redraw_queued_outputs(state: &mut prism_protocols::PrismState) {
     let to_render: Vec<_> = state
         .output_redraw
         .iter()
-        .filter_map(|(id, st)| matches!(st.redraw, RedrawState::Queued).then(|| id.clone()))
+        .filter(|&(_id, st)| matches!(st.redraw, RedrawState::Queued))
+        .map(|(id, _st)| id.clone())
         .collect();
 
     for output_id in to_render {

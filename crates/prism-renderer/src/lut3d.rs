@@ -323,10 +323,10 @@ impl Drop for Lut3dTexture {
 /// generation (identity LUT computation, and future synthesis paths
 /// that need to know what nits a given LUT coord represents).
 pub fn pq_eotf(v: f32) -> f32 {
-    const M1: f32 = 0.1593017578125;
+    const M1: f32 = 0.159_301_76;
     const M2: f32 = 78.84375;
     const C1: f32 = 0.8359375;
-    const C2: f32 = 18.8515625;
+    const C2: f32 = 18.851_563;
     const C3: f32 = 18.6875;
     let v = v.max(0.0);
     let vm = v.powf(1.0 / M2);
@@ -665,11 +665,10 @@ mod tests {
         assert!(lut[0].iter().all(|&v| v.abs() < 1e-3));
         // Last entry = (10000, 10000, 10000).
         let last = lut[17 * 17 * 17 - 1];
-        for c in 0..3 {
+        for (c, &val) in last.iter().take(3).enumerate() {
             assert!(
-                (last[c] - 10000.0).abs() < 0.1,
-                "last[{c}] = {}, expected ~10000",
-                last[c]
+                (val - 10000.0).abs() < 0.1,
+                "last[{c}] = {val}, expected ~10000"
             );
         }
     }
@@ -725,27 +724,27 @@ mod tests {
     #[test]
     fn synthesis_matches_analytical_chain() {
         // From a recent DP-4 calibration run.
-        let ctm = Some([
+        let ctm = [
             [0.303636, -0.083659, -0.002953],
             [-0.040053, 0.774200, -0.042934],
             [-0.000884, -0.012542, 0.105189],
-        ]);
-        let curve = Some(([0.0781f32, 0.1814, 0.0326], [1.0754f32, 1.0759, 1.0330]));
+        ];
+        let curve = ([0.0781f32, 0.1814, 0.0326], [1.0754f32, 1.0759, 1.0330]);
         let n = 9u32;
-        let lut = synthesize_lut_from_matrix_curve(n, ctm, curve);
+        let lut = synthesize_lut_from_matrix_curve(n, Some(ctm), Some(curve));
 
         // Spot-check the (4, 4, 4) grid point — well inside the cube so
         // all three channels see non-trivial CTM contributions.
         let denom = (n - 1) as f32;
         let coord = 4.0 / denom;
         let in_nits = [pq_eotf(coord); 3];
-        let m = ctm.unwrap();
+        let m = ctm;
         let panel = [
             m[0][0] * in_nits[0] + m[0][1] * in_nits[1] + m[0][2] * in_nits[2],
             m[1][0] * in_nits[0] + m[1][1] * in_nits[1] + m[1][2] * in_nits[2],
             m[2][0] * in_nits[0] + m[2][1] * in_nits[1] + m[2][2] * in_nits[2],
         ];
-        let (gain, gamma) = curve.unwrap();
+        let (gain, gamma) = curve;
         let expected = [
             (panel[0].max(0.0) / gain[0]).powf(1.0 / gamma[0]),
             (panel[1].max(0.0) / gain[1]).powf(1.0 / gamma[1]),

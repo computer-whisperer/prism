@@ -154,7 +154,7 @@ pub fn on_pointer_button<I: PrismInputBackend>(
         state,
         &ButtonEvent {
             button,
-            state: event.state().into(),
+            state: event.state(),
             serial,
             time,
         },

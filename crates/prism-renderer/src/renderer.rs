@@ -194,8 +194,8 @@ impl Renderer {
     /// Run the encode pipeline against a 1×1 scratch with `input_nits`
     /// as the synthetic intermediate value, read back the scanout-format
     /// output, and decode to linear cd/m². Lets calibration tools
-    /// verify the LUT path end-to-end (shader emission + LUT contents
-    /// + output transfer) against an independently-computed prediction
+    /// verify the LUT path end-to-end (shader emission + LUT contents +
+    /// output transfer) against an independently-computed prediction
     /// — closes the loop the colorimeter alone can't close.
     ///
     /// Lazy-allocates the probe on first call so non-calibration
