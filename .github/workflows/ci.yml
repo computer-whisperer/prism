@@ -32,10 +32,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            gcc clang pkg-config \
+            gcc clang pkg-config glslang-tools \
             libwayland-dev libxkbcommon-dev libdbus-1-dev \
             libdrm-dev libgbm-dev libudev-dev libinput-dev libseat-dev \
-            libdisplay-info-dev libvulkan-dev
+            libdisplay-info-dev libvulkan-dev libusb-1.0-0-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -48,16 +48,19 @@ jobs:
 
       # smithay drives DRM/GBM/libinput/libseat/udev and binds wayland +
       # xkbcommon + libdisplay-info as system libs; the *-sys crates use
-      # pkg-config (+ libclang for bindgen). Vulkan is dlopen'd at runtime
-      # (ash "loaded"), so libvulkan-dev is only here for completeness.
+      # pkg-config (+ libclang for bindgen). prism-renderer's build.rs
+      # compiles GLSL → SPIR-V via glslangValidator (glslang-tools), and
+      # prism-tune's tristim colorimeter driver needs libusb. Vulkan is
+      # dlopen'd at runtime (ash "loaded"), so libvulkan-dev is only here
+      # for completeness.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            gcc clang pkg-config \
+            gcc clang pkg-config glslang-tools \
             libwayland-dev libxkbcommon-dev libdbus-1-dev \
             libdrm-dev libgbm-dev libudev-dev libinput-dev libseat-dev \
-            libdisplay-info-dev libvulkan-dev
+            libdisplay-info-dev libvulkan-dev libusb-1.0-0-dev
 
       - uses: Swatinem/rust-cache@v2
 
