@@ -27,6 +27,6 @@ smithay = { workspace = true, features = ["backend_libinput"] }
 tracing.workspace = true
 
 [dev-dependencies]
-insta = "1.43.4"
+insta = "1.47.2"
 pretty_assertions = "1.4.1"
 diff = "0.1.13"
