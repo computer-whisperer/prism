@@ -3062,13 +3062,18 @@ fn build_advertised_dmabuf_formats(device: &prism_renderer::Device) -> Vec<DrmFo
     // supported (single-plane, SAMPLED) by *both* the luma and chroma plane
     // formats — the intersection is what we can actually import.
     //
-    // NV12 only for now; P010 (10-bit HDR) lands once the NV12 path is
-    // verified end-to-end against SDR video.
-    for &(fourcc, luma_fmt, chroma_fmt) in &[(
-        DrmFourcc::Nv12,
-        vk::Format::R8_UNORM,
-        vk::Format::R8G8_UNORM,
-    )] {
+    // NV12 (8-bit SDR) verified end-to-end native + cross-GPU; P010 (10-bit
+    // HDR) is what Firefox's Wayland HDR path decodes to. Both planes import
+    // as their own single-plane image, so advertise the modifiers supported
+    // by both: R8/R8G8 for NV12, R16/R16G16 for P010.
+    for &(fourcc, luma_fmt, chroma_fmt) in &[
+        (DrmFourcc::Nv12, vk::Format::R8_UNORM, vk::Format::R8G8_UNORM),
+        (
+            DrmFourcc::P010,
+            vk::Format::R16_UNORM,
+            vk::Format::R16G16_UNORM,
+        ),
+    ] {
         let luma = single_plane_sampled_modifiers(device, luma_fmt);
         let chroma = single_plane_sampled_modifiers(device, chroma_fmt);
         let mut accepted = 0usize;
