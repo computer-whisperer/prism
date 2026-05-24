@@ -326,28 +326,11 @@ fn clamp_pointer_to_outputs(state: &mut PrismState) {
 }
 
 /// Look up the surface (and its global origin) under the current
-/// pointer position. MVP: returns the focused window's toplevel
-/// surface; sub-surface walk + accurate origin land with popup /
-/// sub-surface dispatch.
+/// pointer position. Delegates to [`PrismState::contents_under`], which
+/// resolves layer-shell and layout windows in render order and descends
+/// popups + subsurfaces to the deepest input-accepting surface.
 fn surface_under_pointer(state: &PrismState) -> Option<(WlSurface, Point<f64, Logical>)> {
-    let px = state.pointer_pos.x as i32;
-    let py = state.pointer_pos.y as i32;
-    let output_id = state.output_containing((px, py))?;
-    let output = state.wl_outputs.get(&output_id)?;
-    let output_loc = output.current_location();
-    let pos_within = Point::<f64, Logical>::from((
-        state.pointer_pos.x - output_loc.x as f64,
-        state.pointer_pos.y - output_loc.y as f64,
-    ));
-    let (mapped, _hit) = state.layout.window_under(output, pos_within)?;
-    let toplevel = mapped.toplevel().clone();
-    let wl_surface = toplevel.wl_surface().clone();
-    // TODO(pointer hit-testing): use the layout's per-tile geometry
-    // to derive the actual surface origin (output_loc + tile.loc).
-    // Today we approximate as the output origin; works for the
-    // common single-tile / full-output case.
-    let surface_origin = Point::from((output_loc.x as f64, output_loc.y as f64));
-    Some((wl_surface, surface_origin))
+    state.contents_under(state.pointer_pos)
 }
 
 /// If `input { focus-follows-mouse }` is enabled, update the layout's

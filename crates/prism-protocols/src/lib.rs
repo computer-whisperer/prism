@@ -11,6 +11,7 @@ pub mod color_management;
 pub mod drm_syncobj;
 pub mod input_state;
 pub mod layer_shell;
+pub mod pointer_focus;
 pub mod redraw;
 pub mod selection;
 pub mod server;

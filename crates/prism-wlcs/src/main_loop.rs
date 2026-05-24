@@ -63,6 +63,16 @@ pub fn run(channel: Channel<WlcsEvent>) {
         primary,
     );
 
+    // Settle animations instantly. prism's animation `Clock` is normally
+    // driven forward each frame from the kernel vblank time; this headless
+    // harness has no vblank, so without help, in-flight tile move/open
+    // animations stay pinned at their starting offset (their `value()`
+    // returns `from` while the clock sits at the animation's start time).
+    // That displaces both rendering and pointer hit-testing from a window's
+    // resting position. WLCS asserts on resting-state geometry, not on
+    // animation, so collapse every animation to its target immediately.
+    state.clock.set_complete_instantly(true);
+
     let mut event_loop: EventLoop<'static, PrismState> =
         EventLoop::try_new().expect("WLCS: EventLoop::try_new");
     // Stash the loop handle before any client surfaces appear (drm_syncobj
@@ -127,9 +137,16 @@ pub fn run(channel: Channel<WlcsEvent>) {
         {
             running.set(false);
         } else {
-            // Deferred destructor events queued during dispatch, then flush.
+            // Mirror prism's production post-dispatch step (main.rs:1525+):
+            // drain destructors, advance + prune animations (so move/open
+            // animations settle and stop displacing tile geometry), flush
+            // pending configures to clients, then clear the cached monotonic
+            // time so the next tick re-samples.
             state.color_management.drain_pending_info_done();
+            state.layout.advance_animations();
+            state.layout.refresh(true);
             let _ = state.display_handle.flush_clients();
+            state.clock.clear();
         }
     }
 }
