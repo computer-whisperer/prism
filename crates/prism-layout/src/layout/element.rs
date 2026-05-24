@@ -48,6 +48,11 @@ use smithay::wayland::compositor::SurfaceData;
 /// borrowed `&SurfaceData` keeps the lookup inside the existing scope.
 pub struct RenderCtx<'a> {
     pub texture_lookup: &'a dyn Fn(&SurfaceData) -> Option<vk::ImageView>,
+    /// Look up a YUV video surface's chroma plane view + kind code
+    /// (`DecodePush::yuv`: 1 = NV12, 2 = P010). Same `&SurfaceData`
+    /// contract as `texture_lookup`; `(None, 0)` for RGB surfaces. Pairs
+    /// with `texture_lookup` (the luma/primary plane).
+    pub yuv_lookup: &'a dyn Fn(&SurfaceData) -> (Option<vk::ImageView>, i32),
     /// Look up the surface's color-decoding parameters (TF +
     /// reference white) from its `wp_color_management_v1` image
     /// description. Same shape as `texture_lookup`: closure over
@@ -85,6 +90,11 @@ pub struct RenderCtx<'a> {
 impl<'a> RenderCtx<'a> {
     pub fn texture_for(&self, states: &SurfaceData) -> Option<vk::ImageView> {
         (self.texture_lookup)(states)
+    }
+    /// Chroma plane view + YUV kind code for `states`; `(None, 0)` for RGB.
+    /// See [`RenderCtx::yuv_lookup`].
+    pub fn yuv_for(&self, states: &SurfaceData) -> (Option<vk::ImageView>, i32) {
+        (self.yuv_lookup)(states)
     }
     pub fn color_for(&self, states: &SurfaceData) -> SurfaceColorParams {
         (self.color_lookup)(states).unwrap_or(SurfaceColorParams {

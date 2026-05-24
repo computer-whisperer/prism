@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use prism_renderer::{vk, DrmDevId, ExportableImage, ImportedImage, ShmTexture};
+use prism_renderer::{vk, DrmDevId, ExportableImage, ImportedImage, ShmTexture, YuvKind};
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 
@@ -114,6 +114,21 @@ impl GpuTex {
             Self::Shm(t) => t.view(),
         }
     }
+
+    /// Chroma plane view + YUV kind code (matching `DecodePush::yuv`:
+    /// 1 = NV12, 2 = P010) for a native YUV import. `(None, 0)` for RGB
+    /// native imports, mirrors, and shm — only the zero-copy native path
+    /// carries YUV today (the mirror/shm paths are RGB-only).
+    pub fn yuv(&self) -> (Option<vk::ImageView>, i32) {
+        match self {
+            Self::Native(img) => match img.yuv_kind() {
+                Some(YuvKind::Nv12) => (img.chroma_view(), 1),
+                Some(YuvKind::P010) => (img.chroma_view(), 2),
+                None => (None, 0),
+            },
+            _ => (None, 0),
+        }
+    }
 }
 
 /// A client's committed buffer and its per-GPU materializations.
@@ -134,6 +149,13 @@ impl SurfaceTexture {
     /// no materialization yet (not a consumer, or import/upload pending).
     pub fn view_for(&self, gpu: DrmDevId) -> Option<vk::ImageView> {
         self.by_gpu.get(&gpu).map(|t| t.view())
+    }
+
+    /// Chroma view + YUV kind code for `gpu`, for YUV video surfaces.
+    /// `(None, 0)` when `gpu` has no materialization or the texture is RGB.
+    /// Pairs with [`Self::view_for`] (the luma/primary plane).
+    pub fn yuv_for(&self, gpu: DrmDevId) -> (Option<vk::ImageView>, i32) {
+        self.by_gpu.get(&gpu).map(|t| t.yuv()).unwrap_or((None, 0))
     }
 
     /// Whether this surface's texture on `gpu` is a cross-GPU mirror (vs a

@@ -1962,15 +1962,27 @@ fn import_dmabuf(
     dmabuf: &prism_frame::Dmabuf,
     for_sampling: bool,
 ) -> Result<prism_renderer::ImportedImage> {
-    let vk_format = vk_format_for(dmabuf.format)
-        .with_context(|| format!("no Vulkan format mapping for {:?}", dmabuf.format))?;
-    let image = prism_renderer::ImportedImage::import(
-        device.clone(),
-        dmabuf,
-        vk_format,
-        vk::ImageUsageFlags::SAMPLED,
-    )
-    .context("ImportedImage::import (SAMPLED)")?;
+    let image = if let Some(kind) = yuv_kind_for(dmabuf.format) {
+        // Two-plane YUV video (NV12/P010): import luma + chroma as separate
+        // single-plane images; the decode shader recombines them.
+        prism_renderer::ImportedImage::import_yuv(
+            device.clone(),
+            dmabuf,
+            kind,
+            vk::ImageUsageFlags::SAMPLED,
+        )
+        .context("ImportedImage::import_yuv (SAMPLED)")?
+    } else {
+        let vk_format = vk_format_for(dmabuf.format)
+            .with_context(|| format!("no Vulkan format mapping for {:?}", dmabuf.format))?;
+        prism_renderer::ImportedImage::import(
+            device.clone(),
+            dmabuf,
+            vk_format,
+            vk::ImageUsageFlags::SAMPLED,
+        )
+        .context("ImportedImage::import (SAMPLED)")?
+    };
     // Sampled dmabuf imports start in UNDEFINED layout but the render path
     // binds them as SHADER_READ_ONLY_OPTIMAL. Run the one-shot transition
     // here so the first frame's sample is legal — without this radv hangs
@@ -2836,6 +2848,17 @@ fn vk_format_for_shm(fmt: wl_shm::Format) -> Option<vk::Format> {
     })
 }
 
+/// Two-plane YUV video fourccs prism imports via [`ImportedImage::import_yuv`]
+/// (luma + chroma as separate single-plane images). `None` ⇒ not YUV; the
+/// caller falls back to the packed-RGB [`vk_format_for`] path.
+fn yuv_kind_for(fourcc: DrmFourcc) -> Option<prism_renderer::YuvKind> {
+    match fourcc {
+        DrmFourcc::Nv12 => Some(prism_renderer::YuvKind::Nv12),
+        DrmFourcc::P010 => Some(prism_renderer::YuvKind::P010),
+        _ => None,
+    }
+}
+
 /// Map a DRM fourcc to the Vulkan format we'd sample it as. Single-planar
 /// 32-bit packed formats only for now.
 fn vk_format_for(fourcc: DrmFourcc) -> Option<vk::Format> {
@@ -2882,6 +2905,24 @@ const DMABUF_CANDIDATE_FOURCCS: &[DrmFourcc] = &[
 /// An empty result (driver advertises no modifiers for any candidate)
 /// falls back to LINEAR 8-bit, which every driver supports — keeps
 /// basic clients working even on a minimal driver.
+/// Single-plane, SAMPLED-capable DRM modifiers for `vk_format`. Used to
+/// advertise the per-plane importable modifier set for YUV formats.
+fn single_plane_sampled_modifiers(
+    device: &prism_renderer::Device,
+    vk_format: vk::Format,
+) -> Vec<DrmModifier> {
+    device
+        .supported_drm_format_modifiers(vk_format)
+        .into_iter()
+        .filter(|m| {
+            m.plane_count == 1
+                && m.tiling_features
+                    .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+        })
+        .map(|m| DrmModifier::from(m.modifier))
+        .collect()
+}
+
 fn build_advertised_dmabuf_formats(device: &prism_renderer::Device) -> Vec<DrmFormat> {
     let mut out = Vec::new();
     for &fourcc in DMABUF_CANDIDATE_FOURCCS {
@@ -2926,6 +2967,39 @@ fn build_advertised_dmabuf_formats(device: &prism_renderer::Device) -> Vec<DrmFo
             "dmabuf candidate format"
         );
     }
+
+    // Two-plane YUV video formats. We import each plane as its own
+    // single-plane image (see import_yuv), so advertise the modifiers
+    // supported (single-plane, SAMPLED) by *both* the luma and chroma plane
+    // formats — the intersection is what we can actually import.
+    //
+    // NV12 only for now; P010 (10-bit HDR) lands once the NV12 path is
+    // verified end-to-end against SDR video.
+    for &(fourcc, luma_fmt, chroma_fmt) in &[(
+        DrmFourcc::Nv12,
+        vk::Format::R8_UNORM,
+        vk::Format::R8G8_UNORM,
+    )] {
+        let luma = single_plane_sampled_modifiers(device, luma_fmt);
+        let chroma = single_plane_sampled_modifiers(device, chroma_fmt);
+        let mut accepted = 0usize;
+        let mut has_tiled = false;
+        for m in &luma {
+            if !chroma.contains(m) {
+                continue;
+            }
+            if *m != DrmModifier::Linear {
+                has_tiled = true;
+            }
+            out.push(DrmFormat {
+                code: fourcc,
+                modifier: *m,
+            });
+            accepted += 1;
+        }
+        tracing::info!(?fourcc, accepted, has_tiled, "dmabuf YUV candidate format");
+    }
+
     if out.is_empty() {
         out.extend([
             DrmFormat {

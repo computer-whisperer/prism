@@ -1965,6 +1965,21 @@ fn render_output_now(
                         .and_then(|t| t.view_for(output_gpu_id))
                 })
         };
+    // Chroma plane + YUV kind for video surfaces, on this output's GPU.
+    // Parallels texture_lookup (the luma/primary plane); `(None, 0)` for RGB.
+    let yuv_lookup = |states: &smithay::wayland::compositor::SurfaceData|
+     -> (Option<vk::ImageView>, i32) {
+        states
+            .data_map
+            .get::<prism_protocols::SurfaceTexSlot>()
+            .and_then(|s| {
+                s.0.lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|t| t.yuv_for(output_gpu_id))
+            })
+            .unwrap_or((None, 0))
+    };
     // Per-surface decode params from wp_color_management_v1. Falls
     // through to RenderCtx::color_for's default (sRGB + the output's
     // sdr_reference_nits) for surfaces with no description set —
@@ -2013,6 +2028,7 @@ fn render_output_now(
         };
     let ctx = RenderCtx {
         texture_lookup: &texture_lookup,
+        yuv_lookup: &yuv_lookup,
         color_lookup: &color_lookup,
         sdr_reference_nits: output_sdr_reference_nits,
         report_missing_texture: &report_missing,
@@ -2103,13 +2119,14 @@ fn render_output_now(
         let dst_rect_clip = project(dst);
         // Use RenderCtx::color_for so layer-shell surfaces share the
         // same per-output sdr_reference_nits fallback as toplevels.
-        let color =
-            smithay::wayland::compositor::with_states(wl_surface, |states| ctx.color_for(states));
+        let (color, (chroma_view, yuv)) =
+            smithay::wayland::compositor::with_states(wl_surface, |states| {
+                (ctx.color_for(states), ctx.yuv_for(states))
+            });
         render_els.push(RenderEl::Surface(prism_renderer::SurfaceEl {
             texture_view,
-            // YUV feed not yet threaded through the layer-shell path — RGB.
-            chroma_view: None,
-            yuv: 0,
+            chroma_view,
+            yuv,
             dst_rect_clip,
             src_rect_uv: [0.0, 0.0, 1.0, 1.0],
             color,
