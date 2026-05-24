@@ -86,7 +86,9 @@ impl OutputRedrawState {
         match self.redraw {
             RedrawState::Idle => self.redraw = RedrawState::Queued,
             RedrawState::WaitingForVBlank { .. } => {
-                self.redraw = RedrawState::WaitingForVBlank { redraw_needed: true };
+                self.redraw = RedrawState::WaitingForVBlank {
+                    redraw_needed: true,
+                };
             }
             RedrawState::Queued => {}
         }

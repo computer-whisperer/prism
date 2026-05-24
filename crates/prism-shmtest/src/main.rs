@@ -11,7 +11,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use memmap2::MmapMut;
-use wayland_client::globals::{GlobalListContents, registry_queue_init};
+use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
@@ -39,22 +39,12 @@ struct State {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let secs: u64 = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    let width: u32 = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(640);
-    let height: u32 = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(480);
+    let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let width: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(640);
+    let height: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(480);
 
     let conn = Connection::connect_to_env().expect("connect to wayland: WAYLAND_DISPLAY set?");
-    let (globals, mut event_queue) =
-        registry_queue_init::<State>(&conn).expect("registry init");
+    let (globals, mut event_queue) = registry_queue_init::<State>(&conn).expect("registry init");
     let qh = event_queue.handle();
 
     let compositor: wl_compositor::WlCompositor = globals
@@ -144,14 +134,10 @@ fn draw_frame(qh: &QueueHandle<State>, state: &mut State) {
 
     // memfd-backed pool; we mmap it so we can fill pixels, the server
     // mmaps it from the fd we pass.
-    let fd: OwnedFd = rustix::fs::memfd_create(
-        c"prism-shmtest",
-        rustix::fs::MemfdFlags::CLOEXEC,
-    )
-    .expect("memfd_create");
+    let fd: OwnedFd = rustix::fs::memfd_create(c"prism-shmtest", rustix::fs::MemfdFlags::CLOEXEC)
+        .expect("memfd_create");
     rustix::fs::ftruncate(&fd, size as u64).expect("ftruncate");
-    let mut mmap =
-        unsafe { MmapMut::map_mut(&fd) }.expect("mmap");
+    let mut mmap = unsafe { MmapMut::map_mut(&fd) }.expect("mmap");
 
     // Rotate hue per frame so successive uploads are visually distinct.
     let t = state.frames_drawn;

@@ -543,11 +543,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
     }
 
-    pub fn start_close_animation_for_window(
-        &mut self,
-        id: &W::Id,
-        blocker: TransactionBlocker,
-    ) {
+    pub fn start_close_animation_for_window(&mut self, id: &W::Id, blocker: TransactionBlocker) {
         let (tile, tile_pos) = self
             .tiles_with_render_positions_mut(false)
             .find(|(tile, _)| tile.window().id() == id)

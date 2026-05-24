@@ -10,9 +10,7 @@ use std::time::Duration;
 
 use prism_animation::Clock;
 use prism_config::utils::MergeWith as _;
-use prism_config::{
-    CenterFocusedColumn, CornerRadius, PresetSize, Workspace as WorkspaceConfig,
-};
+use prism_config::{CenterFocusedColumn, CornerRadius, PresetSize, Workspace as WorkspaceConfig};
 use prism_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use prism_renderer::RenderEl;
 use smithay::desktop::{layer_map_for_output, Window};
@@ -31,7 +29,6 @@ use super::{
     ActivateWindow, HitType, InsertPosition, LayoutElement, Options, OutputId, RemovedTile,
     SizeFrac, WorkspaceId,
 };
-
 
 use crate::utils::transaction::{Transaction, TransactionBlocker};
 use crate::utils::{

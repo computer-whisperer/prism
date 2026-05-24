@@ -22,9 +22,9 @@ use smithay::backend::input::{
     PointerMotionEvent,
 };
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
-use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Size};
+use smithay::reexports::wayland_server::Resource;
+use smithay::utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER};
 
 use crate::backend_ext::PrismInputBackend;
 
@@ -78,11 +78,7 @@ pub fn on_pointer_motion_absolute<I: PrismInputBackend>(
         return;
     };
     let pos = event.position_transformed(bounds.size);
-    state.pointer_pos = (
-        bounds.loc.x as f64 + pos.x,
-        bounds.loc.y as f64 + pos.y,
-    )
-        .into();
+    state.pointer_pos = (bounds.loc.x as f64 + pos.x, bounds.loc.y as f64 + pos.y).into();
     clamp_pointer_to_outputs(state);
 
     let focus = surface_under_pointer(state);
@@ -190,12 +186,7 @@ fn try_begin_window_grab(
 
     // Mod-down check. Without it, plain LeftClick would also start a
     // move grab — not what the user wants.
-    let mod_key = state
-        .config
-        .borrow()
-        .input
-        .mod_key
-        .unwrap_or(ModKey::Super);
+    let mod_key = state.config.borrow().input.mod_key.unwrap_or(ModKey::Super);
     let Some(keyboard) = state.seat.get_keyboard() else {
         return false;
     };
@@ -261,10 +252,7 @@ fn try_begin_window_grab(
     }
 }
 
-pub fn on_pointer_axis<I: PrismInputBackend>(
-    state: &mut PrismState,
-    event: I::PointerAxisEvent,
-) {
+pub fn on_pointer_axis<I: PrismInputBackend>(state: &mut PrismState, event: I::PointerAxisEvent) {
     let Some(pointer) = state.seat.get_pointer() else {
         return;
     };
@@ -442,4 +430,3 @@ fn set_keyboard_focus(
         kb.set_focus(state, surface, serial);
     }
 }
-

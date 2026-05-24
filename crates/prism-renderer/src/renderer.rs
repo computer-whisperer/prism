@@ -18,12 +18,12 @@ use ash::khr::external_semaphore_fd;
 use ash::vk;
 
 use crate::device::Device;
+use crate::diagnose::{DiagnosedNits, EncodeDiagnoseProbe};
 use crate::dmabuf::ImportedImage;
 use crate::encode_synth::EncodeConfig;
 use crate::error::{RendererError, Result, VkResultExt};
-use crate::diagnose::{DiagnosedNits, EncodeDiagnoseProbe};
 use crate::intermediate::Intermediate;
-use crate::lut3d::{LUT_CUBE_EDGE, Lut3dTexture, identity_lut};
+use crate::lut3d::{identity_lut, Lut3dTexture, LUT_CUBE_EDGE};
 use crate::pipeline::decode::{DecodePipeline, DecodePush};
 use crate::pipeline::encode::{EncodePipeline, EncodePush};
 use crate::upload::ShmTexture;
@@ -123,8 +123,7 @@ impl Renderer {
             .vk_ctx("allocate_command_buffers (renderer slots)")?;
 
         // One fence per slot, signalled at creation so the first wait is a no-op.
-        let fence_info =
-            vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
         // One exportable binary semaphore per slot. Marked exportable as
         // SYNC_FD via the pNext export-info chain — required by Vulkan to
         // later call vkGetSemaphoreFdKHR. Starts unsignalled (the default
@@ -149,12 +148,16 @@ impl Renderer {
             .try_into()
             .map_err(|_| crate::error::RendererError::MissingFeature("FrameSlot collect"))?;
 
-        let semaphore_fd_loader = external_semaphore_fd::Device::new(device.instance_raw(), &device.raw);
+        let semaphore_fd_loader =
+            external_semaphore_fd::Device::new(device.instance_raw(), &device.raw);
 
         // Solid-color element scratch — one 1×1 white texel, uploaded once.
         let mut white_tex = ShmTexture::new(
             device.clone(),
-            vk::Extent2D { width: 1, height: 1 },
+            vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
             vk::Format::R8G8B8A8_UNORM,
         )?;
         white_tex.upload_bytes(&[255, 255, 255, 255], 4)?;
@@ -302,8 +305,7 @@ impl Renderer {
                 .wait_for_fences(&[slot.fence], true, u64::MAX)
         }
         .vk_ctx("wait_for_fences (slot)")?;
-        unsafe { self.device.raw.reset_fences(&[slot.fence]) }
-            .vk_ctx("reset_fences (slot)")?;
+        unsafe { self.device.raw.reset_fences(&[slot.fence]) }.vk_ctx("reset_fences (slot)")?;
 
         let cb = slot.cmd_buffer;
         unsafe {
@@ -385,9 +387,11 @@ impl Renderer {
             self.device.raw.cmd_set_viewport(cb, 0, &[viewport]);
             self.device.raw.cmd_set_scissor(cb, 0, &[scissor]);
 
-            self.device
-                .raw
-                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.decode.pipeline);
+            self.device.raw.cmd_bind_pipeline(
+                cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.decode.pipeline,
+            );
 
             for el in elements {
                 let image_info = [vk::DescriptorImageInfo::default()
@@ -472,9 +476,11 @@ impl Renderer {
             };
             self.device.raw.cmd_set_viewport(cb, 0, &[viewport]);
             self.device.raw.cmd_set_scissor(cb, 0, &[scissor]);
-            self.device
-                .raw
-                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.encode.pipeline);
+            self.device.raw.cmd_bind_pipeline(
+                cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.encode.pipeline,
+            );
 
             let intermediate_info = [vk::DescriptorImageInfo::default()
                 .sampler(self.encode.sampler)
@@ -591,9 +597,13 @@ impl Drop for Renderer {
             let _ = self.device.raw.device_wait_idle();
             for slot in &self.slots {
                 self.device.raw.destroy_fence(slot.fence, None);
-                self.device.raw.destroy_semaphore(slot.present_semaphore, None);
+                self.device
+                    .raw
+                    .destroy_semaphore(slot.present_semaphore, None);
             }
-            self.device.raw.destroy_command_pool(self.command_pool, None);
+            self.device
+                .raw
+                .destroy_command_pool(self.command_pool, None);
         }
     }
 }

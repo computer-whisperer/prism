@@ -1,7 +1,7 @@
 //! Helpers for the scanout path: picking an output, building a framebuffer
 //! from a GBM BO, and producing the `PlaneState` for an atomic commit.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use drm_fourcc::DrmFourcc;
 use gbm::BufferObject;
 use prism_config::output::Output as OutputCfg;
@@ -9,8 +9,8 @@ use smithay::backend::drm::DrmDevice;
 use smithay::output::Mode as WlMode;
 use smithay::reexports::drm::buffer::PlanarBuffer;
 use smithay::reexports::drm::control::{
-    Device as ControlDevice, FbCmd2Flags, Mode, ModeFlags, ModeTypeFlags, ResourceHandle,
-    connector, crtc, framebuffer, property,
+    connector, crtc, framebuffer, property, Device as ControlDevice, FbCmd2Flags, Mode, ModeFlags,
+    ModeTypeFlags, ResourceHandle,
 };
 
 /// Bit depth + format selection for a scanout BO. Picks the matching DRM
@@ -138,11 +138,18 @@ where
             continue;
         };
         if fallback {
-            tracing::warn!(
-                "{name}: configured mode not available; falling back to preferred",
-            );
+            tracing::warn!("{name}: configured mode not available; falling back to preferred",);
         }
-        let pick = match resolve_pick(drm, &resources, conn_h, &info, &name, mode, &occupied_by_other, &[]) {
+        let pick = match resolve_pick(
+            drm,
+            &resources,
+            conn_h,
+            &info,
+            &name,
+            mode,
+            &occupied_by_other,
+            &[],
+        ) {
             Ok(p) => p,
             Err(e) => return Err(e),
         };
@@ -206,9 +213,7 @@ pub fn pick_all_connected_with_config(
             continue;
         };
         if fallback {
-            tracing::warn!(
-                "{name}: configured mode not available; falling back to preferred",
-            );
+            tracing::warn!("{name}: configured mode not available; falling back to preferred",);
         }
 
         let used_by_us: Vec<crtc::Handle> = picks.iter().map(|p| p.crtc).collect();
@@ -251,12 +256,18 @@ fn collect_other_session_crtcs(
 ) -> Vec<crtc::Handle> {
     let mut out = Vec::new();
     for &c in resources.connectors() {
-        let Ok(info) = drm.get_connector(c, false) else { continue };
+        let Ok(info) = drm.get_connector(c, false) else {
+            continue;
+        };
         if info.state() != connector::State::Connected {
             continue;
         }
-        let Some(enc_h) = info.current_encoder() else { continue };
-        let Ok(enc) = drm.get_encoder(enc_h) else { continue };
+        let Some(enc_h) = info.current_encoder() else {
+            continue;
+        };
+        let Ok(enc) = drm.get_encoder(enc_h) else {
+            continue;
+        };
         if let Some(crtc_h) = enc.crtc() {
             out.push(crtc_h);
         }
@@ -316,9 +327,7 @@ fn pick_mode(info: &connector::Info, cfg: Option<&OutputCfg>) -> Option<(Mode, b
 
     if let Some(cfg) = cfg {
         if cfg.modeline.is_some() {
-            tracing::warn!(
-                "config `modeline` not yet implemented; falling back to preferred mode",
-            );
+            tracing::warn!("config `modeline` not yet implemented; falling back to preferred mode",);
             // Treat as a fallback too — the user asked for something
             // specific and we couldn't honor it.
             fallback = true;

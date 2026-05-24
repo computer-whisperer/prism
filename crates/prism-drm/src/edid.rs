@@ -30,7 +30,7 @@
 
 use anyhow::{Context, Result};
 use smithay::backend::drm::DrmDevice;
-use smithay::reexports::drm::control::{Device as ControlDevice, connector};
+use smithay::reexports::drm::control::{connector, Device as ControlDevice};
 
 /// Parsed EDID summary. Every field is optional so a missing-EDID
 /// connector still produces a value the rest of the codebase can use

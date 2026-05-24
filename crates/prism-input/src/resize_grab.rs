@@ -11,13 +11,13 @@
 
 use prism_protocols::PrismState;
 use smithay::desktop::Window;
-use smithay::input::SeatHandler;
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
     GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
     GestureSwipeUpdateEvent, GrabStartData, MotionEvent, PointerGrab, PointerInnerHandle,
     RelativeMotionEvent,
 };
+use smithay::input::SeatHandler;
 use smithay::utils::{IsAlive, Logical, Point};
 
 use crate::move_grab::queue_redraw_all;
@@ -43,7 +43,10 @@ impl PointerGrab<PrismState> for ResizeGrab {
         &mut self,
         data: &mut PrismState,
         handle: &mut PointerInnerHandle<'_, PrismState>,
-        _focus: Option<(<PrismState as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
+        _focus: Option<(
+            <PrismState as SeatHandler>::PointerFocus,
+            Point<f64, Logical>,
+        )>,
         event: &MotionEvent,
     ) {
         handle.motion(data, None, event);
@@ -64,7 +67,10 @@ impl PointerGrab<PrismState> for ResizeGrab {
         &mut self,
         data: &mut PrismState,
         handle: &mut PointerInnerHandle<'_, PrismState>,
-        _focus: Option<(<PrismState as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
+        _focus: Option<(
+            <PrismState as SeatHandler>::PointerFocus,
+            Point<f64, Logical>,
+        )>,
         event: &RelativeMotionEvent,
     ) {
         handle.relative_motion(data, None, event);

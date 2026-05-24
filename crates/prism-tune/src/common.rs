@@ -104,9 +104,7 @@ pub fn sanitize_for_filename(s: &str) -> String {
 /// Query the prism IPC for the named output's current color state.
 pub fn query_output_baseline(name: &str) -> Result<OutputBaseline> {
     let mut socket = Socket::connect().context("connect to PRISM_SOCKET")?;
-    let reply = socket
-        .send(Request::Outputs)
-        .context("Request::Outputs")?;
+    let reply = socket.send(Request::Outputs).context("Request::Outputs")?;
     let outputs: HashMap<String, prism_ipc::Output> = match reply {
         Ok(Response::Outputs(map)) => map,
         Ok(other) => anyhow::bail!("unexpected reply to Outputs: {other:?}"),
@@ -226,9 +224,9 @@ pub fn set_channel_patch(
     if baseline.hdr_active {
         let mut rgb = [0.0_f64; 3];
         rgb[channel.idx()] = target_nits;
-        patch.set_nits(rgb).with_context(|| {
-            format!("set HDR nits for {} = {:.2}", channel.label(), target_nits)
-        })
+        patch
+            .set_nits(rgb)
+            .with_context(|| format!("set HDR nits for {} = {:.2}", channel.label(), target_nits))
     } else {
         let linear = (target_nits / baseline.sdr_reference_nits).clamp(0.0, 1.0);
         let encoded = srgb_oetf(linear);
@@ -301,9 +299,11 @@ pub fn set_white_patch(
     } else {
         let linear = (target_nits / baseline.sdr_reference_nits).clamp(0.0, 1.0);
         let encoded = srgb_oetf(linear);
-        patch.set_color([encoded, encoded, encoded]).with_context(|| {
-            format!("set SDR white = {encoded:.4} (target {target_nits:.2} cd/m²)")
-        })
+        patch
+            .set_color([encoded, encoded, encoded])
+            .with_context(|| {
+                format!("set SDR white = {encoded:.4} (target {target_nits:.2} cd/m²)")
+            })
     }
 }
 

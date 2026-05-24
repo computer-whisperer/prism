@@ -94,7 +94,11 @@ pub struct SolidColorEl {
 }
 
 impl SolidColorEl {
-    pub fn to_draw(&self, white_view: vk::ImageView, output_peak_nits_rgb: [f32; 3]) -> ElementDraw {
+    pub fn to_draw(
+        &self,
+        white_view: vk::ImageView,
+        output_peak_nits_rgb: [f32; 3],
+    ) -> ElementDraw {
         let mut push = DecodePush::solid(self.rect_clip, self.color_bt2020_nits);
         let [r, g, b] = output_peak_nits_rgb;
         push.output_peak_nits_rgba = [r, g, b, 0.0];

@@ -61,16 +61,16 @@
 use std::sync::Arc;
 
 use smithay::backend::drm::DrmDeviceFd;
-use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic};
-use smithay::reexports::wayland_server::Resource;
-use smithay::reexports::wayland_server::DisplayHandle;
+use smithay::reexports::calloop::{generic::Generic, Interest, LoopHandle, Mode, PostAction};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::DisplayHandle;
+use smithay::reexports::wayland_server::Resource;
 use smithay::wayland::compositor::{
-    BufferAssignment, SurfaceAttributes, add_blocker, add_pre_commit_hook, with_states,
+    add_blocker, add_pre_commit_hook, with_states, BufferAssignment, SurfaceAttributes,
 };
 use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::drm_syncobj::{
-    DrmSyncPoint, DrmSyncobjCachedState, DrmSyncobjState, supports_syncobj_eventfd,
+    supports_syncobj_eventfd, DrmSyncPoint, DrmSyncobjCachedState, DrmSyncobjState,
 };
 
 use crate::state::PrismState;
@@ -136,10 +136,7 @@ impl SurfaceReleaseSlot {
 /// `syncobj_eventfd` ioctl — we can't generate eventfd-backed
 /// blockers without it, so advertising the protocol would let
 /// clients import timelines we can't actually wait on.
-pub fn try_init(
-    dh: &DisplayHandle,
-    device_fd: DrmDeviceFd,
-) -> Option<DrmSyncobjState> {
+pub fn try_init(dh: &DisplayHandle, device_fd: DrmDeviceFd) -> Option<DrmSyncobjState> {
     if !supports_syncobj_eventfd(&device_fd) {
         tracing::info!(
             "drm_syncobj: kernel lacks syncobj_eventfd support — protocol not advertised"
@@ -219,7 +216,9 @@ pub fn install_pre_commit_blocker(surface: &WlSurface) {
                     // blockers are all released.
                     let dh = state.display_handle.clone();
                     use smithay::wayland::compositor::CompositorHandler;
-                    state.client_compositor_state(&client).blocker_cleared(state, &dh);
+                    state
+                        .client_compositor_state(&client)
+                        .blocker_cleared(state, &dh);
                     Ok(())
                 });
                 if res.is_ok() {
@@ -246,9 +245,7 @@ pub fn install_pre_commit_blocker(surface: &WlSurface) {
 /// our compositor commit handler after smithay has already moved
 /// pending→current. Returns `None` if no release point is attached
 /// (non-syncobj surface, or first commit before any set_release_point).
-pub fn build_tracker_for_current_commit(
-    surface: &WlSurface,
-) -> Option<Arc<CommitReleaseTracker>> {
+pub fn build_tracker_for_current_commit(surface: &WlSurface) -> Option<Arc<CommitReleaseTracker>> {
     with_states(surface, |states| {
         states
             .cached_state

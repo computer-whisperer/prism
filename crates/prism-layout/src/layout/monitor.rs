@@ -1187,7 +1187,10 @@ impl<W: LayoutElement> Monitor<W> {
         self.options = options;
     }
 
-    pub fn update_layout_config(&mut self, layout_config: Option<prism_config::LayoutPart>) -> bool {
+    pub fn update_layout_config(
+        &mut self,
+        layout_config: Option<prism_config::LayoutPart>,
+    ) -> bool {
         if self.layout_config == layout_config {
             return false;
         }

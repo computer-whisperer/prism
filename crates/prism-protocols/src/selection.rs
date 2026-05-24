@@ -71,19 +71,19 @@ use std::thread;
 
 use smithay::delegate_data_device;
 use smithay::delegate_primary_selection;
-use smithay::input::Seat;
 use smithay::input::dnd::{self, DnDGrab, DndGrabHandler, DndTarget};
 use smithay::input::pointer::Focus;
+use smithay::input::Seat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point};
-use smithay::wayland::selection::SelectionHandler;
-use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::selection::data_device::{
     DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
 };
 use smithay::wayland::selection::primary_selection::{
     PrimarySelectionHandler, PrimarySelectionState,
 };
+use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::SelectionTarget;
 
 use crate::state::PrismState;
 

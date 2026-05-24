@@ -40,18 +40,18 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use prism_ipc::OutputAction;
-use prism_renderer::{LUT_FILE_IN_TF_PQ, pq_eotf, save_lut3d_file};
+use prism_renderer::{pq_eotf, save_lut3d_file, LUT_FILE_IN_TF_PQ};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
-use tristim_driver::{Colorimeter, Xyz, measurement::raw_to_xyz};
+use tristim_driver::{measurement::raw_to_xyz, Colorimeter, Xyz};
 
 use crate::common::{
-    Channel, OutputBaseline, apply_border, apply_panel_peaks, open_patch_surface,
-    query_output_baseline, sanitize_for_filename, send_action, send_action_for_reply,
-    set_channel_patch, set_patch_off, set_rgb_patch, set_white_patch, show_alignment_patch,
+    apply_border, apply_panel_peaks, open_patch_surface, query_output_baseline,
+    sanitize_for_filename, send_action, send_action_for_reply, set_channel_patch, set_patch_off,
+    set_rgb_patch, set_white_patch, show_alignment_patch, Channel, OutputBaseline,
 };
 use prism_ipc::Response;
 use tristim_display::PatchSurface;
@@ -299,7 +299,11 @@ impl ResponseGrid {
     /// Max cmd per axis (the saturation cap each axis was bounded at).
     fn max_cmd(&self) -> [f64; 3] {
         let n = self.cube_edge - 1;
-        [self.axis_cmds[0][n], self.axis_cmds[1][n], self.axis_cmds[2][n]]
+        [
+            self.axis_cmds[0][n],
+            self.axis_cmds[1][n],
+            self.axis_cmds[2][n],
+        ]
     }
 }
 
@@ -324,7 +328,11 @@ fn bracket_axis(axis: &[f64], value: f64) -> (usize, usize, f64) {
     for i in 1..n {
         if value <= axis[i] {
             let span = axis[i] - axis[i - 1];
-            let t = if span > 0.0 { (value - axis[i - 1]) / span } else { 0.0 };
+            let t = if span > 0.0 {
+                (value - axis[i - 1]) / span
+            } else {
+                0.0
+            };
             return (i - 1, i, t);
         }
     }
@@ -354,8 +362,8 @@ fn sub_xyz_scaled(a: Xyz, b: Xyz, scale: f64) -> Xyz {
 }
 
 pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
-    let baseline = query_output_baseline(&args.output)
-        .context("query baseline output state via prism IPC")?;
+    let baseline =
+        query_output_baseline(&args.output).context("query baseline output state via prism IPC")?;
     eprintln!(
         "Baseline for {}: mode={}, panel_peak={:?}, sdr_ref={}",
         args.output,
@@ -368,8 +376,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     // panel sees raw commanded values during the sweep. SDR clamp stays
     // at sdr_reference_nits — that's the user's policy and we shouldn't
     // override it during measurement.
-    send_action(&args.output, OutputAction::ResetColor)
-        .context("initial ResetColor")?;
+    send_action(&args.output, OutputAction::ResetColor).context("initial ResetColor")?;
     if baseline.hdr_active {
         apply_panel_peaks(&args.output, [10_000.0, 10_000.0, 10_000.0])?;
     }
@@ -388,11 +395,15 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         "Colorimeter: Spyder SN {} HW {}.{:02}",
         info.serial, info.hw_version.0, info.hw_version.1
     );
-    let cal = device.get_calibration(args.cal).context("download cal matrix")?;
+    let cal = device
+        .get_calibration(args.cal)
+        .context("download cal matrix")?;
     let setup = device.get_setup(&cal).context("download setup")?;
 
     let mut patch = open_patch_surface(&args.output, baseline.hdr_active)?;
-    patch.set_window_fraction(args.window).context("set window fraction")?;
+    patch
+        .set_window_fraction(args.window)
+        .context("set window fraction")?;
 
     if !args.no_border {
         apply_border(&mut patch, &baseline, args.border_nits)?;
@@ -477,8 +488,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     } else {
         args.max_cmd.min(baseline.sdr_reference_nits)
     };
-    let targets =
-        log_spaced_targets(args.min_cmd, effective_max_cmd, args.samples_per_channel);
+    let targets = log_spaced_targets(args.min_cmd, effective_max_cmd, args.samples_per_channel);
     let mut responses: [Option<ChannelResponse>; 3] = [None, None, None];
 
     for channel in Channel::ALL {
@@ -543,11 +553,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
                 let cmd_ratio = cmd / prev.commanded.max(0.01);
                 let both_above_floor =
                     xyz.y > SATURATION_NOISE_FLOOR_Y && prev.xyz.y > SATURATION_NOISE_FLOOR_Y;
-                if samples.len() >= 3
-                    && cmd_ratio >= 1.2
-                    && ratio < 1.05
-                    && both_above_floor
-                {
+                if samples.len() >= 3 && cmd_ratio >= 1.2 && ratio < 1.05 && both_above_floor {
                     eprintln!(
                         "  {} saturation detected at cmd {:.1} (Y ratio {:.2} vs cmd ratio {:.2}); \
                          stopping sweep early",
@@ -561,7 +567,10 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
                 peak_y = xyz.y;
             }
             max_cmd = cmd;
-            samples.push(ChannelSample { commanded: cmd, xyz });
+            samples.push(ChannelSample {
+                commanded: cmd,
+                xyz,
+            });
         }
         if samples.len() < 4 {
             anyhow::bail!(
@@ -642,10 +651,11 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     )?;
 
     // ─── Phase 3: inversion to 3D LUT ─────────────────────────────────────
-    eprintln!("\n--- phase 3: invert {}³ forward grid → {}³ inverse LUT ---",
-              args.cube_edge_cmd, args.cube_edge);
-    let (entries, residuals) =
-        build_inverse_lut(args.cube_edge, &grid, seed_gain, black_floor_xyz);
+    eprintln!(
+        "\n--- phase 3: invert {}³ forward grid → {}³ inverse LUT ---",
+        args.cube_edge_cmd, args.cube_edge
+    );
+    let (entries, residuals) = build_inverse_lut(args.cube_edge, &grid, seed_gain, black_floor_xyz);
     if let Some((_, w)) = log.as_mut() {
         // Split residual stats by whether the target was in-gamut for
         // the panel (target_Y ≤ panel total peak). Out-of-gamut grids
@@ -707,11 +717,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         responses[1].peak_y as f32,
         responses[2].peak_y as f32,
     ];
-    let black_point_f32 = [
-        black_xyz.x as f32,
-        black_xyz.y as f32,
-        black_xyz.z as f32,
-    ];
+    let black_point_f32 = [black_xyz.x as f32, black_xyz.y as f32, black_xyz.z as f32];
 
     // ─── Phase 4: write LUT + restore ─────────────────────────────────────
     // Default filename: derive from EDID (Make-Model-Serial) so the
@@ -726,11 +732,20 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             .unwrap_or_else(|| sanitize_for_filename(&args.output));
         PathBuf::from(format!("prism-calibrate-lut3d-{stem}.lut"))
     });
-    save_lut3d_file(&lut_path, args.cube_edge, peak_nits, black_point_f32, &entries)
-        .with_context(|| format!("write LUT file {}", lut_path.display()))?;
+    save_lut3d_file(
+        &lut_path,
+        args.cube_edge,
+        peak_nits,
+        black_point_f32,
+        &entries,
+    )
+    .with_context(|| format!("write LUT file {}", lut_path.display()))?;
     eprintln!(
         "\nWrote {} (cube_edge={}, peaks={:?}, black_xyz={:?})",
-        lut_path.display(), args.cube_edge, peak_nits, black_point_f32,
+        lut_path.display(),
+        args.cube_edge,
+        peak_nits,
+        black_point_f32,
     );
 
     // Apply discovered peaks (HDR mode only) so the IR clamp matches
@@ -738,7 +753,11 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     if baseline.hdr_active {
         apply_panel_peaks(
             &args.output,
-            [peak_nits[0] as f64, peak_nits[1] as f64, peak_nits[2] as f64],
+            [
+                peak_nits[0] as f64,
+                peak_nits[1] as f64,
+                peak_nits[2] as f64,
+            ],
         )?;
     }
 
@@ -761,8 +780,17 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     let verify_result = if !args.no_verify {
         eprintln!("\n--- phase 5 verify: D65 white sweep through live LUT ---");
         Some(verify_white_point(
-            &args, &baseline, &peak_nits, &entries, &grid, black_floor_xyz,
-            &mut device, &mut patch, &setup, &cal, log.as_mut(),
+            &args,
+            &baseline,
+            &peak_nits,
+            &entries,
+            &grid,
+            black_floor_xyz,
+            &mut device,
+            &mut patch,
+            &setup,
+            &cal,
+            log.as_mut(),
         )?)
     } else {
         eprintln!("\n(verify skipped — --no-verify)");
@@ -825,8 +853,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         eprintln!(
             "\nRestoring KDL defaults (use --keep to leave the live-pushed LUT + peaks active)."
         );
-        send_action(&args.output, OutputAction::ResetColor)
-            .context("final ResetColor")?;
+        send_action(&args.output, OutputAction::ResetColor).context("final ResetColor")?;
     } else {
         eprintln!(
             "\n--keep: live-pushed LUT and per-channel panel peaks remain active until prism restart."
@@ -880,9 +907,12 @@ fn sweep_3d_grid(
     ];
     eprintln!(
         "  per-axis cmd ranges: R[{:.2}..{:.2}] G[{:.2}..{:.2}] B[{:.2}..{:.2}]",
-        axis_cmds[0][0], axis_cmds[0][cube_edge - 1],
-        axis_cmds[1][0], axis_cmds[1][cube_edge - 1],
-        axis_cmds[2][0], axis_cmds[2][cube_edge - 1],
+        axis_cmds[0][0],
+        axis_cmds[0][cube_edge - 1],
+        axis_cmds[1][0],
+        axis_cmds[1][cube_edge - 1],
+        axis_cmds[2][0],
+        axis_cmds[2][cube_edge - 1],
     );
     if let Some((_, w)) = log.as_mut() {
         writeln!(
@@ -920,8 +950,12 @@ fn sweep_3d_grid(
                     writeln!(
                         w,
                         "3D,{i},{j},{k},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
-                        cmd_r, cmd_g, cmd_b,
-                        xyz_above_black.x, xyz_above_black.y, xyz_above_black.z,
+                        cmd_r,
+                        cmd_g,
+                        cmd_b,
+                        xyz_above_black.x,
+                        xyz_above_black.y,
+                        xyz_above_black.z,
                     )?;
                 }
                 patches_done += 1;
@@ -931,9 +965,11 @@ fn sweep_3d_grid(
                     let eta_secs = (total - patches_done) as f64 / rate.max(1e-6);
                     eprintln!(
                         "  3D sweep: {}/{} patches ({:.0}%) — {:.1} patches/s, ETA {:.0}s",
-                        patches_done, total,
+                        patches_done,
+                        total,
                         (patches_done as f64 / total as f64) * 100.0,
-                        rate, eta_secs,
+                        rate,
+                        eta_secs,
                     );
                 }
             }
@@ -941,9 +977,14 @@ fn sweep_3d_grid(
     }
     eprintln!(
         "  3D sweep complete: {} patches in {:.1}s",
-        total, start.elapsed().as_secs_f64(),
+        total,
+        start.elapsed().as_secs_f64(),
     );
-    Ok(ResponseGrid { cube_edge, axis_cmds, xyz })
+    Ok(ResponseGrid {
+        cube_edge,
+        axis_cmds,
+        xyz,
+    })
 }
 
 /// Render BT.2020 D65 white at a range of luminances through the
@@ -1066,7 +1107,11 @@ fn verify_white_point(
             writeln!(
                 w,
                 "verify,W,{},{:.4},{:.4},{:.4},{:.4}",
-                patch_idx + 1, t, xyz.x, xyz.y, xyz.z,
+                patch_idx + 1,
+                t,
+                xyz.x,
+                xyz.y,
+                xyz.z,
             )?;
             writeln!(
                 w,
@@ -1076,8 +1121,12 @@ fn verify_white_point(
             writeln!(
                 w,
                 "#   cpu_lut_cmd=({:.3},{:.3},{:.3}) gpu_scanout_cmd=({:.3},{:.3},{:.3})",
-                cmd_predicted[0], cmd_predicted[1], cmd_predicted[2],
-                scanout_decoded[0], scanout_decoded[1], scanout_decoded[2],
+                cmd_predicted[0],
+                cmd_predicted[1],
+                cmd_predicted[2],
+                scanout_decoded[0],
+                scanout_decoded[1],
+                scanout_decoded[2],
             )?;
             writeln!(
                 w,
@@ -1088,7 +1137,10 @@ fn verify_white_point(
         }
     }
 
-    Ok(VerifyResult { max_duv, max_y_err_pct })
+    Ok(VerifyResult {
+        max_duv,
+        max_y_err_pct,
+    })
 }
 
 /// SMPTE ST 2084 (PQ) OETF: linear nits → encoded `[0, 1]`. CPU mirror
@@ -1341,11 +1393,7 @@ fn invert_one(
 /// L2 norm of (grid.forward(cmd) - target_emission). Helper for
 /// inverter's line-search comparison; pulled out so the loop reads
 /// cleanly.
-fn predicted_residual_norm(
-    grid: &ResponseGrid,
-    cmd: &[f64; 3],
-    target_emission: &[f64; 3],
-) -> f64 {
+fn predicted_residual_norm(grid: &ResponseGrid, cmd: &[f64; 3], target_emission: &[f64; 3]) -> f64 {
     let xyz = grid.forward(*cmd);
     let dx = xyz.x - target_emission[0];
     let dy = xyz.y - target_emission[1];
@@ -1420,8 +1468,8 @@ fn open_log(
             .unwrap_or_else(|| sanitize_for_filename(&args.output));
         PathBuf::from(format!("prism-calibrate-lut3d-{stem}.csv"))
     });
-    let file = File::create(&path)
-        .with_context(|| format!("create log file {}", path.display()))?;
+    let file =
+        File::create(&path).with_context(|| format!("create log file {}", path.display()))?;
     let mut w = BufWriter::new(file);
     writeln!(
         w,
@@ -1477,7 +1525,11 @@ mod tests {
                 }
             }
         }
-        ResponseGrid { cube_edge, axis_cmds, xyz }
+        ResponseGrid {
+            cube_edge,
+            axis_cmds,
+            xyz,
+        }
     }
 
     /// Inversion against a "panel that exactly matches BT.2020" must
@@ -1530,8 +1582,16 @@ mod tests {
         // cmd_R dominates (close to 50, within trilinear noise).
         assert!((cmd[0] - 50.0).abs() < 5.0, "cmd_R={}", cmd[0]);
         // cmd_G, cmd_B small relative to cmd_R.
-        assert!(cmd[1] < cmd[0] * 0.2, "cmd_G should be small, got {}", cmd[1]);
-        assert!(cmd[2] < cmd[0] * 0.2, "cmd_B should be small, got {}", cmd[2]);
+        assert!(
+            cmd[1] < cmd[0] * 0.2,
+            "cmd_G should be small, got {}",
+            cmd[1]
+        );
+        assert!(
+            cmd[2] < cmd[0] * 0.2,
+            "cmd_B should be small, got {}",
+            cmd[2]
+        );
     }
 
     /// ResponseGrid::forward at a grid corner returns the corner
@@ -1554,9 +1614,24 @@ mod tests {
             y: 2.0 * cmd_top[1],
             z: 3.0 * cmd_top[2],
         };
-        assert!((xyz.x - expected.x).abs() < 1e-9, "x: got {}, want {}", xyz.x, expected.x);
-        assert!((xyz.y - expected.y).abs() < 1e-9, "y: got {}, want {}", xyz.y, expected.y);
-        assert!((xyz.z - expected.z).abs() < 1e-9, "z: got {}, want {}", xyz.z, expected.z);
+        assert!(
+            (xyz.x - expected.x).abs() < 1e-9,
+            "x: got {}, want {}",
+            xyz.x,
+            expected.x
+        );
+        assert!(
+            (xyz.y - expected.y).abs() < 1e-9,
+            "y: got {}, want {}",
+            xyz.y,
+            expected.y
+        );
+        assert!(
+            (xyz.z - expected.z).abs() < 1e-9,
+            "z: got {}, want {}",
+            xyz.z,
+            expected.z
+        );
     }
 
     /// Out-of-bounds queries clamp to the nearest grid face. Tests
@@ -1596,7 +1671,9 @@ mod tests {
         // Synth grid: X = cmd_R + 0 + 0, so midpoint X = mid_r.
         assert!(
             (xyz.x - mid_r).abs() < 1e-9,
-            "midpoint X: got {}, want {}", xyz.x, mid_r,
+            "midpoint X: got {}, want {}",
+            xyz.x,
+            mid_r,
         );
     }
 }

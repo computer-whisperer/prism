@@ -400,7 +400,9 @@ impl From<prism_ipc::Action> for Action {
             prism_ipc::Action::PowerOnMonitors {} => Self::PowerOnMonitors,
             prism_ipc::Action::Spawn { command } => Self::Spawn(command),
             prism_ipc::Action::SpawnSh { command } => Self::SpawnSh(command),
-            prism_ipc::Action::DoScreenTransition { delay_ms } => Self::DoScreenTransition(delay_ms),
+            prism_ipc::Action::DoScreenTransition { delay_ms } => {
+                Self::DoScreenTransition(delay_ms)
+            }
             prism_ipc::Action::Screenshot { show_pointer, path } => {
                 Self::Screenshot(show_pointer, path)
             }
@@ -456,7 +458,9 @@ impl From<prism_ipc::Action> for Action {
             prism_ipc::Action::FocusWindowDown {} => Self::FocusWindowDown,
             prism_ipc::Action::FocusWindowUp {} => Self::FocusWindowUp,
             prism_ipc::Action::FocusWindowDownOrColumnLeft {} => Self::FocusWindowDownOrColumnLeft,
-            prism_ipc::Action::FocusWindowDownOrColumnRight {} => Self::FocusWindowDownOrColumnRight,
+            prism_ipc::Action::FocusWindowDownOrColumnRight {} => {
+                Self::FocusWindowDownOrColumnRight
+            }
             prism_ipc::Action::FocusWindowUpOrColumnLeft {} => Self::FocusWindowUpOrColumnLeft,
             prism_ipc::Action::FocusWindowUpOrColumnRight {} => Self::FocusWindowUpOrColumnRight,
             prism_ipc::Action::FocusWindowOrWorkspaceDown {} => Self::FocusWindowOrWorkspaceDown,
@@ -588,16 +592,22 @@ impl From<prism_ipc::Action> for Action {
                 id: Some(id),
                 change,
             } => Self::SetWindowWidthById { id, change },
-            prism_ipc::Action::SetWindowHeight { id: None, change } => Self::SetWindowHeight(change),
+            prism_ipc::Action::SetWindowHeight { id: None, change } => {
+                Self::SetWindowHeight(change)
+            }
             prism_ipc::Action::SetWindowHeight {
                 id: Some(id),
                 change,
             } => Self::SetWindowHeightById { id, change },
             prism_ipc::Action::ResetWindowHeight { id: None } => Self::ResetWindowHeight,
-            prism_ipc::Action::ResetWindowHeight { id: Some(id) } => Self::ResetWindowHeightById(id),
+            prism_ipc::Action::ResetWindowHeight { id: Some(id) } => {
+                Self::ResetWindowHeightById(id)
+            }
             prism_ipc::Action::SwitchPresetColumnWidth {} => Self::SwitchPresetColumnWidth,
             prism_ipc::Action::SwitchPresetColumnWidthBack {} => Self::SwitchPresetColumnWidthBack,
-            prism_ipc::Action::SwitchPresetWindowWidth { id: None } => Self::SwitchPresetWindowWidth,
+            prism_ipc::Action::SwitchPresetWindowWidth { id: None } => {
+                Self::SwitchPresetWindowWidth
+            }
             prism_ipc::Action::SwitchPresetWindowWidthBack { id: None } => {
                 Self::SwitchPresetWindowWidthBack
             }
@@ -625,7 +635,9 @@ impl From<prism_ipc::Action> for Action {
                 Self::MaximizeWindowToEdgesById(id)
             }
             prism_ipc::Action::SetColumnWidth { change } => Self::SetColumnWidth(change),
-            prism_ipc::Action::ExpandColumnToAvailableWidth {} => Self::ExpandColumnToAvailableWidth,
+            prism_ipc::Action::ExpandColumnToAvailableWidth {} => {
+                Self::ExpandColumnToAvailableWidth
+            }
             prism_ipc::Action::SwitchLayout { layout } => Self::SwitchLayout(layout),
             prism_ipc::Action::ShowHotkeyOverlay {} => Self::ShowHotkeyOverlay,
             prism_ipc::Action::MoveWorkspaceToMonitorLeft {} => Self::MoveWorkspaceToMonitorLeft,
@@ -681,7 +693,9 @@ impl From<prism_ipc::Action> for Action {
             prism_ipc::Action::MoveFloatingWindow { id, x, y } => {
                 Self::MoveFloatingWindowById { id, x, y }
             }
-            prism_ipc::Action::ToggleWindowRuleOpacity { id: None } => Self::ToggleWindowRuleOpacity,
+            prism_ipc::Action::ToggleWindowRuleOpacity { id: None } => {
+                Self::ToggleWindowRuleOpacity
+            }
             prism_ipc::Action::ToggleWindowRuleOpacity { id: Some(id) } => {
                 Self::ToggleWindowRuleOpacityById(id)
             }

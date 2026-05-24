@@ -15,9 +15,7 @@
 
 use prism_config::{Bind, Binds, ModKey, Modifiers, Trigger};
 use prism_protocols::PrismState;
-use smithay::backend::input::{
-    Device, DeviceCapability, InputEvent, KeyState, KeyboardKeyEvent,
-};
+use smithay::backend::input::{Device, DeviceCapability, InputEvent, KeyState, KeyboardKeyEvent};
 use smithay::input::keyboard::{FilterResult, ModifiersState};
 use smithay::utils::SERIAL_COUNTER;
 
@@ -81,9 +79,7 @@ fn on_device_added(state: &mut PrismState, device: impl Device) {
     let has_kb = device.has_capability(DeviceCapability::Keyboard);
     let has_ptr = device.has_capability(DeviceCapability::Pointer);
     let has_touch = device.has_capability(DeviceCapability::Touch);
-    tracing::info!(
-        "input: device added (keyboard={has_kb} pointer={has_ptr} touch={has_touch})"
-    );
+    tracing::info!("input: device added (keyboard={has_kb} pointer={has_ptr} touch={has_touch})");
 
     if has_kb && state.seat.get_keyboard().is_none() {
         let cfg = state.config.borrow();
@@ -130,12 +126,7 @@ fn on_keyboard<I: PrismInputBackend>(state: &mut PrismState, event: I::KeyboardK
     // "Mod" in user binds maps to Super on TTY (defaults match niri's
     // mod-key resolution). When the config overrides input.mod_key we
     // honour that.
-    let mod_key = state
-        .config
-        .borrow()
-        .input
-        .mod_key
-        .unwrap_or(ModKey::Super);
+    let mod_key = state.config.borrow().input.mod_key.unwrap_or(ModKey::Super);
 
     // Snapshot the binds — the filter closure borrows state, but
     // matching against the config requires also borrowing config; do

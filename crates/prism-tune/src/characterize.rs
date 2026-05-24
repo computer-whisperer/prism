@@ -26,12 +26,12 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
-use tristim_driver::{Colorimeter, measurement::raw_to_xyz};
+use tristim_driver::{measurement::raw_to_xyz, Colorimeter};
 
 use crate::common::{
-    Channel, OutputBaseline, apply_border, apply_panel_peaks, open_patch_surface,
-    query_output_baseline, send_action, set_channel_patch, set_patch_off, set_white_patch,
-    show_alignment_patch,
+    apply_border, apply_panel_peaks, open_patch_surface, query_output_baseline, send_action,
+    set_channel_patch, set_patch_off, set_white_patch, show_alignment_patch, Channel,
+    OutputBaseline,
 };
 
 #[derive(Args)]
@@ -141,8 +141,8 @@ pub fn run(args: CharacterizeArgs) -> Result<()> {
 }
 
 fn run_single_channel(args: SingleChannelArgs) -> Result<()> {
-    let baseline = query_output_baseline(&args.output)
-        .context("query baseline output state via prism IPC")?;
+    let baseline =
+        query_output_baseline(&args.output).context("query baseline output state via prism IPC")?;
     eprintln!(
         "Baseline for {}: mode={}, panel_peak={:?}, sdr_ref={}, prior_curve={}",
         args.output,
@@ -157,8 +157,7 @@ fn run_single_channel(args: SingleChannelArgs) -> Result<()> {
     );
 
     if !args.keep_calibration {
-        send_action(&args.output, OutputAction::ResetColor)
-            .context("initial ResetColor")?;
+        send_action(&args.output, OutputAction::ResetColor).context("initial ResetColor")?;
         eprintln!("Cleared runtime color overrides (--keep-calibration not set).");
     } else {
         eprintln!("Keeping live calibration in place (--keep-calibration).");
@@ -178,11 +177,15 @@ fn run_single_channel(args: SingleChannelArgs) -> Result<()> {
         "Colorimeter: Spyder SN {} HW {}.{:02}",
         info.serial, info.hw_version.0, info.hw_version.1
     );
-    let cal = device.get_calibration(args.cal).context("download cal matrix")?;
+    let cal = device
+        .get_calibration(args.cal)
+        .context("download cal matrix")?;
     let setup = device.get_setup(&cal).context("download setup")?;
 
     let mut patch = open_patch_surface(&args.output, baseline.hdr_active)?;
-    patch.set_window_fraction(args.window).context("set window fraction")?;
+    patch
+        .set_window_fraction(args.window)
+        .context("set window fraction")?;
 
     if !args.no_border {
         apply_border(&mut patch, &baseline, args.border_nits)?;
@@ -236,7 +239,13 @@ fn run_single_channel(args: SingleChannelArgs) -> Result<()> {
             let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
             eprintln!(
                 "  {} cmd {:>8.2} cd/m² → X={:>8.3}  Y={:>8.3}  Z={:>8.3}  xy=({:.4}, {:.4})",
-                channel.label(), cmd, xyz.x, xyz.y, xyz.z, cx, cy,
+                channel.label(),
+                cmd,
+                xyz.x,
+                xyz.y,
+                xyz.z,
+                cx,
+                cy,
             );
             if let Some((_, w)) = log.as_mut() {
                 writeln!(
@@ -265,8 +274,7 @@ fn run_single_channel(args: SingleChannelArgs) -> Result<()> {
     // Restore the bringup state — always, since characterize is purely
     // diagnostic and shouldn't leave the panel in a weird intermediate
     // state.
-    send_action(&args.output, OutputAction::ResetColor)
-        .context("final ResetColor")?;
+    send_action(&args.output, OutputAction::ResetColor).context("final ResetColor")?;
 
     Ok(())
 }
@@ -326,8 +334,8 @@ pub struct WhiteSweepArgs {
 }
 
 fn run_white_sweep(args: WhiteSweepArgs) -> Result<()> {
-    let baseline = query_output_baseline(&args.output)
-        .context("query baseline output state via prism IPC")?;
+    let baseline =
+        query_output_baseline(&args.output).context("query baseline output state via prism IPC")?;
     eprintln!(
         "Baseline for {}: mode={}, panel_peak={:?}, sdr_ref={}, prior_curve={}",
         args.output,
@@ -342,8 +350,7 @@ fn run_white_sweep(args: WhiteSweepArgs) -> Result<()> {
     );
 
     if !args.keep_calibration {
-        send_action(&args.output, OutputAction::ResetColor)
-            .context("initial ResetColor")?;
+        send_action(&args.output, OutputAction::ResetColor).context("initial ResetColor")?;
         eprintln!("Cleared runtime color overrides (--keep-calibration not set).");
     } else {
         eprintln!("Keeping live calibration in place (--keep-calibration).");
@@ -359,11 +366,15 @@ fn run_white_sweep(args: WhiteSweepArgs) -> Result<()> {
         "Colorimeter: Spyder SN {} HW {}.{:02}",
         info.serial, info.hw_version.0, info.hw_version.1
     );
-    let cal = device.get_calibration(args.cal).context("download cal matrix")?;
+    let cal = device
+        .get_calibration(args.cal)
+        .context("download cal matrix")?;
     let setup = device.get_setup(&cal).context("download setup")?;
 
     let mut patch = open_patch_surface(&args.output, baseline.hdr_active)?;
-    patch.set_window_fraction(args.window).context("set window fraction")?;
+    patch
+        .set_window_fraction(args.window)
+        .context("set window fraction")?;
 
     if !args.no_border {
         apply_border(&mut patch, &baseline, args.border_nits)?;
@@ -443,8 +454,7 @@ fn run_white_sweep(args: WhiteSweepArgs) -> Result<()> {
         eprintln!("\nCSV log written to {}", path.display());
     }
 
-    send_action(&args.output, OutputAction::ResetColor)
-        .context("final ResetColor")?;
+    send_action(&args.output, OutputAction::ResetColor).context("final ResetColor")?;
 
     Ok(())
 }
@@ -492,8 +502,8 @@ fn open_log(
     if path.as_os_str() == "/dev/null" {
         return Ok(None);
     }
-    let file = File::create(&path)
-        .with_context(|| format!("create log file {}", path.display()))?;
+    let file =
+        File::create(&path).with_context(|| format!("create log file {}", path.display()))?;
     let mut w = BufWriter::new(file);
     writeln!(
         w,
@@ -538,8 +548,8 @@ fn open_white_log(
     if path.as_os_str() == "/dev/null" {
         return Ok(None);
     }
-    let file = File::create(&path)
-        .with_context(|| format!("create log file {}", path.display()))?;
+    let file =
+        File::create(&path).with_context(|| format!("create log file {}", path.display()))?;
     let mut w = BufWriter::new(file);
     writeln!(
         w,

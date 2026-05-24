@@ -85,10 +85,7 @@ impl DecodePush {
 
 fn mat4_identity() -> [f32; 16] {
     [
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        0.0, 0.0, 0.0, 1.0,
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
     ]
 }
 
@@ -143,13 +140,8 @@ impl DecodePipeline {
         let vert = shader_module(&device, VERT_SPV)?;
         let frag = shader_module(&device, FRAG_SPV)?;
 
-        let pipeline = build_decode_pipeline(
-            &device,
-            pipeline_layout,
-            vert,
-            frag,
-            intermediate_format,
-        )?;
+        let pipeline =
+            build_decode_pipeline(&device, pipeline_layout, vert, frag, intermediate_format)?;
 
         unsafe {
             device.raw.destroy_shader_module(vert, None);
@@ -246,8 +238,7 @@ fn build_decode_pipeline(
     let cb = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
 
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let dyn_state =
-        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let dyn_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
     let color_formats = [color_format];
     let mut dynamic_info =

@@ -15,7 +15,7 @@ use calloop::{Interest, LoopHandle, Mode, PostAction};
 use smithay::reexports::wayland_server::Display;
 use smithay::wayland::socket::ListeningSocketSource;
 
-use crate::state::{PrismState, new_client_data};
+use crate::state::{new_client_data, PrismState};
 
 /// Insert the listening socket + display dispatch sources into the loop.
 /// Returns the socket name (e.g. `"wayland-1"`) that clients should set as
@@ -25,10 +25,7 @@ pub fn insert_wayland_sources(
     display: Display<PrismState>,
 ) -> Result<String> {
     let listening = ListeningSocketSource::new_auto().context("ListeningSocketSource::new_auto")?;
-    let socket_name = listening
-        .socket_name()
-        .to_string_lossy()
-        .into_owned();
+    let socket_name = listening.socket_name().to_string_lossy().into_owned();
 
     // Set WAYLAND_DISPLAY in our own process env so child processes
     // we later spawn (Mod+Return → alacritty, etc.) inherit it and

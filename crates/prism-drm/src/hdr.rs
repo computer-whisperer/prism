@@ -28,7 +28,7 @@
 //! Spyder loop, which needs `wp_color_management_v1` first.
 
 use anyhow::{Context, Result};
-use smithay::reexports::drm::control::{Device as ControlDevice, connector, property};
+use smithay::reexports::drm::control::{connector, property, Device as ControlDevice};
 
 /// HDR transfer function. Only PQ is wired today; HLG is a TODO that
 /// needs a corresponding `OutputTransferHlg` encode fragment.
@@ -150,10 +150,7 @@ impl HdrProps {
     /// `Colorspace`. Returns `Ok(None)` (not an error) if either is
     /// absent — most drivers expose both as a pair, but USB-C dock
     /// outputs and virtual displays sometimes don't.
-    pub fn lookup<D: ControlDevice>(
-        drm: &D,
-        connector: connector::Handle,
-    ) -> Result<Option<Self>> {
+    pub fn lookup<D: ControlDevice>(drm: &D, connector: connector::Handle) -> Result<Option<Self>> {
         let mut hdr_metadata_prop: Option<property::Handle> = None;
         let mut colorspace_prop: Option<property::Handle> = None;
 
@@ -170,7 +167,10 @@ impl HdrProps {
                     if matches!(info.value_type(), property::ValueType::Blob) {
                         hdr_metadata_prop = Some(prop_h);
                     } else {
-                        tracing::warn!(?connector, "HDR_OUTPUT_METADATA exists but isn't blob-typed");
+                        tracing::warn!(
+                            ?connector,
+                            "HDR_OUTPUT_METADATA exists but isn't blob-typed"
+                        );
                     }
                 }
                 "Colorspace" => {
@@ -199,11 +199,7 @@ impl HdrProps {
     /// `Colorspace=BT2020_RGB`. Replaces (and destroys) any prior
     /// blob we previously installed. Errors propagate; partial
     /// failure leaves the blob unset rather than half-applied.
-    pub fn set_hdr<D: ControlDevice>(
-        &mut self,
-        drm: &D,
-        signaling: &HdrSignaling,
-    ) -> Result<()> {
+    pub fn set_hdr<D: ControlDevice>(&mut self, drm: &D, signaling: &HdrSignaling) -> Result<()> {
         let blob_bytes = build_hdr_metadata_blob(signaling);
         // drm-rs's `create_property_blob<T>(&T)` takes a generic
         // reference and forwards its byte view. Passing the array

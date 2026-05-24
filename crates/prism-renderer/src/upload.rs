@@ -82,8 +82,8 @@ impl ShmTexture {
             .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        let image = unsafe { device.raw.create_image(&image_info, None) }
-            .vk_ctx("create_image (shm)")?;
+        let image =
+            unsafe { device.raw.create_image(&image_info, None) }.vk_ctx("create_image (shm)")?;
 
         let img_req = unsafe { device.raw.get_image_memory_requirements(image) };
         let img_mem_type = pick_memory(
@@ -119,15 +119,16 @@ impl ShmTexture {
             .memory_type_index(buf_mem_type);
         let staging_memory = unsafe { device.raw.allocate_memory(&buf_alloc, None) }
             .vk_ctx("allocate_memory (shm staging)")?;
-        unsafe { device.raw.bind_buffer_memory(staging_buffer, staging_memory, 0) }
-            .vk_ctx("bind_buffer_memory (shm staging)")?;
+        unsafe {
+            device
+                .raw
+                .bind_buffer_memory(staging_buffer, staging_memory, 0)
+        }
+        .vk_ctx("bind_buffer_memory (shm staging)")?;
         let staging_ptr = unsafe {
-            device.raw.map_memory(
-                staging_memory,
-                0,
-                buf_req.size,
-                vk::MemoryMapFlags::empty(),
-            )
+            device
+                .raw
+                .map_memory(staging_memory, 0, buf_req.size, vk::MemoryMapFlags::empty())
         }
         .vk_ctx("map_memory (shm staging)")? as *mut u8;
 
@@ -163,7 +164,8 @@ impl ShmTexture {
         if bytes.len() < needed.max(src_stride * (self.extent.height as usize)) {
             // bytes too small for the declared geometry — bail rather than
             // read past the end.
-            if bytes.len() < src_stride * (self.extent.height.saturating_sub(1) as usize) + row_bytes
+            if bytes.len()
+                < src_stride * (self.extent.height.saturating_sub(1) as usize) + row_bytes
             {
                 return Err(RendererError::MissingFeature(
                     "shm upload: source buffer smaller than image extent",
@@ -299,11 +301,7 @@ fn bytes_per_pixel_for(format: vk::Format) -> Result<u32> {
     })
 }
 
-fn pick_memory(
-    device: &Device,
-    type_bits: u32,
-    required: vk::MemoryPropertyFlags,
-) -> Result<u32> {
+fn pick_memory(device: &Device, type_bits: u32, required: vk::MemoryPropertyFlags) -> Result<u32> {
     let props = unsafe {
         device
             .instance_raw()

@@ -22,7 +22,7 @@ use std::fs::OpenOptions;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use drm_fourcc::{DrmFourcc, DrmModifier};
 use gbm::{BufferObject, BufferObjectFlags};
 use prism_frame::{Dmabuf, DmabufPlane};
@@ -132,14 +132,9 @@ impl GbmDevice {
     ///
     /// Always ARGB8888 — the only format universally supported by
     /// hardware cursor planes.
-    pub fn allocate_cursor(
-        &self,
-        width: u32,
-        height: u32,
-    ) -> Result<BufferObject<()>> {
-        let usage = BufferObjectFlags::CURSOR
-            | BufferObjectFlags::WRITE
-            | BufferObjectFlags::LINEAR;
+    pub fn allocate_cursor(&self, width: u32, height: u32) -> Result<BufferObject<()>> {
+        let usage =
+            BufferObjectFlags::CURSOR | BufferObjectFlags::WRITE | BufferObjectFlags::LINEAR;
         let bo = self
             .inner
             .create_buffer_object::<()>(width, height, DrmFourcc::Argb8888, usage)

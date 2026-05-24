@@ -93,8 +93,8 @@ impl ExportableImage {
         // Create with an explicit single-element modifier list = LINEAR.
         // The driver picks LINEAR; we then query its exact plane layout.
         let modifiers = [DRM_FORMAT_MOD_LINEAR];
-        let mut modifier_list = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
-            .drm_format_modifiers(&modifiers);
+        let mut modifier_list =
+            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&modifiers);
         let mut external_image = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
 
@@ -312,9 +312,10 @@ impl MirrorCopier {
         let mut export_info = vk::ExportSemaphoreCreateInfo::default()
             .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
         let sem = unsafe {
-            device
-                .raw
-                .create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export_info), None)
+            device.raw.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut export_info),
+                None,
+            )
         }
         .vk_ctx("create_semaphore (mirror copier, exportable SYNC_FD)")?;
         let sem_fd_loader = external_semaphore_fd::Device::new(device.instance_raw(), &device.raw);
@@ -456,8 +457,12 @@ impl MirrorCopier {
     ///
     /// [`destroy_imported_semaphore`]: MirrorCopier::destroy_imported_semaphore
     pub fn import_wait_semaphore(&self, fd: OwnedFd) -> Result<vk::Semaphore> {
-        let sem = unsafe { self.device.raw.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-            .vk_ctx("create_semaphore (mirror wait import)")?;
+        let sem = unsafe {
+            self.device
+                .raw
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        }
+        .vk_ctx("create_semaphore (mirror wait import)")?;
         let info = vk::ImportSemaphoreFdInfoKHR::default()
             .semaphore(sem)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
@@ -489,7 +494,10 @@ impl MirrorCopier {
 impl Drop for MirrorCopier {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.device.raw.wait_for_fences(&[self.fence], true, u64::MAX);
+            let _ = self
+                .device
+                .raw
+                .wait_for_fences(&[self.fence], true, u64::MAX);
             self.device.raw.destroy_semaphore(self.sem, None);
             self.device.raw.destroy_fence(self.fence, None);
             self.device.raw.destroy_command_pool(self.pool, None);
@@ -520,16 +528,24 @@ fn color_layers() -> vk::ImageSubresourceLayers {
 /// block on a transient fence. For the rare one-time mirror-init
 /// transition; the hot copy path uses [`MirrorCopier`]'s persistent fence.
 fn submit_and_wait(device: &Device, cb: vk::CommandBuffer) -> Result<()> {
-    let fence = unsafe { device.raw.create_fence(&vk::FenceCreateInfo::default(), None) }
-        .vk_ctx("create_fence (mirror init submit)")?;
+    let fence = unsafe {
+        device
+            .raw
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+    }
+    .vk_ctx("create_fence (mirror init submit)")?;
     let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
     let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
-    let res = unsafe { device.raw.queue_submit2(device.graphics_queue, &submits, fence) }
-        .vk_ctx("queue_submit2 (mirror init)")
-        .and_then(|_| {
-            unsafe { device.raw.wait_for_fences(&[fence], true, u64::MAX) }
-                .vk_ctx("wait_for_fences (mirror init)")
-        });
+    let res = unsafe {
+        device
+            .raw
+            .queue_submit2(device.graphics_queue, &submits, fence)
+    }
+    .vk_ctx("queue_submit2 (mirror init)")
+    .and_then(|_| {
+        unsafe { device.raw.wait_for_fences(&[fence], true, u64::MAX) }
+            .vk_ctx("wait_for_fences (mirror init)")
+    });
     unsafe { device.raw.destroy_fence(fence, None) };
     res
 }

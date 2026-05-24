@@ -17,7 +17,7 @@
 //! alongside the session notifier.
 
 use anyhow::{Context, Result};
-use prism_renderer::{DrmDevId, EncodeConfig, vk};
+use prism_renderer::{vk, DrmDevId, EncodeConfig};
 use smithay::backend::drm::{DrmDevice, DrmDeviceNotifier};
 
 use crate::{GbmDevice, ScanoutDepth, SeatSession};
@@ -45,8 +45,8 @@ impl DrmCardContext {
     /// cascade.
     pub fn open(session: &mut SeatSession, path: &str) -> Result<(Self, DrmDeviceNotifier)> {
         let drm_fd = session.open_drm(path)?;
-        let (drm, drm_notifier) = DrmDevice::new(drm_fd, false)
-            .with_context(|| format!("DrmDevice::new({path})"))?;
+        let (drm, drm_notifier) =
+            DrmDevice::new(drm_fd, false).with_context(|| format!("DrmDevice::new({path})"))?;
 
         // GBM must share the same fd as DrmDevice (GEM handles are per-fd).
         let gbm = GbmDevice::from_device_fd(drm.device_fd().device_fd())?;

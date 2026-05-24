@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use prism_frame::{DrmFourcc, DrmModifier};
 use prism_renderer::vk;
 use tracing_subscriber::EnvFilter;
@@ -11,7 +11,8 @@ mod ipc;
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("prism=info,vulkan=info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("prism=info,vulkan=info")),
         )
         .init();
 
@@ -61,8 +62,7 @@ fn load_config() -> prism_config::Config {
     let candidate: Option<PathBuf> = std::env::var_os("PRISM_CONFIG")
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(|h| PathBuf::from(h).join("prism/config.kdl"))
+            std::env::var_os("XDG_CONFIG_HOME").map(|h| PathBuf::from(h).join("prism/config.kdl"))
         })
         .or_else(|| {
             std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/prism/config.kdl"))
@@ -197,10 +197,10 @@ fn vk_format_for_depth(depth: prism_drm::ScanoutDepth) -> prism_renderer::vk::Fo
 /// Clients can connect via `WAYLAND_DISPLAY=wayland-N`. No rendering yet —
 /// surface lifecycle / configure / commit are logged, buffers are dropped.
 fn run_wayland_server() -> Result<()> {
-    use calloop::EventLoop;
     use calloop::signals::{Signal, Signals};
-    use std::sync::Arc;
+    use calloop::EventLoop;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     tracing::info!("prism compositor — wayland server scaffolding");
@@ -231,13 +231,8 @@ fn run_wayland_server() -> Result<()> {
     // Single-GPU wayland mode → that's the primary.
     // No config file loaded in wayland-only mode — defaults give the
     // layout enough to bring up an empty workspace set.
-    let mut state = prism_protocols::PrismState::new(
-        &display,
-        load_config(),
-        None,
-        gpus,
-        Some(key),
-    );
+    let mut state =
+        prism_protocols::PrismState::new(&display, load_config(), None, gpus, Some(key));
 
     let mut event_loop: EventLoop<'static, prism_protocols::PrismState> =
         EventLoop::try_new().context("calloop EventLoop::try_new")?;
@@ -330,9 +325,7 @@ fn run_headless_smoke_tests() -> Result<()> {
                 for c in &summary.connectors {
                     let mode_str = c
                         .preferred_mode()
-                        .map(|m| {
-                            format!("{}x{}@{}Hz", m.size().0, m.size().1, m.vrefresh())
-                        })
+                        .map(|m| format!("{}x{}@{}Hz", m.size().0, m.size().1, m.vrefresh()))
                         .unwrap_or_else(|| "<no mode>".to_string());
                     tracing::info!(
                         "  {} {:?} {} modes, preferred {}",
@@ -369,7 +362,7 @@ fn run_headless_smoke_tests() -> Result<()> {
 /// dmabuf fd handoff, memory-type matching, and that Vulkan commands actually
 /// wrote to the same kernel BO the CPU can see.
 fn tracer_clear(device: Arc<prism_renderer::Device>) -> Result<()> {
-    use prism_renderer::{ImportedImage, OneshotPool, oneshot};
+    use prism_renderer::{oneshot, ImportedImage, OneshotPool};
 
     let width: u32 = 256;
     let height: u32 = 16;
@@ -424,7 +417,10 @@ fn tracer_clear(device: Arc<prism_renderer::Device>) -> Result<()> {
         .context("gbm map readback")?;
     tracing::info!(
         "BO pixel(0,0) after clear: B={:#04x} G={:#04x} R={:#04x} X={:#04x}",
-        probe.0, probe.1, probe.2, probe.3
+        probe.0,
+        probe.1,
+        probe.2,
+        probe.3
     );
 
     if probe.0 == 0xff && probe.1 == 0x00 && probe.2 == 0xff {
@@ -432,7 +428,9 @@ fn tracer_clear(device: Arc<prism_renderer::Device>) -> Result<()> {
     } else {
         return Err(anyhow!(
             "readback mismatch: expected B=ff G=00 R=ff, got B={:#04x} G={:#04x} R={:#04x}",
-            probe.0, probe.1, probe.2
+            probe.0,
+            probe.1,
+            probe.2
         ));
     }
     Ok(())
@@ -475,8 +473,8 @@ fn tracer_dmabuf_protocol(device: Arc<prism_renderer::Device>) -> Result<()> {
         .ok_or_else(|| anyhow!("DmabufBuilder::build returned None"))?;
 
     // Convert + import — same call shape as the wayland handler.
-    let prism_dmabuf = prism_frame::Dmabuf::from_smithay(&smithay_dmabuf)
-        .context("Dmabuf::from_smithay")?;
+    let prism_dmabuf =
+        prism_frame::Dmabuf::from_smithay(&smithay_dmabuf).context("Dmabuf::from_smithay")?;
     let _image = prism_renderer::ImportedImage::import(
         device,
         &prism_dmabuf,
@@ -496,21 +494,15 @@ fn tracer_dmabuf_protocol(device: Arc<prism_renderer::Device>) -> Result<()> {
 ///   - dynamic-rendering attachment setup mistakes
 ///   - sRGB OETF math (compare to known curve values)
 fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
-    use prism_renderer::{
-        DecodePush, ElementDraw, EncodePush, ImportedImage, Renderer, vk,
-    };
+    use prism_renderer::{vk, DecodePush, ElementDraw, EncodePush, ImportedImage, Renderer};
 
     let width: u32 = 256;
     let height: u32 = 1;
 
     // Scanout target: a GBM XRGB8888 LINEAR BO we can map for readback.
     let gbm = prism_drm::GbmDevice::open("/dev/dri/renderD129")?;
-    let (bo, dmabuf) = gbm.allocate_scanout(
-        width,
-        height,
-        DrmFourcc::Xrgb8888,
-        &[DrmModifier::Linear],
-    )?;
+    let (bo, dmabuf) =
+        gbm.allocate_scanout(width, height, DrmFourcc::Xrgb8888, &[DrmModifier::Linear])?;
     let scanout = ImportedImage::import(
         device.clone(),
         &dmabuf,
@@ -538,10 +530,7 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     // Single element covering the whole output.
     let element = ElementDraw {
         texture_view: texture.view,
-        push: DecodePush::identity_srgb(
-            [-1.0, -1.0, 1.0, 1.0],
-            [0.0, 0.0, 1.0, 1.0],
-        ),
+        push: DecodePush::identity_srgb([-1.0, -1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
     };
     let encode_push = EncodePush::sdr_identity();
 
@@ -565,7 +554,9 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
         let pmid = bgra(row, 127);
         tracing::info!(
             "gradient readback: x=0 BGRA={:?}  x=127 BGRA={:?}  x=255 BGRA={:?}",
-            p0, pmid, p255
+            p0,
+            pmid,
+            p255
         );
         // Quick sanity bounds (allow small AMD sRGB-OETF rounding).
         let ok = p0.0 <= 4
@@ -657,14 +648,20 @@ fn build_gradient_texture(
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let staging = unsafe { device.raw.create_buffer(&buffer_info, None) }?;
     let req = unsafe { device.raw.get_buffer_memory_requirements(staging) };
-    let mem_type = pick_memory(&device, req.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?;
+    let mem_type = pick_memory(
+        &device,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
     let alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(req.size)
         .memory_type_index(mem_type);
     let staging_mem = unsafe { device.raw.allocate_memory(&alloc, None) }?;
     unsafe { device.raw.bind_buffer_memory(staging, staging_mem, 0) }?;
     unsafe {
-        let dst = device.raw.map_memory(staging_mem, 0, req.size, vk::MemoryMapFlags::empty())?;
+        let dst = device
+            .raw
+            .map_memory(staging_mem, 0, req.size, vk::MemoryMapFlags::empty())?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
         device.raw.unmap_memory(staging_mem);
     }
@@ -673,7 +670,11 @@ fn build_gradient_texture(
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(vk::Format::R16G16B16A16_SFLOAT)
-        .extent(vk::Extent3D { width, height, depth: 1 })
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
         .mip_levels(1)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
@@ -683,8 +684,11 @@ fn build_gradient_texture(
         .initial_layout(vk::ImageLayout::UNDEFINED);
     let image = unsafe { device.raw.create_image(&image_info, None) }?;
     let req = unsafe { device.raw.get_image_memory_requirements(image) };
-    let mem_type =
-        pick_memory(&device, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+    let mem_type = pick_memory(
+        &device,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
     let alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(req.size)
         .memory_type_index(mem_type);
@@ -701,8 +705,8 @@ fn build_gradient_texture(
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(1);
     let cb = unsafe { device.raw.allocate_command_buffers(&cb_info) }?[0];
-    let begin = vk::CommandBufferBeginInfo::default()
-        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    let begin =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     unsafe { device.raw.begin_command_buffer(cb, &begin) }?;
 
     let to_xfer = [vk::ImageMemoryBarrier2::default()
@@ -738,7 +742,11 @@ fn build_gradient_texture(
             layer_count: 1,
         })
         .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-        .image_extent(vk::Extent3D { width, height, depth: 1 })];
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })];
     unsafe {
         device.raw.cmd_copy_buffer_to_image(
             cb,
@@ -785,7 +793,12 @@ fn build_gradient_texture(
     }
 
     let view = prism_renderer::create_view(&device, image, vk::Format::R16G16B16A16_SFLOAT)?;
-    Ok(GradientTexture { device, image, memory, view })
+    Ok(GradientTexture {
+        device,
+        image,
+        memory,
+        view,
+    })
 }
 
 fn pick_memory(
@@ -867,10 +880,10 @@ fn breadcrumb(msg: &str) {
 /// Breadcrumbs are appended to ./prism.crumbs (override with $PRISM_CRUMBS)
 /// with fsync per line, so they survive a system lockup.
 fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> Result<()> {
-    use calloop::EventLoop;
     use calloop::signals::{Signal, Signals};
-    use std::sync::Arc;
+    use calloop::EventLoop;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     let max_frames: Option<u32> = std::env::var("PRISM_MAX_FRAMES")
@@ -959,10 +972,8 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     // Match Vulkan physical devices to DRM cards via DrmDevId. If a card
     // has no matching Vulkan device (driver mismatch), skip that card's
     // outputs but keep the rest of the bringup.
-    let mut gpus: std::collections::HashMap<
-        prism_renderer::DrmDevId,
-        Arc<prism_renderer::Device>,
-    > = std::collections::HashMap::new();
+    let mut gpus: std::collections::HashMap<prism_renderer::DrmDevId, Arc<prism_renderer::Device>> =
+        std::collections::HashMap::new();
     for card in &cards {
         match prism_renderer::Device::new(instance.clone(), Some(card.drm_dev_id)) {
             Ok(device) => {
@@ -1020,10 +1031,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     for card in &mut cards {
         breadcrumb(&format!("bringup loop: entering card {}", card.path));
         let Some(device) = gpus.get(&card.drm_dev_id).cloned() else {
-            tracing::warn!(
-                "card {} has no GPU; skipping all its outputs",
-                card.path
-            );
+            tracing::warn!("card {} has no GPU; skipping all its outputs", card.path);
             breadcrumb(&format!(
                 "bringup loop: {} has no matching GPU, skipping",
                 card.path
@@ -1032,14 +1040,12 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         };
         breadcrumb(&format!("bringup loop: {} picking connectors", card.path));
         let picks: Vec<prism_drm::OutputPick> = match output_name {
-            Some(name) => match prism_drm::pick_by_name_with_config(
-                &card.drm,
-                name,
-                &config.outputs.0,
-            ) {
-                Ok(p) => vec![p],
-                Err(_) => Vec::new(), // OUTPUT might be on a different card
-            },
+            Some(name) => {
+                match prism_drm::pick_by_name_with_config(&card.drm, name, &config.outputs.0) {
+                    Ok(p) => vec![p],
+                    Err(_) => Vec::new(), // OUTPUT might be on a different card
+                }
+            }
             None => prism_drm::pick_all_connected_with_config(&card.drm, &config.outputs.0)
                 .unwrap_or_default(),
         };
@@ -1069,8 +1075,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                         output_config.hdr = Some(resolve_hdr_signaling(hdr_cfg));
                         output_config.depth = prism_drm::ScanoutDepth::Fp16;
                         output_config.vk_format = vk_format_for_depth(output_config.depth);
-                        output_config.encode_config =
-                            prism_renderer::EncodeConfig::default_pq();
+                        output_config.encode_config = prism_renderer::EncodeConfig::default_pq();
                         tracing::info!(
                             connector = %name,
                             "HDR config present: fp16 scanout + PQ encode + KMS signaling"
@@ -1104,20 +1109,17 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                 //   3. Broadcast of SDR reference (SDR mode)
                 // The broadcast fallbacks are conservative all-channels-
                 // equal guesses; calibrate replaces them.
-                output_config.panel_peak_nits_rgb = match cfg
-                    .color
-                    .as_ref()
-                    .and_then(|c| c.panel_peak_nits)
-                {
-                    Some(p) => [p.r as f32, p.g as f32, p.b as f32],
-                    None => {
-                        let scalar = match output_config.hdr {
-                            Some(hdr) => hdr.max_luminance as f32,
-                            None => output_config.sdr_reference_nits,
-                        };
-                        [scalar, scalar, scalar]
-                    }
-                };
+                output_config.panel_peak_nits_rgb =
+                    match cfg.color.as_ref().and_then(|c| c.panel_peak_nits) {
+                        Some(p) => [p.r as f32, p.g as f32, p.b as f32],
+                        None => {
+                            let scalar = match output_config.hdr {
+                                Some(hdr) => hdr.max_luminance as f32,
+                                None => output_config.sdr_reference_nits,
+                            };
+                            [scalar, scalar, scalar]
+                        }
+                    };
                 tracing::info!(
                     connector = %name,
                     panel_peak_nits_rgb = ?output_config.panel_peak_nits_rgb,
@@ -1189,13 +1191,13 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                     // already-populated EDID so EDID-keyed blocks resolve
                     // here too (the bringup-side `edid` above is out of
                     // scope after OutputContext takes ownership).
-                    if let Some(lut3d_cfg) = find_connector_config(&name, &output.edid, &config.outputs.0)
-                        .and_then(|c| c.color.as_ref())
-                        .and_then(|c| c.lut3d.as_ref())
+                    if let Some(lut3d_cfg) =
+                        find_connector_config(&name, &output.edid, &config.outputs.0)
+                            .and_then(|c| c.color.as_ref())
+                            .and_then(|c| c.lut3d.as_ref())
                     {
-                        match prism_renderer::load_lut3d_file(
-                            std::path::Path::new(&lut3d_cfg.path),
-                        ) {
+                        match prism_renderer::load_lut3d_file(std::path::Path::new(&lut3d_cfg.path))
+                        {
                             Ok(loaded) => {
                                 let renderer_edge = output.renderer.lut3d_cube_edge();
                                 if loaded.cube_edge != renderer_edge {
@@ -1263,9 +1265,14 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         }
         breadcrumb(&format!("bringup loop: finished card {}", card.path));
     }
-    breadcrumb(&format!("bringup loop: all cards done, {} outputs total", outputs.len()));
+    breadcrumb(&format!(
+        "bringup loop: all cards done, {} outputs total",
+        outputs.len()
+    ));
     if outputs.is_empty() {
-        return Err(anyhow!("no outputs successfully brought up across any card"));
+        return Err(anyhow!(
+            "no outputs successfully brought up across any card"
+        ));
     }
 
     // ── Wayland display + PrismState ───────────────────────────────────────
@@ -1289,13 +1296,8 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     if let Some(id) = primary_gpu {
         tracing::info!("primary GPU for dmabuf-feedback: {}:{}", id.major, id.minor);
     }
-    let mut state = prism_protocols::PrismState::new(
-        &display,
-        config,
-        Some(session),
-        gpus,
-        primary_gpu,
-    );
+    let mut state =
+        prism_protocols::PrismState::new(&display, config, Some(session), gpus, primary_gpu);
     for card in cards {
         state.attach_card(card);
     }
@@ -1345,7 +1347,10 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     for output in state.outputs.values() {
         tracing::info!(
             "scanout target: {} {}×{} (crtc {:?})",
-            output.connector_name, output.extent.width, output.extent.height, output.crtc
+            output.connector_name,
+            output.extent.width,
+            output.extent.height,
+            output.crtc
         );
     }
 
@@ -1362,7 +1367,9 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         let running = running.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(secs));
-            breadcrumb(&format!("MAX_RUNTIME: {secs}s elapsed, requesting clean exit"));
+            breadcrumb(&format!(
+                "MAX_RUNTIME: {secs}s elapsed, requesting clean exit"
+            ));
             running.store(false, Ordering::SeqCst);
         });
     }
@@ -1393,9 +1400,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                         let n = frame_counter_for_vblank.fetch_add(1, Ordering::SeqCst) + 1;
                         if let Some(max) = max_frames_copy {
                             if n >= max {
-                                breadcrumb(&format!(
-                                    "frame #{n}: max_frames reached, exit"
-                                ));
+                                breadcrumb(&format!("frame #{n}: max_frames reached, exit"));
                                 running_for_vblank.store(false, Ordering::SeqCst);
                             }
                         }
@@ -1456,8 +1461,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             .expect("integrated mode always has a session")
             .libseat_clone();
         let seat_name = seat_session.seat();
-        let mut libinput =
-            Libinput::new_with_udev(LibinputSessionInterface::from(seat_session));
+        let mut libinput = Libinput::new_with_udev(LibinputSessionInterface::from(seat_session));
         libinput
             .udev_assign_seat(&seat_name)
             .map_err(|()| anyhow!("libinput.udev_assign_seat({seat_name}) failed"))?;
@@ -1474,8 +1478,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     // SIGINT / SIGTERM → clean shutdown.
     {
         let running = running.clone();
-        let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM])
-            .context("Signals::new")?;
+        let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM]).context("Signals::new")?;
         event_loop
             .handle()
             .insert_source(signals, move |evt, _, _state| {
@@ -1792,8 +1795,12 @@ fn on_vblank(
     let entry = state.output_redraw.entry(output_id).or_default();
     let prev = std::mem::take(&mut entry.redraw);
     entry.redraw = match prev {
-        RedrawState::WaitingForVBlank { redraw_needed: true } => RedrawState::Queued,
-        RedrawState::WaitingForVBlank { redraw_needed: false } => {
+        RedrawState::WaitingForVBlank {
+            redraw_needed: true,
+        } => RedrawState::Queued,
+        RedrawState::WaitingForVBlank {
+            redraw_needed: false,
+        } => {
             if animations_ongoing {
                 RedrawState::Queued
             } else {
@@ -1842,10 +1849,7 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
     use prism_protocols::redraw::RedrawState;
     match render_output_now(state, output_id) {
         Ok(Some(pending)) => {
-            let entry = state
-                .output_redraw
-                .entry(output_id.to_owned())
-                .or_default();
+            let entry = state.output_redraw.entry(output_id.to_owned()).or_default();
             entry.pending_feedback = Some(pending);
             entry.redraw = RedrawState::WaitingForVBlank {
                 redraw_needed: false,
@@ -1878,7 +1882,7 @@ fn render_output_now(
 ) -> Result<Option<prism_protocols::PendingFeedback>> {
     use prism_layout::layout::RenderCtx;
     use prism_protocols::PendingFeedback;
-    use prism_renderer::{ElementDraw, EncodePush, RenderEl, vk};
+    use prism_renderer::{vk, ElementDraw, EncodePush, RenderEl};
     use smithay::utils::{Logical, Rectangle};
 
     // Snapshot identity bits without holding any borrow into
@@ -1940,17 +1944,18 @@ fn render_output_now(
         [x0, y0, x1, y1]
     };
 
-    let texture_lookup = |states: &smithay::wayland::compositor::SurfaceData| -> Option<vk::ImageView> {
-        states
-            .data_map
-            .get::<prism_protocols::SurfaceTexSlot>()
-            .and_then(|s| {
-                s.0.lock()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(|t| t.view_for(output_gpu_id))
-            })
-    };
+    let texture_lookup =
+        |states: &smithay::wayland::compositor::SurfaceData| -> Option<vk::ImageView> {
+            states
+                .data_map
+                .get::<prism_protocols::SurfaceTexSlot>()
+                .and_then(|s| {
+                    s.0.lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|t| t.view_for(output_gpu_id))
+                })
+        };
     // Per-surface decode params from wp_color_management_v1. Falls
     // through to RenderCtx::color_for's default (sRGB + the output's
     // sdr_reference_nits) for surfaces with no description set —
@@ -1969,32 +1974,34 @@ fn render_output_now(
     let missing_textures: std::cell::RefCell<
         Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
     > = std::cell::RefCell::new(Vec::new());
-    let report_missing = |s: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| {
-        missing_textures.borrow_mut().push(s.clone());
-    };
+    let report_missing =
+        |s: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| {
+            missing_textures.borrow_mut().push(s.clone());
+        };
     // Surfaces drawn on this output whose texture is a cross-GPU mirror for
     // this GPU — collected during the walk, synced (async copy) before the
     // present submit.
     let mirror_surfaces: std::cell::RefCell<
         Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
     > = std::cell::RefCell::new(Vec::new());
-    let report_mirror = |s: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
-                         states: &smithay::wayland::compositor::SurfaceData| {
-        let is_mirror = states
-            .data_map
-            .get::<prism_protocols::SurfaceTexSlot>()
-            .map(|slot| {
-                slot.0
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|t| t.is_mirror_for(output_gpu_id))
-            })
-            .unwrap_or(false);
-        if is_mirror {
-            mirror_surfaces.borrow_mut().push(s.clone());
-        }
-    };
+    let report_mirror =
+        |s: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+         states: &smithay::wayland::compositor::SurfaceData| {
+            let is_mirror = states
+                .data_map
+                .get::<prism_protocols::SurfaceTexSlot>()
+                .map(|slot| {
+                    slot.0
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|t| t.is_mirror_for(output_gpu_id))
+                })
+                .unwrap_or(false);
+            if is_mirror {
+                mirror_surfaces.borrow_mut().push(s.clone());
+            }
+        };
     let ctx = RenderCtx {
         texture_lookup: &texture_lookup,
         color_lookup: &color_lookup,
@@ -2075,10 +2082,9 @@ fn render_output_now(
         if !matches!(layer, smithay::wayland::shell::wlr_layer::Layer::Overlay) {
             continue;
         }
-        let Some(texture_view) = smithay::wayland::compositor::with_states(
-            wl_surface,
-            |states| (ctx.texture_lookup)(states),
-        ) else {
+        let Some(texture_view) = smithay::wayland::compositor::with_states(wl_surface, |states| {
+            (ctx.texture_lookup)(states)
+        }) else {
             continue;
         };
         let dst = smithay::utils::Rectangle::<f64, smithay::utils::Logical>::new(
@@ -2088,10 +2094,8 @@ fn render_output_now(
         let dst_rect_clip = project(dst);
         // Use RenderCtx::color_for so layer-shell surfaces share the
         // same per-output sdr_reference_nits fallback as toplevels.
-        let color = smithay::wayland::compositor::with_states(
-            wl_surface,
-            |states| ctx.color_for(states),
-        );
+        let color =
+            smithay::wayland::compositor::with_states(wl_surface, |states| ctx.color_for(states));
         render_els.push(RenderEl::Surface(prism_renderer::SurfaceEl {
             texture_view,
             dst_rect_clip,
@@ -2116,12 +2120,10 @@ fn render_output_now(
     static FIRST_WITH_TILES: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashSet<String>>,
     > = std::sync::OnceLock::new();
-    let has_surface = render_els
-        .iter()
-        .any(|e| matches!(e, RenderEl::Surface(_)));
+    let has_surface = render_els.iter().any(|e| matches!(e, RenderEl::Surface(_)));
     if has_surface {
-        let seen =
-            FIRST_WITH_TILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let seen = FIRST_WITH_TILES
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
         if seen.lock().unwrap().insert(output_id.to_owned()) {
             let first_surface = render_els.iter().find_map(|e| match e {
                 RenderEl::Surface(s) => Some(s.dst_rect_clip),
@@ -2228,39 +2230,41 @@ fn render_output_now(
     // `drm_syncobj::tracker_for_render` helper) self-deadlocks
     // here. Read SurfaceReleaseSlot directly off the `states`
     // we already have instead.
-    let mut harvest = |root: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| {
-        use prism_protocols::drm_syncobj::SurfaceReleaseSlot;
-        use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
-        with_surface_tree_downward(
-            root,
-            (),
-            |_, _, &()| TraversalAction::DoChildren(()),
-            |_surface, states, &()| {
-                frame_cbs.append(&mut std::mem::take(
-                    &mut states
-                        .cached_state
-                        .get::<smithay::wayland::compositor::SurfaceAttributes>()
-                        .current()
-                        .frame_callbacks,
-                ));
-                presentation_cbs.append(&mut std::mem::take(
-                    &mut states
-                        .cached_state
-                        .get::<smithay::wayland::presentation::PresentationFeedbackCachedState>()
-                        .current()
-                        .callbacks,
-                ));
-                if let Some(t) = states
-                    .data_map
-                    .get::<SurfaceReleaseSlot>()
-                    .and_then(|slot| slot.current())
-                {
-                    release_trackers.push(t);
-                }
-            },
-            |_, _, &()| true,
-        );
-    };
+    let mut harvest =
+        |root: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| {
+            use prism_protocols::drm_syncobj::SurfaceReleaseSlot;
+            use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
+            with_surface_tree_downward(
+                root,
+                (),
+                |_, _, &()| TraversalAction::DoChildren(()),
+                |_surface, states, &()| {
+                    frame_cbs.append(&mut std::mem::take(
+                        &mut states
+                            .cached_state
+                            .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                            .current()
+                            .frame_callbacks,
+                    ));
+                    presentation_cbs.append(&mut std::mem::take(
+                        &mut states
+                            .cached_state
+                            .get::<smithay::wayland::presentation::PresentationFeedbackCachedState>(
+                            )
+                            .current()
+                            .callbacks,
+                    ));
+                    if let Some(t) = states
+                        .data_map
+                        .get::<SurfaceReleaseSlot>()
+                        .and_then(|slot| slot.current())
+                    {
+                        release_trackers.push(t);
+                    }
+                },
+                |_, _, &()| true,
+            );
+        };
 
     for surface in &surfaces {
         let belongs_here = state
@@ -2349,12 +2353,9 @@ fn clock_monotonic_now() -> std::time::Duration {
 /// the scanout image is rendered through the two-pass decode→encode pipeline
 /// using a horizontal-gradient texture. Visual verification: a smoothly
 /// gamma-correct gradient (black on the left → white on the right).
-fn run_gradient_scanout(
-    output_name: Option<&str>,
-    depth: prism_drm::ScanoutDepth,
-) -> Result<()> {
+fn run_gradient_scanout(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> Result<()> {
     use prism_drm::scanout;
-    use prism_renderer::{DecodePush, ElementDraw, EncodePush, Renderer, vk};
+    use prism_renderer::{vk, DecodePush, ElementDraw, EncodePush, Renderer};
     use smithay::backend::drm::{DrmDevice, PlaneConfig, PlaneState};
     use smithay::utils::{Rectangle, Transform};
     use std::time::Duration;
@@ -2427,7 +2428,8 @@ fn run_gradient_scanout(
     )?;
     tracing::info!(
         "scanout BO ready: {w}x{h} {:?} LINEAR (Vulkan {:?})",
-        fourcc, vk_format
+        fourcc,
+        vk_format
     );
 
     let texture = build_gradient_texture(device.clone(), 1024)?;
@@ -2491,7 +2493,7 @@ fn run_gradient_scanout(
 ///    or `video` group and seatd/logind is running.)
 fn run_scanout_smoke_test(output_name: Option<&str>) -> Result<()> {
     use prism_drm::scanout;
-    use prism_renderer::{ImportedImage, OneshotPool, oneshot};
+    use prism_renderer::{oneshot, ImportedImage, OneshotPool};
     use smithay::backend::drm::{DrmDevice, PlaneConfig, PlaneState};
     use smithay::utils::{Rectangle, Transform};
 
@@ -2526,9 +2528,13 @@ fn run_scanout_smoke_test(output_name: Option<&str>) -> Result<()> {
     let drm_fd = session
         .open_drm(drm_path)
         .with_context(|| format!("open {drm_path} via libseat"))?;
-    let (mut drm, _drm_notifier) = DrmDevice::new(drm_fd, false)
-        .with_context(|| format!("DrmDevice::new({drm_path})"))?;
-    tracing::info!("DRM atomic={} dev_id={:?}", drm.is_atomic(), drm.device_id());
+    let (mut drm, _drm_notifier) =
+        DrmDevice::new(drm_fd, false).with_context(|| format!("DrmDevice::new({drm_path})"))?;
+    tracing::info!(
+        "DRM atomic={} dev_id={:?}",
+        drm.is_atomic(),
+        drm.device_id()
+    );
 
     // Pick a connected output: by name if specified, else the first one.
     let pick = match output_name {

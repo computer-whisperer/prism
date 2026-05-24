@@ -318,7 +318,9 @@ impl Outputs {
     }
 
     pub fn find_mut(&mut self, name: &OutputName) -> Option<&mut Output> {
-        self.0.iter_mut().find(|o| block_matches_output(&o.name, name))
+        self.0
+            .iter_mut()
+            .find(|o| block_matches_output(&o.name, name))
     }
 }
 

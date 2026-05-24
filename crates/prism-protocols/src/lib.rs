@@ -22,8 +22,7 @@ pub use input_state::{KeyboardFocus, PointerVisibility};
 pub use redraw::{OutputRedrawState, PendingFeedback, RedrawState};
 pub use server::insert_wayland_sources;
 pub use state::{
-    PrismState, destroy_mirror_waits, materialize_surface_on_gpu, new_display,
-    prepare_mirror_waits,
+    destroy_mirror_waits, materialize_surface_on_gpu, new_display, prepare_mirror_waits, PrismState,
 };
 pub use surface_tex::{
     GpuTex, SurfacePlacement, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture, TexSource,

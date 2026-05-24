@@ -20,19 +20,19 @@ pub mod upload;
 
 pub use cross_gpu::{ExportableImage, MirrorCopier, MirrorCopyOp};
 pub use device::{Device, DrmDevId, DrmFormatModifierInfo, PhysicalDeviceInfo};
-pub use diagnose::{DiagnosedNits, EncodeDiagnoseProbe, decode_scanout_texel};
+pub use diagnose::{decode_scanout_texel, DiagnosedNits, EncodeDiagnoseProbe};
 pub use dmabuf::ImportedImage;
 pub use element::{
-    BorderEl, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl, srgb_to_bt2020_nits,
+    srgb_to_bt2020_nits, BorderEl, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl,
 };
 pub use encode_synth::{EncodeConfig, EncodeFragment, EncodePushSynth};
 pub use error::{RendererError, Result};
 pub use instance::Instance;
-pub use intermediate::{DEFAULT_INTERMEDIATE_FORMAT, Intermediate, create_view};
+pub use intermediate::{create_view, Intermediate, DEFAULT_INTERMEDIATE_FORMAT};
 pub use lut3d::{
-    LUT_FILE_HEADER_BYTES, LUT_FILE_IN_TF_PQ, LUT_FILE_MAGIC, LUT_FILE_TRIPLE_BYTES,
-    LUT_FILE_VERSION, LUT_FORMAT, LoadedLut, Lut3dTexture, LutFileHeader, identity_lut,
-    load_lut3d_file, pq_eotf, save_lut3d_file, synthesize_lut_from_matrix_curve,
+    identity_lut, load_lut3d_file, pq_eotf, save_lut3d_file, synthesize_lut_from_matrix_curve,
+    LoadedLut, Lut3dTexture, LutFileHeader, LUT_FILE_HEADER_BYTES, LUT_FILE_IN_TF_PQ,
+    LUT_FILE_MAGIC, LUT_FILE_TRIPLE_BYTES, LUT_FILE_VERSION, LUT_FORMAT,
 };
 pub use oneshot::OneshotPool;
 pub use pipeline::decode::{DecodePipeline, DecodePush};

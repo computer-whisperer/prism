@@ -30,27 +30,22 @@
 //! to content-hash so the same parametric description gets a stable ID.
 
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
 };
 
 use smithay::reexports::wayland_protocols::wp::color_management::v1::server::{
-    wp_color_management_surface_v1::{
-        self, WpColorManagementSurfaceV1,
-    },
+    wp_color_management_surface_v1::{self, WpColorManagementSurfaceV1},
     wp_color_manager_v1::{
         self, Feature, Primaries, RenderIntent, TransferFunction, WpColorManagerV1,
     },
-    wp_image_description_creator_params_v1::{
-        self, WpImageDescriptionCreatorParamsV1,
-    },
+    wp_image_description_creator_params_v1::{self, WpImageDescriptionCreatorParamsV1},
     wp_image_description_info_v1::WpImageDescriptionInfoV1,
     wp_image_description_v1::{self, WpImageDescriptionV1},
 };
 use smithay::reexports::wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
-    backend::ClientId,
-    protocol::wl_surface::WlSurface,
+    backend::ClientId, protocol::wl_surface::WlSurface, Client, DataInit, Dispatch, DisplayHandle,
+    GlobalDispatch, New, Resource,
 };
 use smithay::wayland::compositor::{self, SurfaceData};
 
@@ -89,8 +84,7 @@ const SUPPORTED_TFS: &[TransferFunction] = &[
 /// Named primaries we advertise via `supported_primaries_named`.
 /// Spyder + general clients minimally need sRGB and BT.2020; more
 /// can be added as use cases arrive (DCI-P3 / Display P3 for video).
-const SUPPORTED_PRIMARIES: &[Primaries] =
-    &[Primaries::Srgb, Primaries::Bt2020];
+const SUPPORTED_PRIMARIES: &[Primaries] = &[Primaries::Srgb, Primaries::Bt2020];
 
 /// A complete, validated image description. Created by the params
 /// creator's `create` request after all required fields are set.
@@ -240,9 +234,7 @@ impl SurfaceColorFeedbackSlot {
 /// total over every TF we advertise in `SUPPORTED_TFS`; unsupported
 /// TFs can never reach a committed description (the params creator
 /// rejects them with `invalid_tf`).
-pub fn description_to_params(
-    desc: &ImageDescription,
-) -> prism_renderer::SurfaceColorParams {
+pub fn description_to_params(desc: &ImageDescription) -> prism_renderer::SurfaceColorParams {
     let transfer = match desc.tf {
         // Linear path — pixels already in linear-light. Caller
         // anchors via sdr_white_nits.
@@ -316,9 +308,8 @@ pub struct ColorManagementState {
     /// + EDID. Cleared when an output drops. Identity is stable for
     /// the lifetime of the cached `Arc` (re-derivation only happens
     /// when HDR config changes, which today is bringup-static).
-    output_preferred: std::sync::Mutex<
-        std::collections::HashMap<crate::state::OutputId, Arc<ImageDescription>>,
-    >,
+    output_preferred:
+        std::sync::Mutex<std::collections::HashMap<crate::state::OutputId, Arc<ImageDescription>>>,
     /// `wp_image_description_info_v1` resources whose info events have
     /// been emitted but whose terminating `done()` is pending.
     ///
@@ -354,22 +345,12 @@ impl ColorManagementState {
     /// HDR/EDID state. Returns the registered Arc so the caller can
     /// also push it to any feedback resources already bound on
     /// surfaces newly-mapped to this output.
-    pub fn set_output_preferred(
-        &self,
-        id: crate::state::OutputId,
-        desc: Arc<ImageDescription>,
-    ) {
-        self.output_preferred
-            .lock()
-            .unwrap()
-            .insert(id, desc);
+    pub fn set_output_preferred(&self, id: crate::state::OutputId, desc: Arc<ImageDescription>) {
+        self.output_preferred.lock().unwrap().insert(id, desc);
     }
 
     /// Look up an output's preferred description.
-    pub fn output_preferred(
-        &self,
-        id: &crate::state::OutputId,
-    ) -> Option<Arc<ImageDescription>> {
+    pub fn output_preferred(&self, id: &crate::state::OutputId) -> Option<Arc<ImageDescription>> {
         self.output_preferred.lock().unwrap().get(id).cloned()
     }
 
@@ -586,9 +567,9 @@ impl Dispatch<WpColorManagerV1, ()> for PrismState {
                 };
                 let instance = data_init.init(id, data);
                 compositor::with_states(&surface, |states| {
-                    states.data_map.insert_if_missing_threadsafe(
-                        SurfaceColorFeedbackSlot::default,
-                    );
+                    states
+                        .data_map
+                        .insert_if_missing_threadsafe(SurfaceColorFeedbackSlot::default);
                     let slot = states.data_map.get::<SurfaceColorFeedbackSlot>().unwrap();
                     let mut st = slot.0.lock().unwrap();
                     st.instances.push(instance.downgrade());
@@ -631,7 +612,10 @@ impl Dispatch<WpColorManagerV1, ()> for PrismState {
                 );
                 let _ = image_description;
             }
-            Request::GetImageDescription { image_description, reference: _ } => {
+            Request::GetImageDescription {
+                image_description,
+                reference: _,
+            } => {
                 // v2 addition — for clients holding a reference (we
                 // don't expose any reference-yielding requests today),
                 // re-materialize the description. Until reference-
@@ -668,8 +652,10 @@ impl Dispatch<WpColorManagementOutputV1, ()> for PrismState {
         match request {
             Request::Destroy => {}
             Request::GetImageDescription { image_description } => {
-                let desc =
-                    data_init.init(image_description, ImageDescriptionData { description: None });
+                let desc = data_init.init(
+                    image_description,
+                    ImageDescriptionData { description: None },
+                );
                 // Per spec for an inert protocol object: immediately
                 // deliver `failed`.
                 desc.failed(
@@ -821,10 +807,8 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsCreatorData> for PrismSta
                         desc_resource.ready(lo);
                     }
                     Err(reason) => {
-                        desc_resource.failed(
-                            wp_image_description_v1::Cause::Unsupported,
-                            reason.into(),
-                        );
+                        desc_resource
+                            .failed(wp_image_description_v1::Cause::Unsupported, reason.into());
                     }
                 }
             }
@@ -875,7 +859,14 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsCreatorData> for PrismSta
                 inner.primaries = Some(PrimaryVolume::Named(p));
             }
             Request::SetPrimaries {
-                r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y,
+                r_x,
+                r_y,
+                g_x,
+                g_y,
+                b_x,
+                b_y,
+                w_x,
+                w_y,
             } => {
                 if inner.primaries.is_some() {
                     resource.post_error(
@@ -885,11 +876,20 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsCreatorData> for PrismSta
                     return;
                 }
                 inner.primaries = Some(PrimaryVolume::Explicit(PrimaryChromaticities {
-                    r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y,
+                    r_x,
+                    r_y,
+                    g_x,
+                    g_y,
+                    b_x,
+                    b_y,
+                    w_x,
+                    w_y,
                 }));
             }
             Request::SetLuminances {
-                min_lum, max_lum, reference_lum,
+                min_lum,
+                max_lum,
+                reference_lum,
             } => {
                 if inner.luminances.is_some() {
                     resource.post_error(
@@ -914,7 +914,14 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsCreatorData> for PrismSta
                 });
             }
             Request::SetMasteringDisplayPrimaries {
-                r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y,
+                r_x,
+                r_y,
+                g_x,
+                g_y,
+                b_x,
+                b_y,
+                w_x,
+                w_y,
             } => {
                 if inner.mastering_primaries.is_some() {
                     resource.post_error(
@@ -924,7 +931,14 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ParamsCreatorData> for PrismSta
                     return;
                 }
                 inner.mastering_primaries = Some(PrimaryChromaticities {
-                    r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y,
+                    r_x,
+                    r_y,
+                    g_x,
+                    g_y,
+                    b_x,
+                    b_y,
+                    w_x,
+                    w_y,
                 });
             }
             Request::SetMasteringLuminance { min_lum, max_lum } => {
@@ -1021,10 +1035,8 @@ fn emit_info_events(info: &WpImageDescriptionInfoV1, desc: &ImageDescription) {
         PrimaryVolume::Explicit(c) => (c, None),
     };
     info.primaries(
-        chroma.r_x, chroma.r_y,
-        chroma.g_x, chroma.g_y,
-        chroma.b_x, chroma.b_y,
-        chroma.w_x, chroma.w_y,
+        chroma.r_x, chroma.r_y, chroma.g_x, chroma.g_y, chroma.b_x, chroma.b_y, chroma.w_x,
+        chroma.w_y,
     );
     if let Some(p) = named {
         info.primaries_named(p);
@@ -1038,23 +1050,28 @@ fn emit_info_events(info: &WpImageDescriptionInfoV1, desc: &ImageDescription) {
     info.luminances(lums.min_lum_ticks, lums.max_lum, lums.reference_lum);
 
     if let Some(target) = desc.mastering_primaries {
-        let equal = target.r_x == chroma.r_x && target.r_y == chroma.r_y
-            && target.g_x == chroma.g_x && target.g_y == chroma.g_y
-            && target.b_x == chroma.b_x && target.b_y == chroma.b_y
-            && target.w_x == chroma.w_x && target.w_y == chroma.w_y;
+        let equal = target.r_x == chroma.r_x
+            && target.r_y == chroma.r_y
+            && target.g_x == chroma.g_x
+            && target.g_y == chroma.g_y
+            && target.b_x == chroma.b_x
+            && target.b_y == chroma.b_y
+            && target.w_x == chroma.w_x
+            && target.w_y == chroma.w_y;
         if !equal {
             info.target_primaries(
-                target.r_x, target.r_y,
-                target.g_x, target.g_y,
-                target.b_x, target.b_y,
-                target.w_x, target.w_y,
+                target.r_x, target.r_y, target.g_x, target.g_y, target.b_x, target.b_y, target.w_x,
+                target.w_y,
             );
         }
     }
 
     let target_lum = desc.mastering_luminance.unwrap_or_else(|| {
         let l = default_luminances_for_tf(desc.tf);
-        MasteringLuminance { min_lum_ticks: l.min_lum_ticks, max_lum: l.max_lum }
+        MasteringLuminance {
+            min_lum_ticks: l.min_lum_ticks,
+            max_lum: l.max_lum,
+        }
     });
     info.target_luminance(target_lum.min_lum_ticks, target_lum.max_lum);
 
@@ -1075,17 +1092,25 @@ fn emit_info_events(info: &WpImageDescriptionInfoV1, desc: &ImageDescription) {
 fn chromaticities_for_named(p: Primaries) -> PrimaryChromaticities {
     match p {
         Primaries::Bt2020 => PrimaryChromaticities {
-            r_x: 708_000, r_y: 292_000,
-            g_x: 170_000, g_y: 797_000,
-            b_x: 131_000, b_y: 46_000,
-            w_x: 312_700, w_y: 329_000,
+            r_x: 708_000,
+            r_y: 292_000,
+            g_x: 170_000,
+            g_y: 797_000,
+            b_x: 131_000,
+            b_y: 46_000,
+            w_x: 312_700,
+            w_y: 329_000,
         },
         // sRGB / BT.709 + anything we don't have explicit values for.
         _ => PrimaryChromaticities {
-            r_x: 640_000, r_y: 330_000,
-            g_x: 300_000, g_y: 600_000,
-            b_x: 150_000, b_y: 60_000,
-            w_x: 312_700, w_y: 329_000,
+            r_x: 640_000,
+            r_y: 330_000,
+            g_x: 300_000,
+            g_y: 600_000,
+            b_x: 150_000,
+            b_y: 60_000,
+            w_x: 312_700,
+            w_y: 329_000,
         },
     }
 }
@@ -1193,7 +1218,10 @@ impl Dispatch<WpColorManagementSurfaceV1, ColorSurfaceData> for PrismState {
                     queue_unset(&surface);
                 }
             }
-            Request::SetImageDescription { image_description, render_intent } => {
+            Request::SetImageDescription {
+                image_description,
+                render_intent,
+            } => {
                 let Ok(surface) = data.surface.upgrade() else {
                     resource.post_error(
                         wp_color_management_surface_v1::Error::Inert,
@@ -1287,12 +1315,12 @@ fn queue_unset(surface: &WlSurface) {
 
 // ─── Helpers: WEnum conversions ────────────────────────────────────────────
 
-fn into_tf(v: smithay::reexports::wayland_server::WEnum<TransferFunction>) -> Option<TransferFunction> {
+fn into_tf(
+    v: smithay::reexports::wayland_server::WEnum<TransferFunction>,
+) -> Option<TransferFunction> {
     v.into_result().ok()
 }
 
-fn into_primaries(
-    v: smithay::reexports::wayland_server::WEnum<Primaries>,
-) -> Option<Primaries> {
+fn into_primaries(v: smithay::reexports::wayland_server::WEnum<Primaries>) -> Option<Primaries> {
     v.into_result().ok()
 }

@@ -25,9 +25,7 @@
 //! The full layer-shell version (status bars, notification daemons,
 //! wallpapers) is a follow-up — see `docs/phase-2-scanout-followups.md`.
 
-use smithay::reexports::wayland_server::protocol::{
-    wl_output::WlOutput, wl_surface::WlSurface,
-};
+use smithay::reexports::wayland_server::protocol::{wl_output::WlOutput, wl_surface::WlSurface};
 use smithay::utils::{Logical, Rectangle, Size};
 use smithay::wayland::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerSurface, LayerSurfaceCachedState,
@@ -132,9 +130,11 @@ impl PrismState {
     /// about the output yet (e.g. just-added, layout::add_output
     /// hasn't run).
     fn output_logical_size(&self, id: &OutputId) -> Size<i32, Logical> {
-        if let Some(monitor) = self.wl_outputs.get(id).and_then(|out| {
-            self.layout.monitor_for_output(out)
-        }) {
+        if let Some(monitor) = self
+            .wl_outputs
+            .get(id)
+            .and_then(|out| self.layout.monitor_for_output(out))
+        {
             let s: Size<i32, Logical> = monitor.view_size().to_i32_round();
             return Size::from((s.w.max(1), s.h.max(1)));
         }
@@ -174,8 +174,7 @@ impl PrismState {
         let wl_surface = surface.wl_surface().clone();
         let (anchor, want_size, ki, layer_actual) =
             smithay::wayland::compositor::with_states(&wl_surface, |states| {
-                let mut guard =
-                    states.cached_state.get::<LayerSurfaceCachedState>();
+                let mut guard = states.cached_state.get::<LayerSurfaceCachedState>();
                 let pending = guard.pending();
                 (
                     pending.anchor,
@@ -217,9 +216,9 @@ impl PrismState {
         // (mirrors what dispatch_surface_output_from_layout does for
         // xdg toplevels).
         smithay::wayland::compositor::with_states(&wl_surface, |states| {
-            states.data_map.insert_if_missing_threadsafe(
-                crate::surface_tex::SurfacePlacementSlot::default,
-            );
+            states
+                .data_map
+                .insert_if_missing_threadsafe(crate::surface_tex::SurfacePlacementSlot::default);
             let slot = states
                 .data_map
                 .get::<crate::surface_tex::SurfacePlacementSlot>()
@@ -237,7 +236,10 @@ impl PrismState {
             layer: layer_actual,
             last_rect: Some(rect),
         };
-        self.layer_surfaces.entry(output_id.clone()).or_default().push(entry);
+        self.layer_surfaces
+            .entry(output_id.clone())
+            .or_default()
+            .push(entry);
 
         // Queue a redraw — the surface won't actually render until
         // its first buffer commit, but Tab-completing the redraw

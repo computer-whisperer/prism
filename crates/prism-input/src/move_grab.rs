@@ -19,13 +19,13 @@
 
 use prism_protocols::PrismState;
 use smithay::desktop::Window;
-use smithay::input::SeatHandler;
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
     GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
     GestureSwipeUpdateEvent, GrabStartData, MotionEvent, PointerGrab, PointerInnerHandle,
     RelativeMotionEvent,
 };
+use smithay::input::SeatHandler;
 use smithay::output::Output;
 use smithay::utils::{IsAlive, Logical, Point};
 
@@ -49,9 +49,10 @@ impl MoveGrab {
         pos_within_output: Point<f64, Logical>,
         output: Output,
     ) -> Option<Self> {
-        let started = state
-            .layout
-            .interactive_move_begin(window.clone(), &output, pos_within_output);
+        let started =
+            state
+                .layout
+                .interactive_move_begin(window.clone(), &output, pos_within_output);
         if !started {
             return None;
         }
@@ -107,7 +108,10 @@ impl PointerGrab<PrismState> for MoveGrab {
         &mut self,
         data: &mut PrismState,
         handle: &mut PointerInnerHandle<'_, PrismState>,
-        _focus: Option<(<PrismState as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
+        _focus: Option<(
+            <PrismState as SeatHandler>::PointerFocus,
+            Point<f64, Logical>,
+        )>,
         event: &MotionEvent,
     ) {
         // While a move grab is active, no client receives pointer
@@ -121,7 +125,10 @@ impl PointerGrab<PrismState> for MoveGrab {
         &mut self,
         data: &mut PrismState,
         handle: &mut PointerInnerHandle<'_, PrismState>,
-        _focus: Option<(<PrismState as SeatHandler>::PointerFocus, Point<f64, Logical>)>,
+        _focus: Option<(
+            <PrismState as SeatHandler>::PointerFocus,
+            Point<f64, Logical>,
+        )>,
         event: &RelativeMotionEvent,
     ) {
         handle.relative_motion(data, None, event);
@@ -245,4 +252,3 @@ pub(crate) fn queue_redraw_all(state: &mut PrismState) {
         state.output_redraw.entry(id).or_default().queue_redraw();
     }
 }
-

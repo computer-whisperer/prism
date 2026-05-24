@@ -44,12 +44,12 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 use tristim_display::PatchSurface;
-use tristim_driver::{Calibration, Colorimeter, Setup, Xyz, measurement::raw_to_xyz};
+use tristim_driver::{measurement::raw_to_xyz, Calibration, Colorimeter, Setup, Xyz};
 
 use crate::common::{
-    Channel, OutputBaseline, apply_border, apply_panel_peaks, open_patch_surface,
-    query_output_baseline, send_action, set_channel_patch, set_patch_off, set_white_patch,
-    show_alignment_patch,
+    apply_border, apply_panel_peaks, open_patch_surface, query_output_baseline, send_action,
+    set_channel_patch, set_patch_off, set_white_patch, show_alignment_patch, Channel,
+    OutputBaseline,
 };
 use prism_ipc::OutputAction;
 
@@ -173,8 +173,8 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
     // Phase 0 — query baseline state via IPC. Failing here means the
     // compositor isn't running or PRISM_SOCKET isn't set; bail before
     // touching the colorimeter or display surface.
-    let baseline = query_output_baseline(&args.output)
-        .context("query baseline output state via prism IPC")?;
+    let baseline =
+        query_output_baseline(&args.output).context("query baseline output state via prism IPC")?;
     eprintln!(
         "Baseline for {}: mode={}, panel_peak={:?}, sdr_ref={}, prior_curve={}",
         args.output,
@@ -191,8 +191,7 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
     // Reset any prior runtime overrides so we always start from KDL
     // defaults (modulo what's actually compiled in). The fit math
     // assumes the curve is identity before the first iteration.
-    send_action(&args.output, OutputAction::ResetColor)
-        .context("initial ResetColor")?;
+    send_action(&args.output, OutputAction::ResetColor).context("initial ResetColor")?;
 
     // Open hardware. Probe colorimeter first — if the puck isn't
     // plugged in / udev rule missing we want to fail before the user
@@ -203,12 +202,16 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
         "Colorimeter: Spyder SN {} HW {}.{:02}",
         info.serial, info.hw_version.0, info.hw_version.1
     );
-    let cal = device.get_calibration(args.cal).context("download cal matrix")?;
+    let cal = device
+        .get_calibration(args.cal)
+        .context("download cal matrix")?;
     let setup = device.get_setup(&cal).context("download setup")?;
 
     // Patch surface. Mode picks the constructor.
     let mut patch = open_patch_surface(&args.output, baseline.hdr_active)?;
-    patch.set_window_fraction(args.window).context("set window fraction")?;
+    patch
+        .set_window_fraction(args.window)
+        .context("set window fraction")?;
 
     // Configure the border (anti-CABL surround) unless --no-border.
     // The border colour is held across all subsequent set_color /
@@ -270,9 +273,12 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
     );
     eprintln!(
         "  measured panel primaries (xy): R=({:.4}, {:.4})  G=({:.4}, {:.4})  B=({:.4}, {:.4})",
-        measured_primaries[0].0, measured_primaries[0].1,
-        measured_primaries[1].0, measured_primaries[1].1,
-        measured_primaries[2].0, measured_primaries[2].1,
+        measured_primaries[0].0,
+        measured_primaries[0].1,
+        measured_primaries[1].0,
+        measured_primaries[1].1,
+        measured_primaries[2].0,
+        measured_primaries[2].1,
     );
 
     // HDR mode: DON'T set the clamp to probe_peak_y here. Refine
@@ -355,17 +361,18 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
     // path doesn't go through CTM in the SDR pipeline). Discard the
     // identity CTM rather than persisting it.
     let ctm: Option<[[f64; 3]; 3]> = if baseline.hdr_active {
-        eprintln!(
-            "\nFinal CTM (BT.2020 → panel-native, row-major):"
-        );
+        eprintln!("\nFinal CTM (BT.2020 → panel-native, row-major):");
         for row in &ctm_inner {
             eprintln!("  {:>9.5}  {:>9.5}  {:>9.5}", row[0], row[1], row[2]);
         }
         eprintln!(
             "Final measured primaries (xy): R=({:.4},{:.4}) G=({:.4},{:.4}) B=({:.4},{:.4})",
-            final_primaries[0].0, final_primaries[0].1,
-            final_primaries[1].0, final_primaries[1].1,
-            final_primaries[2].0, final_primaries[2].1,
+            final_primaries[0].0,
+            final_primaries[0].1,
+            final_primaries[1].0,
+            final_primaries[1].1,
+            final_primaries[2].0,
+            final_primaries[2].1,
         );
         Some(ctm_inner)
     } else {
@@ -435,9 +442,7 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
             writeln!(
                 w,
                 "# final CTM (row-major): {:.6} {:.6} {:.6}  {:.6} {:.6} {:.6}  {:.6} {:.6} {:.6}",
-                m[0][0], m[0][1], m[0][2],
-                m[1][0], m[1][1], m[1][2],
-                m[2][0], m[2][1], m[2][2],
+                m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
             )?;
         }
         w.flush().ok();
@@ -455,9 +460,7 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
             "\n⚠  {} backlight-off event(s) detected during run (probe {} + refine {}).",
             total_cabl, probe_cabl_count, refine_cabl_count,
         );
-        eprintln!(
-            "   The panel's content-adaptive backlight gated samples to ambient noise."
-        );
+        eprintln!("   The panel's content-adaptive backlight gated samples to ambient noise.");
         eprintln!(
             "   Affected samples were dropped from the fit; current curve uses surviving data."
         );
@@ -466,7 +469,10 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
             (args.border_nits * 2.0).round(),
         );
     } else {
-        eprintln!("\nNo backlight-off events detected — border at {:.0} cd/m² was sufficient.", args.border_nits);
+        eprintln!(
+            "\nNo backlight-off events detected — border at {:.0} cd/m² was sufficient.",
+            args.border_nits
+        );
     }
 
     // ─── Verify summary ────────────────────────────────────────────────
@@ -495,11 +501,8 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
             "\n--keep: discovered panel peak + tuned curve remain active until prism restart."
         );
     } else {
-        eprintln!(
-            "\nRestoring KDL config defaults (use --keep to leave the tuned values active)."
-        );
-        send_action(&args.output, OutputAction::ResetColor)
-            .context("final ResetColor")?;
+        eprintln!("\nRestoring KDL config defaults (use --keep to leave the tuned values active).");
+        send_action(&args.output, OutputAction::ResetColor).context("final ResetColor")?;
     }
 
     Ok(())
@@ -552,13 +555,7 @@ fn discover_per_channel_peaks(
         // SDR equivalents — values in nits, converted to RGB at patch time.
         // Cap at sdr_reference_nits since RGB=1.0 maps to sdr_ref exactly.
         let r = baseline.sdr_reference_nits;
-        vec![
-            r * 0.05,
-            r * 0.15,
-            r * 0.35,
-            r * 0.65,
-            r,
-        ]
+        vec![r * 0.05, r * 0.15, r * 0.35, r * 0.65, r]
     };
 
     let settle = Duration::from_millis(args.settle_ms);
@@ -583,7 +580,11 @@ fn discover_per_channel_peaks(
             let cabl = is_backlight_off(target_nits, &xyz);
             eprintln!(
                 "  {} target {:>7.1} cd/m²  →  X={:>7.2}  Y={:>7.2}  Z={:>7.2}{}",
-                c.label(), target_nits, xyz.x, xyz.y, xyz.z,
+                c.label(),
+                target_nits,
+                xyz.x,
+                xyz.y,
+                xyz.z,
                 if cabl { "  ⚠ backlight-off" } else { "" },
             );
             if cabl {
@@ -609,7 +610,11 @@ fn discover_per_channel_peaks(
                     c.label(),
                     patch_idx + 1,
                     target_nits,
-                    xyz.x, xyz.y, xyz.z, cx, cy,
+                    xyz.x,
+                    xyz.y,
+                    xyz.z,
+                    cx,
+                    cy,
                 )?;
             }
         }
@@ -662,9 +667,7 @@ fn discover_per_channel_peaks(
             Some(sat_i) => {
                 let sat_y = measurements[sat_i].1;
                 let mut left_idx = sat_i - 1;
-                while left_idx > 0
-                    && measurements[left_idx].1 / sat_y.max(0.01) > 0.95
-                {
+                while left_idx > 0 && measurements[left_idx].1 / sat_y.max(0.01) > 0.95 {
                     left_idx -= 1;
                 }
                 if left_idx < sat_i - 1 {
@@ -683,7 +686,9 @@ fn discover_per_channel_peaks(
                 let ly = measurements[left_idx].1;
                 eprintln!(
                     "  {} bisecting cliff in ({:.1}, {:.1}) cd/m² (3 steps)…",
-                    c.label(), lt, right_t,
+                    c.label(),
+                    lt,
+                    right_t,
                 );
                 let mut right_t = right_t;
                 let mut left_t = lt;
@@ -912,11 +917,7 @@ fn refine_per_channel_curve(
     /// typical operating Y for desktop content, trading a small
     /// near-peak miss for a much-improved mid-Y white point.
     const PRIMARY_SAMPLE_Y_FRAC: f64 = 0.4;
-    const IDENTITY_CTM: [[f64; 3]; 3] = [
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ];
+    const IDENTITY_CTM: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
     let mut curve = PerChannelCurve::IDENTITY;
     let mut primaries = *initial_primaries;
@@ -1002,7 +1003,12 @@ fn refine_per_channel_curve(
                 }
                 eprintln!(
                     "  {} target {:>7.2} (send {:>7.2}) → X={:>7.2} Y={:>7.2} Z={:>7.2}{}",
-                    c.label(), t, bt2020_send, xyz.x, xyz.y, xyz.z,
+                    c.label(),
+                    t,
+                    bt2020_send,
+                    xyz.x,
+                    xyz.y,
+                    xyz.z,
                     if cabl { "  ⚠ backlight-off" } else { "" },
                 );
                 samples.push((t, xyz.y, cabl));
@@ -1080,13 +1086,17 @@ fn refine_per_channel_curve(
             if !GAMMA_PLAUSIBLE.contains(&fit_gamma) {
                 eprintln!(
                     "  {} fit rejected: panel_gamma={:.3} outside {:?}",
-                    c.label(), fit_gamma, GAMMA_PLAUSIBLE,
+                    c.label(),
+                    fit_gamma,
+                    GAMMA_PLAUSIBLE,
                 );
                 if let Some((_, w)) = log.as_mut() {
                     writeln!(
                         w,
                         "# refine {} iter {} fit: REJECTED (gamma={:.4} out of plausible range)",
-                        c.label(), iter + 1, fit_gamma,
+                        c.label(),
+                        iter + 1,
+                        fit_gamma,
                     )?;
                 }
                 continue;
@@ -1127,13 +1137,18 @@ fn refine_per_channel_curve(
             curve.gamma[c.idx()] = fit_gamma;
             eprintln!(
                 "  {} fit applied: gain={:.4}, gamma={:.4}",
-                c.label(), fit_gain, fit_gamma,
+                c.label(),
+                fit_gain,
+                fit_gamma,
             );
             if let Some((_, w)) = log.as_mut() {
                 writeln!(
                     w,
                     "# refine {} iter {} fit: applied gain={:.6} gamma={:.6}",
-                    c.label(), iter + 1, fit_gain, fit_gamma,
+                    c.label(),
+                    iter + 1,
+                    fit_gain,
+                    fit_gamma,
                 )?;
             }
         }
@@ -1156,14 +1171,13 @@ fn refine_per_channel_curve(
             match compute_ctm(&primaries) {
                 Ok(new_ctm) => ctm = new_ctm,
                 Err(e) => {
-                    eprintln!(
-                        "  WARN: CTM recompute failed ({e:#}); keeping previous CTM."
-                    );
+                    eprintln!("  WARN: CTM recompute failed ({e:#}); keeping previous CTM.");
                     if let Some((_, w)) = log.as_mut() {
                         writeln!(
                             w,
                             "# refine iter {} CTM recompute FAILED: {} (keeping previous)",
-                            iter + 1, e,
+                            iter + 1,
+                            e,
                         )?;
                     }
                 }
@@ -1175,9 +1189,12 @@ fn refine_per_channel_curve(
                 w,
                 "# refine iter {} primaries: R=({:.4},{:.4}) G=({:.4},{:.4}) B=({:.4},{:.4})",
                 iter + 1,
-                primaries[0].0, primaries[0].1,
-                primaries[1].0, primaries[1].1,
-                primaries[2].0, primaries[2].1,
+                primaries[0].0,
+                primaries[0].1,
+                primaries[1].0,
+                primaries[1].1,
+                primaries[2].0,
+                primaries[2].1,
             )?;
             if baseline.hdr_active {
                 writeln!(
@@ -1230,13 +1247,17 @@ fn refine_per_channel_curve(
         if duv < CONVERGED_DUV {
             eprintln!(
                 "\nConverged after iter {} (Δu'v'={:.4} < {:.4} threshold).",
-                iter + 1, duv, CONVERGED_DUV,
+                iter + 1,
+                duv,
+                CONVERGED_DUV,
             );
             if let Some((_, w)) = log.as_mut() {
                 writeln!(
                     w,
                     "# converged at iter {} (delta_uv={:.5} < {:.5})",
-                    iter + 1, duv, CONVERGED_DUV,
+                    iter + 1,
+                    duv,
+                    CONVERGED_DUV,
                 )?;
             }
             break;
@@ -1265,7 +1286,9 @@ fn refine_per_channel_curve(
                         writeln!(
                             w,
                             "# plateau at iter {} (delta_uv={:.5} stable for {} iters)",
-                            iter + 1, duv, no_improvement_count + 1,
+                            iter + 1,
+                            duv,
+                            no_improvement_count + 1,
                         )?;
                     }
                     break;
@@ -1356,7 +1379,10 @@ fn verify_white_point(
             .collect()
     } else {
         let r = baseline.sdr_reference_nits;
-        vec![0.10, 0.25, 0.50, 0.75, 0.95].into_iter().map(|f| f * r).collect()
+        vec![0.10, 0.25, 0.50, 0.75, 0.95]
+            .into_iter()
+            .map(|f| f * r)
+            .collect()
     };
 
     let settle = Duration::from_millis(args.settle_ms);
@@ -1401,7 +1427,11 @@ fn verify_white_point(
                 Phase::Verify.label(),
                 patch_idx + 1,
                 t,
-                xyz.x, xyz.y, xyz.z, cx, cy,
+                xyz.x,
+                xyz.y,
+                xyz.z,
+                cx,
+                cy,
             )?;
             writeln!(
                 w,
@@ -1411,7 +1441,10 @@ fn verify_white_point(
         }
     }
 
-    Ok(VerifyResult { max_duv, max_y_err_pct })
+    Ok(VerifyResult {
+        max_duv,
+        max_y_err_pct,
+    })
 }
 
 /// CIE 1976 uniform chromaticity (u', v') from xy. Used for Δu'v'
@@ -1494,9 +1527,17 @@ fn white_check_d65(
             "{},W,0,1,{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{:.6},{:.6}",
             Phase::WhiteCheck.label(),
             target_nits,
-            curve.gain[0], curve.gain[1], curve.gain[2],
-            curve.gamma[0], curve.gamma[1], curve.gamma[2],
-            xyz.x, xyz.y, xyz.z, cx, cy,
+            curve.gain[0],
+            curve.gain[1],
+            curve.gain[2],
+            curve.gamma[0],
+            curve.gamma[1],
+            curve.gamma[2],
+            xyz.x,
+            xyz.y,
+            xyz.z,
+            cx,
+            cy,
         )?;
     }
 
@@ -1557,8 +1598,8 @@ fn compute_ctm(measured_primaries: &[(f64, f64); 3]) -> Result<[[f64; 3]; 3]> {
     let m_phys_panel = build_phys_matrix(measured_primaries);
     let m_bt2020 = build_rgb_to_xyz(&[BT2020_R, BT2020_G, BT2020_B], D65)
         .expect("BT.2020 primaries are well-formed (non-singular by construction)");
-    let m_phys_panel_inv = mat3_inverse(&m_phys_panel)
-        .context("singular panel primaries (cannot derive CTM)")?;
+    let m_phys_panel_inv =
+        mat3_inverse(&m_phys_panel).context("singular panel primaries (cannot derive CTM)")?;
     Ok(mat3_mul(&m_phys_panel_inv, &m_bt2020))
 }
 
@@ -1566,9 +1607,15 @@ fn apply_ctm(output: &str, ctm: &[[f64; 3]; 3]) -> Result<()> {
     send_action(
         output,
         OutputAction::Ctm {
-            rr: ctm[0][0], rg: ctm[0][1], rb: ctm[0][2],
-            gr: ctm[1][0], gg: ctm[1][1], gb: ctm[1][2],
-            br: ctm[2][0], bg: ctm[2][1], bb: ctm[2][2],
+            rr: ctm[0][0],
+            rg: ctm[0][1],
+            rb: ctm[0][2],
+            gr: ctm[1][0],
+            gg: ctm[1][1],
+            gb: ctm[1][2],
+            br: ctm[2][0],
+            bg: ctm[2][1],
+            bb: ctm[2][2],
         },
     )
     .context("apply CTM")
@@ -1607,10 +1654,7 @@ fn build_phys_matrix(primaries: &[(f64, f64); 3]) -> [[f64; 3]; 3] {
 /// Forms the un-normalized matrix with primary XYZ as columns, then
 /// scales each column so that `M · (1, 1, 1)ᵀ = XYZ_white`. Returns
 /// `None` if the primaries are degenerate (collinear → singular).
-fn build_rgb_to_xyz(
-    primaries: &[(f64, f64); 3],
-    white: (f64, f64),
-) -> Option<[[f64; 3]; 3]> {
+fn build_rgb_to_xyz(primaries: &[(f64, f64); 3], white: (f64, f64)) -> Option<[[f64; 3]; 3]> {
     let p_r = xy_to_xyz(primaries[0]);
     let p_g = xy_to_xyz(primaries[1]);
     let p_b = xy_to_xyz(primaries[2]);
@@ -1623,9 +1667,21 @@ fn build_rgb_to_xyz(
     let xyz_white = xy_to_xyz(white);
     let s = mat3_mul_vec(&m_inv, &xyz_white);
     Some([
-        [m_unnorm[0][0] * s[0], m_unnorm[0][1] * s[1], m_unnorm[0][2] * s[2]],
-        [m_unnorm[1][0] * s[0], m_unnorm[1][1] * s[1], m_unnorm[1][2] * s[2]],
-        [m_unnorm[2][0] * s[0], m_unnorm[2][1] * s[1], m_unnorm[2][2] * s[2]],
+        [
+            m_unnorm[0][0] * s[0],
+            m_unnorm[0][1] * s[1],
+            m_unnorm[0][2] * s[2],
+        ],
+        [
+            m_unnorm[1][0] * s[0],
+            m_unnorm[1][1] * s[1],
+            m_unnorm[1][2] * s[2],
+        ],
+        [
+            m_unnorm[2][0] * s[0],
+            m_unnorm[2][1] * s[1],
+            m_unnorm[2][2] * s[2],
+        ],
     ])
 }
 
@@ -1709,7 +1765,8 @@ mod tests {
                 assert!(
                     (m[i][j] - expected[i][j]).abs() < 1e-3,
                     "m[{i}][{j}] = {} vs expected {}",
-                    m[i][j], expected[i][j],
+                    m[i][j],
+                    expected[i][j],
                 );
             }
         }
@@ -1749,17 +1806,14 @@ mod tests {
         let m_bt2020 = build_rgb_to_xyz(&primaries, (0.3127, 0.3290)).unwrap();
         let m_phys_inv = mat3_inverse(&m_phys).unwrap();
         let ctm = mat3_mul(&m_phys_inv, &m_bt2020);
-        let expected = [
-            [0.2627, 0.0, 0.0],
-            [0.0, 0.6780, 0.0],
-            [0.0, 0.0, 0.0593],
-        ];
+        let expected = [[0.2627, 0.0, 0.0], [0.0, 0.6780, 0.0], [0.0, 0.0, 0.0593]];
         for i in 0..3 {
             for j in 0..3 {
                 assert!(
                     (ctm[i][j] - expected[i][j]).abs() < 1e-3,
                     "ctm[{i}][{j}] = {} vs expected {}",
-                    ctm[i][j], expected[i][j],
+                    ctm[i][j],
+                    expected[i][j],
                 );
             }
         }
@@ -1830,7 +1884,8 @@ mod tests {
                 assert!(
                     (prod[i][j] - expected).abs() < 1e-9,
                     "prod[{i}][{j}] = {} vs expected {}",
-                    prod[i][j], expected,
+                    prod[i][j],
+                    expected,
                 );
             }
         }
@@ -1855,15 +1910,17 @@ fn open_log(
     if path.as_os_str() == "/dev/null" {
         return Ok(None);
     }
-    let file = File::create(&path)
-        .with_context(|| format!("create log file {}", path.display()))?;
+    let file =
+        File::create(&path).with_context(|| format!("create log file {}", path.display()))?;
     let mut w = BufWriter::new(file);
     writeln!(
         w,
         "# prism-tune calibrate — output={} mode={} iterations={} settle_ms={} window={}",
         args.output,
         if baseline.hdr_active { "HDR" } else { "SDR" },
-        args.iterations, args.settle_ms, args.window,
+        args.iterations,
+        args.settle_ms,
+        args.window,
     )?;
     writeln!(
         w,
@@ -1916,9 +1973,7 @@ fn print_kdl_block(
         // knuffel struct (`#[knuffel(arguments)] values: Vec<f64>`).
         println!(
             "        ctm {:.6} {:.6} {:.6}  {:.6} {:.6} {:.6}  {:.6} {:.6} {:.6}",
-            m[0][0], m[0][1], m[0][2],
-            m[1][0], m[1][1], m[1][2],
-            m[2][0], m[2][1], m[2][2],
+            m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
         );
     }
     println!("    }}");

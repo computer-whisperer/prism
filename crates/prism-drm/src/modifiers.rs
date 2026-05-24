@@ -19,7 +19,7 @@
 //! atomic test commits before mode-changing operations.
 
 use drm_fourcc::DrmModifier;
-use prism_renderer::{DrmFormatModifierInfo, vk};
+use prism_renderer::{vk, DrmFormatModifierInfo};
 
 /// Pick the modifier candidate list to feed `GbmDevice::allocate_scanout`,
 /// from what the Vulkan side advertised. Filter + order:
@@ -39,9 +39,7 @@ use prism_renderer::{DrmFormatModifierInfo, vk};
 ///
 /// Caller is expected to call this once per output at bringup. Result
 /// is a `Vec<DrmModifier>` ready to hand to GBM.
-pub fn pick_scanout_modifiers(
-    renderer_modifiers: &[DrmFormatModifierInfo],
-) -> Vec<DrmModifier> {
+pub fn pick_scanout_modifiers(renderer_modifiers: &[DrmFormatModifierInfo]) -> Vec<DrmModifier> {
     let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT;
 
     let mut picked: Vec<DrmModifier> = renderer_modifiers
@@ -75,8 +73,7 @@ mod tests {
 
     fn entry(mod_value: u64, planes: u32, color: bool) -> DrmFormatModifierInfo {
         let features = if color {
-            vk::FormatFeatureFlags::COLOR_ATTACHMENT
-                | vk::FormatFeatureFlags::SAMPLED_IMAGE
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::SAMPLED_IMAGE
         } else {
             vk::FormatFeatureFlags::SAMPLED_IMAGE
         };
@@ -111,9 +108,9 @@ mod tests {
     #[test]
     fn tiled_modifiers_ordered_before_linear() {
         let mods = [
-            entry(0, 1, true),       // LINEAR first in driver list
-            entry(0xAAA, 1, true),   // some tiled mod
-            entry(0xBBB, 1, true),   // another tiled mod
+            entry(0, 1, true),     // LINEAR first in driver list
+            entry(0xAAA, 1, true), // some tiled mod
+            entry(0xBBB, 1, true), // another tiled mod
         ];
         let out = pick_scanout_modifiers(&mods);
         // Tiled (in driver order), LINEAR last.

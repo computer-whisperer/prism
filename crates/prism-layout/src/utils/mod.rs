@@ -274,7 +274,12 @@ pub fn send_scale_transform(
     scale: smithay::output::Scale,
     transform: smithay::utils::Transform,
 ) {
-    smithay::wayland::compositor::send_surface_state(surface, data, scale.integer_scale(), transform);
+    smithay::wayland::compositor::send_surface_state(
+        surface,
+        data,
+        scale.integer_scale(),
+        transform,
+    );
     smithay::wayland::fractional_scale::with_fractional_scale(data, |fractional| {
         fractional.set_preferred_scale(scale.fractional_scale());
     });

@@ -229,10 +229,7 @@ pub fn emit_output_transfer_pq(ctx: &mut ShaderCtx, in_nits: spirv::Word) -> spi
         .b
         .f_add(vec3_t, None, one_vec, c3_yn)
         .expect("1 + c3*yn");
-    let ratio = ctx
-        .b
-        .f_div(vec3_t, None, num, den)
-        .expect("num/den");
+    let ratio = ctx.b.f_div(vec3_t, None, num, den).expect("num/den");
     ctx.glsl_call_vec3(GLSL_POW, [ratio, m2_vec])
 }
 
@@ -405,10 +402,7 @@ pub fn emit_lut3d(ctx: &mut ShaderCtx, in_nits: spirv::Word) -> spirv::Word {
         .b
         .f_add(vec3_t, None, one_vec, c3_yn)
         .expect("1 + c3*yn_pow");
-    let ratio = ctx
-        .b
-        .f_div(vec3_t, None, num, den)
-        .expect("num / den");
+    let ratio = ctx.b.f_div(vec3_t, None, num, den).expect("num / den");
     let logical_coord = ctx.glsl_call_vec3(GLSL_POW, [ratio, m2_vec]);
 
     // ── Texel-center adjustment ───────────────────────────────────────

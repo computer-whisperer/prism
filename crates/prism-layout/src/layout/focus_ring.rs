@@ -15,7 +15,7 @@
 //!
 //! API preserved so the layout port (`tile.rs`) compiles unchanged.
 
-use prism_renderer::{BorderEl, RenderEl, srgb_to_bt2020_nits};
+use prism_renderer::{srgb_to_bt2020_nits, BorderEl, RenderEl};
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::utils::round_logical_in_physical_max1;
@@ -122,13 +122,8 @@ impl FocusRing {
         let mut rgba = color.to_array_unpremul();
         rgba[3] *= alpha;
 
-        let color_bt2020_nits = srgb_to_bt2020_nits(
-            rgba[0],
-            rgba[1],
-            rgba[2],
-            rgba[3],
-            DEFAULT_SDR_WHITE_NITS,
-        );
+        let color_bt2020_nits =
+            srgb_to_bt2020_nits(rgba[0], rgba[1], rgba[2], rgba[3], DEFAULT_SDR_WHITE_NITS);
 
         let w = self.width;
         let outer = Rectangle::new(
@@ -164,8 +159,7 @@ impl FocusRing {
             return;
         };
 
-        let outer_logical =
-            Rectangle::new(cached.outer.loc + location, cached.outer.size);
+        let outer_logical = Rectangle::new(cached.outer.loc + location, cached.outer.size);
 
         if cached.is_border {
             // Per-side thickness in clip space: project the outer rect
@@ -177,7 +171,10 @@ impl FocusRing {
             let [t, r, b, l] = cached.thickness_logical;
             let inner_logical = Rectangle::new(
                 outer_logical.loc + Point::from((l, t)),
-                Size::from((outer_logical.size.w - (l + r), outer_logical.size.h - (t + b))),
+                Size::from((
+                    outer_logical.size.w - (l + r),
+                    outer_logical.size.h - (t + b),
+                )),
             );
             let inner_clip = project(inner_logical);
             let thickness_clip = [

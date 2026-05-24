@@ -119,7 +119,10 @@ fn handle_connection(stream: UnixStream, state: &mut PrismState) -> Result<()> {
 
     let mut buf = serde_json::to_string(&reply).context("serialize reply")?;
     buf.push('\n');
-    reader.get_mut().write_all(buf.as_bytes()).context("write reply")?;
+    reader
+        .get_mut()
+        .write_all(buf.as_bytes())
+        .context("write reply")?;
     Ok(())
 }
 
@@ -139,7 +142,9 @@ fn dispatch(state: &mut PrismState, req: Request) -> Reply {
             Ok(Response::FocusedOutput(first))
         }
         Request::Output { output, action } => handle_output_action(state, &output, action),
-        other => Err(format!("request {other:?} is not implemented in this build")),
+        other => Err(format!(
+            "request {other:?} is not implemented in this build"
+        )),
     }
 }
 
@@ -175,12 +180,12 @@ fn collect_outputs(state: &PrismState) -> HashMap<String, Output> {
         // and read the current per-channel peaks + response curve
         // without a second round-trip.
         let peaks = ctx.effective_panel_peak_nits_rgb();
-        let curve = ctx.effective_response_curve().map(|(gain, gamma)| {
-            ResponseCurveState {
+        let curve = ctx
+            .effective_response_curve()
+            .map(|(gain, gamma)| ResponseCurveState {
                 gain: [gain[0] as f64, gain[1] as f64, gain[2] as f64],
                 gamma: [gamma[0] as f64, gamma[1] as f64, gamma[2] as f64],
-            }
-        });
+            });
         let ctm = ctx.effective_ctm().map(|m| {
             [
                 [m[0][0] as f64, m[0][1] as f64, m[0][2] as f64],
@@ -293,9 +298,15 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             }
         }
         OutputAction::Ctm {
-            rr, rg, rb,
-            gr, gg, gb,
-            br, bg, bb,
+            rr,
+            rg,
+            rb,
+            gr,
+            gg,
+            gb,
+            br,
+            bg,
+            bb,
         } => {
             let m = [
                 [rr as f32, rg as f32, rb as f32],
@@ -314,9 +325,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             let loaded = match prism_renderer::load_lut3d_file(std::path::Path::new(&path)) {
                 Ok(l) => l,
                 Err(e) => {
-                    return Err(format!(
-                        "load_lut3d_file({path}) failed: {e:#}"
-                    ));
+                    return Err(format!("load_lut3d_file({path}) failed: {e:#}"));
                 }
             };
             let renderer_edge = output_ctx.renderer.lut3d_cube_edge();
@@ -350,7 +359,8 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             let cube_edge = output_ctx.renderer.lut3d_cube_edge();
             if cube_edge == 0 {
                 return Err(
-                    "IdentityLut3d: encode chain has no LUT slot (legacy CTM+curve path)".to_owned(),
+                    "IdentityLut3d: encode chain has no LUT slot (legacy CTM+curve path)"
+                        .to_owned(),
                 );
             }
             let entries = prism_renderer::identity_lut(cube_edge);

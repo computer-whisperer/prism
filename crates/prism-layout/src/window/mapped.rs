@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use prism_config::{Config, WindowRule};
 use prism_renderer::{RenderEl, SurfaceEl};
+use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::Window;
 use smithay::output::{self, Output};
@@ -22,7 +23,6 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource as _;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
-use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::wayland::compositor::{
     remove_pre_commit_hook, with_states, with_surface_tree_downward, HookId, SurfaceData,
     TraversalAction,
@@ -85,7 +85,6 @@ pub struct Mapped {
     // doesn't have an offscreen FBO yet, so the field is dropped —
     // the only callers (`offscreen_data()` getter, `set_offscreen_data`
     // trait method) are stubbed below.
-
     /// Whether this has an urgent indicator.
     is_urgent: bool,
 
@@ -109,7 +108,6 @@ pub struct Mapped {
     // we're recording it" privacy path. Prism's block-out path will
     // emit the rect directly in `render_normal` when wired up, so the
     // cached buffer isn't needed.
-
     /// The blur config, passed for background effect rendering.
     blur_config: prism_config::Blur,
 

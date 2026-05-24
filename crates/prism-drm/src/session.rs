@@ -16,8 +16,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rustix::fs::OFlags;
 use smithay::backend::drm::DrmDeviceFd;
-use smithay::backend::session::Session;
 use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
+use smithay::backend::session::Session;
 use smithay::utils::DeviceFd;
 
 /// libseat-backed session. The companion [`LibSeatSessionNotifier`] returned
@@ -80,9 +80,7 @@ impl SeatSession {
         let mut session = self.session.clone();
         session
             .change_vt(vt)
-            .map_err(|e| {
-                std::io::Error::other(format!("libseat change_vt({vt}): {e:?}"))
-            })
+            .map_err(|e| std::io::Error::other(format!("libseat change_vt({vt}): {e:?}")))
     }
 
     /// Open a DRM device through the seat. The returned fd is master-capable

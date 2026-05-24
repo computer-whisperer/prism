@@ -46,7 +46,9 @@ impl Dmabuf {
     /// Build a `Dmabuf` from smithay's allocator type by dup-ing the plane
     /// fds. The source `Dmabuf` keeps its own references; ours are
     /// independent and live as long as this struct does.
-    pub fn from_smithay(src: &smithay::backend::allocator::dmabuf::Dmabuf) -> std::io::Result<Self> {
+    pub fn from_smithay(
+        src: &smithay::backend::allocator::dmabuf::Dmabuf,
+    ) -> std::io::Result<Self> {
         use smithay::backend::allocator::Buffer;
         let size = Buffer::size(src);
         let format = Buffer::format(src);

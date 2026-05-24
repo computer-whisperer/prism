@@ -99,8 +99,7 @@ impl Lut3dTexture {
                 "Lut3dTexture: cube_edge must be >= 2 (1D-degenerate LUT not supported)",
             ));
         }
-        let staging_size =
-            (cube_edge as vk::DeviceSize).pow(3) * (TEXEL_BYTES as vk::DeviceSize);
+        let staging_size = (cube_edge as vk::DeviceSize).pow(3) * (TEXEL_BYTES as vk::DeviceSize);
 
         // ── 3D image ──────────────────────────────────────────────────────
         let image_info = vk::ImageCreateInfo::default()
@@ -118,8 +117,8 @@ impl Lut3dTexture {
             .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        let image = unsafe { device.raw.create_image(&image_info, None) }
-            .vk_ctx("create_image (lut3d)")?;
+        let image =
+            unsafe { device.raw.create_image(&image_info, None) }.vk_ctx("create_image (lut3d)")?;
 
         let img_req = unsafe { device.raw.get_image_memory_requirements(image) };
         let img_mem_type = pick_memory(
@@ -168,15 +167,16 @@ impl Lut3dTexture {
             .memory_type_index(buf_mem_type);
         let staging_memory = unsafe { device.raw.allocate_memory(&buf_alloc, None) }
             .vk_ctx("allocate_memory (lut3d staging)")?;
-        unsafe { device.raw.bind_buffer_memory(staging_buffer, staging_memory, 0) }
-            .vk_ctx("bind_buffer_memory (lut3d staging)")?;
+        unsafe {
+            device
+                .raw
+                .bind_buffer_memory(staging_buffer, staging_memory, 0)
+        }
+        .vk_ctx("bind_buffer_memory (lut3d staging)")?;
         let staging_ptr = unsafe {
-            device.raw.map_memory(
-                staging_memory,
-                0,
-                buf_req.size,
-                vk::MemoryMapFlags::empty(),
-            )
+            device
+                .raw
+                .map_memory(staging_memory, 0, buf_req.size, vk::MemoryMapFlags::empty())
         }
         .vk_ctx("map_memory (lut3d staging)")? as *mut u8;
 
@@ -622,11 +622,7 @@ fn color_subresource_range() -> vk::ImageSubresourceRange {
     }
 }
 
-fn pick_memory(
-    device: &Device,
-    type_bits: u32,
-    required: vk::MemoryPropertyFlags,
-) -> Result<u32> {
+fn pick_memory(device: &Device, type_bits: u32, required: vk::MemoryPropertyFlags) -> Result<u32> {
     let props = unsafe {
         device
             .instance_raw()
@@ -656,10 +652,7 @@ mod tests {
         assert!((pq_eotf(1.0) - 10000.0).abs() < 0.1);
         // V = 0.5083 ≈ 100 nits (the SDR reference white anchor).
         let y = pq_eotf(0.5083);
-        assert!(
-            (y - 100.0).abs() < 2.0,
-            "PQ(0.5083) = {y}, expected ~100"
-        );
+        assert!((y - 100.0).abs() < 2.0, "PQ(0.5083) = {y}, expected ~100");
     }
 
     /// Identity LUT vertex count matches `cube_edge³`, vertices in
@@ -717,7 +710,8 @@ mod tests {
                 assert!(
                     (s[c] - idn[c]).abs() < 1e-6,
                     "diff at idx {i} ch {c}: synth={} identity={}",
-                    s[c], idn[c],
+                    s[c],
+                    idn[c],
                 );
             }
         }
@@ -762,7 +756,8 @@ mod tests {
             assert!(
                 (lut[idx][c] - expected[c]).abs() < 1e-4,
                 "ch {c}: lut={} expected={}",
-                lut[idx][c], expected[c]
+                lut[idx][c],
+                expected[c]
             );
         }
     }
@@ -781,7 +776,11 @@ mod tests {
         let black_point = [0.21f32, 0.18, 0.34];
         let entries = synthesize_lut_from_matrix_curve(
             cube_edge,
-            Some([[0.95, 0.02, -0.01], [-0.03, 0.92, -0.04], [-0.001, -0.01, 0.95]]),
+            Some([
+                [0.95, 0.02, -0.01],
+                [-0.03, 0.92, -0.04],
+                [-0.001, -0.01, 0.95],
+            ]),
             Some(([0.5, 0.7, 0.3], [1.05, 1.0, 1.02])),
         );
         save_lut3d_file(&path, cube_edge, peak_nits, black_point, &entries).expect("save");
@@ -792,7 +791,8 @@ mod tests {
             assert!(
                 (loaded.black_point_xyz[c] - black_point[c]).abs() < 1e-6,
                 "black ch {c}: orig={} got={}",
-                black_point[c], loaded.black_point_xyz[c],
+                black_point[c],
+                loaded.black_point_xyz[c],
             );
         }
         assert_eq!(loaded.entries.len(), entries.len());
@@ -801,7 +801,8 @@ mod tests {
                 assert!(
                     (orig[c] - got[c]).abs() < 1e-6,
                     "entry {i} ch {c}: orig={} got={}",
-                    orig[c], got[c],
+                    orig[c],
+                    got[c],
                 );
             }
         }
@@ -860,19 +861,23 @@ mod tests {
     #[test]
     fn synthesis_clips_negative_ctm_outputs() {
         // CTM that maps positive R input to negative G and B (contrived).
-        let ctm = Some([
-            [1.0, 0.0, 0.0],
-            [-1.0, 0.0, 0.0],
-            [-1.0, 0.0, 0.0],
-        ]);
+        let ctm = Some([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]);
         let curve = Some(([0.5f32, 0.5, 0.5], [1.2f32, 1.2, 1.2]));
         let lut = synthesize_lut_from_matrix_curve(9, ctm, curve);
         // Grid point (4, 0, 0): R input > 0, so G/B CTM outputs are negative.
         let idx = 4; // (i=4, j=0, k=0) with X-fastest
-        // R should be positive (positive CTM diagonal, positive input).
+                     // R should be positive (positive CTM diagonal, positive input).
         assert!(lut[idx][0] > 0.0, "R should not be zero");
         // G and B clipped to zero before curve → curve(0) = 0.
-        assert!(lut[idx][1].abs() < 1e-6, "G expected 0, got {}", lut[idx][1]);
-        assert!(lut[idx][2].abs() < 1e-6, "B expected 0, got {}", lut[idx][2]);
+        assert!(
+            lut[idx][1].abs() < 1e-6,
+            "G expected 0, got {}",
+            lut[idx][1]
+        );
+        assert!(
+            lut[idx][2].abs() < 1e-6,
+            "B expected 0, got {}",
+            lut[idx][2]
+        );
     }
 }

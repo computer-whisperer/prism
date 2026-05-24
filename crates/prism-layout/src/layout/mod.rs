@@ -1292,7 +1292,6 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn update_output_size(&mut self, output: &Output) {
-
         let Some(mon) = self.monitor_for_output_mut(output) else {
             error!("monitor missing in update_output_size()");
             return;
@@ -2424,7 +2423,6 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn advance_animations(&mut self) {
-
         let mut dnd_scroll = None;
         let mut is_dnd = false;
         if let Some(dnd) = &self.dnd {
@@ -2609,7 +2607,6 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn update_render_elements(&mut self, output: Option<&Output>) {
-
         self.update_render_elements_time = self.clock.now();
 
         let zoom = self.overview_zoom();
@@ -2677,7 +2674,6 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     fn update_insert_hint(&mut self, output: Option<&Output>) {
-
         for mon in self.monitors_mut() {
             mon.insert_hint = None;
         }
@@ -2692,7 +2688,6 @@ impl<W: LayoutElement> Layout<W> {
             self.interactive_move = Some(InteractiveMoveState::Moving(move_));
             return;
         }
-
 
         if let Some(mon) = self.monitor_for_output_mut(&move_.output) {
             let zoom = mon.overview_zoom();
@@ -4653,7 +4648,6 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn refresh(&mut self, is_active: bool) {
-
         self.is_active = is_active;
 
         let mut ongoing_scrolling_dnd = self.dnd.is_some().then_some(true);

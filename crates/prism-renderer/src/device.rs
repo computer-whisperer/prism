@@ -97,10 +97,7 @@ impl Device {
     /// Two-pass query: first call gets the count, second fills the buffer.
     /// Done unconditionally per-output at bringup; the cost is one
     /// `vkGetPhysicalDeviceFormatProperties2` round-trip.
-    pub fn supported_drm_format_modifiers(
-        &self,
-        format: vk::Format,
-    ) -> Vec<DrmFormatModifierInfo> {
+    pub fn supported_drm_format_modifiers(&self, format: vk::Format) -> Vec<DrmFormatModifierInfo> {
         let phys = self.physical.raw;
         let instance = self.instance.raw();
 
@@ -173,9 +170,9 @@ impl Device {
 
         let pick_index = prefer_drm_node
             .and_then(|want| {
-                candidates.iter().position(|c| {
-                    c.drm_primary == Some(want) || c.drm_render == Some(want)
-                })
+                candidates
+                    .iter()
+                    .position(|c| c.drm_primary == Some(want) || c.drm_render == Some(want))
             })
             .or_else(|| {
                 candidates

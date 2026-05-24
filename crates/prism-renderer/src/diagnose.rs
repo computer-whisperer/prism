@@ -24,7 +24,7 @@ use ash::vk;
 use crate::device::Device;
 use crate::encode_synth::EncodePushSynth as EncodePush;
 use crate::error::{RendererError, Result, VkResultExt};
-use crate::lut3d::{Lut3dTexture, pq_eotf};
+use crate::lut3d::{pq_eotf, Lut3dTexture};
 use crate::oneshot::OneshotPool;
 use crate::pipeline::encode::EncodePipeline;
 
@@ -99,17 +99,11 @@ impl EncodeDiagnoseProbe {
 
         // ── Staging: upload + readback, host-visible/coherent ─────────
         let upload_size = intermediate_texel_bytes as vk::DeviceSize;
-        let (upload_buffer, upload_memory, upload_ptr, upload_size) = create_host_buffer(
-            &device,
-            upload_size,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-        )?;
+        let (upload_buffer, upload_memory, upload_ptr, upload_size) =
+            create_host_buffer(&device, upload_size, vk::BufferUsageFlags::TRANSFER_SRC)?;
         let readback_size = scanout_texel_bytes as vk::DeviceSize;
-        let (readback_buffer, readback_memory, readback_ptr, readback_size) = create_host_buffer(
-            &device,
-            readback_size,
-            vk::BufferUsageFlags::TRANSFER_DST,
-        )?;
+        let (readback_buffer, readback_memory, readback_ptr, readback_size) =
+            create_host_buffer(&device, readback_size, vk::BufferUsageFlags::TRANSFER_DST)?;
 
         let oneshot = OneshotPool::new(device.clone())?;
 
@@ -234,7 +228,11 @@ impl EncodeDiagnoseProbe {
                     base_array_layer: 0,
                     layer_count: 1,
                 })
-                .image_extent(vk::Extent3D { width: 1, height: 1, depth: 1 })];
+                .image_extent(vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                })];
             raw.cmd_copy_buffer_to_image(
                 cb,
                 upload_buffer,
@@ -306,7 +304,10 @@ impl EncodeDiagnoseProbe {
             let rendering_info = vk::RenderingInfo::default()
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D { width: 1, height: 1 },
+                    extent: vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
                 })
                 .layer_count(1)
                 .color_attachments(&color_attach);
@@ -326,7 +327,10 @@ impl EncodeDiagnoseProbe {
                 0,
                 &[vk::Rect2D {
                     offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D { width: 1, height: 1 },
+                    extent: vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
                 }],
             );
             raw.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -403,7 +407,11 @@ impl EncodeDiagnoseProbe {
                     base_array_layer: 0,
                     layer_count: 1,
                 })
-                .image_extent(vk::Extent3D { width: 1, height: 1, depth: 1 })];
+                .image_extent(vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                })];
             raw.cmd_copy_image_to_buffer(
                 cb,
                 offscreen_image,
@@ -415,7 +423,8 @@ impl EncodeDiagnoseProbe {
 
         // SAFETY: HOST_COHERENT readback memory, just submitted-and-
         // waited copy into it. Read texel and decode.
-        let raw = unsafe { std::slice::from_raw_parts(self.readback_ptr, self.readback_size as usize) };
+        let raw =
+            unsafe { std::slice::from_raw_parts(self.readback_ptr, self.readback_size as usize) };
         let nits = decode_scanout_texel(self.scanout_format, raw, sdr_white_nits)?;
         let _ = self.readback_size;
         Ok(nits)
@@ -432,10 +441,14 @@ impl Drop for EncodeDiagnoseProbe {
             self.device.raw.destroy_buffer(self.readback_buffer, None);
             self.device.raw.free_memory(self.upload_memory, None);
             self.device.raw.free_memory(self.readback_memory, None);
-            self.device.raw.destroy_image_view(self.offscreen_view, None);
+            self.device
+                .raw
+                .destroy_image_view(self.offscreen_view, None);
             self.device.raw.destroy_image(self.offscreen_image, None);
             self.device.raw.free_memory(self.offscreen_memory, None);
-            self.device.raw.destroy_image_view(self.intermediate_view, None);
+            self.device
+                .raw
+                .destroy_image_view(self.intermediate_view, None);
             self.device.raw.destroy_image(self.intermediate_image, None);
             self.device.raw.free_memory(self.intermediate_memory, None);
         }
@@ -575,7 +588,11 @@ fn create_image_1x1(
     let info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
-        .extent(vk::Extent3D { width: 1, height: 1, depth: 1 })
+        .extent(vk::Extent3D {
+            width: 1,
+            height: 1,
+            depth: 1,
+        })
         .mip_levels(1)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
@@ -583,8 +600,8 @@ fn create_image_1x1(
         .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
-    let image = unsafe { device.raw.create_image(&info, None) }
-        .vk_ctx("create_image (diagnose 1×1)")?;
+    let image =
+        unsafe { device.raw.create_image(&info, None) }.vk_ctx("create_image (diagnose 1×1)")?;
     let req = unsafe { device.raw.get_image_memory_requirements(image) };
     let mem_type = pick_memory(device, req.memory_type_bits, mem_props)?;
     let alloc = vk::MemoryAllocateInfo::default()
@@ -597,18 +614,13 @@ fn create_image_1x1(
     Ok((image, memory))
 }
 
-fn create_view_1x1(
-    device: &Device,
-    image: vk::Image,
-    format: vk::Format,
-) -> Result<vk::ImageView> {
+fn create_view_1x1(device: &Device, image: vk::Image, format: vk::Format) -> Result<vk::ImageView> {
     let info = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(format)
         .subresource_range(color_subresource_range());
-    unsafe { device.raw.create_image_view(&info, None) }
-        .vk_ctx("create_image_view (diagnose 1×1)")
+    unsafe { device.raw.create_image_view(&info, None) }.vk_ctx("create_image_view (diagnose 1×1)")
 }
 
 fn create_host_buffer(
@@ -636,7 +648,9 @@ fn create_host_buffer(
     unsafe { device.raw.bind_buffer_memory(buffer, memory, 0) }
         .vk_ctx("bind_buffer_memory (diagnose staging)")?;
     let ptr = unsafe {
-        device.raw.map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
+        device
+            .raw
+            .map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
     }
     .vk_ctx("map_memory (diagnose staging)")? as *mut u8;
     Ok((buffer, memory, ptr, req.size))
@@ -652,11 +666,7 @@ fn color_subresource_range() -> vk::ImageSubresourceRange {
     }
 }
 
-fn pick_memory(
-    device: &Device,
-    type_bits: u32,
-    required: vk::MemoryPropertyFlags,
-) -> Result<u32> {
+fn pick_memory(device: &Device, type_bits: u32, required: vk::MemoryPropertyFlags) -> Result<u32> {
     let props = unsafe {
         device
             .instance_raw()
@@ -744,7 +754,17 @@ mod tests {
         let buf = pack.to_le_bytes();
         let decoded =
             decode_scanout_texel(vk::Format::A2R10G10B10_UNORM_PACK32, &buf, 100.0).unwrap();
-        assert!(decoded[0] > decoded[1], "R={} should > G={}", decoded[0], decoded[1]);
-        assert!(decoded[1] > decoded[2], "G={} should > B={}", decoded[1], decoded[2]);
+        assert!(
+            decoded[0] > decoded[1],
+            "R={} should > G={}",
+            decoded[0],
+            decoded[1]
+        );
+        assert!(
+            decoded[1] > decoded[2],
+            "G={} should > B={}",
+            decoded[1],
+            decoded[2]
+        );
     }
 }

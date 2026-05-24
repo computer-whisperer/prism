@@ -237,7 +237,6 @@ fn spawn(args: Vec<String>) {
     }
 }
 
-
 /// Move the active column to `target`. No-op if the target is `None`
 /// (i.e. there's no monitor in that direction). After moving, focus
 /// follows the column to the new monitor (`activate=true`) and we
@@ -276,10 +275,6 @@ fn move_active_window_to(state: &mut PrismState, target: Option<Output>) {
 fn queue_redraw_active_output(state: &mut PrismState) {
     let ids: Vec<_> = state.outputs.keys().cloned().collect();
     for id in ids {
-        state
-            .output_redraw
-            .entry(id)
-            .or_default()
-            .queue_redraw();
+        state.output_redraw.entry(id).or_default().queue_redraw();
     }
 }

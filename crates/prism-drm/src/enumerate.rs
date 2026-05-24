@@ -9,7 +9,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use smithay::reexports::drm::control::{
-    Device as ControlDevice, ModeTypeFlags, connector, crtc, plane,
+    connector, crtc, plane, Device as ControlDevice, ModeTypeFlags,
 };
 use smithay::reexports::drm::{ClientCapability, Device as BasicDevice};
 

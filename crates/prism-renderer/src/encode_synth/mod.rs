@@ -103,7 +103,9 @@ impl EncodeConfig {
     /// this — when false, binding 1 is never declared and the pipeline
     /// doesn't expect an LUT image at draw time.
     pub fn uses_lut3d(&self) -> bool {
-        self.fragments.iter().any(|f| matches!(f, EncodeFragment::Lut3d))
+        self.fragments
+            .iter()
+            .any(|f| matches!(f, EncodeFragment::Lut3d))
     }
 }
 

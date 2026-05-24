@@ -101,8 +101,8 @@ impl ImportedImage {
             .push_next(&mut external_image)
             .push_next(&mut modifier_info);
 
-        let image =
-            unsafe { device.raw.create_image(&image_info, None) }.vk_ctx("create_image (dmabuf)")?;
+        let image = unsafe { device.raw.create_image(&image_info, None) }
+            .vk_ctx("create_image (dmabuf)")?;
 
         let memory = match allocate_imported_memory(&device, image, plane.fd.as_fd()) {
             Ok(m) => m,
@@ -227,9 +227,8 @@ impl ImportedImage {
             let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
             let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
                 .vk_ctx("create_fence (dmabuf transition)")?;
-            let submit_result = unsafe {
-                device.queue_submit2(self.device.graphics_queue, &submits, fence)
-            };
+            let submit_result =
+                unsafe { device.queue_submit2(self.device.graphics_queue, &submits, fence) };
             if let Err(e) = submit_result {
                 unsafe { device.destroy_fence(fence, None) };
                 return Err(RendererError::Vk {
@@ -273,10 +272,12 @@ fn allocate_imported_memory(
 
     // Query which memory types accept this fd. The query does NOT consume
     // the fd, but takes a raw i32; dup so we don't borrow the caller's.
-    let query_fd: OwnedFd = plane_fd.try_clone_to_owned().map_err(|_| RendererError::Vk {
-        context: "dup dmabuf fd for memory-type query",
-        result: vk::Result::ERROR_OUT_OF_HOST_MEMORY,
-    })?;
+    let query_fd: OwnedFd = plane_fd
+        .try_clone_to_owned()
+        .map_err(|_| RendererError::Vk {
+            context: "dup dmabuf fd for memory-type query",
+            result: vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+        })?;
     let mut fd_props = vk::MemoryFdPropertiesKHR::default();
     unsafe {
         fd_loader.get_memory_fd_properties(
@@ -298,10 +299,12 @@ fn allocate_imported_memory(
 
     // Vulkan consumes this fd on success. Dup so the caller's Dmabuf stays
     // valid. On failure, reclaim into an OwnedFd to close it.
-    let import_fd: OwnedFd = plane_fd.try_clone_to_owned().map_err(|_| RendererError::Vk {
-        context: "dup dmabuf fd for import",
-        result: vk::Result::ERROR_OUT_OF_HOST_MEMORY,
-    })?;
+    let import_fd: OwnedFd = plane_fd
+        .try_clone_to_owned()
+        .map_err(|_| RendererError::Vk {
+            context: "dup dmabuf fd for import",
+            result: vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+        })?;
     let raw_import_fd = import_fd.into_raw_fd();
 
     let mut import_info = vk::ImportMemoryFdInfoKHR::default()

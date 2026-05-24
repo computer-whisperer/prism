@@ -26,11 +26,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use drm_fourcc::DrmModifier;
 use prism_renderer::{
-    Device, DrmDevId, ElementDraw, EncodePush, ImportedImage, Renderer,
-    synthesize_lut_from_matrix_curve, vk,
+    synthesize_lut_from_matrix_curve, vk, Device, DrmDevId, ElementDraw, EncodePush, ImportedImage,
+    Renderer,
 };
 use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneState};
-use smithay::reexports::drm::control::{Mode, connector, crtc, framebuffer};
+use smithay::reexports::drm::control::{connector, crtc, framebuffer, Mode};
 
 use crate::frame_clock::FrameClock;
 use smithay::utils::{Rectangle, Transform};
@@ -48,9 +48,9 @@ use smithay::utils::{Rectangle, Transform};
 const BT2020_DECODE_CAP_MARGIN: f32 = 1.5;
 
 use crate::{
-    CursorPlane, DrmCardContext, OutputConfig, OutputPick, add_framebuffer_for_bo,
+    add_framebuffer_for_bo,
     breadcrumb::{breadcrumb, flip_trace},
-    set_connector_max_bpc,
+    set_connector_max_bpc, CursorPlane, DrmCardContext, OutputConfig, OutputPick,
 };
 
 /// One BO + Vulkan view + DRM framebuffer handle. Two of these live in
@@ -251,9 +251,9 @@ impl OutputContext {
 
         match set_connector_max_bpc(&card.drm, pick.connector, config.depth.max_bpc()) {
             Ok(true) => tracing::info!("connector max bpc set to {}", config.depth.max_bpc()),
-            Ok(false) => tracing::warn!(
-                "connector doesn't expose 'max bpc'; link depth driver-controlled"
-            ),
+            Ok(false) => {
+                tracing::warn!("connector doesn't expose 'max bpc'; link depth driver-controlled")
+            }
             Err(e) => tracing::warn!("set max bpc failed: {e:#}"),
         }
 
@@ -304,10 +304,8 @@ impl OutputContext {
             match surface.vrr_supported(pick.connector) {
                 Ok(support) => {
                     use smithay::backend::drm::VrrSupport;
-                    let supported = matches!(
-                        support,
-                        VrrSupport::Supported | VrrSupport::RequiresModeset
-                    );
+                    let supported =
+                        matches!(support, VrrSupport::Supported | VrrSupport::RequiresModeset);
                     if !supported {
                         tracing::warn!(
                             connector = %pick.connector_name,
@@ -487,8 +485,8 @@ impl OutputContext {
                 cube_edge,
             );
         }
-        let ipc_curve_override_active = self.color_override.ctm.is_some()
-            || self.color_override.response_curve.is_some();
+        let ipc_curve_override_active =
+            self.color_override.ctm.is_some() || self.color_override.response_curve.is_some();
         if !ipc_curve_override_active {
             if let Some(entries) = self.kdl_lut3d_entries.as_ref() {
                 if entries.len() == (cube_edge as usize).pow(3) {
@@ -511,11 +509,8 @@ impl OutputContext {
         } else {
             None
         };
-        let entries = synthesize_lut_from_matrix_curve(
-            cube_edge,
-            self.effective_ctm(),
-            response_curve,
-        );
+        let entries =
+            synthesize_lut_from_matrix_curve(cube_edge, self.effective_ctm(), response_curve);
         self.renderer
             .upload_lut3d(&entries)
             .context("upload synthesized color LUT")
@@ -630,7 +625,6 @@ pub struct ColorOverride {
 }
 
 impl OutputContext {
-
     /// Clear the `frame_pending` flag, advance the back-buffer index, and
     /// feed the actual kernel-reported presentation time into the
     /// `FrameClock` so the next render can predict the upcoming vblank.
@@ -693,14 +687,13 @@ impl OutputContext {
         // below for the duration of the atomic commit; after the
         // commit ioctl returns, the kernel holds its own dup and
         // the `OwnedFd` is free to be returned to the caller.
-        let present_sync = self
-            .renderer
-            .render_frame(&back.image, elements, encode_push, wait_semaphores)?;
+        let present_sync =
+            self.renderer
+                .render_frame(&back.image, elements, encode_push, wait_semaphores)?;
 
-        let src = Rectangle::from_size(
-            (self.extent.width as i32, self.extent.height as i32).into(),
-        )
-        .to_f64();
+        let src =
+            Rectangle::from_size((self.extent.width as i32, self.extent.height as i32).into())
+                .to_f64();
         let dst =
             Rectangle::from_size((self.extent.width as i32, self.extent.height as i32).into());
         // Build the plane state vector: primary first, then the
@@ -803,35 +796,29 @@ fn alloc_scanout_buffer(
     let render_mods = device.supported_drm_format_modifiers(config.vk_format);
     let candidates = crate::pick_scanout_modifiers(&render_mods);
     let fourcc = config.depth.drm_fourcc();
-    let (bo, dmabuf) = match card.gbm.allocate_scanout(
-        extent.width,
-        extent.height,
-        fourcc,
-        &candidates,
-    ) {
-        Ok(pair) => pair,
-        Err(first_err) => {
-            tracing::warn!(
-                buffer = label,
-                ?candidates,
-                "scanout alloc with tiled-modifier candidates failed ({first_err:#}); \
+    let (bo, dmabuf) =
+        match card
+            .gbm
+            .allocate_scanout(extent.width, extent.height, fourcc, &candidates)
+        {
+            Ok(pair) => pair,
+            Err(first_err) => {
+                tracing::warn!(
+                    buffer = label,
+                    ?candidates,
+                    "scanout alloc with tiled-modifier candidates failed ({first_err:#}); \
                  retrying LINEAR-only"
-            );
-            card.gbm
-                .allocate_scanout(
-                    extent.width,
-                    extent.height,
-                    fourcc,
-                    &[DrmModifier::Linear],
-                )
-                .with_context(|| {
-                    format!(
-                        "GBM allocate {} {}×{} {:?} (LINEAR fallback after tiled failed)",
-                        label, extent.width, extent.height, fourcc
-                    )
-                })?
-        }
-    };
+                );
+                card.gbm
+                    .allocate_scanout(extent.width, extent.height, fourcc, &[DrmModifier::Linear])
+                    .with_context(|| {
+                        format!(
+                            "GBM allocate {} {}×{} {:?} (LINEAR fallback after tiled failed)",
+                            label, extent.width, extent.height, fourcc
+                        )
+                    })?
+            }
+        };
     tracing::debug!(
         buffer = label,
         modifier = ?bo.modifier(),
@@ -845,11 +832,7 @@ fn alloc_scanout_buffer(
     )?;
     let fb = add_framebuffer_for_bo(&card.drm, &bo)?;
     Ok(AllocResult {
-        buffer: ScanoutBuffer {
-            image,
-            _bo: bo,
-            fb,
-        },
+        buffer: ScanoutBuffer { image, _bo: bo, fb },
         candidates,
     })
 }
@@ -1030,11 +1013,30 @@ mod tests {
         let expect_r = 37.842 / 0.307197 * 1.5;
         let expect_g = 109.423 / 0.776906 * 1.5;
         let expect_b = 15.256 / 0.104517 * 1.5;
-        assert!((cap[0] - expect_r).abs() < 1e-3, "R: {} vs {}", cap[0], expect_r);
-        assert!((cap[1] - expect_g).abs() < 1e-3, "G: {} vs {}", cap[1], expect_g);
-        assert!((cap[2] - expect_b).abs() < 1e-3, "B: {} vs {}", cap[2], expect_b);
+        assert!(
+            (cap[0] - expect_r).abs() < 1e-3,
+            "R: {} vs {}",
+            cap[0],
+            expect_r
+        );
+        assert!(
+            (cap[1] - expect_g).abs() < 1e-3,
+            "G: {} vs {}",
+            cap[1],
+            expect_g
+        );
+        assert!(
+            (cap[2] - expect_b).abs() < 1e-3,
+            "B: {} vs {}",
+            cap[2],
+            expect_b
+        );
         // Sanity: blue cap is ~10× the panel-native blue peak.
-        assert!(cap[2] > 200.0, "blue cap should be far above panel-native peak, got {}", cap[2]);
+        assert!(
+            cap[2] > 200.0,
+            "blue cap should be far above panel-native peak, got {}",
+            cap[2]
+        );
     }
 
     /// When a CTM column has multiple positive entries, the tightest
@@ -1058,11 +1060,7 @@ mod tests {
     #[test]
     fn margin_scales_output() {
         let panel = [100.0, 100.0, 100.0];
-        let ctm = Some([
-            [0.5, 0.0, 0.0],
-            [0.0, 0.5, 0.0],
-            [0.0, 0.0, 0.5],
-        ]);
+        let ctm = Some([[0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 0.5]]);
         let cap_no_margin = derive_bt2020_decode_clamp(panel, ctm, 1.0);
         let cap_margined = derive_bt2020_decode_clamp(panel, ctm, 2.0);
         for c in 0..3 {

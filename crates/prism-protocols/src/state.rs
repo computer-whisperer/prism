@@ -27,12 +27,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use prism_animation::Clock;
 use prism_config::Config;
+use prism_frame::{DrmFourcc, DrmModifier};
 use prism_layout::cursor::{CursorManager, CursorTextureCache, RenderCursor};
 use prism_layout::layout::{ActivateWindow, AddWindowTarget, Layout};
 use prism_layout::window::{Mapped, ResolvedWindowRules};
-use prism_renderer::{DrmDevId, vk};
-use smithay::backend::allocator::Format as DrmFormat;
+use prism_renderer::{vk, DrmDevId};
 use smithay::backend::allocator::dmabuf::Dmabuf as SmithayDmabuf;
+use smithay::backend::allocator::Format as DrmFormat;
+use smithay::backend::renderer::utils::{on_commit_buffer_handler, RendererSurfaceStateUserData};
 use smithay::delegate_compositor;
 use smithay::delegate_content_type;
 use smithay::delegate_dmabuf;
@@ -47,57 +49,49 @@ use smithay::delegate_viewporter;
 use smithay::delegate_xdg_activation;
 use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
+use smithay::desktop::Window;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::LoopHandle;
-use prism_frame::{DrmFourcc, DrmModifier};
-use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::backend::{ClientData, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource};
 use smithay::utils::{Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    add_pre_commit_hook, CompositorClientState, CompositorHandler, CompositorState, get_parent,
-    get_role, with_states,
+    add_pre_commit_hook, get_parent, get_role, with_states, CompositorClientState,
+    CompositorHandler, CompositorState,
 };
-use smithay::backend::renderer::utils::{on_commit_buffer_handler, RendererSurfaceStateUserData};
-use smithay::desktop::Window;
+use smithay::wayland::content_type::ContentTypeState;
 use smithay::wayland::dmabuf::{
     DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState,
     ImportNotifier, SurfaceDmabufFeedbackState,
 };
-use smithay::wayland::content_type::ContentTypeState;
 use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState};
-use smithay::wayland::fractional_scale::{
-    FractionalScaleHandler, FractionalScaleManagerState,
-};
+use smithay::wayland::fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::presentation::PresentationState;
-use smithay::wayland::selection::data_device::{DataDeviceState, set_data_device_focus};
-use smithay::wayland::selection::primary_selection::{
-    PrimarySelectionState, set_primary_focus,
-};
-use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
-use smithay::wayland::viewporter::ViewporterState;
-use smithay::wayland::xdg_activation::{
-    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
-};
+use smithay::wayland::selection::data_device::{set_data_device_focus, DataDeviceState};
+use smithay::wayland::selection::primary_selection::{set_primary_focus, PrimarySelectionState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
 };
-use smithay::wayland::shm::{ShmHandler, ShmState, with_buffer_contents};
+use smithay::wayland::shm::{with_buffer_contents, ShmHandler, ShmState};
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::wayland::viewporter::ViewporterState;
+use smithay::wayland::xdg_activation::{
+    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+};
 
 use crate::client::PrismClient;
 use crate::input_state::{KeyboardFocus, PointerVisibility};
-use crate::surface_tex::{
-    GpuTex, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture, TexSource,
-};
+use crate::surface_tex::{GpuTex, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture, TexSource};
 
 /// Stable per-output id. Today we key by the connector name (e.g. `"DP-4"`,
 /// `"HDMI-A-1"`). amdgpu's connector names are globally unique across cards
@@ -266,8 +260,7 @@ pub struct PrismState {
     pub loop_handle: Option<LoopHandle<'static, PrismState>>,
     /// `wlr_layer_shell_unstable_v1` server state. MVP — see
     /// [`crate::layer_shell`] for the deliberate scope gaps.
-    pub layer_shell_state:
-        smithay::wayland::shell::wlr_layer::WlrLayerShellState,
+    pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
     /// Per-output layer-shell surfaces. Render order within a vec
     /// is creation order; cross-layer Z is enforced at render time
     /// (Background, Bottom, normal-layout, Top, Overlay).
@@ -338,8 +331,7 @@ pub struct PrismState {
     /// client never sees a dangling release. Keyed by raw keycode
     /// (same `Keycode` type smithay's `KeyboardKeyEvent::key_code`
     /// returns).
-    pub suppressed_keys:
-        std::collections::HashSet<smithay::input::keyboard::Keycode>,
+    pub suppressed_keys: std::collections::HashSet<smithay::input::keyboard::Keycode>,
     /// libinput devices currently plugged in. Used to recompute seat
     /// capabilities and apply per-device settings on (re)load.
     pub libinput_devices: std::collections::HashSet<input::Device>,
@@ -447,9 +439,7 @@ impl PrismState {
         // render node. Without that we'd fall back to v3 (no feedback),
         // and clients like mpv that probe the dmabuf-feedback's
         // main_device to pick a render node land in software EGL.
-        let dmabuf_global = match primary_gpu.and_then(|id| {
-            gpus.get(&id).map(|dev| (id, dev))
-        }) {
+        let dmabuf_global = match primary_gpu.and_then(|id| gpus.get(&id).map(|dev| (id, dev))) {
             Some((id, device)) => {
                 // Prefer the render node for client rendering; fall
                 // back to the primary node if a render node isn't
@@ -460,12 +450,10 @@ impl PrismState {
                     .or(device.physical.drm_primary)
                     .unwrap_or(id);
                 let main_device = libc::makedev(node.major as u32, node.minor as u32);
-                let feedback = DmabufFeedbackBuilder::new(
-                    main_device,
-                    supported_formats.iter().copied(),
-                )
-                .build()
-                .expect("DmabufFeedbackBuilder::build");
+                let feedback =
+                    DmabufFeedbackBuilder::new(main_device, supported_formats.iter().copied())
+                        .build()
+                        .expect("DmabufFeedbackBuilder::build");
                 tracing::info!(
                     "dmabuf v4 advertised with main_device {}:{} ({} format/modifier pairs)",
                     node.major,
@@ -474,8 +462,7 @@ impl PrismState {
                 );
                 // Log the distinct fourccs so HDR client support is
                 // verifiable at a glance (10-bit / fp16 present?).
-                let mut codes: Vec<DrmFourcc> =
-                    supported_formats.iter().map(|f| f.code).collect();
+                let mut codes: Vec<DrmFourcc> = supported_formats.iter().map(|f| f.code).collect();
                 codes.dedup();
                 tracing::info!(?codes, "dmabuf advertised fourccs");
                 dmabuf_state.create_global_with_default_feedback::<PrismState>(&dh, &feedback)
@@ -534,8 +521,7 @@ impl PrismState {
         // pacing — otherwise it estimates display time from
         // wl_callback.frame timestamps and ends up dropping frames
         // pessimistically.
-        let presentation =
-            PresentationState::new::<PrismState>(&dh, libc::CLOCK_MONOTONIC as u32);
+        let presentation = PresentationState::new::<PrismState>(&dh, libc::CLOCK_MONOTONIC as u32);
 
         // wp_color_management_v1 global. See module doc for scope —
         // accepts parametric image descriptions, surfaces them via
@@ -653,8 +639,7 @@ impl PrismState {
             return;
         };
         let device_fd = card.drm.device_fd().clone();
-        self.drm_syncobj_state =
-            crate::drm_syncobj::try_init(&self.display_handle, device_fd);
+        self.drm_syncobj_state = crate::drm_syncobj::try_init(&self.display_handle, device_fd);
     }
 
     /// Insert a built output. Returns the previous entry for that
@@ -673,9 +658,11 @@ impl PrismState {
         // subsequent show won't flash. set_visible(false) keeps it off
         // until update_output_cursors flips it.
         if let Some(cursor_plane) = output.cursor.as_mut() {
-            if let Err(e) =
-                upload_default_cursor(&self.cursor_manager, &self.cursor_texture_cache, cursor_plane)
-            {
+            if let Err(e) = upload_default_cursor(
+                &self.cursor_manager,
+                &self.cursor_texture_cache,
+                cursor_plane,
+            ) {
                 tracing::warn!(
                     "cursor seed failed on {}: {e:#} — cursor will not appear on this output",
                     output.connector_name
@@ -687,11 +674,9 @@ impl PrismState {
         // (shouldn't happen — `gpus` is populated before bringup) or
         // if feedback build fails (e.g. shm shortage). Either way the
         // client gets the global default feedback as a fallback.
-        if let Some(feedback) = build_output_feedback(
-            &output,
-            &self.gpus,
-            &self.dmabuf_main_formats,
-        ) {
+        if let Some(feedback) =
+            build_output_feedback(&output, &self.gpus, &self.dmabuf_main_formats)
+        {
             self.output_feedback.insert(id.clone(), feedback);
         }
         // Same step for wp_color_management_v1: derive the output's
@@ -699,10 +684,8 @@ impl PrismState {
         // by `wp_color_management_surface_feedback_v1` so clients
         // know "this surface, on this output, should be PQ BT.2020
         // mastered to X nits" (HDR) or sRGB+gamma22 (SDR).
-        let preferred = crate::color_management::build_output_preferred(
-            &output,
-            &self.color_management,
-        );
+        let preferred =
+            crate::color_management::build_output_preferred(&output, &self.color_management);
         tracing::info!(
             connector = %output.connector_name,
             identity = preferred.identity,
@@ -768,7 +751,11 @@ impl PrismState {
             .size_mm
             .map(|(w, h)| (w as i32, h as i32).into())
             .unwrap_or_else(|| (0, 0).into());
-        let make = ctx.edid.make.clone().unwrap_or_else(|| "Unknown".to_owned());
+        let make = ctx
+            .edid
+            .make
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_owned());
         let model = ctx
             .edid
             .model
@@ -925,18 +912,18 @@ impl PrismState {
                 let cx = x + w / 2;
                 let cy = y + h / 2;
                 match dir {
-                    Direction::Left => (cx < cur_cx
-                        && overlaps_y(cur.2, cur.4, y, h))
-                        .then(|| (o, cur_cx - cx)),
-                    Direction::Right => (cx > cur_cx
-                        && overlaps_y(cur.2, cur.4, y, h))
-                        .then(|| (o, cx - cur_cx)),
-                    Direction::Up => (cy < cur_cy
-                        && overlaps_x(cur.1, cur.3, x, w))
-                        .then(|| (o, cur_cy - cy)),
-                    Direction::Down => (cy > cur_cy
-                        && overlaps_x(cur.1, cur.3, x, w))
-                        .then(|| (o, cy - cur_cy)),
+                    Direction::Left => {
+                        (cx < cur_cx && overlaps_y(cur.2, cur.4, y, h)).then(|| (o, cur_cx - cx))
+                    }
+                    Direction::Right => {
+                        (cx > cur_cx && overlaps_y(cur.2, cur.4, y, h)).then(|| (o, cx - cur_cx))
+                    }
+                    Direction::Up => {
+                        (cy < cur_cy && overlaps_x(cur.1, cur.3, x, w)).then(|| (o, cur_cy - cy))
+                    }
+                    Direction::Down => {
+                        (cy > cur_cy && overlaps_x(cur.1, cur.3, x, w)).then(|| (o, cy - cur_cy))
+                    }
                 }
             })
             .min_by_key(|(_, d)| *d)
@@ -1032,8 +1019,8 @@ impl PrismState {
                 .iter()
                 .map(|(name, output)| {
                     let output_name = output_name_from_smithay(name, output);
-                    let pos = find_output_cfg(&output_name, &cfg.outputs.0)
-                        .and_then(|o| o.position);
+                    let pos =
+                        find_output_cfg(&output_name, &cfg.outputs.0).and_then(|o| o.position);
                     (name.clone(), pos)
                 })
                 .collect()
@@ -1311,12 +1298,8 @@ impl CompositorHandler for PrismState {
                         );
                         let (mapped, default_column_width) = {
                             let config = self.config.borrow();
-                            let m = Mapped::new(
-                                window,
-                                ResolvedWindowRules::default(),
-                                hook,
-                                &config,
-                            );
+                            let m =
+                                Mapped::new(window, ResolvedWindowRules::default(), hook, &config);
                             // Without an explicit per-window-rule width,
                             // fall back to the configured default. niri
                             // resolves this via
@@ -1385,9 +1368,7 @@ impl CompositorHandler for PrismState {
                         );
                     }
                 }
-            } else if let Some((mapped, _)) =
-                self.layout.find_window_and_output(surface)
-            {
+            } else if let Some((mapped, _)) = self.layout.find_window_and_output(surface) {
                 // Re-commit on an already-mapped window.
                 //
                 // First refresh the smithay Window's cached bbox from
@@ -1760,11 +1741,7 @@ impl XdgActivationHandler for PrismState {
         &mut self.xdg_activation
     }
 
-    fn token_created(
-        &mut self,
-        _token: XdgActivationToken,
-        data: XdgActivationTokenData,
-    ) -> bool {
+    fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
         let Some((serial, seat)) = data.serial else {
             // No serial — urgency-only path. Always accept; the
             // window manager treats this as a hint, not a focus
@@ -1778,12 +1755,18 @@ impl XdgActivationHandler for PrismState {
         // a layer-shell surface with no keyboard interactivity may
         // still produce a valid token via pointer focus alone.
         if let Some(kb) = seat.get_keyboard() {
-            if kb.last_enter().is_some_and(|le| serial.is_no_older_than(&le)) {
+            if kb
+                .last_enter()
+                .is_some_and(|le| serial.is_no_older_than(&le))
+            {
                 return true;
             }
         }
         if let Some(ptr) = seat.get_pointer() {
-            if ptr.last_enter().is_some_and(|le| serial.is_no_older_than(&le)) {
+            if ptr
+                .last_enter()
+                .is_some_and(|le| serial.is_no_older_than(&le))
+            {
                 return true;
             }
         }
@@ -1999,8 +1982,7 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
         // BufferAssignment out of cached_state and stashed it in
         // RendererSurfaceState. We read it back from there.
         let renderer_state = states.data_map.get::<RendererSurfaceStateUserData>();
-        let current_buffer = renderer_state
-            .and_then(|s| s.lock().unwrap().buffer().cloned());
+        let current_buffer = renderer_state.and_then(|s| s.lock().unwrap().buffer().cloned());
 
         states
             .data_map
@@ -2072,7 +2054,10 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
                     }
                     _ => HashMap::new(),
                 };
-                *guard = Some(SurfaceTexture { source, by_gpu: carried });
+                *guard = Some(SurfaceTexture {
+                    source,
+                    by_gpu: carried,
+                });
             }
             Err(e) => tracing::warn!("surface buffer source build failed: {e:#}"),
         }
@@ -2243,7 +2228,11 @@ fn upload_default_cursor(
 ) -> Result<()> {
     let render = cursor_manager.get_render_cursor(1);
     let (icon, scale, xcursor) = match render {
-        RenderCursor::Named { icon, scale, cursor } => (icon, scale, cursor),
+        RenderCursor::Named {
+            icon,
+            scale,
+            cursor,
+        } => (icon, scale, cursor),
         RenderCursor::Hidden | RenderCursor::Surface { .. } => {
             return Ok(());
         }
@@ -2278,15 +2267,19 @@ pub fn update_output_cursors(state: &mut PrismState) {
             hide_all_cursors(state);
             return;
         }
-        RenderCursor::Named { icon, scale, cursor } => {
+        RenderCursor::Named {
+            icon,
+            scale,
+            cursor,
+        } => {
             let frame = state.cursor_texture_cache.get(*icon, *scale, cursor, 0);
             // xcursor hotspot lives on the original Image, not on
             // CursorImageFrame — fish it back out via xcursor.frame(0).
             let (_idx, image) = cursor.frame(0);
             let hot = (image.xhot as i32, image.yhot as i32);
             // Pick the output the pointer is in.
-            let owner = state
-                .output_containing((state.pointer_pos.x as i32, state.pointer_pos.y as i32));
+            let owner =
+                state.output_containing((state.pointer_pos.x as i32, state.pointer_pos.y as i32));
             let _ = frame; // sprite already seeded at attach_output
             (hot, owner)
         }
@@ -2506,7 +2499,9 @@ pub fn materialize_surface_on_gpu(state: &PrismState, surface: &WlSurface, gpu: 
             TexSource::Shm { .. } => refresh_shm_uploads(state, tex, &[gpu]),
         };
         match result {
-            Ok(()) => tracing::debug!(gpu = ?gpu, surface = ?surface.id(), "demand-materialized surface texture"),
+            Ok(()) => {
+                tracing::debug!(gpu = ?gpu, surface = ?surface.id(), "demand-materialized surface texture")
+            }
             Err(e) => tracing::warn!(gpu = ?gpu, "demand materialize failed: {e:#}"),
         }
     });
@@ -2615,7 +2610,8 @@ fn materialize_dmabuf_for_gpu(
     let modifier = u64::from(dmabuf.modifier);
 
     if gpu_supports_dmabuf(&device_g, format, modifier) {
-        let img = import_dmabuf(&device_g, &dmabuf, true).context("native import on consumer GPU")?;
+        let img =
+            import_dmabuf(&device_g, &dmabuf, true).context("native import on consumer GPU")?;
         tex.by_gpu.insert(g, GpuTex::Native(Arc::new(img)));
         return Ok(());
     }
@@ -2637,9 +2633,8 @@ fn materialize_dmabuf_for_gpu(
     if !gpu_supports_dmabuf(&device_g, format, DRM_FORMAT_MOD_LINEAR) {
         anyhow::bail!("consumer GPU can't sample LINEAR for {format:?}; no mirror");
     }
-    let scratch =
-        prism_renderer::ExportableImage::new(device_home, extent, format, dmabuf.format)
-            .context("ExportableImage::new (mirror scratch)")?;
+    let scratch = prism_renderer::ExportableImage::new(device_home, extent, format, dmabuf.format)
+        .context("ExportableImage::new (mirror scratch)")?;
     // No copy here: the scratch is filled at render time by the async
     // copy (prepare_mirror_waits), GPU-synchronized against the target's
     // render submit. The target import just sets up the sampleable image;
@@ -2825,15 +2820,11 @@ fn vk_format_for(fourcc: DrmFourcc) -> Option<vk::Format> {
         // 10-bit: DRM AB30/XB30 pack [A:30][B:20][G:10][R:0] in a LE u32,
         // which is exactly Vulkan's A2B10G10R10_UNORM_PACK32. HDR10 clients
         // (Firefox with HDR on, mpv PQ passthrough) allocate these.
-        DrmFourcc::Xbgr2101010 | DrmFourcc::Abgr2101010 => {
-            vk::Format::A2B10G10R10_UNORM_PACK32
-        }
+        DrmFourcc::Xbgr2101010 | DrmFourcc::Abgr2101010 => vk::Format::A2B10G10R10_UNORM_PACK32,
         // fp16: DRM ABGR16161616F is R,G,B,A 16-bit floats in memory order,
         // matching Vulkan R16G16B16A16_SFLOAT. scRGB / fp16 HDR clients use
         // this; values can exceed 1.0.
-        DrmFourcc::Xbgr16161616f | DrmFourcc::Abgr16161616f => {
-            vk::Format::R16G16B16A16_SFLOAT
-        }
+        DrmFourcc::Xbgr16161616f | DrmFourcc::Abgr16161616f => vk::Format::R16G16B16A16_SFLOAT,
         _ => return None,
     })
 }

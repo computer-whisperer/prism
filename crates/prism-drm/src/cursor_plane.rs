@@ -26,7 +26,7 @@
 
 use anyhow::{Context, Result};
 use gbm::BufferObject;
-use smithay::backend::drm::{DrmSurface, PlaneClaim, PlaneState, PlaneConfig};
+use smithay::backend::drm::{DrmSurface, PlaneClaim, PlaneConfig, PlaneState};
 use smithay::reexports::drm::control::{framebuffer, plane};
 use smithay::utils::{Rectangle, Transform};
 
@@ -85,8 +85,8 @@ impl CursorPlane {
         let bo = gbm
             .allocate_cursor(cw, ch)
             .with_context(|| format!("allocate cursor BO {cw}x{ch}"))?;
-        let fb = add_framebuffer_for_bo(&card.drm, &bo)
-            .context("add_framebuffer_for_bo (cursor)")?;
+        let fb =
+            add_framebuffer_for_bo(&card.drm, &bo).context("add_framebuffer_for_bo (cursor)")?;
 
         tracing::info!(
             "cursor plane claimed: handle={:?} bo={cw}x{ch}",
@@ -116,12 +116,7 @@ impl CursorPlane {
     ///
     /// `pixels` is in RGBA8888 byte order (the format xcursor returns)
     /// — we swizzle to ARGB8888 during the copy.
-    pub fn upload_sprite(
-        &mut self,
-        pixels_rgba: &[u8],
-        src_w: u32,
-        src_h: u32,
-    ) -> Result<()> {
+    pub fn upload_sprite(&mut self, pixels_rgba: &[u8], src_w: u32, src_h: u32) -> Result<()> {
         let (cw, ch) = self.size;
         anyhow::ensure!(
             src_w <= cw && src_h <= ch,
@@ -141,8 +136,7 @@ impl CursorPlane {
         // LINEAR + ARGB8888 the row pitch == cw * 4 so that's correct.
         let mut out = vec![0u8; (cw * ch * 4) as usize];
         for y in 0..src_h {
-            let src_row =
-                &pixels_rgba[(y * src_w * 4) as usize..((y + 1) * src_w * 4) as usize];
+            let src_row = &pixels_rgba[(y * src_w * 4) as usize..((y + 1) * src_w * 4) as usize];
             let dst_off = (y * cw * 4) as usize;
             for x in 0..src_w {
                 let i = (x * 4) as usize;
@@ -197,10 +191,7 @@ impl CursorPlane {
         let (cw, ch) = self.size;
         let (x, y) = self.pos;
         let src = Rectangle::from_size((cw as i32, ch as i32).into()).to_f64();
-        let dst = Rectangle::new(
-            (x, y).into(),
-            (cw as i32, ch as i32).into(),
-        );
+        let dst = Rectangle::new((x, y).into(), (cw as i32, ch as i32).into());
         PlaneState {
             handle: self.handle,
             config: Some(PlaneConfig {

@@ -95,7 +95,6 @@ pub fn region_to_non_overlapping_rects(
     region: &RegionAttributes,
     output: &mut Vec<Rectangle<i32, Logical>>,
 ) {
-
     output.clear();
 
     // Collect all unique Y coordinates.

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use crate::device::Device;
-use crate::encode_synth::{EncodeConfig, PUSH_CONSTANTS_SIZE, synthesize_fragment_shader};
+use crate::encode_synth::{synthesize_fragment_shader, EncodeConfig, PUSH_CONSTANTS_SIZE};
 use crate::error::{Result, VkResultExt};
 
 use super::shader_module;
@@ -91,8 +91,7 @@ impl EncodePipeline {
         let frag_spv_words = synthesize_fragment_shader(encode_config)?;
         let frag = create_shader_from_words(&device, &frag_spv_words)?;
 
-        let pipeline =
-            build_encode_pipeline(&device, pipeline_layout, vert, frag, scanout_format)?;
+        let pipeline = build_encode_pipeline(&device, pipeline_layout, vert, frag, scanout_format)?;
         unsafe {
             device.raw.destroy_shader_module(vert, None);
             device.raw.destroy_shader_module(frag, None);
@@ -204,8 +203,7 @@ fn build_encode_pipeline(
     let cb = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
 
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let dyn_state =
-        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let dyn_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
     let color_formats = [color_format];
     let mut dynamic_info =

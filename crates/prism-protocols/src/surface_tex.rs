@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use prism_renderer::{DrmDevId, ExportableImage, ImportedImage, ShmTexture, vk};
+use prism_renderer::{vk, DrmDevId, ExportableImage, ImportedImage, ShmTexture};
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 

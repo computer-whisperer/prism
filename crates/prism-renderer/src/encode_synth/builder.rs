@@ -9,8 +9,8 @@
 use rspirv::dr::Builder;
 use rspirv::spirv;
 
-use super::EncodeConfig;
 use super::push_constants::*;
+use super::EncodeConfig;
 
 /// Cached SPIR-V Word IDs for types we use across the shader.
 pub struct TypeIds {
@@ -161,10 +161,10 @@ impl ShaderCtx {
 
         // ── Push-constant struct type ──────────────────────────────────────
         let push_struct = b.type_struct(vec![
-            mat4, // 0: cal_matrix
-            vec4, // 1: response_gain (rgb + reserved)
-            vec4, // 2: response_gamma (rgb + reserved)
-            vec4, // 3: aux2_reserved
+            mat4,  // 0: cal_matrix
+            vec4,  // 1: response_gain (rgb + reserved)
+            vec4,  // 2: response_gamma (rgb + reserved)
+            vec4,  // 3: aux2_reserved
             f32_t, // 4: sdr_white_nits
             f32_t, // 5: target_peak_nits
             f32_t, // 6: dither_strength
@@ -345,12 +345,7 @@ impl ShaderCtx {
         if let Some(lut_ptr) = u_lut_ptr {
             iface_list.push(lut_ptr);
         }
-        b.entry_point(
-            spirv::ExecutionModel::Fragment,
-            main_id,
-            "main",
-            iface_list,
-        );
+        b.entry_point(spirv::ExecutionModel::Fragment, main_id, "main", iface_list);
         b.execution_mode(main_id, spirv::ExecutionMode::OriginUpperLeft, []);
 
         Self {
@@ -389,10 +384,7 @@ impl ShaderCtx {
     ) -> spirv::Word {
         let ty = self.types.f32_t;
         let ext = self.iface.glsl_ext;
-        let operands: Vec<_> = args
-            .into_iter()
-            .map(rspirv::dr::Operand::IdRef)
-            .collect();
+        let operands: Vec<_> = args.into_iter().map(rspirv::dr::Operand::IdRef).collect();
         self.b
             .ext_inst(ty, None, ext, instruction, operands)
             .expect("ext_inst")
@@ -406,10 +398,7 @@ impl ShaderCtx {
     ) -> spirv::Word {
         let ty = self.types.vec3;
         let ext = self.iface.glsl_ext;
-        let operands: Vec<_> = args
-            .into_iter()
-            .map(rspirv::dr::Operand::IdRef)
-            .collect();
+        let operands: Vec<_> = args.into_iter().map(rspirv::dr::Operand::IdRef).collect();
         self.b
             .ext_inst(ty, None, ext, instruction, operands)
             .expect("ext_inst")

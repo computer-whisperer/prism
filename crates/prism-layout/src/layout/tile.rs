@@ -66,7 +66,6 @@ pub struct Tile<W: LayoutElement> {
     // backdrop here; prism's render path will draw the backdrop
     // directly from the tile's fullscreen rect in `render()`, so no
     // cached buffer is needed.
-
     /// Whether the tile should float upon unfullscreening.
     pub(super) restore_to_floating: bool,
 
@@ -118,7 +117,6 @@ pub struct Tile<W: LayoutElement> {
     // is part of the GLES path we're not porting. Damage tracking for
     // corner-radius changes will be added with the Vulkan rounded-
     // corner element.
-
     /// The view size for the tile's workspace.
     ///
     /// Used as the fullscreen target size.
@@ -1095,13 +1093,8 @@ impl<W: LayoutElement> Tile<W> {
             let backdrop = Rectangle::new(location, self.animated_tile_size());
             let rect_clip = project(backdrop);
             let alpha = fullscreen_progress as f32 * tile_alpha;
-            let color_bt2020_nits = prism_renderer::srgb_to_bt2020_nits(
-                0.,
-                0.,
-                0.,
-                alpha,
-                BACKDROP_SDR_WHITE_NITS,
-            );
+            let color_bt2020_nits =
+                prism_renderer::srgb_to_bt2020_nits(0., 0., 0., alpha, BACKDROP_SDR_WHITE_NITS);
             out.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
                 rect_clip,
                 color_bt2020_nits,

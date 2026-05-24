@@ -35,7 +35,11 @@ use prism_ipc::socket::Socket;
 use prism_ipc::{OutputAction, Reply, Request, Response};
 
 #[derive(Parser)]
-#[command(name = "prism-tune", version, about = "Closed-loop color calibration + IPC client for prism")]
+#[command(
+    name = "prism-tune",
+    version,
+    about = "Closed-loop color calibration + IPC client for prism"
+)]
 struct Cli {
     #[command(subcommand)]
     command: TopCommand,
@@ -110,9 +114,7 @@ fn run_msg(cmd: MsgCommand) -> Result<()> {
 
     let mut socket = Socket::connect()
         .context("connect to PRISM_SOCKET (is prism running, and are you in its env?)")?;
-    let reply = socket
-        .send(request)
-        .context("send request / read reply")?;
+    let reply = socket.send(request).context("send request / read reply")?;
 
     print_reply(reply)
 }
@@ -125,8 +127,8 @@ fn print_reply(reply: Reply) -> Result<()> {
             println!("{v}");
         }
         Ok(response) => {
-            let pretty = serde_json::to_string_pretty(&response)
-                .context("pretty-print response")?;
+            let pretty =
+                serde_json::to_string_pretty(&response).context("pretty-print response")?;
             println!("{pretty}");
         }
         Err(message) => {
