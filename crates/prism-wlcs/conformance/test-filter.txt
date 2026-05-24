@@ -1,0 +1,12 @@
+# WLCS gtest filter — the conformance subset prism targets today.
+#
+# A single line, passed verbatim to `--gtest_filter`. We run a curated
+# subset rather than the whole suite because prism advertises only some
+# globals (no wl_shell / zxdg_shell_v6 / wl_touch), so most of the suite
+# would SKIP or fail for "missing extension" reasons unrelated to
+# conformance. Grow this as prism gains protocols.
+#
+# Covered today: subsurface input routing + synchronization, surface
+# pointer enter/leave/motion, client surface events, wl_output, frame
+# timestamps. (Non-xdg_stable subsurface params SKIP cleanly.)
+*Subsurface*:*ClientSurfaceEvents*:*SurfacePointerMotion*:*WlOutput*:*frame*

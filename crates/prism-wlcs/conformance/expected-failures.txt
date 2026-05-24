@@ -1,0 +1,42 @@
+# WLCS expected failures — tests prism does not (yet) pass.
+#
+# Format: one gtest full name per line (Suite.Test). Lines starting with
+# `#` and blank lines are ignored. `run.sh` treats every test in the
+# configured filter as expected-pass UNLESS it is listed here; a listed
+# test that starts passing is reported as an "unexpected pass" so the
+# entry can be removed.
+#
+# Keep this list small and every entry explained. An expected failure is
+# a deferred bug, not a license to ignore — revisit when the underlying
+# subsystem changes.
+
+# ─── smithay-level subsurface synchronization gap ───────────────────────────
+#
+# Per the wl_subsurface spec, both `set_position` and `place_above`/
+# `place_below` are *parent-committed* state: they take effect "whenever
+# the state of the parent surface is applied", regardless of the
+# subsurface's sync/desync mode. The pinned smithay
+# (ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef) instead ties `set_position`
+# to the *subsurface's own* cached-state commit (sync child → applied on
+# parent commit via commit_sync_surface_tree; desync child → applied on
+# the subsurface's own commit) and applies PlaceAbove/PlaceBelow
+# immediately. This is in core `PrivateSurfaceData::commit`
+# (src/wayland/compositor/tree.rs), so smithay's own wlcs_anvil would fail
+# these too — it is not a prism-specific bug.
+#
+# Real-world impact is low: desync subsurface clients (GTK4, Firefox,
+# Mesa) commit the subsurface themselves alongside content, and position
+# is normally set once at creation paired with a parent commit. These
+# tests exercise the synthetic "position-only, exactly one side
+# committed" orderings.
+#
+# Fixing requires either patching/forking the pinned smithay or
+# reimplementing subsurface position + stacking with parent-commit
+# semantics in prism (bypassing SubsurfaceCachedState). Deferred by
+# decision 2026-05-24.
+XdgShellStableSubsurfaces/SubsurfaceTest.desync_subsurface_moves_when_only_parent_committed/0
+XdgShellStableSubsurfaces/SubsurfaceTest.subsurface_does_not_move_when_parent_not_committed/0
+XdgShellStableSubsurfaces/SubsurfaceTest.place_above_simple/0
+XdgShellStableSubsurfaces/SubsurfaceTest.place_below_simple/0
+XdgShellStableSubsurfaces/SubsurfaceMultilevelTest.subsurface_with_sync_parent_does_not_move_when_only_grandparent_committed/0
+XdgShellStableSubsurfaces/SubsurfaceMultilevelTest.subsurface_does_not_move_when_grandparent_commit_is_before_sync_parent_commit/0
