@@ -95,7 +95,9 @@ use smithay::wayland::shm::{ShmHandler, ShmState, with_buffer_contents};
 
 use crate::client::PrismClient;
 use crate::input_state::{KeyboardFocus, PointerVisibility};
-use crate::surface_tex::{SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture};
+use crate::surface_tex::{
+    GpuTex, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture, TexSource,
+};
 
 /// Stable per-output id. Today we key by the connector name (e.g. `"DP-4"`,
 /// `"HDMI-A-1"`). amdgpu's connector names are globally unique across cards
@@ -281,14 +283,20 @@ pub struct PrismState {
     // ── Client buffer textures ─────────────────────────────────────────────
     // Reference Vulkan devices (via Arc); drop before `gpus` so we don't
     // double-free or hit "device destroyed while images outstanding" paths.
-    /// Per-GPU Vulkan import of every dmabuf-backed `wl_buffer`. Outer key
-    /// is the wl_buffer object id; inner key is the GPU's `DrmDevId`.
-    /// Populated in `dmabuf_imported` (imports on every registered GPU so
-    /// any output's render path can sample the buffer without GPU→GPU
-    /// copies); dropped in `buffer_destroyed`. Multi-GPU support (#59.3)
-    /// makes the inner map non-trivial; today there's typically one entry.
-    pub dmabuf_textures:
-        HashMap<ObjectId, HashMap<DrmDevId, Arc<prism_renderer::ImportedImage>>>,
+    /// GPU-agnostic source description of every accepted dmabuf-backed
+    /// `wl_buffer`, keyed by wl_buffer object id. Holds the dup'd fds so we
+    /// can import the buffer *lazily* on whichever GPU(s) actually display
+    /// the surface (`ensure_surface_textures`), rather than eagerly on every
+    /// registered GPU. Populated in `dmabuf_imported`; dropped in
+    /// `buffer_destroyed`. The per-GPU `VkImage` materializations live on
+    /// the surface's `SurfaceTexSlot`, not here.
+    pub dmabuf_sources: HashMap<ObjectId, Arc<prism_frame::Dmabuf>>,
+
+    /// Per-GPU command infrastructure for the cross-GPU mirror copy
+    /// (`GpuTex::Mirror`). One reusable copier per registered GPU, used
+    /// when a surface is displayed on an output whose GPU can't natively
+    /// import the client buffer. Empty/unused in single-GPU configs.
+    pub mirror_copiers: HashMap<DrmDevId, prism_renderer::MirrorCopier>,
 
     /// Per-output redraw state machine + the `wl_callback.frame` /
     /// `wp_presentation_feedback` stashed at submit time, waiting on
@@ -587,10 +595,11 @@ impl PrismState {
             layer_surfaces: HashMap::new(),
             session,
             cards: HashMap::new(),
+            mirror_copiers: build_mirror_copiers(&gpus),
             gpus,
             outputs: HashMap::new(),
             wl_outputs: HashMap::new(),
-            dmabuf_textures: HashMap::new(),
+            dmabuf_sources: HashMap::new(),
             output_redraw: HashMap::new(),
             keyboard_focus: KeyboardFocus::default(),
             pointer_visibility: PointerVisibility::default(),
@@ -1414,6 +1423,13 @@ impl CompositorHandler for PrismState {
         // moving a window between outputs.
         dispatch_surface_output_from_layout(self, surface);
 
+        // Materialize this surface's texture on the GPU(s) that display it
+        // (consumer set from the placement resolved just above), and do the
+        // per-commit refresh (mirror copies, shm re-uploads). Deferred to
+        // here so the consumer-GPU set is known; a window on a single
+        // monitor only ever imports on that monitor's GPU.
+        ensure_surface_textures(self, surface);
+
         // Damage-driven redraw scheduling: a commit that lands renderable
         // pixels (new buffer, geometry change, popup attach…) needs the
         // output(s) it sits on to repaint. Mark them Queued; the next
@@ -1426,9 +1442,11 @@ impl CompositorHandler for PrismState {
 
 impl BufferHandler for PrismState {
     fn buffer_destroyed(&mut self, buffer: &WlBuffer) {
-        // Drop our dmabuf import if this buffer was a dmabuf. shm buffers
-        // aren't in the map, so this is a no-op for them.
-        self.dmabuf_textures.remove(&buffer.id());
+        // Drop the dmabuf source if this buffer was a dmabuf. The per-GPU
+        // materializations live on surfaces' SurfaceTexSlots and are
+        // replaced when the surface commits a different buffer; shm buffers
+        // were never in this map, so this is a no-op for them.
+        self.dmabuf_sources.remove(&buffer.id());
     }
 }
 
@@ -1624,56 +1642,63 @@ impl DmabufHandler for PrismState {
         dmabuf: SmithayDmabuf,
         notifier: ImportNotifier,
     ) {
-        // Import the client's dmabuf into a Vulkan image **on every registered
-        // GPU**. Any output's render path will sample from the import that
-        // matches its GPU's `DrmDevId`. If we have one GPU, this is one
-        // import; with multi-GPU (#59.3) it's one per GPU. If any GPU fails
-        // to import, we still accept the buffer iff at least one succeeded
-        // (the remaining outputs can sample it; the failing GPU will skip
-        // surfaces using this buffer until a copy path exists).
+        // Don't import to any GPU here. A wl_buffer is created
+        // surface-agnostically (create_immed), so we don't yet know which
+        // output — hence which GPU(s) — will display it. Instead keep a
+        // GPU-agnostic source description (dup'd fds); the surface that
+        // ends up showing this buffer drives a lazy per-GPU import in
+        // `ensure_surface_textures`. GPUs that can't read the modifier get
+        // a cross-GPU mirror there rather than blank.
         if self.gpus.is_empty() {
             tracing::warn!("dmabuf import: no GPUs registered, rejecting");
             notifier.failed();
             return;
         }
 
-        let w = smithay::backend::allocator::Buffer::size(&dmabuf).w;
-        let h = smithay::backend::allocator::Buffer::size(&dmabuf).h;
-        let fmt = smithay::backend::allocator::Buffer::format(&dmabuf);
-
-        let mut imports: HashMap<DrmDevId, Arc<prism_renderer::ImportedImage>> = HashMap::new();
-        for (&gpu_id, device) in &self.gpus {
-            match import_dmabuf(device, &dmabuf) {
-                Ok(image) => {
-                    imports.insert(gpu_id, Arc::new(image));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        gpu = ?gpu_id,
-                        "dmabuf import failed on this GPU: {e:#}"
-                    );
-                }
+        let src = match prism_frame::Dmabuf::from_smithay(&dmabuf) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("dmabuf rejected: Dmabuf::from_smithay failed: {e:#}");
+                notifier.failed();
+                return;
             }
-        }
+        };
 
-        if imports.is_empty() {
-            tracing::warn!("dmabuf import rejected: failed on every GPU");
+        // Validate up front: a Vulkan format mapping must exist, and at
+        // least one GPU must be able to import this (format, modifier)
+        // natively (it becomes the mirror's "home" for the others).
+        // Otherwise the buffer is unusable — reject so the client falls
+        // back instead of rendering blank forever.
+        let Some(vk_format) = vk_format_for(src.format) else {
+            tracing::warn!(fmt = ?src.format, "dmabuf rejected: no Vulkan format mapping");
+            notifier.failed();
+            return;
+        };
+        let modifier = u64::from(src.modifier);
+        let importable = self
+            .gpus
+            .values()
+            .any(|d| gpu_supports_dmabuf(d, vk_format, modifier));
+        if !importable {
+            tracing::warn!(
+                fmt = ?src.format,
+                modifier = format!("{modifier:#x}"),
+                "dmabuf rejected: no GPU supports this format+modifier for single-plane SAMPLED"
+            );
             notifier.failed();
             return;
         }
 
         match notifier.successful::<PrismState>() {
             Ok(buffer) => {
-                let id = buffer.id();
                 tracing::info!(
-                    ?w,
-                    ?h,
-                    ?fmt,
-                    gpus = imports.len(),
-                    "imported client dmabuf as VkImage (cached on {} GPU(s))",
-                    imports.len()
+                    w = src.width,
+                    h = src.height,
+                    fmt = ?src.format,
+                    modifier = format!("{modifier:#x}"),
+                    "accepted client dmabuf source (lazy per-GPU import)"
                 );
-                self.dmabuf_textures.insert(id, imports);
+                self.dmabuf_sources.insert(buffer.id(), Arc::new(src));
             }
             Err(_) => {
                 tracing::warn!("dmabuf successful() failed — client may be dead");
@@ -1863,50 +1888,75 @@ fn build_output_feedback(
 /// Import a client-provided dmabuf as a sampled `VkImage`. Returned image
 /// is owned by the caller; the dmabuf fds are dup'd by Vulkan during import
 /// so it's safe for the caller's `SmithayDmabuf` to be dropped afterward.
+/// Build one reusable [`MirrorCopier`] per registered GPU, for the
+/// cross-GPU mirror path. A copier that fails to construct is simply
+/// omitted (logged) — the mirror path for that GPU then can't run, but
+/// native imports and single-GPU configs are unaffected.
+fn build_mirror_copiers(
+    gpus: &HashMap<DrmDevId, Arc<prism_renderer::Device>>,
+) -> HashMap<DrmDevId, prism_renderer::MirrorCopier> {
+    let mut copiers = HashMap::new();
+    for (&gpu_id, device) in gpus {
+        match prism_renderer::MirrorCopier::new(device.clone()) {
+            Ok(c) => {
+                copiers.insert(gpu_id, c);
+            }
+            Err(e) => tracing::warn!(gpu = ?gpu_id, "mirror copier init failed: {e:#}"),
+        }
+    }
+    copiers
+}
+
+/// Whether `device`'s driver can import a single-plane SAMPLED image with
+/// this `(vk_format, modifier)`. This is the guard that keeps a bad buffer
+/// off the GPU.
+///
+/// The case that matters most is `modifier == DRM_FORMAT_MOD_INVALID`
+/// (u64::MAX): a client that allocated without an explicit modifier
+/// (legacy GBM). On modern AMD the real layout is tiled, but
+/// `ImageDrmFormatModifierExplicitCreateInfoEXT` would take u64::MAX at
+/// face value, build a garbage-tiled image, and page-fault the GPU on
+/// first sample — a *hard* recovery that wedges the card. Invalid is never
+/// in the driver's reported modifier list, so this check rejects it. It's
+/// also how we decide native-vs-mirror: a GPU that returns false here gets
+/// a cross-GPU mirror instead of a native import.
+fn gpu_supports_dmabuf(
+    device: &prism_renderer::Device,
+    vk_format: vk::Format,
+    modifier: u64,
+) -> bool {
+    device
+        .supported_drm_format_modifiers(vk_format)
+        .iter()
+        .any(|m| {
+            m.modifier == modifier
+                && m.plane_count == 1
+                && m.tiling_features
+                    .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+        })
+}
+
+/// Import a client dmabuf as a zero-copy `VkImage` on `device`. Caller must
+/// have already confirmed the modifier is supported (via
+/// [`gpu_supports_dmabuf`]).
+///
+/// `for_sampling`: when true, transition the image to
+/// `SHADER_READ_ONLY_OPTIMAL` so the render path can sample it (needed for
+/// native consumer textures and the mirror's LINEAR target). When false the
+/// image is left in `UNDEFINED` — used for a mirror's `home_src`, which is
+/// only ever a copy *source*: the async copy transitions it to
+/// `TRANSFER_SRC` itself, so the extra blocking transition submit is skipped
+/// (it would stall the event loop on every commit of a non-pooling client).
 fn import_dmabuf(
     device: &Arc<prism_renderer::Device>,
-    src: &SmithayDmabuf,
+    dmabuf: &prism_frame::Dmabuf,
+    for_sampling: bool,
 ) -> Result<prism_renderer::ImportedImage> {
-    let dmabuf = prism_frame::Dmabuf::from_smithay(src).context("Dmabuf::from_smithay")?;
-    let vk_format = vk_format_for(dmabuf.format).with_context(|| {
-        format!("no Vulkan format mapping for {:?}", dmabuf.format)
-    })?;
-
-    // Guard: only import a (format, modifier) the driver actually
-    // supports for single-plane SAMPLED use. This is the backstop that
-    // keeps a bad buffer off the GPU entirely.
-    //
-    // The case that matters most is `modifier == DRM_FORMAT_MOD_INVALID`
-    // (u64::MAX): a client that allocated without an explicit modifier
-    // (legacy GBM). On modern AMD the real layout is tiled, but
-    // `ImageDrmFormatModifierExplicitCreateInfoEXT` would take u64::MAX
-    // at face value, build a garbage-tiled image, and page-fault the GPU
-    // on first sample — a *hard* recovery that takes down every Vulkan
-    // context on the card (and leaves the GPU wedged for other
-    // compositors until reboot). Invalid is never in the driver's
-    // reported modifier list, so this check rejects it. Now that we
-    // advertise real modifiers (build_advertised_dmabuf_formats), modern
-    // clients negotiate a supported one and never hit this path.
-    let modifier = u64::from(dmabuf.modifier);
-    let supported = device.supported_drm_format_modifiers(vk_format);
-    let ok = supported.iter().any(|m| {
-        m.modifier == modifier
-            && m.plane_count == 1
-            && m.tiling_features
-                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
-    });
-    if !ok {
-        anyhow::bail!(
-            "refusing dmabuf import: format {:?} modifier {:#x} not in the \
-             driver's single-plane SAMPLED modifier set (would risk a GPU fault)",
-            dmabuf.format,
-            modifier,
-        );
-    }
-
+    let vk_format = vk_format_for(dmabuf.format)
+        .with_context(|| format!("no Vulkan format mapping for {:?}", dmabuf.format))?;
     let image = prism_renderer::ImportedImage::import(
         device.clone(),
-        &dmabuf,
+        dmabuf,
         vk_format,
         vk::ImageUsageFlags::SAMPLED,
     )
@@ -1915,9 +1965,11 @@ fn import_dmabuf(
     // binds them as SHADER_READ_ONLY_OPTIMAL. Run the one-shot transition
     // here so the first frame's sample is legal — without this radv hangs
     // the queue on the first cmd_draw that touches the descriptor.
-    image
-        .transition_for_sampling()
-        .context("ImportedImage::transition_for_sampling")?;
+    if for_sampling {
+        image
+            .transition_for_sampling()
+            .context("ImportedImage::transition_for_sampling")?;
+    }
     Ok(image)
 }
 
@@ -1936,17 +1988,16 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
         return;
     }
 
-    // Take the new buffer assignment (if any) and (re-)build the texture
-    // under the SurfaceData lock. Output assignment + wl_surface.enter/leave
-    // dispatch happens separately (after this returns) in
-    // dispatch_surface_output_from_layout — that source of truth is the
+    // Set (or refresh) the surface's GPU-agnostic texture SOURCE under the
+    // SurfaceData lock. No GPU work happens here — the per-GPU
+    // materialization is deferred to `ensure_surface_textures`, which runs
+    // after `dispatch_surface_output_from_layout` has resolved which
+    // output (hence GPU) displays the surface. That source of truth is the
     // layout, not the buffer's logical_pos.
     with_states(surface, |states| {
         // `on_commit_buffer_handler` (called before us) took the
         // BufferAssignment out of cached_state and stashed it in
-        // RendererSurfaceState. We read it back from there. The
-        // "previously imported" handle we keep in SurfaceTexSlot
-        // tells us whether to re-import or skip.
+        // RendererSurfaceState. We read it back from there.
         let renderer_state = states.data_map.get::<RendererSurfaceStateUserData>();
         let current_buffer = renderer_state
             .and_then(|s| s.lock().unwrap().buffer().cloned());
@@ -1959,34 +2010,71 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
             .get::<SurfaceTexSlot>()
             .expect("just inserted SurfaceTexSlot");
 
-        match current_buffer {
-            None => {
-                // No buffer currently attached — either initial (never had
-                // one) or just unmapped (BufferAssignment::Removed arrived
-                // this commit and on_commit_buffer_handler cleared the
-                // state). Drop our texture; smithay's `InnerBuffer::Drop`
-                // already fired `wl_buffer.release` when it cleared its
-                // own state — don't release again here.
+        let Some(buffer) = current_buffer else {
+            // No buffer attached — initial commit, or unmapped this commit
+            // (BufferAssignment::Removed). Drop our texture; smithay's
+            // `InnerBuffer::Drop` already fired `wl_buffer.release` when it
+            // cleared its own state — don't release again here.
+            slot.0.lock().unwrap().take();
+            return;
+        };
+        let wl_buffer: &WlBuffer = &buffer;
+
+        // Same dmabuf re-committed (damage-only): the zero-copy import is
+        // still valid and `ensure_surface_textures` will refresh any
+        // mirror. Leave the existing materializations untouched.
+        let same_dmabuf = matches!(
+            &*slot.0.lock().unwrap(),
+            Some(SurfaceTexture { source: TexSource::Dmabuf { buffer: existing, .. }, .. })
+                if existing == wl_buffer
+        );
+        if same_dmabuf {
+            return;
+        }
+
+        // New/changed buffer: (re)build the source, carrying over the
+        // materializations that survive a buffer swap.
+        //   - shm: keep everything if geometry matches (re-uploaded each
+        //     commit anyway), so double-buffered clients don't recreate
+        //     ShmTextures every frame.
+        //   - dmabuf: keep only Mirror entries when extent+format match —
+        //     their scratch + target import depend only on extent/format and
+        //     are expensive to rebuild, so a churning client that
+        //     reallocates its dmabuf every frame reuses them (ensure only
+        //     re-imports home_src + re-copies). Native entries reference the
+        //     old buffer and are dropped (re-imported for the new buffer).
+        match build_tex_source(state, wl_buffer) {
+            Ok(source) => {
                 let mut guard = slot.0.lock().unwrap();
-                let _ = guard.take();
-            }
-            Some(buffer) => {
-                // `buffer` derefs to &WlBuffer. Check whether it's the
-                // same WlBuffer we already have a SurfaceTexture for —
-                // skip the import on damage-only commits where the
-                // client reused the buffer. For shm and for any new
-                // dmabuf, (re-)import.
-                let wl_buffer: &WlBuffer = &buffer;
-                let is_same_dmabuf = matches!(
-                    &*slot.0.lock().unwrap(),
-                    Some(SurfaceTexture::Dmabuf { buffer: existing, .. }) if existing == wl_buffer
-                );
-                if !is_same_dmabuf {
-                    if let Err(e) = build_surface_texture(state, wl_buffer, slot) {
-                        tracing::warn!("surface buffer import failed: {e:#}");
+                let carried: HashMap<DrmDevId, GpuTex> = match (guard.take(), &source) {
+                    (Some(old), TexSource::Shm { extent, format, .. })
+                        if matches!(
+                            &old.source,
+                            TexSource::Shm { extent: oe, format: of, .. }
+                                if oe == extent && of == format
+                        ) =>
+                    {
+                        old.by_gpu
                     }
-                }
+                    (Some(old), TexSource::Dmabuf { dmabuf, format, .. })
+                        if matches!(
+                            &old.source,
+                            TexSource::Dmabuf { dmabuf: od, format: of, .. }
+                                if od.width == dmabuf.width
+                                    && od.height == dmabuf.height
+                                    && of == format
+                        ) =>
+                    {
+                        old.by_gpu
+                            .into_iter()
+                            .filter(|(_, gt)| matches!(gt, GpuTex::Mirror { .. }))
+                            .collect()
+                    }
+                    _ => HashMap::new(),
+                };
+                *guard = Some(SurfaceTexture { source, by_gpu: carried });
             }
+            Err(e) => tracing::warn!("surface buffer source build failed: {e:#}"),
         }
     });
 }
@@ -2271,129 +2359,443 @@ fn hide_all_cursors(state: &mut PrismState) {
     }
 }
 
-fn build_surface_texture(
-    state: &PrismState,
-    buffer: &WlBuffer,
-    slot: &SurfaceTexSlot,
-) -> Result<()> {
-    // dmabuf path: clone the per-GPU import map directly into the slot —
-    // any output's render path can pick its GPU's view at sample time.
-    //
-    // We do NOT call `old.release()` when swapping — smithay's
-    // `RendererSurfaceState` wraps every `WlBuffer` in an
-    // `Arc<InnerBuffer>` whose `Drop` already invokes
-    // `wl_buffer.release()` (and signals the syncobj release point if
-    // one was attached). Doing it ourselves additionally yields a
-    // double-release that crashes GTK4 clients on their next frame
-    // (cairo's `CAIRO_REFERENCE_COUNT_HAS_REFERENCE` assertion fires
-    // when the second release callback hits a freed cairo_surface).
-    if let Some(per_gpu) = state.dmabuf_textures.get(&buffer.id()) {
-        if per_gpu.is_empty() {
-            anyhow::bail!("dmabuf buffer has no imports on any GPU");
-        }
-        let mut guard = slot.0.lock().unwrap();
-        let _previous = guard.replace(SurfaceTexture::Dmabuf {
-            by_gpu: per_gpu.clone(),
+/// Build the GPU-agnostic [`TexSource`] for `buffer`: a dmabuf source
+/// (looked up in `dmabuf_sources`) or an shm source (geometry read from
+/// the buffer). No GPU work.
+fn build_tex_source(state: &PrismState, buffer: &WlBuffer) -> Result<TexSource> {
+    if let Some(dmabuf) = state.dmabuf_sources.get(&buffer.id()) {
+        let format = vk_format_for(dmabuf.format)
+            .with_context(|| format!("no Vulkan format mapping for {:?}", dmabuf.format))?;
+        return Ok(TexSource::Dmabuf {
+            dmabuf: dmabuf.clone(),
+            format,
             buffer: buffer.clone(),
         });
+    }
+    // shm: read geometry (uploads happen lazily per consuming GPU).
+    let (extent, format) = with_buffer_contents(buffer, |_ptr, _len, data| {
+        let format = vk_format_for_shm(data.format)
+            .with_context(|| format!("no Vulkan format mapping for wl_shm::{:?}", data.format))?;
+        if data.width <= 0 || data.height <= 0 {
+            anyhow::bail!("invalid shm geometry: {}x{}", data.width, data.height);
+        }
+        Ok((
+            vk::Extent2D {
+                width: data.width as u32,
+                height: data.height as u32,
+            },
+            format,
+        ))
+    })
+    .context("with_buffer_contents (shm geometry)")??;
+    Ok(TexSource::Shm {
+        extent,
+        format,
+        buffer: buffer.clone(),
+    })
+}
+
+/// The set of GPUs that currently need this surface's pixels, derived from
+/// placement: the GPU driving the output the surface's *root* toplevel is
+/// on. Subsurfaces inherit their toplevel's output/GPU. Single-output
+/// today (the layout assigns each window one monitor), but the return type
+/// is a set so spanning windows extend it with no change to materialization.
+/// Empty for surfaces the layout doesn't place yet (pre-map, layer shell) —
+/// the render-demand safety net covers those.
+fn consumer_gpus_for_surface(state: &PrismState, surface: &WlSurface) -> Vec<DrmDevId> {
+    let mut root = surface.clone();
+    while let Some(parent) = get_parent(&root) {
+        root = parent;
+    }
+    let output_name = state
+        .layout
+        .find_window_and_output(&root)
+        .and_then(|(_, out)| out.map(|o| o.name()));
+    let Some(name) = output_name else {
+        return Vec::new();
+    };
+    state
+        .outputs
+        .get(&name)
+        .map(|o| o.gpu_id)
+        .into_iter()
+        .collect()
+}
+
+/// Materialize a surface's texture on each GPU that displays it, and do the
+/// per-commit refresh work (mirror copies, shm re-uploads). Runs from the
+/// commit handler *after* `dispatch_surface_output_from_layout`, so the
+/// consumer-GPU set is known. All GPU work is on `&PrismState` (devices and
+/// copiers are shared via `Arc` / `&self`), so this takes a shared borrow.
+///
+/// Materializations are kept warm: a GPU's texture is built once and reused
+/// across commits, dropped only when the surface's buffer is replaced
+/// (`process_surface_buffer` rebuilds the source with an empty per-GPU map)
+/// or destroyed.
+fn ensure_surface_textures(state: &PrismState, surface: &WlSurface) {
+    if state.gpus.is_empty() {
+        return;
+    }
+    let consumer_gpus = consumer_gpus_for_surface(state, surface);
+
+    with_states(surface, |states| {
+        let Some(slot) = states.data_map.get::<SurfaceTexSlot>() else {
+            return;
+        };
+        let mut guard = slot.0.lock().unwrap();
+        let Some(tex) = guard.as_mut() else {
+            return;
+        };
+        let extent = tex.extent();
+
+        match &tex.source {
+            TexSource::Dmabuf { .. } => {
+                // Refresh existing mirrors first — the client rewrote the BO
+                // this commit (new buffer, or damage on a reused one). The
+                // scratch + target import are reused; we only re-import
+                // home_src if the client buffer changed, then re-copy + make
+                // the new pixels visible on the target GPU. Bounded: only
+                // cross-GPU surfaces have mirror entries.
+                refresh_dmabuf_mirrors(state, tex, extent);
+                // Materialize for any consumer GPU we don't yet have.
+                for &g in &consumer_gpus {
+                    if tex.by_gpu.contains_key(&g) {
+                        continue;
+                    }
+                    if let Err(e) = materialize_dmabuf_for_gpu(state, tex, g) {
+                        tracing::warn!(gpu = ?g, "dmabuf materialize failed: {e:#}");
+                    }
+                }
+            }
+            TexSource::Shm { .. } => {
+                // shm contents change every commit; re-upload to each
+                // consumer GPU (creating the per-GPU image if needed).
+                if let Err(e) = refresh_shm_uploads(state, tex, &consumer_gpus) {
+                    tracing::warn!("shm upload failed: {e:#}");
+                }
+            }
+        }
+    });
+}
+
+/// Render-demand safety net: materialize `surface` on `gpu` because the
+/// render walk found it being drawn on an output whose GPU has no texture
+/// for it yet (a (surface, GPU) pair the commit-time, placement-driven
+/// `ensure_surface_textures` didn't cover — spanning windows, surfaces that
+/// committed before their toplevel was placed, layer surfaces). Called by
+/// the integrator *after* the surface-tree walk, never inside it (GPU work
+/// + `with_states` would re-enter the surface lock and deadlock). A no-op
+/// if the texture already exists on `gpu` by the time we run.
+pub fn materialize_surface_on_gpu(state: &PrismState, surface: &WlSurface, gpu: DrmDevId) {
+    if state.gpus.is_empty() {
+        return;
+    }
+    with_states(surface, |states| {
+        let Some(slot) = states.data_map.get::<SurfaceTexSlot>() else {
+            return;
+        };
+        let mut guard = slot.0.lock().unwrap();
+        let Some(tex) = guard.as_mut() else {
+            return;
+        };
+        if tex.by_gpu.contains_key(&gpu) {
+            return;
+        }
+        let result = match &tex.source {
+            TexSource::Dmabuf { .. } => materialize_dmabuf_for_gpu(state, tex, gpu),
+            TexSource::Shm { .. } => refresh_shm_uploads(state, tex, &[gpu]),
+        };
+        match result {
+            Ok(()) => tracing::debug!(gpu = ?gpu, surface = ?surface.id(), "demand-materialized surface texture"),
+            Err(e) => tracing::warn!(gpu = ?gpu, "demand materialize failed: {e:#}"),
+        }
+    });
+}
+
+/// Render-time cross-GPU mirror sync. For each surface in `surfaces` that
+/// has a mirror on `target_gpu`, submit its home→scratch copy
+/// asynchronously on the home GPU (batched per home, one submit each) and
+/// import the resulting `sync_file` as a wait semaphore on the target GPU.
+/// The caller adds the returned semaphores to the target output's render
+/// submit (so the render waits for the copies GPU-side) and **must** pass
+/// them back to [`destroy_mirror_waits`] afterwards.
+///
+/// This is what keeps the cross-GPU path off the event loop: the copy is
+/// non-blocking and the render↔copy dependency is a GPU semaphore, not a
+/// CPU fence wait. Returns empty for outputs with no mirrored surfaces.
+pub fn prepare_mirror_waits(
+    state: &PrismState,
+    surfaces: &[WlSurface],
+    target_gpu: DrmDevId,
+) -> Vec<vk::Semaphore> {
+    if surfaces.is_empty() {
+        return Vec::new();
+    }
+    // Gather copy ops grouped by home GPU (collect the vk::Image handles
+    // under each surface's lock; submit after releasing it).
+    let mut by_home: HashMap<DrmDevId, Vec<prism_renderer::MirrorCopyOp>> = HashMap::new();
+    for surface in surfaces {
+        with_states(surface, |states| {
+            let Some(slot) = states.data_map.get::<SurfaceTexSlot>() else {
+                return;
+            };
+            let guard = slot.0.lock().unwrap();
+            let Some(tex) = guard.as_ref() else { return };
+            if let Some(GpuTex::Mirror {
+                home,
+                home_src,
+                scratch,
+                ..
+            }) = tex.by_gpu.get(&target_gpu)
+            {
+                by_home
+                    .entry(*home)
+                    .or_default()
+                    .push(prism_renderer::MirrorCopyOp {
+                        src: home_src.image(),
+                        dst: scratch.image(),
+                        extent: scratch.extent(),
+                    });
+            }
+        });
+    }
+
+    let mut waits = Vec::new();
+    let Some(target_copier) = state.mirror_copiers.get(&target_gpu) else {
+        return waits;
+    };
+    for (home, ops) in by_home {
+        let Some(home_copier) = state.mirror_copiers.get(&home) else {
+            continue;
+        };
+        match home_copier.copy_batch_async(&ops) {
+            Ok(fd) => match target_copier.import_wait_semaphore(fd) {
+                Ok(sem) => waits.push(sem),
+                Err(e) => tracing::warn!(?home, "mirror wait import failed: {e:#}"),
+            },
+            Err(e) => tracing::warn!(?home, "mirror copy submit failed: {e:#}"),
+        }
+    }
+    waits
+}
+
+/// Destroy the wait semaphores returned by [`prepare_mirror_waits`], after
+/// the render submit that waited on them has been queued.
+pub fn destroy_mirror_waits(state: &PrismState, target_gpu: DrmDevId, sems: Vec<vk::Semaphore>) {
+    if let Some(copier) = state.mirror_copiers.get(&target_gpu) {
+        for sem in sems {
+            copier.destroy_imported_semaphore(sem);
+        }
+    }
+}
+
+/// Materialize a dmabuf-backed surface on GPU `g`: a zero-copy native
+/// import if `g`'s driver supports the modifier, else a cross-GPU mirror
+/// (home import + LINEAR exportable scratch copied and re-imported on `g`).
+fn materialize_dmabuf_for_gpu(
+    state: &PrismState,
+    tex: &mut SurfaceTexture,
+    g: DrmDevId,
+) -> Result<()> {
+    // Pull source essentials out so we don't hold a borrow on tex.source
+    // while mutating tex.by_gpu below.
+    let (dmabuf, format, buffer_id) = match &tex.source {
+        TexSource::Dmabuf {
+            dmabuf,
+            format,
+            buffer,
+        } => (dmabuf.clone(), *format, buffer.id()),
+        TexSource::Shm { .. } => return Ok(()),
+    };
+    let device_g = state
+        .gpus
+        .get(&g)
+        .context("target gpu not registered")?
+        .clone();
+    let modifier = u64::from(dmabuf.modifier);
+
+    if gpu_supports_dmabuf(&device_g, format, modifier) {
+        let img = import_dmabuf(&device_g, &dmabuf, true).context("native import on consumer GPU")?;
+        tex.by_gpu.insert(g, GpuTex::Native(Arc::new(img)));
         return Ok(());
     }
 
-    // shm path: read bytes once, upload to every registered GPU.
-    if state.gpus.is_empty() {
-        anyhow::bail!("shm upload requires at least one registered GPU");
+    // Cross-GPU mirror. Find/establish a home GPU that can read the buffer.
+    // home_src is a copy *source* only → imported untransitioned (the async
+    // copy moves it to TRANSFER_SRC itself).
+    let (home_id, home_src) = ensure_home_import(state, tex, format, &dmabuf)?;
+    let device_home = state.gpus.get(&home_id).context("home gpu gone")?.clone();
+    let extent = vk::Extent2D {
+        width: dmabuf.width,
+        height: dmabuf.height,
+    };
+    // The scratch is LINEAR (modifier 0) — a safe, universally-defined
+    // layout (unlike DRM_FORMAT_MOD_INVALID, which faulted the GPU). Still
+    // confirm this GPU can sample LINEAR for the format before building the
+    // mirror, so an unsupported pairing fails cleanly rather than at import.
+    const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+    if !gpu_supports_dmabuf(&device_g, format, DRM_FORMAT_MOD_LINEAR) {
+        anyhow::bail!("consumer GPU can't sample LINEAR for {format:?}; no mirror");
     }
-    let upload_result = with_buffer_contents(buffer, |ptr, len, data| {
-        upload_shm_buffer(&state.gpus, slot, ptr, len, data)
-    })
-    .context("with_buffer_contents")?;
-    upload_result?;
-    // Bytes are copied; smithay's `InnerBuffer::Drop` will send
-    // `wl_buffer.release` when this buffer is replaced on the next
-    // commit (or when the surface state resets). Calling it here
-    // ourselves was a double-release bug — see comment in the dmabuf
-    // branch above.
+    let scratch =
+        prism_renderer::ExportableImage::new(device_home, extent, format, dmabuf.format)
+            .context("ExportableImage::new (mirror scratch)")?;
+    // No copy here: the scratch is filled at render time by the async
+    // copy (prepare_mirror_waits), GPU-synchronized against the target's
+    // render submit. The target import just sets up the sampleable image;
+    // its first sample is gated behind that copy's semaphore.
+    let target = import_dmabuf(&device_g, scratch.exported_dmabuf(), true)
+        .context("import mirror scratch on consumer GPU")?;
+    tracing::debug!(
+        target = ?g,
+        home = ?home_id,
+        "built cross-GPU mirror for surface ({}x{})",
+        extent.width,
+        extent.height
+    );
+    tex.by_gpu.insert(
+        g,
+        GpuTex::Mirror {
+            home: home_id,
+            home_src,
+            home_src_buffer: buffer_id,
+            scratch,
+            target: Arc::new(target),
+        },
+    );
     Ok(())
 }
 
-fn upload_shm_buffer(
-    gpus: &HashMap<DrmDevId, Arc<prism_renderer::Device>>,
-    slot: &SurfaceTexSlot,
-    ptr: *const u8,
-    len: usize,
-    data: smithay::wayland::shm::BufferData,
+/// Find a home GPU for a mirror (one whose driver can import the client
+/// buffer, to serve as the copy source) and import the buffer there. Reuses
+/// an existing native import of this surface on some GPU if one is present
+/// (e.g. a spanning window with both a native and a mirrored consumer);
+/// otherwise imports on the first capable GPU. Does NOT insert into
+/// `tex.by_gpu` — the import is owned by the mirror's `home_src`.
+fn ensure_home_import(
+    state: &PrismState,
+    tex: &SurfaceTexture,
+    format: vk::Format,
+    dmabuf: &Arc<prism_frame::Dmabuf>,
+) -> Result<(DrmDevId, Arc<prism_renderer::ImportedImage>)> {
+    if let Some((&gid, img)) = tex.by_gpu.iter().find_map(|(id, gt)| match gt {
+        GpuTex::Native(img) => Some((id, img.clone())),
+        _ => None,
+    }) {
+        return Ok((gid, img));
+    }
+    let modifier = u64::from(dmabuf.modifier);
+    let (&home_id, device) = state
+        .gpus
+        .iter()
+        .find(|(_, d)| gpu_supports_dmabuf(d, format, modifier))
+        .context("no GPU can import this dmabuf to serve as a mirror home")?;
+    let img = Arc::new(import_dmabuf(device, dmabuf, false).context("home import for mirror")?);
+    Ok((home_id, img))
+}
+
+/// Per-commit refresh of a dmabuf surface's existing cross-GPU mirrors:
+/// re-import `home_src` (the copy source) when the client swapped to a new
+/// buffer. **No GPU copy or sync happens here** — that's deferred to render
+/// time ([`prepare_mirror_waits`]), where it's submitted asynchronously and
+/// synchronized against the target's render via a semaphore, so the commit
+/// path never blocks the event loop. The scratch + target import are reused
+/// across buffer swaps. No-op for surfaces with no mirror entries.
+fn refresh_dmabuf_mirrors(state: &PrismState, tex: &mut SurfaceTexture, _extent: vk::Extent2D) {
+    let (dmabuf, buffer_id) = match &tex.source {
+        TexSource::Dmabuf { dmabuf, buffer, .. } => (dmabuf.clone(), buffer.id()),
+        TexSource::Shm { .. } => return,
+    };
+
+    for gt in tex.by_gpu.values_mut() {
+        let GpuTex::Mirror {
+            home,
+            home_src,
+            home_src_buffer,
+            ..
+        } = gt
+        else {
+            continue;
+        };
+        if *home_src_buffer == buffer_id {
+            continue; // same buffer — home_src still valid (damage re-copied at render)
+        }
+        match state.gpus.get(home) {
+            Some(home_dev) => match import_dmabuf(home_dev, &dmabuf, false) {
+                Ok(img) => {
+                    *home_src = Arc::new(img);
+                    *home_src_buffer = buffer_id.clone();
+                }
+                Err(e) => tracing::warn!(home = ?home, "mirror home_src re-import failed: {e:#}"),
+            },
+            None => {}
+        }
+    }
+}
+
+/// Upload the current shm bytes to each consuming GPU, creating or reusing
+/// a per-GPU [`ShmTexture`]. shm contents change every commit, so this runs
+/// each commit for shm-backed surfaces.
+fn refresh_shm_uploads(
+    state: &PrismState,
+    tex: &mut SurfaceTexture,
+    consumer_gpus: &[DrmDevId],
 ) -> Result<()> {
-    let vk_format = vk_format_for_shm(data.format).with_context(|| {
-        format!("no Vulkan format mapping for wl_shm::{:?}", data.format)
-    })?;
-    if data.width <= 0 || data.height <= 0 || data.stride <= 0 || data.offset < 0 {
-        anyhow::bail!(
-            "invalid shm buffer geometry: {}x{} stride={} offset={}",
-            data.width,
-            data.height,
-            data.stride,
-            data.offset
-        );
-    }
-    let extent = vk::Extent2D {
-        width: data.width as u32,
-        height: data.height as u32,
+    let (extent, format, buffer) = match &tex.source {
+        TexSource::Shm {
+            extent,
+            format,
+            buffer,
+        } => (*extent, *format, buffer.clone()),
+        TexSource::Dmabuf { .. } => return Ok(()),
     };
-    let offset = data.offset as usize;
-    let stride = data.stride as usize;
-    let needed = stride * (data.height as usize);
-    if offset.saturating_add(needed) > len {
-        anyhow::bail!(
-            "shm buffer too small: offset={} need={} pool_len={}",
-            offset,
-            needed,
-            len
-        );
-    }
-
-    // SAFETY: smithay holds the pool mapping for the duration of the
-    // with_buffer_contents callback; ptr+offset..+needed is in-bounds per
-    // the check above. We immediately copy out into per-GPU staging buffers.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), needed) };
-
-    let mut guard = slot.0.lock().unwrap();
-    // Reuse existing per-GPU ShmTextures iff extent + format still match
-    // AND the registered GPU set hasn't changed. The GPU-set check is
-    // cheap insurance for hotplug; at runtime today the set is constant.
-    let needs_new = match &*guard {
-        Some(SurfaceTexture::Shm { by_gpu }) => {
-            by_gpu.len() != gpus.len()
-                || by_gpu
-                    .iter()
-                    .any(|(id, t)| !gpus.contains_key(id)
-                        || t.extent() != extent
-                        || t.format() != vk_format)
+    with_buffer_contents(&buffer, |ptr, len, data| {
+        if data.width <= 0 || data.height <= 0 || data.stride <= 0 || data.offset < 0 {
+            anyhow::bail!(
+                "invalid shm buffer geometry: {}x{} stride={} offset={}",
+                data.width,
+                data.height,
+                data.stride,
+                data.offset
+            );
         }
-        _ => true,
-    };
-    if needs_new {
-        let mut by_gpu = HashMap::with_capacity(gpus.len());
-        for (&gpu_id, device) in gpus {
-            let texture = prism_renderer::ShmTexture::new(device.clone(), extent, vk_format)
-                .with_context(|| {
-                    format!("ShmTexture::new on gpu {}:{}", gpu_id.major, gpu_id.minor)
+        let offset = data.offset as usize;
+        let stride = data.stride as usize;
+        let needed = stride * (data.height as usize);
+        if offset.saturating_add(needed) > len {
+            anyhow::bail!(
+                "shm buffer too small: offset={} need={} pool_len={}",
+                offset,
+                needed,
+                len
+            );
+        }
+        // SAFETY: smithay holds the pool mapping for the duration of this
+        // callback; ptr+offset..+needed is in-bounds per the check above.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), needed) };
+
+        for &g in consumer_gpus {
+            let Some(device) = state.gpus.get(&g) else {
+                continue;
+            };
+            let reuse = matches!(
+                tex.by_gpu.get(&g),
+                Some(GpuTex::Shm(t)) if t.extent() == extent && t.format() == format
+            );
+            if !reuse {
+                let t = prism_renderer::ShmTexture::new(device.clone(), extent, format)
+                    .with_context(|| format!("ShmTexture::new on gpu {}:{}", g.major, g.minor))?;
+                tex.by_gpu.insert(g, GpuTex::Shm(t));
+            }
+            if let Some(GpuTex::Shm(t)) = tex.by_gpu.get_mut(&g) {
+                t.upload_bytes(bytes, stride).with_context(|| {
+                    format!("ShmTexture::upload_bytes on gpu {}:{}", g.major, g.minor)
                 })?;
-            by_gpu.insert(gpu_id, texture);
+            }
         }
-        *guard = Some(SurfaceTexture::Shm { by_gpu });
-    }
-    let Some(SurfaceTexture::Shm { by_gpu }) = guard.as_mut() else {
-        unreachable!("just ensured Some(Shm)");
-    };
-    for (gpu_id, texture) in by_gpu.iter_mut() {
-        texture.upload_bytes(bytes, stride).with_context(|| {
-            format!(
-                "ShmTexture::upload_bytes on gpu {}:{}",
-                gpu_id.major, gpu_id.minor
-            )
-        })?;
-    }
-    Ok(())
+        Ok(())
+    })
+    .context("with_buffer_contents (shm upload)")?
 }
 
 fn vk_format_for_shm(fmt: wl_shm::Format) -> Option<vk::Format> {
@@ -2469,7 +2871,10 @@ fn build_advertised_dmabuf_formats(device: &prism_renderer::Device) -> Vec<DrmFo
         let Some(vk_format) = vk_format_for(fourcc) else {
             continue;
         };
-        for m in device.supported_drm_format_modifiers(vk_format) {
+        let all = device.supported_drm_format_modifiers(vk_format);
+        let mut accepted = 0usize;
+        let mut has_tiled = false;
+        for m in &all {
             // Our importer is single-plane only; multi-plane modifiers
             // (DCC/CCS metadata planes) need separate memory imports.
             if m.plane_count != 1 {
@@ -2481,11 +2886,28 @@ fn build_advertised_dmabuf_formats(device: &prism_renderer::Device) -> Vec<DrmFo
             {
                 continue;
             }
+            let modifier = DrmModifier::from(m.modifier);
+            if modifier != DrmModifier::Linear {
+                has_tiled = true;
+            }
             out.push(DrmFormat {
                 code: fourcc,
-                modifier: DrmModifier::from(m.modifier),
+                modifier,
             });
+            accepted += 1;
         }
+        // Per-format breakdown: a client (Firefox HDR) that wants to
+        // *render* into a format needs a tiled modifier — if we only
+        // offer LINEAR for an HDR format, Mesa won't use it as a render
+        // target and falls back to 8-bit. `has_tiled=false` on a 10-bit
+        // or fp16 row is the thing to look at.
+        tracing::info!(
+            ?fourcc,
+            queried = all.len(),
+            accepted,
+            has_tiled,
+            "dmabuf candidate format"
+        );
     }
     if out.is_empty() {
         out.extend([

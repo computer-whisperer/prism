@@ -3,6 +3,7 @@
 //! One renderer instance per GPU. Consumes `prism_frame::FrameDescription`,
 //! produces scanout buffers for `prism_drm` to submit.
 
+pub mod cross_gpu;
 pub mod device;
 pub mod diagnose;
 pub mod dmabuf;
@@ -17,6 +18,7 @@ pub mod pipeline;
 pub mod renderer;
 pub mod upload;
 
+pub use cross_gpu::{ExportableImage, MirrorCopier, MirrorCopyOp};
 pub use device::{Device, DrmDevId, DrmFormatModifierInfo, PhysicalDeviceInfo};
 pub use diagnose::{DiagnosedNits, EncodeDiagnoseProbe, decode_scanout_texel};
 pub use dmabuf::ImportedImage;

@@ -613,12 +613,29 @@ impl LayoutElement for Mapped {
                 }
             },
             // Visit: emit a SurfaceEl for this surface at `surf_loc + view.offset`.
-            |_surf, states, &surf_loc| {
+            |surf, states, &surf_loc| {
                 let data = states.data_map.get::<RendererSurfaceStateUserData>();
-                let Some(data) = data else { return };
+                let Some(data) = data else {
+                    // No renderer state at all — never committed through
+                    // on_commit_buffer_handler. Normal for a just-created
+                    // subsurface; log at trace for tree-walk visibility.
+                    trace!(
+                        target: "render_walk",
+                        id = ?surf.id(), role = ?states.role,
+                        "skip: no RendererSurfaceState"
+                    );
+                    return;
+                };
                 let view = match data.lock().unwrap().view() {
                     Some(v) => v,
-                    None => return,
+                    None => {
+                        trace!(
+                            target: "render_walk",
+                            id = ?surf.id(), role = ?states.role,
+                            "skip: no view (no buffer committed)"
+                        );
+                        return;
+                    }
                 };
                 // texture_for reads from `states` directly — DO NOT call
                 // with_states(surf) here. We're already inside
@@ -626,8 +643,32 @@ impl LayoutElement for Mapped {
                 // this surface's SurfaceData lock; re-acquiring it would
                 // deadlock.
                 let Some(texture_view) = ctx.texture_for(states) else {
+                    // The surface HAS a committed buffer (view present) but
+                    // no texture for this output's GPU — the proactive,
+                    // placement-driven materialization didn't cover this
+                    // (surface, GPU) pair. Hand it to the render-demand
+                    // safety net: the integrator materializes it on this
+                    // GPU after the walk (can't do GPU work / with_states
+                    // here — we hold this surface's lock), so it draws next
+                    // frame. Blank for this one frame only.
+                    ctx.report_missing(surf);
+                    trace!(
+                        target: "render_walk",
+                        id = ?surf.id(), role = ?states.role,
+                        dst = ?view.dst,
+                        "no texture for this output's GPU yet — queued for demand materialization"
+                    );
                     return;
                 };
+                trace!(
+                    target: "render_walk",
+                    id = ?surf.id(), role = ?states.role, dst = ?view.dst,
+                    "emit surface"
+                );
+                // If this surface's texture is a cross-GPU mirror for this
+                // output's GPU, note it so the integrator syncs the copy
+                // (async) into the render submit.
+                ctx.note_mirror(surf, states);
 
                 let pos = surf_loc + view.offset.to_f64();
                 let dst = Rectangle::new(pos, view.dst.to_f64());

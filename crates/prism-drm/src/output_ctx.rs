@@ -675,6 +675,9 @@ impl OutputContext {
         &mut self,
         elements: &[ElementDraw],
         encode_push: &EncodePush,
+        // Cross-GPU mirror copy-done semaphores the render must wait on
+        // before sampling. Empty for outputs with no mirrored surfaces.
+        wait_semaphores: &[vk::Semaphore],
     ) -> Result<Option<std::os::fd::OwnedFd>> {
         if self.frame_pending {
             return Ok(None);
@@ -692,7 +695,7 @@ impl OutputContext {
         // the `OwnedFd` is free to be returned to the caller.
         let present_sync = self
             .renderer
-            .render_frame(&back.image, elements, encode_push)?;
+            .render_frame(&back.image, elements, encode_push, wait_semaphores)?;
 
         let src = Rectangle::from_size(
             (self.extent.width as i32, self.extent.height as i32).into(),

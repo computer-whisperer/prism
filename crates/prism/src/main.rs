@@ -548,7 +548,7 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     // Headless readback path — the SYNC_FD returned by render_frame is
     // dropped, and we device_wait_idle for completeness. (One-shot test
     // doesn't use the page-flip path the fd is meant for.)
-    let _present_sync = renderer.render_frame(&scanout, &[element], &encode_push)?;
+    let _present_sync = renderer.render_frame(&scanout, &[element], &encode_push, &[])?;
     unsafe {
         let _ = device.raw.device_wait_idle();
     }
@@ -1597,11 +1597,11 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     // session_notifier second), so DrmDevice::Drop fires (its own
     // clear_state succeeds) BEFORE the libseat seat closes.
     breadcrumb(&format!(
-        "shutdown: outputs={} cards={} gpus={} dmabuf_textures={}",
+        "shutdown: outputs={} cards={} gpus={} dmabuf_sources={}",
         state.outputs.len(),
         state.cards.len(),
         state.gpus.len(),
-        state.dmabuf_textures.len()
+        state.dmabuf_sources.len()
     ));
     let t_start = std::time::Instant::now();
 
@@ -1621,9 +1621,13 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     }
 
     let t = std::time::Instant::now();
-    state.dmabuf_textures.clear();
+    // Drop the dmabuf fd descriptions. The per-GPU VkImages live on
+    // surfaces' SurfaceTexSlots and are dropped when `state` (→ Display →
+    // clients → surfaces) drops below; their `Arc<Device>` keeps each
+    // Device alive until then, so there's no images-outstanding hazard.
+    state.dmabuf_sources.clear();
     breadcrumb(&format!(
-        "shutdown: cleared dmabuf_textures in {}ms",
+        "shutdown: cleared dmabuf_sources in {}ms",
         t.elapsed().as_millis()
     ));
 
@@ -1958,10 +1962,45 @@ fn render_output_now(
             .as_deref()
             .map(prism_protocols::color_management::description_to_params)
     };
+    // Render-demand safety net: surfaces the walk finds without a texture
+    // on this output's GPU get collected here and materialized after the
+    // walk (GPU work can't happen inside the walk — it holds surface
+    // locks). See RenderCtx::report_missing_texture.
+    let missing_textures: std::cell::RefCell<
+        Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    > = std::cell::RefCell::new(Vec::new());
+    let report_missing = |s: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| {
+        missing_textures.borrow_mut().push(s.clone());
+    };
+    // Surfaces drawn on this output whose texture is a cross-GPU mirror for
+    // this GPU — collected during the walk, synced (async copy) before the
+    // present submit.
+    let mirror_surfaces: std::cell::RefCell<
+        Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    > = std::cell::RefCell::new(Vec::new());
+    let report_mirror = |s: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+                         states: &smithay::wayland::compositor::SurfaceData| {
+        let is_mirror = states
+            .data_map
+            .get::<prism_protocols::SurfaceTexSlot>()
+            .map(|slot| {
+                slot.0
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|t| t.is_mirror_for(output_gpu_id))
+            })
+            .unwrap_or(false);
+        if is_mirror {
+            mirror_surfaces.borrow_mut().push(s.clone());
+        }
+    };
     let ctx = RenderCtx {
         texture_lookup: &texture_lookup,
         color_lookup: &color_lookup,
         sdr_reference_nits: output_sdr_reference_nits,
+        report_missing_texture: &report_missing,
+        report_mirror: &report_mirror,
     };
 
     // Refresh per-tile cached render elements (focus ring / border /
@@ -1998,6 +2037,28 @@ fn render_output_now(
         &ctx,
         &mut render_els,
     );
+
+    // Render-demand safety net: materialize any surfaces the walk drew on
+    // this output but had no texture for its GPU (spanning windows,
+    // surfaces committed before placement, layer surfaces). They render
+    // blank this frame; materialize now (outside the walk — safe to do GPU
+    // work + with_states here) and queue a redraw so they draw next frame.
+    let missing = missing_textures.take();
+    if !missing.is_empty() {
+        for surf in &missing {
+            prism_protocols::materialize_surface_on_gpu(state, surf, output_gpu_id);
+        }
+        tracing::debug!(
+            output = %output_id,
+            count = missing.len(),
+            "demand-materialized missing surface textures"
+        );
+        state
+            .output_redraw
+            .entry(output_id.to_string())
+            .or_default()
+            .queue_redraw();
+    }
 
     // wlr_layer_shell Overlay surfaces: drawn on top of the layout
     // walk (and above any interactive-move tile). MVP only renders
@@ -2103,13 +2164,24 @@ fn render_output_now(
         }
         p
     };
+    // Cross-GPU mirror sync: for surfaces drawn on this output whose texture
+    // is a mirror, submit their home→scratch copies asynchronously and get
+    // wait semaphores the render submit blocks on (GPU-side, not on the
+    // event loop). Empty for the native case. Computed before the mutable
+    // borrow of state.outputs for present.
+    let mirror_surfaces = mirror_surfaces.take();
+    let mirror_waits =
+        prism_protocols::prepare_mirror_waits(state, &mirror_surfaces, output_gpu_id);
     let present_sync_fd = {
         let output = state
             .outputs
             .get_mut(output_id)
             .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
-        output.present(&elements, &encode_push)?
+        output.present(&elements, &encode_push, &mirror_waits)?
     };
+    // The render submit has been queued with the waits in its dependency
+    // list; the imported semaphores can be destroyed now.
+    prism_protocols::destroy_mirror_waits(state, output_gpu_id, mirror_waits);
 
     let Some(present_sync_fd) = present_sync_fd else {
         // Flip still pending — caller will retry next pass.
@@ -2379,7 +2451,7 @@ fn run_gradient_scanout(
     // committed by render_frame finishes before the page-flip; the
     // returned SYNC_FD is dropped (we don't use the IN_FENCE_FD path
     // here, the synchronous wait is simpler for a one-shot test).
-    let _present_sync = renderer.render_frame(&scanout_image, &[element], &encode_push)?;
+    let _present_sync = renderer.render_frame(&scanout_image, &[element], &encode_push, &[])?;
     unsafe {
         let _ = device.raw.device_wait_idle();
     }

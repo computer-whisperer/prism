@@ -1,87 +1,163 @@
-//! Per-surface texture cache (multi-GPU aware).
+//! Per-surface texture cache (multi-GPU, consumer-driven).
 //!
-//! A `SurfaceTexture` represents a client's most recently committed buffer.
-//! In both variants the buffer's pixels are available on **every registered
-//! GPU**, so any output's render path can sample it via [`view_for`] without
-//! caring which GPU rendered the frame.
+//! A `SurfaceTexture` is a client's most recently committed buffer plus the
+//! per-GPU materializations of its pixels. The model separates two things:
 //!
-//!   - **Dmabuf**: imported as a `VkImage` on each GPU in `dmabuf_imported`
-//!     (zero-copy import; the kernel dups the fd per device).
-//!   - **Shm**: client bytes are read once and uploaded into a per-GPU
-//!     staged `VkImage` on each commit. Costs N× upload bandwidth for N
-//!     GPUs but keeps the render path uniform; surface-to-output mapping
-//!     (#59.5) will later let us skip GPUs whose outputs don't host the
-//!     surface.
+//!   - **source** ([`TexSource`]): a GPU-agnostic description of the pixels
+//!     — the dmabuf fds, or the shm buffer handle — kept so we can
+//!     materialize on a GPU lazily, when (and only when) an output on that
+//!     GPU actually displays the surface.
+//!   - **materializations** (`by_gpu`): for each GPU that needs to sample
+//!     this surface, the concrete Vulkan texture it samples ([`GpuTex`]).
 //!
-//! Storage: one `SurfaceTexSlot` per `wl_surface`, kept in the surface's
-//! `data_map`. Populated / refreshed by `process_surface_buffer` on each
-//! commit; read by the render path on each frame.
+//! A GPU's materialization is one of:
+//!   - [`GpuTex::Native`] — zero-copy dmabuf import. Available only on GPUs
+//!     whose driver understands the buffer's DRM format modifier.
+//!   - [`GpuTex::Mirror`] — for a GPU that *can't* natively import the
+//!     buffer (different vendor/gen in a multi-GPU box): a LINEAR
+//!     exportable scratch image on a "home" GPU that can read the buffer,
+//!     copied each commit and re-imported on this GPU. The cross-GPU
+//!     fallback; see [`prism_renderer::cross_gpu`].
+//!   - [`GpuTex::Shm`] — client bytes uploaded into a per-GPU image.
 //!
-//! [`view_for`]: SurfaceTexture::view_for
+//! Unlike the previous design, materialization is **not** eager on every
+//! registered GPU. The set of consuming GPUs is derived from where the
+//! surface is displayed (placement + render-walk demand), so a window on a
+//! single monitor only ever materializes on that monitor's GPU.
+//!
+//! Storage: one `SurfaceTexSlot` per `wl_surface` in the surface's
+//! `data_map`. Source set by `process_surface_buffer` on commit;
+//! per-GPU materializations built/refreshed by `ensure_surface_textures`.
+//! Read by the render path via [`SurfaceTexture::view_for`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use prism_renderer::{DrmDevId, ImportedImage, ShmTexture, vk};
+use prism_renderer::{DrmDevId, ExportableImage, ImportedImage, ShmTexture, vk};
+use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 
-/// What the renderer samples from on a given commit.
-pub enum SurfaceTexture {
-    /// Bytes uploaded into a Vulkan image on every registered GPU. Lookup
-    /// by GPU returns the matching upload target.
-    Shm { by_gpu: HashMap<DrmDevId, ShmTexture> },
-    /// VkImage backed by client-owned dmabuf (linux-dmabuf path), imported
-    /// on every registered GPU. Lookup by GPU returns the matching import.
-    ///
-    /// `buffer` is held so we can send `wl_buffer.release` when the
-    /// client commits a replacement buffer. Without that the client's
-    /// dmabuf pool fills up and it stalls / errors out (mpv exits with
-    /// "Error occurred on display fd" after ~4 unreleased commits).
-    /// The release happens at "replacement" time, not at present-done
-    /// time — so there's a small race where we may still be GPU-reading
-    /// the BO when the client starts writing it. Acceptable for video
-    /// (next frame masks any tearing); proper sync needs explicit
-    /// fences (linux-drm-syncobj-v1) and lands later.
+/// GPU-agnostic description of a surface's current pixels, retained so we
+/// can materialize the texture on any GPU on demand.
+pub enum TexSource {
+    /// dmabuf-backed. `dmabuf` owns dup'd fds and can be imported on any
+    /// GPU whose driver supports its modifier; GPUs that can't get a
+    /// [`GpuTex::Mirror`] instead. `format` is the Vulkan format the
+    /// import uses. `buffer` is held so the render-path release tracking
+    /// and reuse detection have the original `wl_buffer` identity.
     Dmabuf {
-        by_gpu: HashMap<DrmDevId, Arc<ImportedImage>>,
+        dmabuf: Arc<prism_frame::Dmabuf>,
+        format: vk::Format,
+        buffer: WlBuffer,
+    },
+    /// shm-backed. We don't hold a CPU copy of the bytes; uploads read the
+    /// live buffer (`buffer`) via `with_buffer_contents` at materialization
+    /// time. `extent`/`format` describe the upload target.
+    Shm {
+        extent: vk::Extent2D,
+        format: vk::Format,
         buffer: WlBuffer,
     },
 }
 
-impl SurfaceTexture {
-    /// View into this surface's texture on the given GPU, or `None` if the
-    /// GPU doesn't have an applicable upload/import (e.g. import failed on
-    /// this GPU for a dmabuf, or the GPU wasn't registered when this
-    /// texture was built).
-    pub fn view_for(&self, gpu: DrmDevId) -> Option<vk::ImageView> {
+impl TexSource {
+    pub fn buffer(&self) -> &WlBuffer {
         match self {
-            Self::Shm { by_gpu } => by_gpu.get(&gpu).map(|t| t.view()),
-            Self::Dmabuf { by_gpu, .. } => by_gpu.get(&gpu).map(|t| t.view()),
+            Self::Dmabuf { buffer, .. } | Self::Shm { buffer, .. } => buffer,
+        }
+    }
+    fn extent(&self) -> vk::Extent2D {
+        match self {
+            Self::Dmabuf { dmabuf, .. } => vk::Extent2D {
+                width: dmabuf.width,
+                height: dmabuf.height,
+            },
+            Self::Shm { extent, .. } => *extent,
+        }
+    }
+}
+
+/// One GPU's materialization of a surface's pixels.
+pub enum GpuTex {
+    /// Zero-copy dmabuf import on this GPU. The client writes the BO, we
+    /// sample it — no per-frame copy.
+    Native(Arc<ImportedImage>),
+    /// Cross-GPU mirror: this GPU can't import the client buffer, so a
+    /// "home" GPU that can holds the client import (`home_src`) and copies
+    /// it into a LINEAR exportable scratch image (`scratch`) each commit;
+    /// `target` is that scratch's dmabuf imported on *this* GPU. Sampling
+    /// `target` returns the mirrored pixels.
+    ///
+    /// `scratch` + `target` depend only on extent/format and are **reused
+    /// across buffer swaps** (a churning client that reallocates its
+    /// dmabuf every frame keeps the same scratch + target import — we only
+    /// re-import `home_src` and re-copy). `home_src_buffer` is the
+    /// `wl_buffer` id `home_src` was imported from, so the refresh path
+    /// knows when the client buffer changed and `home_src` must be
+    /// re-imported.
+    Mirror {
+        home: DrmDevId,
+        home_src: Arc<ImportedImage>,
+        home_src_buffer: ObjectId,
+        scratch: ExportableImage,
+        target: Arc<ImportedImage>,
+    },
+    /// Client bytes uploaded into an image on this GPU.
+    Shm(ShmTexture),
+}
+
+impl GpuTex {
+    pub fn view(&self) -> vk::ImageView {
+        match self {
+            Self::Native(img) => img.view(),
+            Self::Mirror { target, .. } => target.view(),
+            Self::Shm(t) => t.view(),
+        }
+    }
+}
+
+/// A client's committed buffer and its per-GPU materializations.
+pub struct SurfaceTexture {
+    pub source: TexSource,
+    pub by_gpu: HashMap<DrmDevId, GpuTex>,
+}
+
+impl SurfaceTexture {
+    pub fn new(source: TexSource) -> Self {
+        Self {
+            source,
+            by_gpu: HashMap::new(),
         }
     }
 
-    /// Width × height in pixels, GPU-independent (same across all
-    /// uploads/imports of the same buffer).
+    /// View into this surface's texture on `gpu`, or `None` if `gpu` has
+    /// no materialization yet (not a consumer, or import/upload pending).
+    pub fn view_for(&self, gpu: DrmDevId) -> Option<vk::ImageView> {
+        self.by_gpu.get(&gpu).map(|t| t.view())
+    }
+
+    /// Whether this surface's texture on `gpu` is a cross-GPU mirror (vs a
+    /// native import or shm upload). Mirrors need a per-frame copy +
+    /// GPU-side sync before the render samples them; the render path uses
+    /// this to collect them for `prepare_mirror_waits`.
+    pub fn is_mirror_for(&self, gpu: DrmDevId) -> bool {
+        matches!(self.by_gpu.get(&gpu), Some(GpuTex::Mirror { .. }))
+    }
+
+    /// Width × height of the source pixels (GPU-independent).
     pub fn extent(&self) -> vk::Extent2D {
-        match self {
-            Self::Shm { by_gpu } => by_gpu
-                .values()
-                .next()
-                .map(|t| t.extent())
-                .unwrap_or_default(),
-            Self::Dmabuf { by_gpu, .. } => by_gpu
-                .values()
-                .next()
-                .map(|i| i.extent())
-                .unwrap_or_default(),
-        }
+        self.source.extent()
+    }
+
+    /// The `wl_buffer` this texture is currently backed by.
+    pub fn buffer(&self) -> &WlBuffer {
+        self.source.buffer()
     }
 }
 
 /// Per-surface slot inserted into `SurfaceData::data_map`. Wrapped in
 /// `Mutex` because the surface's data_map is shared (`&UserDataMap`) but
-/// the texture replacement happens from `commit` (single-threaded today,
-/// but the smithay API gives us a shared reference, so we lock to mutate).
+/// texture replacement / materialization happens from `commit`.
 #[derive(Default)]
 pub struct SurfaceTexSlot(pub Mutex<Option<SurfaceTexture>>);
 
@@ -91,12 +167,13 @@ pub struct SurfaceTexSlot(pub Mutex<Option<SurfaceTexture>>);
 /// the commit hook (which holds `&UserDataMap`, hence the interior
 /// `Mutex`).
 ///
-/// `current_output` is updated by `process_surface_buffer` after each
-/// commit; on transitions we dispatch `wl_surface.enter` / `.leave`
-/// events to the appropriate smithay `Output`s. Today's containment
-/// rule is "the output whose geometry contains the surface's center";
-/// when surfaces span multiple outputs (real layout / overlapping
-/// outputs / fractional scaling) this becomes a `Vec<OutputId>`.
+/// `current_output` is updated by `dispatch_surface_output_from_layout`
+/// after each commit; on transitions we dispatch `wl_surface.enter` /
+/// `.leave` events to the appropriate smithay `Output`s. Today's
+/// containment rule is single-output (the layout assigns each window to
+/// one monitor). The texture layer treats the consuming-GPU set as
+/// plural regardless, so when floating-window spanning lands this becomes
+/// a set with no churn to the materialization path.
 #[derive(Default)]
 pub struct SurfacePlacementSlot(pub Mutex<SurfacePlacement>);
 

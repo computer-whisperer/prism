@@ -279,6 +279,12 @@ impl Renderer {
         scanout: &ImportedImage,
         elements: &[ElementDraw],
         encode_push: &EncodePush,
+        // Binary semaphores the render must wait on before sampling — used
+        // for cross-GPU mirror copies (a home GPU's copy into the shared
+        // scratch must complete before this GPU samples it). Empty for the
+        // common case (native textures, no mirror). Consumed by the wait;
+        // the caller destroys them after this returns.
+        wait_semaphores: &[vk::Semaphore],
     ) -> Result<OwnedFd> {
         let extent = scanout.extent();
         self.ensure_intermediate(extent)?;
@@ -532,8 +538,20 @@ impl Renderer {
         let signal_sem = [vk::SemaphoreSubmitInfo::default()
             .semaphore(slot.present_semaphore)
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        // Wait on any cross-GPU mirror copies before the decode pass samples
+        // their scratch textures. Fragment-shader stage = where the decode
+        // pipeline samples.
+        let wait_sems: Vec<vk::SemaphoreSubmitInfo> = wait_semaphores
+            .iter()
+            .map(|&s| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(s)
+                    .stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            })
+            .collect();
         let submit = [vk::SubmitInfo2::default()
             .command_buffer_infos(&cb_infos)
+            .wait_semaphore_infos(&wait_sems)
             .signal_semaphore_infos(&signal_sem)];
         unsafe {
             self.device

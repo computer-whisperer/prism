@@ -61,6 +61,25 @@ pub struct RenderCtx<'a> {
     /// with no `wp_color_management_v1` description. IEC sRGB default
     /// is 80; HDR-configured outputs typically want higher.
     pub sdr_reference_nits: f32,
+    /// Render-demand safety net. Called from the surface-tree walk when a
+    /// surface has a committed buffer (a `SurfaceView`) but no texture for
+    /// *this* output's GPU — i.e. the proactive, placement-driven
+    /// materialization didn't cover this (surface, GPU) pair (a window
+    /// spanning two GPUs, a surface that committed before its toplevel was
+    /// placed, a layer surface, …). The integrator records the surface and
+    /// materializes it on this output's GPU *after* the walk (doing GPU
+    /// work / `with_states` inside the walk would re-enter the surface lock
+    /// and deadlock). The surface renders blank for this one frame, then
+    /// draws on the next. Same `&WlSurface`-only contract as the lookups.
+    pub report_missing_texture: &'a dyn Fn(&WlSurface),
+    /// Records a surface drawn on this output whose texture is a **cross-GPU
+    /// mirror** for this output's GPU. The integrator collects these and,
+    /// after the walk, submits their home→scratch copies asynchronously and
+    /// adds the resulting wait semaphores to this output's render submit
+    /// (prism-protocols' `prepare_mirror_waits`). Called with both the
+    /// surface and its already-locked `SurfaceData` so the integrator can
+    /// check the mirror flag without re-entering the lock.
+    pub report_mirror: &'a dyn Fn(&WlSurface, &SurfaceData),
 }
 
 impl<'a> RenderCtx<'a> {
@@ -72,6 +91,18 @@ impl<'a> RenderCtx<'a> {
             transfer: 1,
             sdr_white_nits: self.sdr_reference_nits,
         })
+    }
+    /// Record that `surf` has no texture on this output's GPU yet, so the
+    /// integrator can materialize it after the walk. See
+    /// [`RenderCtx::report_missing_texture`].
+    pub fn report_missing(&self, surf: &WlSurface) {
+        (self.report_missing_texture)(surf)
+    }
+    /// Note `surf` (with its locked `states`) as drawn on this output, so
+    /// the integrator can sync its cross-GPU mirror if it has one. See
+    /// [`RenderCtx::report_mirror`].
+    pub fn note_mirror(&self, surf: &WlSurface, states: &SurfaceData) {
+        (self.report_mirror)(surf, states)
     }
 }
 
