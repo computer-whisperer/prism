@@ -18,6 +18,13 @@ prism.crumbs
 prism-client.log
 tty-test.log
 
+# Test-run artifacts from scripts/firefox-test.sh
+firefox-prism.log
+firefox-client.log
+firefox-test.log
+firefox-moz.log*
+firefox.crumbs
+
 # Calibration / tuning run outputs (prism-tune writes these to the CWD)
 /prism-tune-*.csv
 /prism-calibrate-*.csv
