@@ -44,18 +44,26 @@ pub struct SurfaceColorParams {
     /// to anchor into the same absolute-nits coordinate system the
     /// intermediate buffer uses.
     pub sdr_white_nits: f32,
+    /// Linear-light matrix converting the client's primaries into the
+    /// BT.2020 working space, row-major (`out[i] = Σ_k m[i][k]·in[k]`).
+    /// Built from the surface's `wp_color_management_v1` primaries (or
+    /// the sRGB/BT.709 default for unmanaged clients) via
+    /// [`prism_frame::primaries_to_bt2020`]. Near-identity for content
+    /// already in BT.2020. `to_draw` lowers this into the decode shader's
+    /// `decode_matrix`.
+    pub primaries_to_bt2020: prism_frame::Mat3,
 }
 
 impl Default for SurfaceColorParams {
     fn default() -> Self {
-        // Matches the pre-color-management hard-coded default the
-        // mapped-window render walk used: sRGB EOTF + 80-nit white.
-        // Surfaces that never set an image description (every client
-        // before wp_color_management_v1 lands in their toolkit) flow
-        // through this path unchanged.
+        // Pre-color-management default: sRGB EOTF + 80-nit white, and the
+        // sRGB/BT.709 → BT.2020 primaries conversion (legacy clients author
+        // in sRGB by convention). Every client before wp_color_management_v1
+        // lands in their toolkit flows through this path.
         Self {
             transfer: 1,
             sdr_white_nits: 80.0,
+            primaries_to_bt2020: prism_frame::srgb_to_bt2020_matrix(),
         }
     }
 }
@@ -76,6 +84,7 @@ impl SurfaceEl {
         let mut push = DecodePush::identity_srgb(self.dst_rect_clip, self.src_rect_uv);
         push.transfer = self.color.transfer;
         push.sdr_white_nits = self.color.sdr_white_nits;
+        push.decode_matrix = mat3_to_mat4_colmajor(self.color.primaries_to_bt2020);
         let [r, g, b] = output_peak_nits_rgb;
         push.output_peak_nits_rgba = [r, g, b, 0.0];
         ElementDraw {
@@ -83,6 +92,19 @@ impl SurfaceEl {
             push,
         }
     }
+}
+
+/// Lay a row-major 3×3 into the upper-left of a column-major `mat4`
+/// (`[f32; 16]`, the decode push's `decode_matrix` storage). The shader reads
+/// `mat3(decode_matrix)`, so only the 3×3 block matters; the rest is set to
+/// the identity tail. Column `j` of the mat4 holds `(m[0][j], m[1][j], m[2][j])`.
+fn mat3_to_mat4_colmajor(m: prism_frame::Mat3) -> [f32; 16] {
+    [
+        m[0][0], m[1][0], m[2][0], 0.0, // column 0
+        m[0][1], m[1][1], m[2][1], 0.0, // column 1
+        m[0][2], m[1][2], m[2][2], 0.0, // column 2
+        0.0, 0.0, 0.0, 1.0, // column 3
+    ]
 }
 
 /// Uniformly-coloured rectangle. Backs window/layer backgrounds,
@@ -212,8 +234,9 @@ impl RenderEl {
 /// white maps to — typically the per-output `sdr_white_nits` config
 /// (commonly 80–200 for SDR-only setups, 203 for the BT.2408 reference).
 ///
-/// Matrix is the standard BT.709 → BT.2020 primaries conversion in
-/// linear-light (rows from BT.2087-0).
+/// Primaries conversion uses the shared [`prism_frame::srgb_to_bt2020_matrix`]
+/// (BT.709 → BT.2020, Bradford-adapted) so solid colors and sampled surfaces
+/// agree on the BT.709 → BT.2020 transform.
 pub fn srgb_to_bt2020_nits(r: f32, g: f32, b: f32, a: f32, sdr_white_nits: f32) -> [f32; 4] {
     fn eotf(c: f32) -> f32 {
         if c <= 0.04045 {
@@ -222,16 +245,12 @@ pub fn srgb_to_bt2020_nits(r: f32, g: f32, b: f32, a: f32, sdr_white_nits: f32) 
             ((c + 0.055) / 1.055).powf(2.4)
         }
     }
-    let lr = eotf(r);
-    let lg = eotf(g);
-    let lb = eotf(b);
-    let r2 = 0.6274 * lr + 0.3293 * lg + 0.0433 * lb;
-    let g2 = 0.0691 * lr + 0.9195 * lg + 0.0114 * lb;
-    let b2 = 0.0164 * lr + 0.0880 * lg + 0.8956 * lb;
+    let lin = [eotf(r), eotf(g), eotf(b)];
+    let m = prism_frame::srgb_to_bt2020_matrix();
     [
-        r2 * sdr_white_nits,
-        g2 * sdr_white_nits,
-        b2 * sdr_white_nits,
+        (m[0][0] * lin[0] + m[0][1] * lin[1] + m[0][2] * lin[2]) * sdr_white_nits,
+        (m[1][0] * lin[0] + m[1][1] * lin[1] + m[1][2] * lin[2]) * sdr_white_nits,
+        (m[2][0] * lin[0] + m[2][1] * lin[1] + m[2][2] * lin[2]) * sdr_white_nits,
         a,
     ]
 }

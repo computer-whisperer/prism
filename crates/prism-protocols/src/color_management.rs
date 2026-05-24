@@ -260,9 +260,29 @@ pub fn description_to_params(desc: &ImageDescription) -> prism_renderer::Surface
         .map(|l| l.reference_lum as f32)
         // sRGB default reference white per the protocol spec.
         .unwrap_or(80.0);
+    // Convert the surface's primaries into the BT.2020 working space. Named
+    // sets resolve to their standard chromaticities; explicit sets are used
+    // verbatim. `primaries_to_bt2020` Bradford-adapts any non-D65 white.
+    let chroma = match desc.primaries {
+        PrimaryVolume::Named(p) => frame_chromaticities(chromaticities_for_named(p)),
+        PrimaryVolume::Explicit(c) => frame_chromaticities(c),
+    };
     prism_renderer::SurfaceColorParams {
         transfer,
         sdr_white_nits,
+        primaries_to_bt2020: prism_frame::primaries_to_bt2020(&chroma),
+    }
+}
+
+/// Convert protocol chromaticities (CIE xy × 1,000,000) into the renderer's
+/// floating-point [`prism_frame::Chromaticities`].
+fn frame_chromaticities(c: PrimaryChromaticities) -> prism_frame::Chromaticities {
+    let f = |v: i32| v as f32 / 1_000_000.0;
+    prism_frame::Chromaticities {
+        red: (f(c.r_x), f(c.r_y)),
+        green: (f(c.g_x), f(c.g_y)),
+        blue: (f(c.b_x), f(c.b_y)),
+        white: (f(c.w_x), f(c.w_y)),
     }
 }
 

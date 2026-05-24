@@ -19,7 +19,10 @@ pub mod element;
 pub mod handle;
 pub mod output;
 
-pub use color::{ColorDescription, GammaExponent, MasteringInfo, Primaries, TransferFunction};
+pub use color::{
+    primaries_to_bt2020, srgb_to_bt2020_matrix, Chromaticities, ColorDescription, GammaExponent,
+    Mat3, MasteringInfo, Primaries, TransferFunction,
+};
 pub use dmabuf::{Dmabuf, DmabufPlane};
 pub use element::{Element, ElementId, ElementSource, ShaderUniform};
 pub use handle::{ShaderHandle, TextureHandle};

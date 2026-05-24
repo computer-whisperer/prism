@@ -90,6 +90,8 @@ impl<'a> RenderCtx<'a> {
         (self.color_lookup)(states).unwrap_or(SurfaceColorParams {
             transfer: 1,
             sdr_white_nits: self.sdr_reference_nits,
+            // sRGB/BT.709 → BT.2020 conversion for unmanaged clients.
+            ..SurfaceColorParams::default()
         })
     }
     /// Record that `surf` has no texture on this output's GPU yet, so the
