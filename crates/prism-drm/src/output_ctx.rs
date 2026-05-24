@@ -659,13 +659,25 @@ impl OutputContext {
     /// Returns `Ok(false)` (no-op) if a previous flip is still pending —
     /// the caller should wait for the next VBlank event before retrying.
     /// Returns `Ok(true)` if a frame was submitted.
+    /// Render + submit + page-flip. Returns:
+    ///   - `Ok(None)`: previous flip still in flight; caller should
+    ///     wait for the next VBlank event before retrying.
+    ///   - `Ok(Some(fd))`: frame submitted. The returned fd is the
+    ///     present-completion `SYNC_FD` from `render_frame` —
+    ///     becomes readable once the GPU finishes our submit. It's
+    ///     already been handed to the DRM atomic commit as
+    ///     `IN_FENCE_FD` (kernel dup'd internally), and is returned
+    ///     to the caller so they can also use it to time
+    ///     post-submit work — e.g., signaling `wp_linux_drm_syncobj`
+    ///     release points on the input dmabufs. Caller may drop it
+    ///     if not needed.
     pub fn present(
         &mut self,
         elements: &[ElementDraw],
         encode_push: &EncodePush,
-    ) -> Result<bool> {
+    ) -> Result<Option<std::os::fd::OwnedFd>> {
         if self.frame_pending {
-            return Ok(false);
+            return Ok(None);
         }
 
         let back = &self.buffers[self.back_index];
@@ -674,9 +686,10 @@ impl OutputContext {
         // IN_FENCE_FD so the kernel sequences the page-flip after our
         // GPU writes complete, without falling back to dmabuf
         // implicit-sync (which makes page_flip itself stall ~16ms on
-        // radv). The fd is BorrowedFd-lifetime tied to `plane_state`
-        // below; it's closed when `present_sync` drops at the end of
-        // this function.
+        // radv). The fd is `BorrowedFd`-borrowed by `plane_state`
+        // below for the duration of the atomic commit; after the
+        // commit ioctl returns, the kernel holds its own dup and
+        // the `OwnedFd` is free to be returned to the caller.
         let present_sync = self
             .renderer
             .render_frame(&back.image, elements, encode_push)?;
@@ -749,7 +762,7 @@ impl OutputContext {
             res?;
         }
         self.frame_pending = true;
-        Ok(true)
+        Ok(Some(present_sync))
     }
 }
 

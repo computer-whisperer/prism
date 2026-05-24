@@ -36,6 +36,7 @@ use smithay::backend::allocator::dmabuf::Dmabuf as SmithayDmabuf;
 use smithay::delegate_compositor;
 use smithay::delegate_content_type;
 use smithay::delegate_dmabuf;
+use smithay::delegate_drm_syncobj;
 use smithay::delegate_fractional_scale;
 use smithay::delegate_output;
 use smithay::delegate_presentation;
@@ -48,6 +49,7 @@ use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
+use smithay::reexports::calloop::LoopHandle;
 use prism_frame::{DrmFourcc, DrmModifier};
 use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::backend::{ClientData, ObjectId};
@@ -69,11 +71,16 @@ use smithay::wayland::dmabuf::{
     ImportNotifier, SurfaceDmabufFeedbackState,
 };
 use smithay::wayland::content_type::ContentTypeState;
+use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState};
 use smithay::wayland::fractional_scale::{
     FractionalScaleHandler, FractionalScaleManagerState,
 };
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::presentation::PresentationState;
+use smithay::wayland::selection::data_device::{DataDeviceState, set_data_device_focus};
+use smithay::wayland::selection::primary_selection::{
+    PrimarySelectionState, set_primary_focus,
+};
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::xdg_activation::{
@@ -159,15 +166,34 @@ pub struct PrismState {
     /// for the xdg-output manager; per-output `Output` instances live in
     /// `wl_outputs` and carry their own wl_output global IDs.
     pub output_manager: OutputManagerState,
-    /// wl_seat state for all advertised seats. We only have one ("seat0")
-    /// today and it's advertised with zero capabilities — enough to make
-    /// clients (mpv, browsers) that require *some* seat to be present
-    /// connect successfully. Real input dispatch (keyboard/pointer)
-    /// lands when we wire up libinput.
+    /// wl_seat state for all advertised seats. We only have one
+    /// ("seat0") today, advertised with keyboard + pointer capabilities
+    /// at startup so GDK clients (Firefox/GTK) construct a usable
+    /// GdkSeat before they query it — see the bind-site comment in
+    /// `PrismState::new`.
     pub seat_state: SeatState<PrismState>,
-    /// The single seat we advertise. Kept around so we can flip
-    /// capabilities on later (when we add keyboard/pointer support).
+    /// The single seat we advertise. Kept around so libinput's
+    /// device-added handler can attach per-device state and so we can
+    /// retract capabilities if the last device of a kind unplugs.
     pub seat: Seat<PrismState>,
+    /// `wl_data_device_manager` (v3) — clipboard + DnD. GTK4 ≥ 4.22
+    /// hard-requires this; before we advertised it, every GTK app
+    /// silently refused to use the wayland display and either fell
+    /// back to X11 (then failed) or crashed in obscure ways
+    /// (Firefox: child-process abort, Nautilus: clean exit). All
+    /// handler trait impls and the delegate live in
+    /// [`crate::selection`].
+    pub data_device_state: DataDeviceState,
+    /// `wp_primary_selection_device_manager_v1` — middle-click paste.
+    /// Universally expected on Linux desktops; advertised to all
+    /// clients (no per-client filter — see TODO in
+    /// [`crate::selection`]).
+    pub primary_selection_state: PrimarySelectionState,
+    /// Active drag-and-drop cursor icon, set while a DnD grab is
+    /// in flight. Currently *stored only* — the render path doesn't
+    /// draw it yet, so drags work functionally but without a visual
+    /// preview. See [`crate::selection`] for the TODO.
+    pub dnd_icon: Option<crate::selection::DndIcon>,
     /// wp_viewporter global. mpv (with `--vo=gpu --gpu-context=wayland`)
     /// hard-requires this to attach destination/source rects to each
     /// surface. We accept the protocol but currently *ignore* the
@@ -215,6 +241,27 @@ pub struct PrismState {
     /// against the seat's last keyboard/pointer enter serial and
     /// calls [`Layout::activate_window`] on success.
     pub xdg_activation: XdgActivationState,
+    /// `wp_linux_drm_syncobj_v1` state, or `None` when the kernel
+    /// lacks `syncobj_eventfd` support (we can't generate
+    /// eventfd-backed blockers without it, so we don't advertise
+    /// the global). Initialized via [`Self::init_drm_syncobj`] after
+    /// the primary card is attached — at `PrismState::new` time we
+    /// don't yet have a `DrmDeviceFd`. See [`crate::drm_syncobj`].
+    pub drm_syncobj_state: Option<DrmSyncobjState>,
+    /// DrmDevId of the GPU we advertise as the dmabuf main_device.
+    /// Kept around so [`Self::init_drm_syncobj`] can look up the
+    /// matching card after [`Self::attach_card`] populates `cards`.
+    pub primary_gpu_id: Option<DrmDevId>,
+    /// calloop handle used by the drm_syncobj acquire-blocker
+    /// pre-commit hook and the per-render release-signal source.
+    /// `None` until [`Self::set_loop_handle`] is called from
+    /// `main.rs` after the event loop is constructed; the hook
+    /// guards on `.as_ref()` so commits before set_loop_handle
+    /// just skip the explicit-sync work (no client surfaces can
+    /// possibly exist before the wayland socket is bound, which
+    /// happens after the event loop is built, so this is a
+    /// theoretical window).
+    pub loop_handle: Option<LoopHandle<'static, PrismState>>,
     /// `wlr_layer_shell_unstable_v1` server state. MVP — see
     /// [`crate::layer_shell`] for the deliberate scope gaps.
     pub layer_shell_state:
@@ -426,13 +473,35 @@ impl PrismState {
         // accounts for fractional scaling.
         let output_manager = OutputManagerState::new_with_xdg_output::<PrismState>(&dh);
 
-        // wl_seat advertised with zero capabilities. Many clients (mpv
-        // in particular) refuse to start without *some* wl_seat global;
-        // advertising one with no keyboard/pointer/touch makes them
-        // connect cleanly. Real input dispatch lands when libinput
-        // wiring does.
+        // wl_seat advertised with keyboard + pointer capabilities up
+        // front. Adding the capabilities at bind time (vs. waiting for
+        // libinput to enumerate) matters because:
+        //   - libseat/libinput device enumeration on this hardware lags
+        //     several seconds behind socket-ready, and clients that
+        //     bind wl_seat in that window see capabilities=0.
+        //   - GDK (Firefox, GTK apps) refuses to construct a GdkSeat
+        //     from a capability-less wl_seat: gdk_seat_get_keyboard
+        //     starts returning NULL, internal assertions fire, and the
+        //     client crashes within ~700ms of connecting.
+        // The xkb keymap is loaded from the config that's already on
+        // disk. The libinput dispatcher's on_device_added guards with
+        // `get_keyboard().is_none()` so real device discovery becomes a
+        // no-op for capability bookkeeping (it still attaches per-device
+        // settings).
         let mut seat_state = SeatState::<PrismState>::new();
-        let seat = seat_state.new_wl_seat(&dh, "seat0");
+        let mut seat = seat_state.new_wl_seat(&dh, "seat0");
+        {
+            let cfg = config.borrow();
+            let kb = &cfg.input.keyboard;
+            if let Err(e) = seat.add_keyboard(
+                kb.xkb.to_xkb_config(),
+                i32::from(kb.repeat_delay),
+                i32::from(kb.repeat_rate),
+            ) {
+                tracing::warn!("seat: failed to add keyboard at startup: {e:?}");
+            }
+        }
+        seat.add_pointer();
 
         // wp_viewporter — hard-required by mpv's wayland-egl path so it
         // can set destination rects on its video surface. Smithay
@@ -466,6 +535,12 @@ impl PrismState {
         let content_type = ContentTypeState::new::<PrismState>(&dh);
         let xdg_activation = XdgActivationState::new::<PrismState>(&dh);
 
+        // wl_data_device_manager + wp_primary_selection_device_manager_v1.
+        // GTK4 ≥ 4.22 hard-requires the former; without it every GTK
+        // client refuses the wayland display. See crate::selection.
+        let data_device_state = DataDeviceState::new::<PrismState>(&dh);
+        let primary_selection_state = PrimarySelectionState::new::<PrismState>(&dh);
+
         Self {
             config,
             clock,
@@ -482,6 +557,9 @@ impl PrismState {
             output_manager,
             seat_state,
             seat,
+            data_device_state,
+            primary_selection_state,
+            dnd_icon: None,
             viewporter,
             presentation,
             color_management,
@@ -489,6 +567,9 @@ impl PrismState {
             single_pixel_buffer,
             content_type,
             xdg_activation,
+            drm_syncobj_state: None,
+            primary_gpu_id: primary_gpu,
+            loop_handle: None,
             layer_shell_state,
             layer_surfaces: HashMap::new(),
             session,
@@ -517,6 +598,41 @@ impl PrismState {
         card: prism_drm::DrmCardContext,
     ) -> Option<prism_drm::DrmCardContext> {
         self.cards.insert(card.drm_dev_id, card)
+    }
+
+    /// Stash the calloop loop handle on the state. Needed by the
+    /// `drm_syncobj` pre-commit hook (registers eventfd sources for
+    /// acquire blockers) and the per-render release-signal source.
+    /// Must be called after the event loop is built and before the
+    /// dispatch loop starts servicing clients — `main.rs` does this
+    /// once at startup.
+    pub fn set_loop_handle(&mut self, handle: LoopHandle<'static, PrismState>) {
+        self.loop_handle = Some(handle);
+    }
+
+    /// Bring up the `wp_linux_drm_syncobj_manager_v1` global using
+    /// the primary GPU's card fd as the syncobj import device.
+    /// No-op when:
+    ///   - no primary GPU was registered at construction time
+    ///   - the primary GPU's card isn't yet attached
+    ///   - the kernel lacks `syncobj_eventfd` support
+    ///
+    /// Call from `main.rs` after the `attach_card` loop completes.
+    pub fn init_drm_syncobj(&mut self) {
+        let Some(primary) = self.primary_gpu_id else {
+            tracing::info!("drm_syncobj: no primary GPU set, skipping");
+            return;
+        };
+        let Some(card) = self.cards.get(&primary) else {
+            tracing::warn!(
+                gpu = ?primary,
+                "drm_syncobj: primary GPU card not attached, skipping"
+            );
+            return;
+        };
+        let device_fd = card.drm.device_fd().clone();
+        self.drm_syncobj_state =
+            crate::drm_syncobj::try_init(&self.display_handle, device_fd);
     }
 
     /// Insert a built output. Returns the previous entry for that
@@ -991,10 +1107,6 @@ delegate_output!(PrismState);
 // ─── wl_seat ────────────────────────────────────────────────────────────────
 
 impl SeatHandler for PrismState {
-    // WlSurface is the focus carrier — smithay provides KeyboardTarget /
-    // PointerTarget / TouchTarget impls for it. No input dispatch yet,
-    // so these are mostly placeholders; the seat is advertised with
-    // zero capabilities and clients can bind but won't receive events.
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
@@ -1002,7 +1114,18 @@ impl SeatHandler for PrismState {
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
-    // focus_changed / cursor_image / led_state_changed default to no-ops.
+
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // Hand clipboard + primary selection ownership to whatever
+        // client owns the keyboard focus. Without this, data offers
+        // are never dispatched and paste targets see an empty
+        // clipboard. The lookup-then-call pattern matches niri's.
+        let dh = &self.display_handle;
+        let client = focused.and_then(|s| dh.get_client(s.id()).ok());
+        set_data_device_focus(dh, seat, client.clone());
+        set_primary_focus(dh, seat, client);
+    }
+    // cursor_image / led_state_changed default to no-ops.
 }
 
 delegate_seat!(PrismState);
@@ -1032,9 +1155,30 @@ impl CompositorHandler for PrismState {
             .compositor
     }
 
+    fn new_surface(&mut self, surface: &WlSurface) {
+        // Install the drm_syncobj acquire-blocker pre-commit hook.
+        // The hook itself is a fast no-op for non-syncobj surfaces
+        // (it checks pending acquire_point + pending dmabuf and
+        // returns early when either is absent), so installing on
+        // every surface is fine. The hook also self-guards on
+        // drm_syncobj being enabled + loop_handle being set,
+        // reading both from `state` at fire time.
+        crate::drm_syncobj::install_pre_commit_blocker(surface);
+    }
+
     fn commit(&mut self, surface: &WlSurface) {
         let role = get_role(surface);
         tracing::debug!(?role, "wl_surface commit");
+
+        // drm_syncobj release tracking: if this commit carries a
+        // release point, wrap it in a CommitReleaseTracker and
+        // install on the surface (replacing any previous one). The
+        // old tracker's Arc drops here; if no in-flight render holds
+        // a clone, its Drop signals the old release point
+        // immediately, otherwise the last clone drop does. Surfaces
+        // not using drm_syncobj produce None — no-op.
+        let new_tracker = crate::drm_syncobj::build_tracker_for_current_commit(surface);
+        crate::drm_syncobj::install_tracker(surface, new_tracker);
 
         // Populate smithay's `RendererSurfaceState` for every surface in
         // the tree under `surface`. This is what computes the
@@ -1545,6 +1689,19 @@ impl FractionalScaleHandler for PrismState {}
 delegate_fractional_scale!(PrismState);
 delegate_single_pixel_buffer!(PrismState);
 delegate_content_type!(PrismState);
+
+// ─── linux_drm_syncobj_v1 ───────────────────────────────────────────────────
+// Real handler lives in [`crate::drm_syncobj`] — release tracking,
+// pre-commit blocker installation, calloop wiring. This impl just
+// hands smithay the state slot (or None when the kernel doesn't
+// support `syncobj_eventfd` and we couldn't bring up the global).
+
+impl DrmSyncobjHandler for PrismState {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        self.drm_syncobj_state.as_mut()
+    }
+}
+delegate_drm_syncobj!(PrismState);
 
 // ─── xdg_activation_v1 ──────────────────────────────────────────────────────
 // Activation tokens carry a seat + serial that the requesting client

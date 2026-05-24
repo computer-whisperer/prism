@@ -8,9 +8,11 @@
 
 pub mod client;
 pub mod color_management;
+pub mod drm_syncobj;
 pub mod input_state;
 pub mod layer_shell;
 pub mod redraw;
+pub mod selection;
 pub mod server;
 pub mod state;
 pub mod surface_tex;

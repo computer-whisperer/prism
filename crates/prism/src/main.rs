@@ -242,6 +242,12 @@ fn run_wayland_server() -> Result<()> {
     let mut event_loop: EventLoop<'static, prism_protocols::PrismState> =
         EventLoop::try_new().context("calloop EventLoop::try_new")?;
 
+    // Stash the LoopHandle before client surfaces can appear, so the
+    // drm_syncobj pre-commit hook can register eventfd sources.
+    // `init_drm_syncobj` is a no-op in wayland-only mode (no card
+    // attached), so we don't call it — the hook self-guards on
+    // drm_syncobj_state.is_some().
+    state.set_loop_handle(event_loop.handle());
     let socket = prism_protocols::insert_wayland_sources(&event_loop.handle(), display)?;
     tracing::info!(
         "WAYLAND_DISPLAY={socket}  — try: `WAYLAND_DISPLAY={socket} foot` (or weston-terminal)"
@@ -1313,6 +1319,17 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     // Event loop + sources.
     let mut event_loop: EventLoop<'static, prism_protocols::PrismState> =
         EventLoop::try_new().context("EventLoop::try_new")?;
+    // Stash the LoopHandle on state before any client can connect:
+    // drm_syncobj's pre-commit hook (registered from new_surface)
+    // reads it to insert eventfd sources for acquire blockers, and
+    // render_output_now reads it to schedule release-point signals
+    // on the per-submit sync_fd. Must happen before
+    // `insert_wayland_sources` (which makes the socket reachable).
+    state.set_loop_handle(event_loop.handle());
+    // Bring up the wp_linux_drm_syncobj global now that cards are
+    // attached. Skipped silently if kernel lacks `syncobj_eventfd`
+    // or the primary GPU's card isn't registered.
+    state.init_drm_syncobj();
     let socket = prism_protocols::insert_wayland_sources(&event_loop.handle(), display)?;
     tracing::info!("WAYLAND_DISPLAY={socket}");
     // IPC socket for runtime control (prism-tune, future prism-msg, etc.).
@@ -2087,7 +2104,7 @@ fn render_output_now(
         }
         p
     };
-    let presented = {
+    let present_sync_fd = {
         let output = state
             .outputs
             .get_mut(output_id)
@@ -2095,10 +2112,10 @@ fn render_output_now(
         output.present(&elements, &encode_push)?
     };
 
-    if !presented {
+    let Some(present_sync_fd) = present_sync_fd else {
         // Flip still pending — caller will retry next pass.
         return Ok(None);
-    }
+    };
 
     // Extract pending frame_callbacks + presentation_feedback from
     // every surface mapped to this output so we can fire them at the
@@ -2106,6 +2123,14 @@ fn render_output_now(
     // them now (at submit, before scanout) would lie to clients about
     // when the buffer hit the screen and cause over-production / stalls
     // — see the redraw module's docs.
+    //
+    // Same walk also harvests `wp_linux_drm_syncobj` release trackers
+    // for surfaces that opted into explicit sync: every surface we
+    // just rendered contributes one Arc clone, and we hand the whole
+    // batch + the present sync_fd to drm_syncobj's release wiring.
+    // When the fd signals (Vulkan submit done), the Arcs drop; the
+    // last drop across all outputs that sampled the surface signals
+    // the client's release point.
     let surfaces: Vec<_> = state
         .xdg_shell
         .toplevel_surfaces()
@@ -2115,6 +2140,7 @@ fn render_output_now(
 
     let mut frame_cbs = Vec::new();
     let mut presentation_cbs = Vec::new();
+    let mut release_trackers = Vec::new();
     for surface in &surfaces {
         let belongs_here = state
             .layout
@@ -2141,6 +2167,42 @@ fn render_output_now(
                     .callbacks,
             ));
         });
+        if let Some(t) = prism_protocols::drm_syncobj::tracker_for_render(surface) {
+            release_trackers.push(t);
+        }
+    }
+    // Same harvest for Overlay layer-shell surfaces we just rendered.
+    // Bottom/Top layers aren't yet composited (see crate::layer_shell
+    // scope notes), so don't appear in the render walk and don't need
+    // release tracking here.
+    for (wl_surface, _rect, layer) in state.layer_surfaces_for_output(&output_id.to_string()) {
+        if !matches!(layer, smithay::wayland::shell::wlr_layer::Layer::Overlay) {
+            continue;
+        }
+        if let Some(t) = prism_protocols::drm_syncobj::tracker_for_render(wl_surface) {
+            release_trackers.push(t);
+        }
+    }
+
+    if let Some(loop_handle) = state.loop_handle.as_ref() {
+        prism_protocols::drm_syncobj::register_release_after_submit(
+            loop_handle,
+            present_sync_fd,
+            release_trackers,
+        );
+    } else {
+        // No LoopHandle stashed — drop the trackers (signals release
+        // immediately, racy with in-flight GPU). Only reachable if
+        // main forgot to call state.set_loop_handle before dispatch;
+        // log loudly.
+        if !release_trackers.is_empty() {
+            tracing::error!(
+                "drm_syncobj: state.loop_handle is None during render — \
+                 release points will fire before GPU completes"
+            );
+        }
+        drop(release_trackers);
+        drop(present_sync_fd);
     }
 
     Ok(Some(PendingFeedback {
