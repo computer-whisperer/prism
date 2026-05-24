@@ -740,33 +740,52 @@ impl PrismState {
         // `output "Make Model Serial"` blocks resolve here. Without this
         // the resolution falls back to defaults (scale=1, no rotation)
         // for any EDID-keyed config.
-        let scale_xfrm_name = prism_config::output::OutputName {
+        let name = prism_config::output::OutputName {
             connector: ctx.connector_name.clone(),
             make: ctx.edid.make.clone(),
             model: ctx.edid.model.clone(),
             serial: ctx.edid.serial.clone(),
         };
-        let (scale, transform) = self.resolve_output_scale_transform(&scale_xfrm_name);
         let size_mm = ctx
             .edid
             .size_mm
-            .map(|(w, h)| (w as i32, h as i32).into())
-            .unwrap_or_else(|| (0, 0).into());
-        let make = ctx
-            .edid
-            .make
-            .clone()
-            .unwrap_or_else(|| "Unknown".to_owned());
-        let model = ctx
-            .edid
-            .model
-            .clone()
-            .unwrap_or_else(|| ctx.connector_name.clone());
-        let serial_number = ctx.edid.serial.clone().unwrap_or_default();
+            .map(|(w, h)| (w as i32, h as i32))
+            .unwrap_or((0, 0));
+        self.advertise_output_from_parts(name, mode, size_mm)
+    }
+
+    /// DRM-independent core of [`advertise_output`]: build the smithay
+    /// `Output` from already-extracted parts, create its `wl_output`
+    /// global, apply mode/scale/transform, attach the `OutputName`
+    /// user-data, inform the layout, and stash it in `wl_outputs`.
+    ///
+    /// `name` drives both scale/transform resolution (the KDL `output
+    /// "…"` block lookup) and the `wl_output` make/model/serial
+    /// advertisement; its `connector` is the `wl_outputs` map key.
+    /// `size_mm` is the physical panel size in millimetres (`(0, 0)` ⇒
+    /// unknown). Scale comes from config; transform is forced to `Normal`
+    /// until the render path can rotate scanout. Logical position is
+    /// **not** assigned here — call [`layout_outputs`] once every output
+    /// has been advertised.
+    ///
+    /// Used by [`advertise_output`] (DRM path, parts pulled from an
+    /// `OutputContext`) and by the WLCS test harness (synthetic parts,
+    /// no `OutputContext` / no scanout behind the output).
+    pub fn advertise_output_from_parts(
+        &mut self,
+        name: prism_config::output::OutputName,
+        mode: OutputMode,
+        size_mm: (i32, i32),
+    ) -> &Output {
+        let (scale, transform) = self.resolve_output_scale_transform(&name);
+        let connector = name.connector.clone();
+        let make = name.make.clone().unwrap_or_else(|| "Unknown".to_owned());
+        let model = name.model.clone().unwrap_or_else(|| connector.clone());
+        let serial_number = name.serial.clone().unwrap_or_default();
         let output = Output::new(
-            ctx.connector_name.clone(),
+            connector.clone(),
             PhysicalProperties {
-                size: size_mm,
+                size: size_mm.into(),
                 subpixel: Subpixel::Unknown,
                 make,
                 model,
@@ -788,7 +807,7 @@ impl PrismState {
             None,
         );
         tracing::info!(
-            connector = %ctx.connector_name,
+            connector = %connector,
             mode_w = mode.size.w,
             mode_h = mode.size.h,
             scale = scale.fractional_scale(),
@@ -799,23 +818,16 @@ impl PrismState {
         // output they originated on by name). Populated from EDID so
         // `OutputName::matches` can now match either the kernel
         // connector name OR a `"Make Model Serial"` config target.
-        output
-            .user_data()
-            .insert_if_missing(|| prism_config::OutputName {
-                connector: ctx.connector_name.clone(),
-                make: ctx.edid.make.clone(),
-                model: ctx.edid.model.clone(),
-                serial: ctx.edid.serial.clone(),
-            });
+        output.user_data().insert_if_missing(|| name);
         // Inform the layout. This creates a Monitor entry, splices in any
         // workspaces that named this output via `original_output`, and
         // (if this is the first output) hosts the no-output workspace
         // backlog. `None` layout_config = use defaults; per-output config
         // lookup arrives once we wire `config.outputs` indexing.
         self.layout.add_output(output.clone(), None);
-        self.wl_outputs.insert(ctx.connector_name.clone(), output);
+        self.wl_outputs.insert(connector.clone(), output);
         // unwrap: just inserted under this key
-        self.wl_outputs.get(&ctx.connector_name).unwrap()
+        self.wl_outputs.get(&connector).unwrap()
     }
 
     /// First `OutputId` whose advertised geometry (current_location +

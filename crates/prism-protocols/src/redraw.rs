@@ -33,10 +33,14 @@
 //! isn't on screen yet — and clients (mpv) that interpret it as "go
 //! make another frame" will over-produce and stall the compositor.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::presentation::PresentationFeedbackCallback;
+
+use crate::drm_syncobj::CommitReleaseTracker;
 
 /// What we plan to do for an output between now and its next vblank.
 #[derive(Debug, Default)]
@@ -93,4 +97,71 @@ impl OutputRedrawState {
             RedrawState::Queued => {}
         }
     }
+}
+
+/// Walk the surface tree rooted at `root` (a toplevel or layer-shell root,
+/// down through every subsurface) and harvest, from each surface's current
+/// committed state, its pending `wl_callback.frame` callbacks, its
+/// `wp_presentation_feedback` callbacks, and its `wp_linux_drm_syncobj`
+/// release trackers. Appends to the caller's accumulators so one set can
+/// span several roots.
+///
+/// Descending into subsurfaces is load-bearing: GTK4 / Firefox / Mesa
+/// register frame callbacks on subsurface-backed content, and harvesting
+/// only the root freezes their animation loops until something else nudges
+/// the output (e.g. cursor motion).
+///
+/// CAREFUL: the visit callback runs *inside* smithay's per-surface
+/// data_map lock. Anything that would re-enter `with_states` on the same
+/// surface (e.g. the public `drm_syncobj::tracker_for_render` helper)
+/// self-deadlocks here — read `SurfaceReleaseSlot` directly off the
+/// `states` we already hold, as below.
+///
+/// Used by the DRM submit path (feeds [`PendingFeedback`] + the
+/// release-after-submit wiring) and by the WLCS test harness, which
+/// consumes only `frame_cbs` — it fires them off a timer, with no scanout
+/// or explicit-sync behind the surfaces, so `presentation_cbs` and
+/// `release_trackers` come back empty there.
+pub fn harvest_surface_feedback(
+    root: &WlSurface,
+    frame_cbs: &mut Vec<WlCallback>,
+    presentation_cbs: &mut Vec<PresentationFeedbackCallback>,
+    release_trackers: &mut Vec<Arc<CommitReleaseTracker>>,
+) {
+    use smithay::wayland::compositor::{
+        with_surface_tree_downward, SurfaceAttributes, TraversalAction,
+    };
+    use smithay::wayland::presentation::PresentationFeedbackCachedState;
+
+    use crate::drm_syncobj::SurfaceReleaseSlot;
+
+    with_surface_tree_downward(
+        root,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |_surface, states, &()| {
+            frame_cbs.append(&mut std::mem::take(
+                &mut states
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .current()
+                    .frame_callbacks,
+            ));
+            presentation_cbs.append(&mut std::mem::take(
+                &mut states
+                    .cached_state
+                    .get::<PresentationFeedbackCachedState>()
+                    .current()
+                    .callbacks,
+            ));
+            if let Some(t) = states
+                .data_map
+                .get::<SurfaceReleaseSlot>()
+                .and_then(|slot| slot.current())
+            {
+                release_trackers.push(t);
+            }
+        },
+        |_, _, &()| true,
+    );
 }
