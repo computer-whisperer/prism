@@ -644,6 +644,18 @@ impl LayoutElement for Mapped {
         let buf_origin = location - self.window_geometry().loc.to_f64();
         let surface = self.toplevel().wl_surface();
 
+        // Paint-order fixup: `with_surface_tree_downward` visits surfaces
+        // top-to-bottom (it iterates the bottom-to-top child stack in reverse,
+        // emitting the topmost subsurface first) — niri/smithay's front-to-back
+        // render-element convention. prism's renderer is the opposite: it draws
+        // the element vec in order with src-over blend, so *earlier* entries
+        // paint behind (see tile.rs's "build back-to-front" note). We therefore
+        // collect the walk's emissions and append them to `out` reversed, so the
+        // bottommost subsurface lands first. Without this, overlapping
+        // subsurfaces (e.g. Firefox's video vs. page-chrome tiles, restacked via
+        // wl_subsurface.place_above) composite in inverted z-order.
+        let mut surf_els: Vec<RenderEl> = Vec::new();
+
         with_surface_tree_downward(
             surface,
             buf_origin,
@@ -729,7 +741,7 @@ impl LayoutElement for Mapped {
                 let dst_rect_clip = project(dst);
 
                 let (chroma_view, yuv) = ctx.yuv_for(states);
-                out.push(RenderEl::Surface(SurfaceEl {
+                surf_els.push(RenderEl::Surface(SurfaceEl {
                     texture_view,
                     chroma_view,
                     yuv,
@@ -740,6 +752,12 @@ impl LayoutElement for Mapped {
             },
             |_, _, _| true,
         );
+
+        // Reverse top-to-bottom walk order into prism's back-to-front draw
+        // order (see the note above the walk). The walk already baked each
+        // element's absolute position, so reversing only flips compositing
+        // order, not placement.
+        out.extend(surf_els.into_iter().rev());
     }
 
     fn render_popups(
