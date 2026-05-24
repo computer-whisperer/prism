@@ -10,8 +10,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use smithay::output::Mode as OutputMode;
 use smithay::reexports::calloop::channel::{Channel, Event as ChannelEvent};
@@ -140,9 +140,10 @@ fn make_gpu() -> anyhow::Result<Arc<prism_renderer::Device>> {
 }
 
 /// Harvest pending `wl_surface.frame` callbacks across mapped toplevels
-/// (descending into subsurfaces) and fire them with the current clock.
+/// (descending into subsurfaces) and fire them with a real monotonic
+/// timestamp.
 fn send_frame_callbacks(state: &mut PrismState) {
-    let time_ms = state.clock.now().as_millis() as u32;
+    let time_ms = monotonic_ms();
     let roots: Vec<_> = state
         .xdg_shell
         .toplevel_surfaces()
@@ -186,19 +187,19 @@ fn handle_event(event: WlcsEvent, state: &mut PrismState, clients: &Clients, run
             location,
         } => position_window(state, clients, client_id, surface_id, location),
         WlcsEvent::PointerMoveAbsolute { location, .. } => {
-            let time = now_ms(state);
+            let time = monotonic_ms();
             prism_input::pointer::wlcs_pointer_motion_absolute(state, location, time);
         }
         WlcsEvent::PointerMoveRelative { delta, .. } => {
-            let time = now_ms(state);
+            let time = monotonic_ms();
             prism_input::pointer::wlcs_pointer_motion_relative(state, delta, time);
         }
         WlcsEvent::PointerButtonDown { button_id, .. } => {
-            let time = now_ms(state);
+            let time = monotonic_ms();
             prism_input::pointer::wlcs_pointer_button(state, button_id as u32, true, time);
         }
         WlcsEvent::PointerButtonUp { button_id, .. } => {
-            let time = now_ms(state);
+            let time = monotonic_ms();
             prism_input::pointer::wlcs_pointer_button(state, button_id as u32, false, time);
         }
         // Device add/remove is bookkeeping only — prism has no per-device
@@ -214,8 +215,16 @@ fn handle_event(event: WlcsEvent, state: &mut PrismState, clients: &Clients, run
     }
 }
 
-fn now_ms(state: &PrismState) -> u32 {
-    state.clock.now().as_millis() as u32
+/// Milliseconds from a fixed process start — the timestamp source for
+/// `wl_callback.done` and synthetic input events. prism's `state.clock` is a
+/// manually-advanced animation clock that nothing drives in the headless
+/// harness, so it reports a frozen time and fails WLCS's monotonic-timestamp
+/// checks. A real monotonic source matches how production sources
+/// frame-callback time from the kernel vblank clock rather than the animation
+/// clock; the base is arbitrary, which is all `wl_callback` requires.
+fn monotonic_ms() -> u32 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u32
 }
 
 /// Resolve a WLCS (client, surface) pair to a mapped toplevel and place it
