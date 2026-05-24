@@ -145,6 +145,9 @@ pub fn run(channel: Channel<WlcsEvent>) {
             state.color_management.drain_pending_info_done();
             state.layout.advance_animations();
             state.layout.refresh(true);
+            // Re-evaluate pointer focus: a surface may have moved, resized,
+            // or restacked under a stationary pointer this cycle.
+            prism_input::pointer::refresh_pointer_focus(&mut state);
             let _ = state.display_handle.flush_clients();
             state.clock.clear();
         }

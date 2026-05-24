@@ -44,6 +44,9 @@ pub fn on_pointer_motion<I: PrismInputBackend>(
     clamp_pointer_to_outputs(state);
 
     let focus = surface_under_pointer(state);
+    // Keep the tracked contents in sync so the post-dispatch
+    // `refresh_pointer_focus` doesn't see a spurious change and re-fire.
+    state.pointer_contents = focus.clone();
     let new_pos = state.pointer_pos;
 
     let Some(pointer) = state.seat.get_pointer() else {
@@ -82,6 +85,9 @@ pub fn on_pointer_motion_absolute<I: PrismInputBackend>(
     clamp_pointer_to_outputs(state);
 
     let focus = surface_under_pointer(state);
+    // Keep the tracked contents in sync so the post-dispatch
+    // `refresh_pointer_focus` doesn't see a spurious change and re-fire.
+    state.pointer_contents = focus.clone();
     let new_pos = state.pointer_pos;
 
     let Some(pointer) = state.seat.get_pointer() else {
@@ -333,6 +339,42 @@ fn surface_under_pointer(state: &PrismState) -> Option<(WlSurface, Point<f64, Lo
     state.contents_under(state.pointer_pos)
 }
 
+/// Re-evaluate what's under the pointer after a surface/layout change and
+/// deliver enter/leave/motion if it differs from what the client last saw.
+///
+/// Unlike the motion handlers above, this is driven from the post-dispatch
+/// refresh, not from input: a pointer that never moved still needs an
+/// `enter` when a window slides, resizes, or restacks under it, or when a
+/// subsurface commit changes the input geometry beneath it. Mirrors niri's
+/// `update_pointer_contents` (niri.rs:1054) — recompute `contents_under` at
+/// the current location, bail if unchanged, otherwise re-send `motion` so
+/// smithay emits the right enter/leave pair.
+///
+/// Skipped while a grab (interactive move/resize, popup, or an implicit
+/// button grab) owns the pointer: the grab decides focus, so we leave it
+/// alone and re-sync once the grab ends.
+pub fn refresh_pointer_focus(state: &mut PrismState) {
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
+    if pointer.is_grabbed() {
+        return;
+    }
+
+    let under = surface_under_pointer(state);
+    if under == state.pointer_contents {
+        return;
+    }
+    state.pointer_contents = under.clone();
+
+    let serial = SERIAL_COUNTER.next_serial();
+    let time = state.clock.now().as_millis() as u32;
+    let location = state.pointer_pos;
+    pointer.motion(state, under, &MotionEvent { location, serial, time });
+    pointer.frame(state);
+    prism_protocols::state::update_output_cursors(state);
+}
+
 /// If `input { focus-follows-mouse }` is enabled, update the layout's
 /// active monitor + active window + keyboard focus to track the pointer.
 ///
@@ -446,6 +488,9 @@ fn wlcs_pointer_reposition(state: &mut PrismState, time: u32) {
     let serial = SERIAL_COUNTER.next_serial();
     clamp_pointer_to_outputs(state);
     let focus = surface_under_pointer(state);
+    // Keep the tracked contents in sync so the post-dispatch
+    // `refresh_pointer_focus` doesn't see a spurious change and re-fire.
+    state.pointer_contents = focus.clone();
     let new_pos = state.pointer_pos;
     let Some(pointer) = state.seat.get_pointer() else {
         return;

@@ -349,6 +349,18 @@ pub struct PrismState {
     /// by hit-test and (later) cursor-plane setup. Starts at (0, 0).
     pub pointer_pos: smithay::utils::Point<f64, smithay::utils::Logical>,
 
+    /// The surface (and its global origin) last reported under the pointer,
+    /// as resolved by [`PrismState::contents_under`]. Tracked so that focus
+    /// can be re-evaluated after surface/layout changes (window moved,
+    /// resized, restacked, subsurface committed) without a pointer-motion
+    /// event: [`refresh_pointer_focus`] recomputes the contents and only
+    /// re-delivers enter/leave/motion when this differs.
+    ///
+    /// [`refresh_pointer_focus`]: prism_input equivalent — kept in sync by
+    /// both the pointer-motion handlers and the post-dispatch refresh.
+    pub pointer_contents:
+        Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)>,
+
     /// XCursor theme + sprite source. Resolves [`CursorImageStatus`]
     /// (Hidden / Named / client-Surface) into a renderable sprite
     /// every frame. Initialized in [`Self::new`] with a config-derived
@@ -595,6 +607,7 @@ impl PrismState {
             monitors_active: true,
             should_stop: false,
             pointer_pos: smithay::utils::Point::from((0.0, 0.0)),
+            pointer_contents: None,
             cursor_manager: CursorManager::new("default", 24),
             cursor_texture_cache: CursorTextureCache::default(),
         }

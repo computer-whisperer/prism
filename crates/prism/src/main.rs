@@ -1543,6 +1543,13 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         // intercepting); for prism today that's always.
         state.layout.refresh(true);
 
+        // Re-evaluate what's under the pointer after this cycle's layout
+        // changes. A window that moved, resized, or restacked under a
+        // stationary pointer (or a subsurface commit changing input
+        // geometry) needs an enter/leave the client wouldn't otherwise get,
+        // since nothing generated a pointer-motion event.
+        prism_input::pointer::refresh_pointer_focus(&mut state);
+
         state
             .display_handle
             .flush_clients()
