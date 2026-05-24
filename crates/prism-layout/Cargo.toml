@@ -40,3 +40,10 @@ smithay-drm-extras.workspace = true
 tracing.workspace = true
 wayland-backend = "0.3"
 xcursor = "0.3.10"
+
+[dev-dependencies]
+# Test-only deps for the niri-ported layout tests (snapshots, float asserts,
+# property tests). Versions tracked to niri's.
+approx = "0.5.1"
+insta = "1.47.2"
+proptest = "1.11.0"

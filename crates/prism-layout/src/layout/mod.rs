@@ -2209,7 +2209,12 @@ impl<W: LayoutElement> Layout<W> {
         compute_overview_zoom(&self.options, progress)
     }
 
+    // Entry point for the niri-ported randomized layout op-sequence tests,
+    // which have not been ported yet (niri's ~2500-line test module in this
+    // file). Drop the allow once those land — it transitively exercises the
+    // monitor/workspace/scrolling/floating verify_invariants helpers too.
     #[cfg(test)]
+    #[allow(dead_code)]
     fn verify_invariants(&self) {
         use std::collections::HashSet;
 
