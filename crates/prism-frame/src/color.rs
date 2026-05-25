@@ -253,11 +253,7 @@ fn rgb_to_xyz(c: &Chromaticities) -> Mat3 {
     let g = xy_to_xyz(c.green);
     let b = xy_to_xyz(c.blue);
     // Columns are the primaries' XYZ.
-    let m = [
-        [r[0], g[0], b[0]],
-        [r[1], g[1], b[1]],
-        [r[2], g[2], b[2]],
-    ];
+    let m = [[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]];
     // Per-primary scale so the column sum equals the white point.
     let s = mat3_vec(mat3_inverse(m), xy_to_xyz(c.white));
     // result = M · diag(s): scale column j by s[j].
@@ -294,7 +290,10 @@ fn bradford_adapt(src_white: [f32; 3], dst_white: [f32; 3]) -> Mat3 {
 pub fn primaries_to_bt2020(src: &Chromaticities) -> Mat3 {
     let m_src = rgb_to_xyz(src);
     let m_dst = rgb_to_xyz(&Chromaticities::BT2020);
-    let cat = bradford_adapt(xy_to_xyz(src.white), xy_to_xyz(Chromaticities::BT2020.white));
+    let cat = bradford_adapt(
+        xy_to_xyz(src.white),
+        xy_to_xyz(Chromaticities::BT2020.white),
+    );
     mat3_mul(mat3_inverse(m_dst), mat3_mul(cat, m_src))
 }
 

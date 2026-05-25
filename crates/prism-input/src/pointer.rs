@@ -370,7 +370,15 @@ pub fn refresh_pointer_focus(state: &mut PrismState) {
     let serial = SERIAL_COUNTER.next_serial();
     let time = state.clock.now().as_millis() as u32;
     let location = state.pointer_pos;
-    pointer.motion(state, under, &MotionEvent { location, serial, time });
+    pointer.motion(
+        state,
+        under,
+        &MotionEvent {
+            location,
+            serial,
+            time,
+        },
+    );
     pointer.frame(state);
     prism_protocols::state::update_output_cursors(state);
 }

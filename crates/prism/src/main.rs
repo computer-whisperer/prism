@@ -1967,19 +1967,19 @@ fn render_output_now(
         };
     // Chroma plane + YUV kind for video surfaces, on this output's GPU.
     // Parallels texture_lookup (the luma/primary plane); `(None, 0)` for RGB.
-    let yuv_lookup = |states: &smithay::wayland::compositor::SurfaceData|
-     -> (Option<vk::ImageView>, i32) {
-        states
-            .data_map
-            .get::<prism_protocols::SurfaceTexSlot>()
-            .and_then(|s| {
-                s.0.lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|t| t.yuv_for(output_gpu_id))
-            })
-            .unwrap_or((None, 0))
-    };
+    let yuv_lookup =
+        |states: &smithay::wayland::compositor::SurfaceData| -> (Option<vk::ImageView>, i32) {
+            states
+                .data_map
+                .get::<prism_protocols::SurfaceTexSlot>()
+                .and_then(|s| {
+                    s.0.lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|t| t.yuv_for(output_gpu_id))
+                })
+                .unwrap_or((None, 0))
+        };
     // Per-surface decode params from wp_color_management_v1. Falls
     // through to RenderCtx::color_for's default (sRGB + the output's
     // sdr_reference_nits) for surfaces with no description set —

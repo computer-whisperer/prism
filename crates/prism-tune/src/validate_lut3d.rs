@@ -94,12 +94,15 @@ pub fn run(args: ValidateLut3dArgs) -> Result<()> {
         .with_context(|| format!("query baseline for {}", args.output))?;
 
     let white_peak: f64 = baseline.initial_panel_peak_nits.iter().sum();
-    let max_nits = args.max_nits.unwrap_or(white_peak * 1.5).max(args.min_nits * 2.0);
+    let max_nits = args
+        .max_nits
+        .unwrap_or(white_peak * 1.5)
+        .max(args.min_nits * 2.0);
 
     let lut = match &args.lut {
-        Some(path) => Some(
-            load_lut3d_file(path).with_context(|| format!("load LUT {}", path.display()))?,
-        ),
+        Some(path) => {
+            Some(load_lut3d_file(path).with_context(|| format!("load LUT {}", path.display()))?)
+        }
         None => None,
     };
 
@@ -134,7 +137,8 @@ pub fn run(args: ValidateLut3dArgs) -> Result<()> {
     }
 
     if let Some(csv_path) = &args.csv {
-        write_csv(csv_path, &samples).with_context(|| format!("write CSV {}", csv_path.display()))?;
+        write_csv(csv_path, &samples)
+            .with_context(|| format!("write CSV {}", csv_path.display()))?;
         println!("\nwrote {}", csv_path.display());
     }
 

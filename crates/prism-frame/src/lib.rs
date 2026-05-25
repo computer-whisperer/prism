@@ -21,7 +21,7 @@ pub mod output;
 
 pub use color::{
     primaries_to_bt2020, srgb_to_bt2020_matrix, Chromaticities, ColorDescription, GammaExponent,
-    Mat3, MasteringInfo, Primaries, TransferFunction,
+    MasteringInfo, Mat3, Primaries, TransferFunction,
 };
 pub use dmabuf::{Dmabuf, DmabufPlane};
 pub use element::{Element, ElementId, ElementSource, ShaderUniform};

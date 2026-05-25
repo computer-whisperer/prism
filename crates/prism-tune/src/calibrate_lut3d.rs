@@ -1163,7 +1163,11 @@ pub(crate) fn pq_oetf_f64(nits: f64) -> f64 {
 /// "what cmd values the shader would emit" without a roundtrip
 /// through Vulkan. Entries are X-fastest then Y then Z (matches the
 /// upload + binary format).
-pub(crate) fn trilinear_sample_lut(entries: &[[f32; 3]], cube_edge: u32, coord: [f64; 3]) -> [f32; 3] {
+pub(crate) fn trilinear_sample_lut(
+    entries: &[[f32; 3]],
+    cube_edge: u32,
+    coord: [f64; 3],
+) -> [f32; 3] {
     let n = cube_edge as usize;
     let denom = (cube_edge - 1) as f64;
     // Map [0, 1] → [0, N-1] continuous index, then split into integer

@@ -389,8 +389,8 @@ fn import_plane(
         .push_next(&mut external_image)
         .push_next(&mut modifier_info);
 
-    let image = unsafe { device.raw.create_image(&image_info, None) }
-        .vk_ctx("create_image (dmabuf)")?;
+    let image =
+        unsafe { device.raw.create_image(&image_info, None) }.vk_ctx("create_image (dmabuf)")?;
 
     let memory = match allocate_imported_memory(device, image, plane.fd.as_fd()) {
         Ok(m) => m,

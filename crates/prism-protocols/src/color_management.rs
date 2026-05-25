@@ -35,6 +35,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
+use smithay::output::Output;
 use smithay::reexports::wayland_protocols::wp::color_management::v1::server::{
     wp_color_management_surface_v1::{self, WpColorManagementSurfaceV1},
     wp_color_manager_v1::{
@@ -48,7 +49,6 @@ use smithay::reexports::wayland_server::{
     backend::ClientId, protocol::wl_surface::WlSurface, Client, DataInit, Dispatch, DisplayHandle,
     GlobalDispatch, New, Resource,
 };
-use smithay::output::Output;
 use smithay::wayland::compositor::{self, SurfaceData};
 
 use crate::state::PrismState;

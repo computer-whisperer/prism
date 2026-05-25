@@ -360,8 +360,10 @@ pub struct PrismState {
     ///
     /// [`refresh_pointer_focus`]: prism_input equivalent — kept in sync by
     /// both the pointer-motion handlers and the post-dispatch refresh.
-    pub pointer_contents:
-        Option<(WlSurface, smithay::utils::Point<f64, smithay::utils::Logical>)>,
+    pub pointer_contents: Option<(
+        WlSurface,
+        smithay::utils::Point<f64, smithay::utils::Logical>,
+    )>,
 
     /// XCursor theme + sprite source. Resolves [`CursorImageStatus`]
     /// (Hidden / Named / client-Surface) into a renderable sprite
@@ -2716,7 +2718,10 @@ fn materialize_dmabuf_for_gpu(
     // up front so an unsupported pairing fails cleanly rather than at import,
     // and import with the known vk::Format directly (the scratch is always
     // single-plane, so no fourcc round-trip is needed).
-    let make_plane = |plane_extent: vk::Extent2D, vk_fmt: vk::Format, fourcc: DrmFourcc| -> Result<(
+    let make_plane = |plane_extent: vk::Extent2D,
+                      vk_fmt: vk::Format,
+                      fourcc: DrmFourcc|
+     -> Result<(
         prism_renderer::ExportableImage,
         Arc<prism_renderer::ImportedImage>,
     )> {
@@ -3089,7 +3094,11 @@ fn build_advertised_dmabuf_formats(device: &prism_renderer::Device) -> Vec<DrmFo
     // as their own single-plane image, so advertise the modifiers supported
     // by both: R8/R8G8 for NV12, R16/R16G16 for P010.
     for &(fourcc, luma_fmt, chroma_fmt) in &[
-        (DrmFourcc::Nv12, vk::Format::R8_UNORM, vk::Format::R8G8_UNORM),
+        (
+            DrmFourcc::Nv12,
+            vk::Format::R8_UNORM,
+            vk::Format::R8G8_UNORM,
+        ),
         (
             DrmFourcc::P010,
             vk::Format::R16_UNORM,
