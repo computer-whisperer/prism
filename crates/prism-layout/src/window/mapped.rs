@@ -656,7 +656,8 @@ impl LayoutElement for Mapped {
         // as `render_normal`: the layout gives us the window CONTENT origin,
         // so subtract the window geometry offset to get the buffer origin.
         let parent = self.toplevel().wl_surface();
-        let parent_buf_origin = location - self.window_geometry().loc.to_f64();
+        let parent_geo = self.window_geometry();
+        let parent_buf_origin = location - parent_geo.loc.to_f64();
 
         // `popups_for_surface` reads the popup tree off the parent surface's
         // own data_map (it's an associated fn, no PopupManager handle
@@ -664,12 +665,25 @@ impl LayoutElement for Mapped {
         // accumulated down the chain — so nested submenus come through with
         // the correct cumulative placement.
         for (popup, popup_offset) in PopupManager::popups_for_surface(parent) {
-            // `popup_offset` places the popup's window-geometry top-left
-            // relative to the parent surface origin; subtract the popup's
-            // own geometry inset to land its BUFFER top-left, mirroring
-            // smithay's own popup render math.
+            // Popup buffer top-left, relative to the PARENT buffer origin:
+            //
+            //   parent_geo.loc + popup_offset - popup.geometry().loc
+            //
+            // `popup_offset` is the positioner placement in the parent's
+            // *window-geometry* space (not buffer space), so we add
+            // parent_geo.loc to convert it to parent-buffer space; then
+            // subtract the popup's own geometry inset to land its buffer
+            // top-left. This mirrors smithay's WINDOW popup render math
+            // (desktop/space/wayland/window.rs) and, crucially, matches the
+            // hit-test in `Window::surface_under`, which uses the identical
+            // `self.geometry().loc + location - popup.geometry().loc` offset.
+            // The earlier version dropped parent_geo.loc (copied from the
+            // *layer* path, where geometry loc is zero); for CSD clients like
+            // Firefox whose window geometry insets the shadow, that shifted
+            // the rendered popup away from its clickable region — menus drew
+            // but couldn't be hovered/clicked.
             let popup_buf_origin =
-                parent_buf_origin + (popup_offset - popup.geometry().loc).to_f64();
+                parent_buf_origin + (parent_geo.loc + popup_offset - popup.geometry().loc).to_f64();
             crate::layout::element::push_surface_tree_elements(
                 popup.wl_surface(),
                 popup_buf_origin,
