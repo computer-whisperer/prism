@@ -431,10 +431,7 @@ fn global_bounding_rect(state: &PrismState) -> Option<Rectangle<i32, Logical>> {
 
 /// Clamp a point into the union of all output rects. Returns the point
 /// unchanged if no outputs are advertised.
-fn clamp_point_to_outputs(
-    state: &PrismState,
-    mut p: Point<f64, Logical>,
-) -> Point<f64, Logical> {
+fn clamp_point_to_outputs(state: &PrismState, mut p: Point<f64, Logical>) -> Point<f64, Logical> {
     let Some(bounds) = global_bounding_rect(state) else {
         return p;
     };
