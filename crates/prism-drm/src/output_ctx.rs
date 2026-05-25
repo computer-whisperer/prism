@@ -124,6 +124,14 @@ pub struct OutputContext {
     /// Set on first present to switch from `commit` (mode-set) to `page_flip`
     /// (just-swap-fb) for subsequent frames.
     mode_set_done: bool,
+    /// Forces the next present to render even with empty element damage, then
+    /// self-clears. Set via [`Self::force_next_present`] when the encode output
+    /// changed without any element changing — a new color LUT or encode params
+    /// (calibration / HDR). Without it the zero-damage skip would drop the
+    /// frame and the recolor wouldn't reach the screen until something moved.
+    /// (The decode still scissors to the empty damage, so only the cheap
+    /// full-screen encode re-runs.)
+    force_present: bool,
     /// True between submitting a page-flip and receiving its vblank event.
     /// Submitting another flip while one is pending causes the kernel to
     /// reject with ENOMEM. Don't re-enter present() until `mark_vblank()`.
@@ -388,6 +396,7 @@ impl OutputContext {
             kdl_lut3d_entries: None,
             kdl_black_point_xyz: None,
             mode_set_done: false,
+            force_present: false,
             frame_pending: false,
             powered_off: false,
             frame_clock,
@@ -635,6 +644,20 @@ pub struct ColorOverride {
     pub black_point_xyz: Option<[f32; 3]>,
 }
 
+/// Outcome of [`OutputContext::present`].
+pub enum PresentOutcome {
+    /// Rendered and submitted a page-flip; carries the present-completion
+    /// SYNC_FD (handed to KMS as IN_FENCE_FD, returned for release wiring).
+    Presented(std::os::fd::OwnedFd),
+    /// Nothing changed since the last presented frame (empty damage) and a
+    /// valid image is already on screen, so no render or flip happened. The
+    /// caller should arm an estimated-vblank instead of waiting for a real one.
+    SkippedNoDamage,
+    /// A previous flip is still in flight; the caller should retry after the
+    /// next vblank (was `Ok(None)` before).
+    FlipPending,
+}
+
 impl OutputContext {
     /// Clear the `frame_pending` flag, advance the back-buffer index, and
     /// feed the actual kernel-reported presentation time into the
@@ -702,24 +725,29 @@ impl OutputContext {
         tracing::info!(connector = %self.connector_name, "DPMS on (re-modeset on next present)");
     }
 
-    /// Render the supplied `elements` (with the supplied encode parameters)
-    /// into the *back* scanout image and submit it for display.
-    ///
-    /// Returns `Ok(false)` (no-op) if a previous flip is still pending —
-    /// the caller should wait for the next VBlank event before retrying.
-    /// Returns `Ok(true)` if a frame was submitted.
-    /// Render + submit + page-flip. Returns:
-    ///   - `Ok(None)`: previous flip still in flight; caller should
+    /// Force the next [`Self::present`] to render even if no element changed.
+    /// Call after mutating something the encode pass consumes but the damage
+    /// tracker doesn't see — a new color LUT or encode parameters (calibration,
+    /// HDR) — so the recolor reaches the screen instead of being dropped by the
+    /// zero-damage skip. One-shot: cleared by the next render.
+    pub fn force_next_present(&mut self) {
+        self.force_present = true;
+    }
+
+    /// Render the supplied frame (with the supplied encode parameters) into the
+    /// *back* scanout image and submit it for display. Returns a
+    /// [`PresentOutcome`]:
+    ///   - `FlipPending`: a previous flip is still in flight; the caller should
     ///     wait for the next VBlank event before retrying.
-    ///   - `Ok(Some(fd))`: frame submitted. The returned fd is the
-    ///     present-completion `SYNC_FD` from `render_frame` —
-    ///     becomes readable once the GPU finishes our submit. It's
-    ///     already been handed to the DRM atomic commit as
-    ///     `IN_FENCE_FD` (kernel dup'd internally), and is returned
-    ///     to the caller so they can also use it to time
-    ///     post-submit work — e.g., signaling `wp_linux_drm_syncobj`
-    ///     release points on the input dmabufs. Caller may drop it
-    ///     if not needed.
+    ///   - `SkippedNoDamage`: nothing changed since the last presented frame, so
+    ///     no render or flip happened; the caller should arm an estimated vblank
+    ///     (no real vblank will arrive).
+    ///   - `Presented(fd)`: frame submitted. `fd` is the present-completion
+    ///     `SYNC_FD` from `render_frame` — readable once the GPU finishes our
+    ///     submit. It's already been handed to the DRM atomic commit as
+    ///     `IN_FENCE_FD` (kernel dup'd internally), and is returned so the caller
+    ///     can also time post-submit work — e.g. signaling `wp_linux_drm_syncobj`
+    ///     release points on the input dmabufs. Caller may drop it if not needed.
     pub fn present(
         &mut self,
         frame: &LoweredFrame,
@@ -730,9 +758,9 @@ impl OutputContext {
         // Cross-GPU mirror copy-done semaphores the render must wait on
         // before sampling. Empty for outputs with no mirrored surfaces.
         wait_semaphores: &[vk::Semaphore],
-    ) -> Result<Option<std::os::fd::OwnedFd>> {
+    ) -> Result<PresentOutcome> {
         if self.frame_pending {
-            return Ok(None);
+            return Ok(PresentOutcome::FlipPending);
         }
 
         // Region damage for this frame. Logged for now (Stage 1b); Stage 2
@@ -757,6 +785,21 @@ impl OutputContext {
             full_px = self.extent.width as i64 * self.extent.height as i64,
             "frame damage",
         );
+
+        // Zero-damage skip: nothing changed and we've already presented a valid
+        // frame (mode_set_done). The front buffer still holds the correct image,
+        // so rendering + flipping would just reproduce it — skip both. We do NOT
+        // call `damage_tracker.commit()`: `compute` only staged `pending`, so the
+        // baseline stays at the on-screen frame and the next real change diffs
+        // against what's actually displayed. The caller arms an estimated vblank.
+        // `force_present` overrides the skip when the encode output changed
+        // without any element moving (recolor / recalibration).
+        if damage.is_empty() && self.mode_set_done && !self.force_present {
+            tracing::debug!(target: "damage", output = %self.connector_name, "skip: no damage");
+            return Ok(PresentOutcome::SkippedNoDamage);
+        }
+        // Committing to a render — consume the one-shot force flag.
+        self.force_present = false;
 
         let back = &self.buffers[self.back_index];
         // render_frame returns the present-completion sync as a Linux
@@ -847,7 +890,7 @@ impl OutputContext {
         // so advance the tracker's baseline. (On the `?` early-returns above the
         // commit is skipped, so a failed flip re-damages next frame.)
         self.damage_tracker.commit();
-        Ok(Some(present_sync))
+        Ok(PresentOutcome::Presented(present_sync))
     }
 }
 

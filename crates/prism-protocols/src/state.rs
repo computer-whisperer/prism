@@ -3128,6 +3128,12 @@ pub fn update_output_cursors(state: &mut PrismState) {
 
         let changed = was_visible != cursor.visible() || prev_pos != cursor.position();
         if changed {
+            // The cursor is a hardware plane committed in `present`'s page-flip,
+            // not a render element — so a move / visibility change produces no
+            // element damage. Force the present past the zero-damage skip, or the
+            // cursor would freeze on screen until something else damaged. (`cursor`
+            // is no longer borrowed here, so the &mut self call is fine.)
+            output_ctx.force_next_present();
             state
                 .output_redraw
                 .entry(id.clone())
@@ -3139,15 +3145,24 @@ pub fn update_output_cursors(state: &mut PrismState) {
 
 fn hide_all_cursors(state: &mut PrismState) {
     for (id, output_ctx) in state.outputs.iter_mut() {
-        if let Some(cursor) = output_ctx.cursor.as_mut() {
-            if cursor.visible() {
-                cursor.set_visible(false);
-                state
-                    .output_redraw
-                    .entry(id.clone())
-                    .or_default()
-                    .queue_redraw();
+        // Hide the plane if it was visible; `changed` ends the cursor borrow
+        // before the `force_next_present`/`queue_redraw` calls below.
+        let changed = match output_ctx.cursor.as_mut() {
+            Some(c) if c.visible() => {
+                c.set_visible(false);
+                true
             }
+            _ => false,
+        };
+        if changed {
+            // Hiding the cursor plane is a page-flip change with no element
+            // damage — force the present so the hide actually reaches the screen.
+            output_ctx.force_next_present();
+            state
+                .output_redraw
+                .entry(id.clone())
+                .or_default()
+                .queue_redraw();
         }
     }
 }

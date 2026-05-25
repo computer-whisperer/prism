@@ -36,6 +36,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use smithay::reexports::calloop::RegistrationToken;
 use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::presentation::PresentationFeedbackCallback;
@@ -57,6 +58,14 @@ pub enum RedrawState {
     ///     (e.g. continuous animation, or damage since submit).
     ///   - `redraw_needed: false` ⇒ transition to `Idle`.
     WaitingForVBlank { redraw_needed: bool },
+    /// We skipped a render because nothing changed (no page-flip ⇒ no real
+    /// vblank). The token is an event-loop timer armed at the predicted next
+    /// vblank; on fire, [`crate::on_estimated_vblank`] advances the
+    /// frame-callback cycle and returns to `Idle` (or `Queued`).
+    WaitingForEstimatedVBlank(RegistrationToken),
+    /// As above, but a redraw was requested (commit / animation) while the
+    /// estimated-vblank timer was pending. On fire we go straight to `Queued`.
+    WaitingForEstimatedVBlankAndQueued(RegistrationToken),
 }
 
 /// `wp_presentation_feedback` objects extracted from a frame's surfaces at
@@ -122,15 +131,19 @@ impl OutputRedrawState {
     /// ⇒ flag `redraw_needed: true` so the vblank handler queues a
     /// follow-up render. From `Queued` ⇒ already queued, no-op.
     pub fn queue_redraw(&mut self) {
-        match self.redraw {
-            RedrawState::Idle => self.redraw = RedrawState::Queued,
-            RedrawState::WaitingForVBlank { .. } => {
-                self.redraw = RedrawState::WaitingForVBlank {
-                    redraw_needed: true,
-                };
+        self.redraw = match std::mem::take(&mut self.redraw) {
+            RedrawState::Idle => RedrawState::Queued,
+            RedrawState::WaitingForVBlank { .. } => RedrawState::WaitingForVBlank {
+                redraw_needed: true,
+            },
+            RedrawState::Queued => RedrawState::Queued,
+            // Keep the armed timer; just remember a redraw is now wanted so the
+            // estimated-vblank handler queues it instead of going idle.
+            RedrawState::WaitingForEstimatedVBlank(token)
+            | RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
+                RedrawState::WaitingForEstimatedVBlankAndQueued(token)
             }
-            RedrawState::Queued => {}
-        }
+        };
     }
 }
 

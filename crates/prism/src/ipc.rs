@@ -454,6 +454,12 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
         }
     }
 
+    // The recolor changes the encode output without moving any element, so the
+    // damage tracker sees nothing — force the next present past the zero-damage
+    // skip, or the change wouldn't reach the screen until something moved.
+    if let Some(output_ctx) = state.outputs.get_mut(&output_id) {
+        output_ctx.force_next_present();
+    }
     // Override won't be observable until the next frame — kick a
     // redraw so users see the change immediately even on otherwise-
     // idle outputs.

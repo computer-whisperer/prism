@@ -1896,17 +1896,22 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
         return;
     }
     match render_output_now(state, output_id) {
-        Ok(Some(pending)) => {
+        Ok(RenderOutcome::Presented(pending)) => {
             let entry = state.output_redraw.entry(output_id.to_owned()).or_default();
             entry.pending_feedback = Some(pending);
             entry.redraw = RedrawState::WaitingForVBlank {
                 redraw_needed: false,
             };
         }
-        Ok(None) => {
-            // present() returned Ok(false) — flip still in flight.
-            // Shouldn't normally happen because we only enter Queued
-            // after a vblank cleared frame_pending, but defensive:
+        Ok(RenderOutcome::SkippedNoDamage) => {
+            // Nothing changed, so no page-flip and thus no real vblank will
+            // arrive to advance the frame-callback cycle or resume animations.
+            // Arm an estimated-vblank timer in its place.
+            queue_estimated_vblank(state, output_id);
+        }
+        Ok(RenderOutcome::FlipPending) => {
+            // Flip still in flight. Shouldn't normally happen (we only enter
+            // Queued after a vblank cleared frame_pending), but defensive:
             // leave Queued so the next pass retries.
             tracing::debug!(output = %output_id, "render_output_now: flip still pending, retry next pass");
         }
@@ -1920,14 +1925,122 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
     }
 }
 
-/// Render one output now and submit the page-flip. Returns the
-/// `PendingFeedback` to be stashed on the OutputRedrawState for the
-/// matching vblank handler to fire. Returns `Ok(None)` if the output's
-/// previous flip is still pending (caller will retry).
+/// Arm an estimated-vblank timer for an output whose render was skipped for
+/// lack of damage. A skipped frame submits no page-flip, so no real vblank will
+/// arrive; this timer, fired at the predicted next vblank, substitutes for it —
+/// advancing the frame-callback cycle (so clients keep getting callbacks) and
+/// resuming any animation. Mirrors niri's `queue_estimated_vblank_timer`.
+///
+/// At most one timer is armed per output: if one is already pending we keep it.
+fn queue_estimated_vblank(state: &mut prism_protocols::PrismState, output_id: &str) {
+    use prism_protocols::redraw::RedrawState;
+    use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+
+    // Don't double-arm — keep an already-pending timer.
+    if matches!(
+        state.output_redraw.get(output_id).map(|s| &s.redraw),
+        Some(RedrawState::WaitingForEstimatedVBlank(_))
+            | Some(RedrawState::WaitingForEstimatedVBlankAndQueued(_))
+    ) {
+        return;
+    }
+
+    let Some((target, refresh)) = state.outputs.get(output_id).map(|o| {
+        (
+            o.frame_clock.next_presentation_time(),
+            o.frame_clock.refresh_interval(),
+        )
+    }) else {
+        return;
+    };
+    // Fire at the predicted vblank. If that's already due (zero), wait one
+    // refresh — a zero-delay timer would just respin (we'd re-skip immediately).
+    let now = clock_monotonic_now();
+    let mut duration = target.saturating_sub(now);
+    if duration.is_zero() {
+        duration += refresh.unwrap_or(Duration::from_micros(16_667));
+    }
+
+    let Some(loop_handle) = state.loop_handle.clone() else {
+        // No event loop yet (pre-bringup) — fall back to Idle rather than wedge.
+        if let Some(entry) = state.output_redraw.get_mut(output_id) {
+            entry.redraw = RedrawState::Idle;
+        }
+        return;
+    };
+    let oid = output_id.to_owned();
+    let res = loop_handle.insert_source(Timer::from_duration(duration), move |_, _, state| {
+        on_estimated_vblank(state, &oid);
+        TimeoutAction::Drop
+    });
+    let entry = state.output_redraw.entry(output_id.to_owned()).or_default();
+    entry.redraw = match res {
+        Ok(token) => RedrawState::WaitingForEstimatedVBlank(token),
+        Err(e) => {
+            tracing::warn!(output = %output_id, "failed to arm estimated-vblank timer: {e}");
+            RedrawState::Idle
+        }
+    };
+}
+
+/// Fired by the estimated-vblank timer (see [`queue_estimated_vblank`]). Stands
+/// in for a real vblank on a frame we chose not to flip: advance the
+/// frame-callback cycle, deliver callbacks, and re-queue if a redraw is now
+/// wanted (a commit arrived, or an animation is ongoing) — else go idle.
+fn on_estimated_vblank(state: &mut prism_protocols::PrismState, output_id: &str) {
+    use prism_protocols::redraw::RedrawState;
+
+    // Act only if we're still waiting on this estimated vblank (a later
+    // transition may have superseded the timer that fired us).
+    if !matches!(
+        state.output_redraw.get(output_id).map(|s| &s.redraw),
+        Some(RedrawState::WaitingForEstimatedVBlank(_))
+            | Some(RedrawState::WaitingForEstimatedVBlankAndQueued(_))
+    ) {
+        return;
+    }
+
+    // Advance the refresh-cycle counter and deliver frame callbacks, exactly as
+    // the real vblank handler does. Unlike niri (which sends in `redraw`), prism
+    // only sends in the vblank handlers, so we MUST send here on every estimated
+    // vblank — otherwise a client flooding frame-callback-only commits (which
+    // keep us in the AndQueued↔Queued↔skip loop) would never be unblocked.
+    {
+        let entry = state.output_redraw.entry(output_id.to_owned()).or_default();
+        entry.frame_callback_sequence = entry.frame_callback_sequence.wrapping_add(1);
+    }
+    send_frame_callbacks(state, output_id, clock_monotonic_now());
+
+    // Transition: a redraw queued while we waited ⇒ Queued; an ongoing animation
+    // ⇒ Queued (advance it next pass); otherwise the output is now idle.
+    let smithay_output = state.wl_outputs.get(output_id).cloned();
+    let animations_ongoing = smithay_output
+        .as_ref()
+        .map(|o| state.layout.are_animations_ongoing(Some(o)))
+        .unwrap_or(false);
+    let entry = state.output_redraw.entry(output_id.to_owned()).or_default();
+    entry.redraw = match std::mem::take(&mut entry.redraw) {
+        RedrawState::WaitingForEstimatedVBlankAndQueued(_) => RedrawState::Queued,
+        RedrawState::WaitingForEstimatedVBlank(_) => {
+            if animations_ongoing {
+                RedrawState::Queued
+            } else {
+                RedrawState::Idle
+            }
+        }
+        other => other,
+    };
+}
+
+/// Render one output now and submit the page-flip. Returns a [`RenderOutcome`]:
+/// `Presented` carries the `PendingFeedback` to stash for the matching vblank;
+/// `SkippedNoDamage` if nothing changed (caller arms an estimated vblank);
+/// `FlipPending` if the output's previous flip is still in flight (caller
+/// retries).
 fn render_output_now(
     state: &mut prism_protocols::PrismState,
     output_id: &str,
-) -> Result<Option<prism_protocols::PendingFeedback>> {
+) -> Result<RenderOutcome> {
     use prism_layout::layout::RenderCtx;
     use prism_protocols::PendingFeedback;
     use prism_renderer::{vk, EncodePush, RenderEl};
@@ -1974,8 +2087,9 @@ fn render_output_now(
     let view_size = match state.layout.monitor_for_output(&smithay_output) {
         Some(m) => m.view_size(),
         // Output not in the layout yet (race between add_output and the
-        // first vblank). Skip this frame; the next one will be fine.
-        None => return Ok(None),
+        // first vblank). Leave it Queued and retry next pass (as the old
+        // `Ok(None)` did); the next pass will find the monitor.
+        None => return Ok(RenderOutcome::FlipPending),
     };
 
     let texture_lookup =
@@ -2246,20 +2360,25 @@ fn render_output_now(
         &acquire_surfaces,
         output_gpu_id,
     ));
-    let present_sync_fd = {
+    let outcome = {
         let output = state
             .outputs
             .get_mut(output_id)
             .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
         output.present(&frame, view_size, &encode_push, &render_waits)?
     };
-    // The render submit has been queued with the waits in its dependency
-    // list; the imported semaphores can be destroyed now.
+    // The render submit has been queued with the waits in its dependency list
+    // (or, on skip / flip-pending, never used them); either way the imported
+    // semaphores can be destroyed now.
     prism_protocols::destroy_render_wait_semaphores(state, output_gpu_id, render_waits);
 
-    let Some(present_sync_fd) = present_sync_fd else {
-        // Flip still pending — caller will retry next pass.
-        return Ok(None);
+    let present_sync_fd = match outcome {
+        prism_drm::PresentOutcome::Presented(fd) => fd,
+        // Flip still in flight — caller leaves the output Queued and retries.
+        prism_drm::PresentOutcome::FlipPending => return Ok(RenderOutcome::FlipPending),
+        // Nothing changed — caller arms an estimated vblank instead of waiting
+        // for a real one. No harvest (no scanout, so no presentation feedback).
+        prism_drm::PresentOutcome::SkippedNoDamage => return Ok(RenderOutcome::SkippedNoDamage),
     };
 
     // Extract pending frame_callbacks + presentation_feedback from
@@ -2355,10 +2474,21 @@ fn render_output_now(
         drop(present_sync_fd);
     }
 
-    Ok(Some(PendingFeedback {
+    Ok(RenderOutcome::Presented(PendingFeedback {
         presentation_cbs,
         target_time,
     }))
+}
+
+/// Outcome of [`render_output_now`] — mirrors `prism_drm::PresentOutcome` but
+/// carries the harvested `PendingFeedback` on the presented path.
+enum RenderOutcome {
+    /// Rendered + flipped; the stash to fire at the matching vblank.
+    Presented(prism_protocols::PendingFeedback),
+    /// Nothing changed; no flip happened. Caller arms an estimated vblank.
+    SkippedNoDamage,
+    /// A previous flip is still in flight; caller retries next pass.
+    FlipPending,
 }
 
 /// Deliver `wl_callback.frame` callbacks to every surface mapped to `output_id`,
