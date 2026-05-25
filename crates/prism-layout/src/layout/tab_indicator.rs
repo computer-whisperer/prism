@@ -110,13 +110,7 @@ impl TabIndicator {
     ) {
     }
 
-    pub fn render(
-        &self,
-        _location: Point<f64, Logical>,
-        _project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
-        _out: &mut Vec<RenderEl>,
-    ) {
-    }
+    pub fn render(&self, _location: Point<f64, Logical>, _out: &mut Vec<RenderEl>) {}
 
     /// Niri uses this for click hit-test on the indicator strip.
     /// Returns the index of the hit tab, if any. Stub returns None.

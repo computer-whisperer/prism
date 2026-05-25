@@ -1054,7 +1054,6 @@ impl<W: LayoutElement> FloatingSpace<W> {
         &self,
         _view_rect: Rectangle<f64, Logical>,
         focus_ring: bool,
-        project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
         ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
@@ -1062,13 +1061,13 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
         // Closing windows first — stubbed.
         for closing in self.closing_windows.iter().rev() {
-            closing.render(closing.geometry().loc, scale, 1.0, project, out);
+            closing.render(closing.geometry().loc, scale, 1.0, out);
         }
 
         let active = self.active_window_id.clone();
         for (tile, tile_pos) in self.tiles_with_render_positions() {
             let focus_ring = focus_ring && Some(tile.window().id()) == active.as_ref();
-            tile.render(tile_pos, scale, focus_ring, project, ctx, out);
+            tile.render(tile_pos, scale, focus_ring, ctx, out);
         }
     }
 

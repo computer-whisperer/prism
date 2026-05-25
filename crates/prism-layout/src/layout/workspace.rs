@@ -1585,20 +1585,17 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn render_scrolling(
         &self,
         focus_ring: bool,
-        project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
         ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
         let scrolling_focus_ring = focus_ring && !self.floating_is_active();
-        self.scrolling
-            .render(scrolling_focus_ring, project, ctx, out);
+        self.scrolling.render(scrolling_focus_ring, ctx, out);
     }
 
     /// Emit the floating layer's draw calls into `out`.
     pub fn render_floating(
         &self,
         focus_ring: bool,
-        project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
         ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
@@ -1609,34 +1606,26 @@ impl<W: LayoutElement> Workspace<W> {
         let view_rect = Rectangle::from_size(self.view_size);
         let floating_focus_ring = focus_ring && self.floating_is_active();
         self.floating
-            .render(view_rect, floating_focus_ring, project, ctx, out);
+            .render(view_rect, floating_focus_ring, ctx, out);
     }
 
     /// Emit the workspace's overview shadow into `out`. Shadow is
     /// currently a no-op stub; the call remains so the consumer in
     /// `monitor.rs` ports unchanged.
-    pub fn render_shadow(
-        &self,
-        project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
-        out: &mut Vec<RenderEl>,
-    ) {
-        self.shadow.render(Point::from((0., 0.)), project, out);
+    pub fn render_shadow(&self, out: &mut Vec<RenderEl>) {
+        self.shadow.render(Point::from((0., 0.)), out);
     }
 
     /// Emit the workspace background as a SolidColorEl filling the view.
     /// Replaces niri's `SolidColorRenderElement::from_buffer` against
     /// the cached `background_buffer`.
-    pub fn render_background(
-        &self,
-        project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
-    ) -> RenderEl {
+    pub fn render_background(&self) -> RenderEl {
         let rect = Rectangle::new(Point::from((0., 0.)), self.view_size);
-        let rect_clip = project(rect);
         let rgba = self.background_color.to_array_unpremul();
         let color_bt2020_nits =
             prism_renderer::srgb_to_bt2020_nits(rgba[0], rgba[1], rgba[2], rgba[3], 80.0);
         RenderEl::SolidColor(prism_renderer::SolidColorEl {
-            rect_clip,
+            geometry: rect,
             color_bt2020_nits,
         })
     }

@@ -31,9 +31,10 @@ use smithay::wayland::compositor::{with_surface_tree_downward, SurfaceData, Trav
 use tracing::trace;
 
 /// Side-channel a `LayoutElement` needs to actually emit content during a
-/// render walk: how to project logical rects into clip space, and how to
-/// resolve a surface (via its already-locked `SurfaceData`) to the
-/// GPU-side texture view the render path will sample. Constructed once
+/// render walk: how to resolve a surface (via its already-locked
+/// `SurfaceData`) to the GPU-side texture view the render path will sample.
+/// Elements emit output-space logical geometry; the renderer projects to clip
+/// space at lowering time. Constructed once
 /// per output at the top of the render walk by the integrator
 /// (prism-protocols' `present_for_crtc`), then threaded through
 /// `Monitor → Workspace → Tile → Mapped`.
@@ -154,7 +155,6 @@ impl<'a> RenderCtx<'a> {
 pub fn push_surface_tree_elements(
     surface: &WlSurface,
     buf_origin: Point<f64, Logical>,
-    project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
     ctx: &RenderCtx<'_>,
     out: &mut Vec<RenderEl>,
 ) {
@@ -224,7 +224,7 @@ pub fn push_surface_tree_elements(
                 let dst = Rectangle::new(pos, view.dst.to_f64());
                 let nits = ctx.color_for(states).sdr_white_nits;
                 surf_els.push(RenderEl::SolidColor(SolidColorEl {
-                    rect_clip: project(dst),
+                    geometry: dst,
                     color_bt2020_nits: srgb_to_bt2020_nits(
                         rgba[0] as f32 / 255.0,
                         rgba[1] as f32 / 255.0,
@@ -262,14 +262,13 @@ pub fn push_surface_tree_elements(
 
             let pos = surf_loc + view.offset.to_f64();
             let dst = Rectangle::new(pos, view.dst.to_f64());
-            let dst_rect_clip = project(dst);
 
             let (chroma_view, yuv) = ctx.yuv_for(states);
             surf_els.push(RenderEl::Surface(SurfaceEl {
                 texture_view,
                 chroma_view,
                 yuv,
-                dst_rect_clip,
+                geometry: dst,
                 src_rect_uv: crate::utils::src_rect_uv_from_view(&view, buffer_size),
                 color: ctx.color_for(states),
             }));
@@ -374,12 +373,11 @@ pub trait LayoutElement {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
-        project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
         ctx: &RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
-        self.render_normal(location, scale, alpha, project, ctx, out);
-        self.render_popups(location, scale, alpha, project, ctx, out);
+        self.render_normal(location, scale, alpha, ctx, out);
+        self.render_popups(location, scale, alpha, ctx, out);
     }
 
     /// Emit the non-popup parts of the element. Default = no-op.
@@ -388,11 +386,10 @@ pub trait LayoutElement {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
-        project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
         ctx: &RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
-        let _ = (location, scale, alpha, project, ctx, out);
+        let _ = (location, scale, alpha, ctx, out);
     }
 
     /// Emit the popup-tree parts of the element. Default = no-op.
@@ -401,11 +398,10 @@ pub trait LayoutElement {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
-        project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
         ctx: &RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
-        let _ = (location, scale, alpha, project, ctx, out);
+        let _ = (location, scale, alpha, ctx, out);
     }
 
     fn request_size(

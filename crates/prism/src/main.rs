@@ -1915,8 +1915,7 @@ fn render_output_now(
 ) -> Result<Option<prism_protocols::PendingFeedback>> {
     use prism_layout::layout::RenderCtx;
     use prism_protocols::PendingFeedback;
-    use prism_renderer::{vk, ElementDraw, EncodePush, RenderEl};
-    use smithay::utils::{Logical, Rectangle};
+    use prism_renderer::{vk, EncodePush, RenderEl};
 
     // Snapshot identity bits without holding any borrow into
     // state.outputs (we'll re-borrow mutably at present() time below).
@@ -1951,30 +1950,17 @@ fn render_output_now(
         .ok_or_else(|| anyhow!("no smithay Output for {output_id}"))?;
 
     // Build the render walk's inputs:
-    //   project: logical → clip space using the monitor's view_size
     //   ctx.texture_lookup: WlSurface → vk::ImageView (per-GPU)
     //
-    // Both close over things that don't touch &mut state, so the
-    // walk and the present can sequence cleanly. view_size is in
-    // logical pixels; framebuffer extent (used by the renderer's
-    // viewport) is in physical pixels. The conversion logical →
-    // clip space is the same regardless of fractional scale because
-    // [-1, 1] always means "full framebuffer".
+    // It closes over things that don't touch &mut state, so the walk and the
+    // present can sequence cleanly. `view_size` (logical pixels) is handed to
+    // the renderer at lowering time, where it owns the logical → clip-space
+    // projection; the walk itself emits output-space logical geometry.
     let view_size = match state.layout.monitor_for_output(&smithay_output) {
         Some(m) => m.view_size(),
         // Output not in the layout yet (race between add_output and the
         // first vblank). Skip this frame; the next one will be fine.
         None => return Ok(None),
-    };
-
-    let project = |rect: Rectangle<f64, Logical>| -> [f32; 4] {
-        let w = view_size.w.max(1.0);
-        let h = view_size.h.max(1.0);
-        let x0 = (2.0 * rect.loc.x / w - 1.0) as f32;
-        let y0 = (2.0 * rect.loc.y / h - 1.0) as f32;
-        let x1 = (2.0 * (rect.loc.x + rect.size.w) / w - 1.0) as f32;
-        let y1 = (2.0 * (rect.loc.y + rect.size.h) / h - 1.0) as f32;
-        [x0, y0, x1, y1]
     };
 
     let texture_lookup =
@@ -2105,7 +2091,6 @@ fn render_output_now(
                 prism_layout::layout::element::push_surface_tree_elements(
                     ls.wl_surface(),
                     geo.loc.to_f64(),
-                    &project,
                     &ctx,
                     out,
                 );
@@ -2118,7 +2103,7 @@ fn render_output_now(
         // focus_ring: this is the focused monitor's render — for
         // single-monitor configs it always is; multi-monitor focus
         // tracking lands when input dispatch does.
-        monitor.render_workspaces(true, &project, &ctx, &mut render_els);
+        monitor.render_workspaces(true, &ctx, &mut render_els);
         true
     } else {
         false
@@ -2132,12 +2117,9 @@ fn render_output_now(
     // the assignment as the cursor crosses output boundaries during
     // the drag). Append after the workspace pass so the moving window
     // draws on top of normal tiles.
-    state.layout.render_interactive_move_for_output(
-        &smithay_output,
-        &project,
-        &ctx,
-        &mut render_els,
-    );
+    state
+        .layout
+        .render_interactive_move_for_output(&smithay_output, &ctx, &mut render_els);
 
     // Top + Overlay layers: above the workspace walk and the interactive-move
     // tile. Same color-managed walk as Background/Bottom. Done before the
@@ -2167,15 +2149,18 @@ fn render_output_now(
             .queue_redraw();
     }
 
-    // Lower RenderEls (geometry + tint) → ElementDraws (texture + push
-    // constants). One pass; SolidColor/Border elements bind the white
-    // texel, Surface elements bind the per-surface view. The per-output
-    // panel peak is threaded through so the decoder's display-referred
-    // clamp lands at the right value for each output.
-    let mut elements: Vec<ElementDraw> = Vec::with_capacity(render_els.len());
-    for el in &render_els {
-        el.lower(white_view, output_decode_clamp_bt2020_rgb, &mut elements);
-    }
+    // Lower RenderEls (output-space logical geometry + tint) → ElementDraws
+    // (clip-space + push constants). The renderer owns the logical → clip
+    // projection (built once from `view_size`); SolidColor/Border elements
+    // bind the white texel, Surface elements bind the per-surface view. The
+    // per-output panel peak is threaded through so the decoder's
+    // display-referred clamp lands at the right value for each output.
+    let elements = prism_renderer::lower_elements(
+        &render_els,
+        view_size,
+        white_view,
+        output_decode_clamp_bt2020_rgb,
+    );
 
     // Once per output, the first present that actually carries tiles —
     // a single tracing line we use as a regression sentinel for
@@ -2189,7 +2174,7 @@ fn render_output_now(
             .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
         if seen.lock().unwrap().insert(output_id.to_owned()) {
             let first_surface = render_els.iter().find_map(|e| match e {
-                RenderEl::Surface(s) => Some(s.dst_rect_clip),
+                RenderEl::Surface(s) => Some(s.geometry),
                 _ => None,
             });
             tracing::info!(

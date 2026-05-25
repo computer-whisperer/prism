@@ -145,17 +145,10 @@ impl FocusRing {
         });
     }
 
-    /// Append this ring's draw elements onto `out`, projecting into the
-    /// supplied output coord system. `location` is the visual top-left of
-    /// the owning window in logical pixels; `project` is the
-    /// logical→clip-space transform the caller provides (typically
-    /// composed from the output extent + any tile-level scale/translate).
-    pub fn render(
-        &self,
-        location: Point<f64, Logical>,
-        project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
-        out: &mut Vec<RenderEl>,
-    ) {
+    /// Append this ring's draw elements onto `out` in output-space logical
+    /// pixels. `location` is the visual top-left of the owning window in
+    /// logical pixels; the renderer projects to clip space at lowering time.
+    pub fn render(&self, location: Point<f64, Logical>, out: &mut Vec<RenderEl>) {
         let Some(cached) = &self.cached else {
             return;
         };
@@ -163,37 +156,14 @@ impl FocusRing {
         let outer_logical = Rectangle::new(cached.outer.loc + location, cached.outer.size);
 
         if cached.is_border {
-            // Per-side thickness in clip space: project the outer rect
-            // and the inner rect (outer shrunk by `thickness_logical` on
-            // each side), then take the difference along each axis. This
-            // routes the caller's logical→clip projection through
-            // without needing to know the output's pixel scale.
-            let outer_clip = project(outer_logical);
-            let [t, r, b, l] = cached.thickness_logical;
-            let inner_logical = Rectangle::new(
-                outer_logical.loc + Point::from((l, t)),
-                Size::from((
-                    outer_logical.size.w - (l + r),
-                    outer_logical.size.h - (t + b),
-                )),
-            );
-            let inner_clip = project(inner_logical);
-            let thickness_clip = [
-                inner_clip[1] - outer_clip[1], // top
-                outer_clip[2] - inner_clip[2], // right
-                outer_clip[3] - inner_clip[3], // bottom
-                inner_clip[0] - outer_clip[0], // left
-            ];
-
             out.push(RenderEl::Border(BorderEl {
-                rect_clip: outer_clip,
-                thickness_clip,
+                geometry: outer_logical,
+                thickness: cached.thickness_logical,
                 color_bt2020_nits: cached.color_bt2020_nits,
             }));
         } else {
-            let rect_clip = project(outer_logical);
             out.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
-                rect_clip,
+                geometry: outer_logical,
                 color_bt2020_nits: cached.color_bt2020_nits,
             }));
         }

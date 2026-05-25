@@ -1628,11 +1628,7 @@ impl<W: LayoutElement> Monitor<W> {
     /// elements here (Crop + Rescale + Relocate + InsertHint); prism
     /// emits a flat `Vec<RenderEl>` via the InsertHint stub, which
     /// is currently a no-op.
-    pub fn render_insert_hint_between_workspaces(
-        &self,
-        project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
-        out: &mut Vec<RenderEl>,
-    ) {
+    pub fn render_insert_hint_between_workspaces(&self, out: &mut Vec<RenderEl>) {
         if self.options.layout.insert_hint.off {
             return;
         }
@@ -1643,17 +1639,15 @@ impl<W: LayoutElement> Monitor<W> {
             return;
         };
 
-        self.insert_hint_element
-            .render(render_loc.location, project, out);
+        self.insert_hint_element.render(render_loc.location, out);
     }
 
     /// Render all workspaces on this monitor. Niri composes 7-layer
     /// element stacks here (Workspace contents wrapped in Crop +
     /// Rescale + Relocate, interleaved with InsertHint) inside a
     /// `MonitorRenderElement<R>` enum; prism's port flattens these to
-    /// `Vec<RenderEl>` and routes the rescale/relocate transforms
-    /// through the supplied `project` closure (the call site supplies
-    /// a closure that composes the per-workspace geo + zoom transform).
+    /// `Vec<RenderEl>` carrying output-space logical geometry (the renderer
+    /// projects to clip space at lowering time).
     ///
     /// The corresponding niri features that aren't visually wired
     /// today: overview-mode crop bounds, MonitorInnerRenderElement
@@ -1661,7 +1655,6 @@ impl<W: LayoutElement> Monitor<W> {
     pub fn render_workspaces(
         &self,
         focus_ring: bool,
-        project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
         ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
@@ -1670,31 +1663,27 @@ impl<W: LayoutElement> Monitor<W> {
             .filter(|_| !self.options.layout.insert_hint.off);
 
         for (ws, _geo) in self.workspaces_with_render_geo() {
-            ws.render_floating(focus_ring, project, ctx, out);
+            ws.render_floating(focus_ring, ctx, out);
 
             if let Some(loc) = insert_hint_render_loc {
                 if loc.workspace == InsertWorkspace::Existing(ws.id()) {
-                    self.insert_hint_element.render(loc.location, project, out);
+                    self.insert_hint_element.render(loc.location, out);
                 }
             }
 
-            ws.render_scrolling(focus_ring, project, ctx, out);
+            ws.render_scrolling(focus_ring, ctx, out);
         }
     }
 
     /// Render the overview-mode shadow under each workspace card.
     /// Stubbed to a no-op (matches the rest of the Shadow port).
-    pub fn render_workspace_shadows(
-        &self,
-        project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
-        out: &mut Vec<RenderEl>,
-    ) {
+    pub fn render_workspace_shadows(&self, out: &mut Vec<RenderEl>) {
         let Some(_progress) = self.overview_progress.as_ref().map(|p| p.clamped_value()) else {
             return;
         };
 
         for (ws, _geo) in self.workspaces_with_render_geo() {
-            ws.render_shadow(project, out);
+            ws.render_shadow(out);
         }
     }
 

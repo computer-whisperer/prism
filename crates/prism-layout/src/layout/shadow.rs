@@ -14,7 +14,7 @@
 //! stay the same; only the body changes.
 
 use prism_renderer::RenderEl;
-use smithay::utils::{Logical, Point, Rectangle, Size};
+use smithay::utils::{Logical, Point, Size};
 
 #[derive(Debug)]
 pub struct Shadow {
@@ -49,11 +49,5 @@ impl Shadow {
     }
 
     /// No shadow draws today.
-    pub fn render(
-        &self,
-        _location: Point<f64, Logical>,
-        _project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
-        _out: &mut Vec<RenderEl>,
-    ) {
-    }
+    pub fn render(&self, _location: Point<f64, Logical>, _out: &mut Vec<RenderEl>) {}
 }

@@ -1021,11 +1021,10 @@ impl<W: LayoutElement> Tile<W> {
         Point::from((0., y))
     }
 
-    /// Emit this tile's draw calls into `out`. `location` is the tile's
-    /// visual top-left in logical coordinates (this is **not** the
-    /// window's top-left — the window sits inside the tile, inset by
-    /// the border on all sides when one is drawn). `project` converts
-    /// logical rects to renderer clip space `[x0, y0, x1, y1]`.
+    /// Emit this tile's draw calls into `out` in output-space logical
+    /// pixels. `location` is the tile's visual top-left in logical
+    /// coordinates (this is **not** the window's top-left — the window sits
+    /// inside the tile, inset by the border on all sides when one is drawn).
     ///
     /// Heavily simplified from niri/src/layout/tile.rs's
     /// `render_inner` (290 LOC): no resize crossfade, no offscreen
@@ -1042,7 +1041,6 @@ impl<W: LayoutElement> Tile<W> {
         location: Point<f64, Logical>,
         scale: smithay::utils::Scale<f64>,
         focus_ring_visible: bool,
-        project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
         ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
@@ -1078,12 +1076,12 @@ impl<W: LayoutElement> Tile<W> {
         // inside `LayoutElement::render`).
 
         if expanded_progress < 1. {
-            self.shadow.render(location, project, out);
+            self.shadow.render(location, out);
         }
 
         // Hide focus ring when maximized/fullscreened — niri's logic.
         if focus_ring_visible && expanded_progress < 1. {
-            self.focus_ring.render(location, project, out);
+            self.focus_ring.render(location, out);
         }
 
         // Fullscreen black backdrop. Niri caches a `SolidColorBuffer`;
@@ -1091,26 +1089,25 @@ impl<W: LayoutElement> Tile<W> {
         // size so the backdrop fades in/out with the resize animation.
         if fullscreen_progress > 0. {
             let backdrop = Rectangle::new(location, self.animated_tile_size());
-            let rect_clip = project(backdrop);
             let alpha = fullscreen_progress as f32 * tile_alpha;
             let color_bt2020_nits =
                 prism_renderer::srgb_to_bt2020_nits(0., 0., 0., alpha, BACKDROP_SDR_WHITE_NITS);
             out.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
-                rect_clip,
+                geometry: backdrop,
                 color_bt2020_nits,
             }));
         }
 
         // Border ring around the window itself.
         if self.visual_border_width().is_some() {
-            self.border.render(window_render_loc, project, out);
+            self.border.render(window_render_loc, out);
         }
 
         // Window content. Delegates to `LayoutElement::render` (popups
         // emit on top of normal content; we leave that ordering to the
         // trait impl).
         self.window
-            .render(window_render_loc, scale, win_alpha, project, ctx, out);
+            .render(window_render_loc, scale, win_alpha, ctx, out);
     }
 
     /// Snapshot bookkeeping for the close animation. Niri renders the

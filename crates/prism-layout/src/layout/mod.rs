@@ -4623,11 +4623,10 @@ impl<W: LayoutElement> Layout<W> {
 
     /// Render the interactively-moved tile on top of `output`'s
     /// workspaces. Niri threaded `RenderCtx<R>` + `RescaleRenderElement`;
-    /// prism emits flat `Vec<RenderEl>` via the supplied `project`.
+    /// prism emits a flat `Vec<RenderEl>` in output-space logical pixels.
     pub fn render_interactive_move_for_output(
         &self,
         output: &Output,
-        project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
         ctx: &RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
@@ -4647,9 +4646,7 @@ impl<W: LayoutElement> Layout<W> {
         let zoom = self.overview_zoom();
         let pos_in_backdrop = move_.tile_render_location(zoom);
         let _ = zoom;
-        move_
-            .tile
-            .render(pos_in_backdrop, scale, true, project, ctx, out);
+        move_.tile.render(pos_in_backdrop, scale, true, ctx, out);
     }
 
     pub fn refresh(&mut self, is_active: bool) {

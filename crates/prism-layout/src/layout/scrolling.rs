@@ -2903,8 +2903,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             .is_fullscreen()
     }
 
-    /// Emit this space's draw calls into `out`. `project` converts
-    /// logical rects to renderer clip space.
+    /// Emit this space's draw calls into `out` in output-space logical pixels.
     ///
     /// Simplified vs niri's render — niri's path threaded a
     /// `RenderCtx<R>` (so render-helpers shaders could read a target +
@@ -2916,7 +2915,6 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     pub fn render(
         &self,
         focus_ring: bool,
-        project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
         ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
@@ -2926,7 +2924,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         // the active tiles); our ClosingWindow::render is a stub, so
         // these contribute nothing today.
         for closing in self.closing_windows.iter().rev() {
-            closing.render(closing.geometry().loc, scale, 1.0, project, out);
+            closing.render(closing.geometry().loc, scale, 1.0, out);
         }
 
         if self.columns.is_empty() {
@@ -2945,7 +2943,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             {
                 let pos = view_off + col_off + col_render_off;
                 let pos = pos.to_physical_precise_round(scale).to_logical(scale);
-                col.tab_indicator.render(pos, project, out);
+                col.tab_indicator.render(pos, out);
             }
 
             for (tile, tile_off, visible) in col.tiles_in_render_order() {
@@ -2968,7 +2966,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     continue;
                 }
 
-                tile.render(tile_pos, scale, focus_ring, project, ctx, out);
+                tile.render(tile_pos, scale, focus_ring, ctx, out);
             }
         }
     }

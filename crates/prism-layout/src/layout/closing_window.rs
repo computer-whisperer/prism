@@ -72,7 +72,6 @@ impl ClosingWindow {
         _location: Point<f64, Logical>,
         _scale: Scale<f64>,
         _alpha: f32,
-        _project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
         _out: &mut Vec<RenderEl>,
     ) {
     }

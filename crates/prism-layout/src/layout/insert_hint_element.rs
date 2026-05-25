@@ -37,13 +37,7 @@ impl InsertHintElement {
     ) {
     }
 
-    pub fn render(
-        &self,
-        _location: Point<f64, Logical>,
-        _project: &impl Fn(Rectangle<f64, Logical>) -> [f32; 4],
-        _out: &mut Vec<RenderEl>,
-    ) {
-    }
+    pub fn render(&self, _location: Point<f64, Logical>, _out: &mut Vec<RenderEl>) {}
 
     pub fn extra_size(&self) -> Size<f64, Logical> {
         Size::default()
