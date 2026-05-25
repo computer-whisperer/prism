@@ -4,15 +4,15 @@
 //! `on_pointer_motion_absolute` / `on_pointer_button` /
 //! `on_pointer_axis` (input/mod.rs lines 2414, 2658, 2750, 3074).
 //!
+//! Pointer constraints (lock / confine) and relative-pointer deltas are
+//! handled in `on_pointer_motion`; activation/teardown lives in
+//! [`prism_protocols::PrismState::maybe_activate_pointer_constraint`].
+//!
 //! What's intentionally not here (yet):
-//!   - Pointer constraints / locked / confined regions
 //!   - Hot corners
 //!   - Tablet integration
 //!   - Move/resize/spatial/pick_window/pick_color grabs (niri's 7 grab files)
-//!   - Follow-pointer focus / MRU click-to-focus
 //!   - Cursor auto-hide / pointer-inactivity timer
-//!   - Sub-surface hit-testing (we hand the toplevel surface and treat
-//!     the window placement as the surface origin)
 //!
 //! These can all bolt onto this file as their backing state lands.
 
@@ -21,9 +21,10 @@ use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, PointerAxisEvent, PointerButtonEvent,
     PointerMotionEvent,
 };
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
+use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER};
+use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 
 use crate::backend_ext::PrismInputBackend;
 
@@ -34,30 +35,124 @@ pub fn on_pointer_motion<I: PrismInputBackend>(
     let serial = SERIAL_COUNTER.next_serial();
     let time = smithay::backend::input::Event::time_msec(&event);
 
-    // Advance the global pointer by the relative delta, then clamp
-    // into the union of all output rects. Without clamping the
-    // pointer can drift forever and the focus query stops finding
-    // anything.
-    state.pointer_pos.x += event.delta_x();
-    state.pointer_pos.y += event.delta_y();
-    clamp_pointer_to_outputs(state);
-
-    let focus = surface_under_pointer(state);
-    // Keep the tracked contents in sync so the post-dispatch
-    // `refresh_pointer_focus` doesn't see a spurious change and re-fire.
-    state.pointer_contents = focus.clone();
-    let new_pos = state.pointer_pos;
-
     let Some(pointer) = state.seat.get_pointer() else {
         return;
     };
+
+    // Both accelerated and raw deltas, plus the microsecond timestamp, are
+    // needed for relative-motion events (zwp_relative_pointer_v1).
+    let delta = event.delta();
+    let delta_unaccel = event.delta_unaccel();
+    let utime = smithay::backend::input::Event::time(&event);
+
+    let pos = state.pointer_pos;
+    // Tentative new position: only committed to `state.pointer_pos` once we
+    // know a pointer lock / confinement doesn't forbid the move.
+    let new_pos = pos + delta;
+
+    // Pointer constraint check against the CURRENT pointer focus. The
+    // constraint deactivates automatically (in smithay) when focus leaves the
+    // surface, so an active constraint here means focus is still on it.
+    let current = state.pointer_contents.clone();
+    let mut pointer_confined = None;
+    if let Some(under) = &current {
+        let pos_within_surface = pos - under.1;
+
+        let mut pointer_locked = false;
+        with_pointer_constraint(&under.0, &pointer, |constraint| {
+            let Some(constraint) = constraint else {
+                return;
+            };
+            if !constraint.is_active() {
+                return;
+            }
+            // Constraint does not apply if the pointer is outside its region.
+            if let Some(region) = constraint.region() {
+                if !region.contains(pos_within_surface.to_i32_round()) {
+                    return;
+                }
+            }
+            match &*constraint {
+                PointerConstraint::Locked(_locked) => pointer_locked = true,
+                PointerConstraint::Confined(confine) => {
+                    pointer_confined = Some((under.clone(), confine.region().cloned()));
+                }
+            }
+        });
+
+        // Locked: the pointer stays put. Deliver only relative motion (this is
+        // what FPS mouselook reads) and leave `pointer_pos` untouched.
+        if pointer_locked {
+            pointer.relative_motion(
+                state,
+                Some(under.clone()),
+                &RelativeMotionEvent {
+                    delta,
+                    delta_unaccel,
+                    utime,
+                },
+            );
+            pointer.frame(state);
+            return;
+        }
+    }
+
+    // Clamp the tentative position into the union of all output rects, then
+    // resolve what's under it. Without clamping the pointer can drift forever
+    // and the focus query stops finding anything.
+    let new_pos = clamp_point_to_outputs(state, new_pos);
+    let focus = state.contents_under(new_pos);
+
+    // Confined: prevent the pointer from leaving the focused surface (or its
+    // confine region). Like the locked case, deliver relative motion only and
+    // don't move the pointer when the move would breach the confinement.
+    if let Some((focus_surface, region)) = pointer_confined {
+        let mut prevent = false;
+        if Some(&focus_surface.0) != focus.as_ref().map(|(s, _)| s) {
+            prevent = true;
+        }
+        if let Some(region) = region {
+            let new_within_surface = new_pos - focus_surface.1;
+            if !region.contains(new_within_surface.to_i32_round()) {
+                prevent = true;
+            }
+        }
+        if prevent {
+            pointer.relative_motion(
+                state,
+                Some(focus_surface),
+                &RelativeMotionEvent {
+                    delta,
+                    delta_unaccel,
+                    utime,
+                },
+            );
+            pointer.frame(state);
+            return;
+        }
+    }
+
+    state.pointer_pos = new_pos;
+    // Keep the tracked contents in sync so the post-dispatch
+    // `refresh_pointer_focus` doesn't see a spurious change and re-fire.
+    state.pointer_contents = focus.clone();
+
     pointer.motion(
         state,
-        focus,
+        focus.clone(),
         &MotionEvent {
             location: new_pos,
             serial,
             time,
+        },
+    );
+    pointer.relative_motion(
+        state,
+        focus,
+        &RelativeMotionEvent {
+            delta,
+            delta_unaccel,
+            utime,
         },
     );
     pointer.frame(state);
@@ -65,6 +160,8 @@ pub fn on_pointer_motion<I: PrismInputBackend>(
     // Walk the cursor plane on every output: show on the output the
     // pointer is in, hide on the rest, queue redraws on changes.
     prism_protocols::state::update_output_cursors(state);
+    // A constraint may want to activate now that focus settled here.
+    state.maybe_activate_pointer_constraint();
 }
 
 pub fn on_pointer_motion_absolute<I: PrismInputBackend>(
@@ -104,6 +201,10 @@ pub fn on_pointer_motion_absolute<I: PrismInputBackend>(
     pointer.frame(state);
     maybe_focus_follows_mouse(state);
     prism_protocols::state::update_output_cursors(state);
+    // Absolute motion doesn't enforce locks (no meaningful raw delta), but it
+    // can still settle focus onto a surface that wants to activate a
+    // constraint — e.g. a confine. Matches niri's absolute-motion handler.
+    state.maybe_activate_pointer_constraint();
 }
 
 pub fn on_pointer_button<I: PrismInputBackend>(
@@ -328,16 +429,24 @@ fn global_bounding_rect(state: &PrismState) -> Option<Rectangle<i32, Logical>> {
     acc
 }
 
-fn clamp_pointer_to_outputs(state: &mut PrismState) {
+/// Clamp a point into the union of all output rects. Returns the point
+/// unchanged if no outputs are advertised.
+fn clamp_point_to_outputs(
+    state: &PrismState,
+    mut p: Point<f64, Logical>,
+) -> Point<f64, Logical> {
     let Some(bounds) = global_bounding_rect(state) else {
-        return;
+        return p;
     };
     let max_x = (bounds.loc.x + bounds.size.w - 1) as f64;
     let max_y = (bounds.loc.y + bounds.size.h - 1) as f64;
-    let min_x = bounds.loc.x as f64;
-    let min_y = bounds.loc.y as f64;
-    state.pointer_pos.x = state.pointer_pos.x.clamp(min_x, max_x);
-    state.pointer_pos.y = state.pointer_pos.y.clamp(min_y, max_y);
+    p.x = p.x.clamp(bounds.loc.x as f64, max_x);
+    p.y = p.y.clamp(bounds.loc.y as f64, max_y);
+    p
+}
+
+fn clamp_pointer_to_outputs(state: &mut PrismState) {
+    state.pointer_pos = clamp_point_to_outputs(state, state.pointer_pos);
 }
 
 /// Look up the surface (and its global origin) under the current

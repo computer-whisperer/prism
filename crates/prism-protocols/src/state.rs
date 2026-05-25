@@ -44,7 +44,9 @@ use smithay::delegate_fractional_scale;
 use smithay::delegate_idle_inhibit;
 use smithay::delegate_idle_notify;
 use smithay::delegate_output;
+use smithay::delegate_pointer_constraints;
 use smithay::delegate_presentation;
+use smithay::delegate_relative_pointer;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_single_pixel_buffer;
@@ -56,7 +58,7 @@ use smithay::desktop::{
     find_popup_root_surface, get_popup_toplevel_coords, PopupKeyboardGrab, PopupKind, PopupManager,
     PopupPointerGrab, PopupUngrabStrategy, Window,
 };
-use smithay::input::pointer::{CursorIcon, CursorImageStatus, Focus};
+use smithay::input::pointer::{CursorIcon, CursorImageStatus, Focus, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -87,7 +89,11 @@ use smithay::wayland::fractional_scale::{FractionalScaleHandler, FractionalScale
 use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
 use smithay::wayland::idle_notify::{IdleNotifierHandler, IdleNotifierState};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::pointer_constraints::{
+    with_pointer_constraint, PointerConstraintsHandler, PointerConstraintsState,
+};
 use smithay::wayland::presentation::PresentationState;
+use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::{set_data_device_focus, DataDeviceState};
 use smithay::wayland::selection::primary_selection::{set_primary_focus, PrimarySelectionState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
@@ -666,6 +672,19 @@ impl PrismState {
         let single_pixel_buffer = SinglePixelBufferState::new::<PrismState>(&dh);
         let content_type = ContentTypeState::new::<PrismState>(&dh);
         let xdg_activation = XdgActivationState::new::<PrismState>(&dh);
+
+        // zwp_relative_pointer_manager_v1 — lets clients (games, 3D/CAD apps,
+        // and X11 apps via xwayland-satellite) read unaccelerated relative
+        // motion deltas alongside absolute pointer motion. Emitted from the
+        // pointer-motion handler; global kept alive by the display.
+        let _relative_pointer = RelativePointerManagerState::new::<PrismState>(&dh);
+
+        // zwp_pointer_constraints_v1 — lets a surface lock the pointer in place
+        // (FPS mouselook) or confine it to a region (drawing apps). Activation
+        // and enforcement live in the pointer-motion handler; smithay
+        // auto-deactivates a constraint when pointer focus leaves the surface.
+        // Global kept alive by the display.
+        let _pointer_constraints = PointerConstraintsState::new::<PrismState>(&dh);
 
         // wl_data_device_manager + wp_primary_selection_device_manager_v1.
         // GTK4 ≥ 4.22 hard-requires the former; without it every GTK
@@ -1461,6 +1480,52 @@ delegate_seat!(PrismState);
 impl smithay::wayland::tablet_manager::TabletSeatHandler for PrismState {}
 
 delegate_cursor_shape!(PrismState);
+
+// ─── zwp_relative_pointer / zwp_pointer_constraints ──────────────────────────
+
+// Relative pointer needs no handler trait — the manager just gates the global,
+// and the per-motion deltas are pushed from the input layer via
+// `PointerHandle::relative_motion`.
+delegate_relative_pointer!(PrismState);
+
+impl PointerConstraintsHandler for PrismState {
+    fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {
+        // A constraint can only activate while the pointer is focused on its
+        // surface and inside any requested region. `pointer_contents` is kept
+        // current by the motion handlers and the post-dispatch focus refresh,
+        // so a constraint created while the pointer is already inside (the
+        // normal case for click-to-lock games) activates immediately.
+        self.maybe_activate_pointer_constraint();
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+        // The client hints where the cursor should reappear once a lock is
+        // released. Only honor it while the constraint is actually active and
+        // the hint surface is the one under the pointer (we need its origin).
+        let is_active =
+            with_pointer_constraint(surface, pointer, |c| c.is_some_and(|c| c.is_active()));
+        if !is_active {
+            return;
+        }
+        let Some((under, origin)) = self.pointer_contents.clone() else {
+            return;
+        };
+        if &under != surface {
+            return;
+        }
+        // `location` is surface-local; `origin` is the surface origin in global
+        // logical space. prism tracks the pointer position itself, so move it
+        // directly — the next motion event syncs smithay's internal location.
+        self.pointer_pos = origin + location;
+        update_output_cursors(self);
+    }
+}
+delegate_pointer_constraints!(PrismState);
 
 // ─── ext-idle-notify-v1 / zwp_idle_inhibit ───────────────────────────────────
 

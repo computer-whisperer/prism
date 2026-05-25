@@ -16,6 +16,7 @@ use smithay::desktop::{layer_map_for_output, WindowSurfaceType};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point};
 use smithay::wayland::compositor::get_parent;
+use smithay::wayland::pointer_constraints::with_pointer_constraint;
 use smithay::wayland::shell::wlr_layer::Layer;
 
 use prism_layout::layout::HitType;
@@ -96,6 +97,45 @@ impl PrismState {
 
         // Lift the output-local origin into global space.
         Some((within_output.0, within_output.1 + output_loc))
+    }
+
+    /// Activate the pointer constraint on the surface under the pointer, if
+    /// one exists and the conditions are met: the pointer must be focused on
+    /// that surface and, for a constraint with a region, inside the region.
+    ///
+    /// Called after pointer focus settles (motion handlers) and when a client
+    /// creates a new constraint. smithay handles *de*activation automatically
+    /// when pointer focus leaves the surface. Ported from niri's
+    /// `Niri::maybe_activate_pointer_constraint`.
+    pub fn maybe_activate_pointer_constraint(&self) {
+        let Some((surface, surface_loc)) = &self.pointer_contents else {
+            return;
+        };
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        // Only activate if this surface actually holds the pointer focus.
+        if Some(surface) != pointer.current_focus().as_ref() {
+            return;
+        }
+
+        with_pointer_constraint(surface, &pointer, |constraint| {
+            let Some(constraint) = constraint else {
+                return;
+            };
+            if constraint.is_active() {
+                return;
+            }
+            // A region-limited constraint only applies while the pointer is
+            // inside the region.
+            if let Some(region) = constraint.region() {
+                let pos_within_surface = self.pointer_pos - *surface_loc;
+                if !region.contains(pos_within_surface.to_i32_round()) {
+                    return;
+                }
+            }
+            constraint.activate();
+        });
     }
 
     /// Hit-test the layer-shell surfaces on `output_id` belonging to `layer`.
