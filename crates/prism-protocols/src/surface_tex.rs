@@ -58,12 +58,20 @@ pub enum TexSource {
         format: vk::Format,
         buffer: WlBuffer,
     },
+    /// A `wp_single_pixel_buffer` solid color (e.g. swaybg `-c`, GTK/Qt solid
+    /// backgrounds). There is no texture to upload — the render walk lowers it
+    /// to a color-managed [`SolidColorEl`](prism_renderer::SolidColorEl) from
+    /// `rgba` (premultiplied sRGB per the protocol). `buffer` is held for
+    /// reuse-detection / release-tracking parity with the textured variants.
+    SolidColor { rgba: [u8; 4], buffer: WlBuffer },
 }
 
 impl TexSource {
     pub fn buffer(&self) -> &WlBuffer {
         match self {
-            Self::Dmabuf { buffer, .. } | Self::Shm { buffer, .. } => buffer,
+            Self::Dmabuf { buffer, .. }
+            | Self::Shm { buffer, .. }
+            | Self::SolidColor { buffer, .. } => buffer,
         }
     }
     fn extent(&self) -> vk::Extent2D {
@@ -73,6 +81,12 @@ impl TexSource {
                 height: dmabuf.height,
             },
             Self::Shm { extent, .. } => *extent,
+            // No texture; the surface's logical dst (from its viewport) drives
+            // the SolidColorEl rect, not this extent.
+            Self::SolidColor { .. } => vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
         }
     }
 }
@@ -195,6 +209,16 @@ impl SurfaceTexture {
     /// The `wl_buffer` this texture is currently backed by.
     pub fn buffer(&self) -> &WlBuffer {
         self.source.buffer()
+    }
+
+    /// Premultiplied sRGB RGBA if this surface is a `wp_single_pixel_buffer`
+    /// solid color (rendered as a color-managed `SolidColorEl`, no texture);
+    /// `None` for textured surfaces.
+    pub fn solid_color(&self) -> Option<[u8; 4]> {
+        match &self.source {
+            TexSource::SolidColor { rgba, .. } => Some(*rgba),
+            _ => None,
+        }
     }
 }
 

@@ -2026,6 +2026,15 @@ fn render_output_now(
                 mirror_surfaces.borrow_mut().push(s.clone());
             }
         };
+    // Solid color (wp_single_pixel_buffer) lookup — the walk lowers these to a
+    // SolidColorEl instead of sampling a texture. Premultiplied sRGB RGBA.
+    let solid_color_lookup =
+        |states: &smithay::wayland::compositor::SurfaceData| -> Option<[u8; 4]> {
+            states
+                .data_map
+                .get::<prism_protocols::SurfaceTexSlot>()
+                .and_then(|s| s.0.lock().unwrap().as_ref().and_then(|t| t.solid_color()))
+        };
     let ctx = RenderCtx {
         texture_lookup: &texture_lookup,
         yuv_lookup: &yuv_lookup,
@@ -2033,6 +2042,7 @@ fn render_output_now(
         sdr_reference_nits: output_sdr_reference_nits,
         report_missing_texture: &report_missing,
         report_mirror: &report_mirror,
+        solid_color_lookup: &solid_color_lookup,
     };
 
     // Refresh per-tile cached render elements (focus ring / border /

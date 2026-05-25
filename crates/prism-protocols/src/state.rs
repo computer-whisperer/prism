@@ -83,7 +83,7 @@ use smithay::wayland::shell::xdg::{
     XdgToplevelSurfaceData,
 };
 use smithay::wayland::shm::{with_buffer_contents, ShmHandler, ShmState};
-use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::wayland::single_pixel_buffer::{self, SinglePixelBufferState};
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
@@ -2141,9 +2141,20 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
 /// actually placed the window on. Per-frame this also re-syncs us if the
 /// layout moved the window to a different monitor.
 fn dispatch_surface_output_from_layout(state: &mut PrismState, surface: &WlSurface) {
-    // Resolve the surface's current output via the layout. If the surface
-    // isn't a layout-tracked window (e.g., a layer surface, once those land)
-    // we silently skip — the layer-surface path will do its own dispatch.
+    // Layer-shell surfaces (and their subsurface trees) bind to an output via
+    // the LayerMap, and arrange() already sends their wl_surface.enter. Skip
+    // the layout-driven placement dispatch for them so we don't clobber that
+    // assignment or fire a spurious wl_surface.leave.
+    let mut probe = surface.clone();
+    while let Some(p) = get_parent(&probe) {
+        probe = p;
+    }
+    if matches!(get_role(&probe), Some("zwlr_layer_surface_v1")) {
+        return;
+    }
+
+    // Resolve the surface's current output via the layout. Non-window surfaces
+    // (handled above for layer shell) resolve to None and silently skip.
     let new_output: Option<String> = state
         .layout
         .find_window_and_output(surface)
@@ -2422,6 +2433,16 @@ fn build_tex_source(state: &PrismState, buffer: &WlBuffer) -> Result<TexSource> 
             buffer: buffer.clone(),
         });
     }
+    // wp_single_pixel_buffer: a 1x1 solid color (swaybg `-c`, solid
+    // backgrounds). Not dmabuf or shm — there's no texture to upload; carry
+    // the premultiplied sRGB RGBA and lower it to a color-managed SolidColorEl
+    // in the render walk.
+    if let Ok(spb) = single_pixel_buffer::get_single_pixel_buffer(buffer) {
+        return Ok(TexSource::SolidColor {
+            rgba: spb.rgba8888(),
+            buffer: buffer.clone(),
+        });
+    }
     // shm: read geometry (uploads happen lazily per consuming GPU).
     let (extent, format) = with_buffer_contents(buffer, |_ptr, _len, data| {
         let format = vk_format_for_shm(data.format)
@@ -2460,7 +2481,10 @@ fn consumer_gpus_for_surface(state: &PrismState, surface: &WlSurface) -> Vec<Drm
     let output_name = state
         .layout
         .find_window_and_output(&root)
-        .and_then(|(_, out)| out.map(|o| o.name()));
+        .and_then(|(_, out)| out.map(|o| o.name()))
+        // Layer-shell surfaces aren't layout windows; resolve their output
+        // from the LayerMap so their textures materialize on the hosting GPU.
+        .or_else(|| state.layer_surface_output_id(&root));
     let Some(name) = output_name else {
         return Vec::new();
     };
@@ -2524,6 +2548,9 @@ fn ensure_surface_textures(state: &PrismState, surface: &WlSurface) {
                     tracing::warn!("shm upload failed: {e:#}");
                 }
             }
+            // No texture to materialize — the render walk reads the color
+            // directly and emits a SolidColorEl.
+            TexSource::SolidColor { .. } => {}
         }
     });
 }
@@ -2554,6 +2581,8 @@ pub fn materialize_surface_on_gpu(state: &PrismState, surface: &WlSurface, gpu: 
         let result = match &tex.source {
             TexSource::Dmabuf { .. } => materialize_dmabuf_for_gpu(state, tex, gpu),
             TexSource::Shm { .. } => refresh_shm_uploads(state, tex, &[gpu]),
+            // Solid color: no per-GPU texture; the render walk lowers it.
+            TexSource::SolidColor { .. } => Ok(()),
         };
         match result {
             Ok(()) => {
@@ -2667,7 +2696,7 @@ fn materialize_dmabuf_for_gpu(
             format,
             buffer,
         } => (dmabuf.clone(), *format, buffer.id()),
-        TexSource::Shm { .. } => return Ok(()),
+        TexSource::Shm { .. } | TexSource::SolidColor { .. } => return Ok(()),
     };
     let device_g = state
         .gpus
@@ -2825,7 +2854,7 @@ fn ensure_home_import(
 fn refresh_dmabuf_mirrors(state: &PrismState, tex: &mut SurfaceTexture, _extent: vk::Extent2D) {
     let (dmabuf, buffer_id) = match &tex.source {
         TexSource::Dmabuf { dmabuf, buffer, .. } => (dmabuf.clone(), buffer.id()),
-        TexSource::Shm { .. } => return,
+        TexSource::Shm { .. } | TexSource::SolidColor { .. } => return,
     };
 
     for gt in tex.by_gpu.values_mut() {
@@ -2867,7 +2896,7 @@ fn refresh_shm_uploads(
             format,
             buffer,
         } => (*extent, *format, buffer.clone()),
-        TexSource::Dmabuf { .. } => return Ok(()),
+        TexSource::Dmabuf { .. } | TexSource::SolidColor { .. } => return Ok(()),
     };
     with_buffer_contents(&buffer, |ptr, len, data| {
         if data.width <= 0 || data.height <= 0 || data.stride <= 0 || data.offset < 0 {

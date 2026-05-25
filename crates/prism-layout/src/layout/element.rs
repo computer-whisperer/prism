@@ -19,7 +19,7 @@
 //! they'll be plumbed back in.
 
 use prism_config::CornerRadius;
-use prism_renderer::{vk, RenderEl, SurfaceColorParams, SurfaceEl};
+use prism_renderer::{srgb_to_bt2020_nits, vk, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl};
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -88,6 +88,11 @@ pub struct RenderCtx<'a> {
     /// surface and its already-locked `SurfaceData` so the integrator can
     /// check the mirror flag without re-entering the lock.
     pub report_mirror: &'a dyn Fn(&WlSurface, &SurfaceData),
+    /// Premultiplied sRGB RGBA if the surface's current buffer is a
+    /// `wp_single_pixel_buffer` solid color, else `None`. Such surfaces have
+    /// no texture; the walk lowers them to a color-managed `SolidColorEl`.
+    /// Same `&SurfaceData` contract as the other lookups.
+    pub solid_color_lookup: &'a dyn Fn(&SurfaceData) -> Option<[u8; 4]>,
 }
 
 impl<'a> RenderCtx<'a> {
@@ -118,6 +123,11 @@ impl<'a> RenderCtx<'a> {
     /// [`RenderCtx::report_mirror`].
     pub fn note_mirror(&self, surf: &WlSurface, states: &SurfaceData) {
         (self.report_mirror)(surf, states)
+    }
+    /// Premultiplied sRGB RGBA for a `wp_single_pixel_buffer` surface, else
+    /// `None`. See [`RenderCtx::solid_color_lookup`].
+    pub fn solid_color_for(&self, states: &SurfaceData) -> Option<[u8; 4]> {
+        (self.solid_color_lookup)(states)
     }
 }
 
@@ -195,6 +205,29 @@ pub fn push_surface_tree_elements(
                     }
                 }
             };
+            // Single-pixel (wp_single_pixel_buffer) solid color: no texture —
+            // lower to a color-managed SolidColorEl over the surface's dst.
+            // The sRGB→BT.2020-nits conversion uses the surface's reference
+            // white (per-output sdr_reference_nits, or its color description),
+            // so a "white" background lands at SDR diffuse white on a PQ panel
+            // rather than peak. (rgba is premultiplied; exact for the common
+            // opaque case, the only one single-pixel backgrounds use.)
+            if let Some(rgba) = ctx.solid_color_for(states) {
+                let pos = surf_loc + view.offset.to_f64();
+                let dst = Rectangle::new(pos, view.dst.to_f64());
+                let nits = ctx.color_for(states).sdr_white_nits;
+                surf_els.push(RenderEl::SolidColor(SolidColorEl {
+                    rect_clip: project(dst),
+                    color_bt2020_nits: srgb_to_bt2020_nits(
+                        rgba[0] as f32 / 255.0,
+                        rgba[1] as f32 / 255.0,
+                        rgba[2] as f32 / 255.0,
+                        rgba[3] as f32 / 255.0,
+                        nits,
+                    ),
+                }));
+                return;
+            }
             // texture_for reads from `states` directly — DO NOT call
             // with_states(surf) here. We're already inside
             // with_surface_tree_downward's visit callback, which holds this
