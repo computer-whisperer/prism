@@ -18,6 +18,7 @@ pub mod selection;
 pub mod server;
 pub mod state;
 pub mod surface_tex;
+pub mod xwayland;
 
 pub use client::PrismClient;
 pub use input_state::{KeyboardFocus, PointerVisibility};

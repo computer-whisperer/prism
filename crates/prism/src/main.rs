@@ -244,6 +244,10 @@ fn run_wayland_server() -> Result<()> {
     // drm_syncobj_state.is_some().
     state.set_loop_handle(event_loop.handle());
     let socket = prism_protocols::insert_wayland_sources(&event_loop.handle(), display)?;
+    // Bring up xwayland-satellite integration (binds X11 sockets, exports
+    // $DISPLAY for children, spawns the satellite on-demand). Single-threaded
+    // startup is required for the $DISPLAY env mutation — see its docs.
+    prism_protocols::xwayland::satellite::setup(&mut state);
     tracing::info!(
         "WAYLAND_DISPLAY={socket}  — try: `WAYLAND_DISPLAY={socket} foot` (or weston-terminal)"
     );
@@ -1334,6 +1338,10 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     // or the primary GPU's card isn't registered.
     state.init_drm_syncobj();
     let socket = prism_protocols::insert_wayland_sources(&event_loop.handle(), display)?;
+    // Bring up xwayland-satellite integration (binds X11 sockets, exports
+    // $DISPLAY for children, spawns the satellite on-demand). Single-threaded
+    // startup is required for the $DISPLAY env mutation — see its docs.
+    prism_protocols::xwayland::satellite::setup(&mut state);
     tracing::info!("WAYLAND_DISPLAY={socket}");
     // IPC socket for runtime control (prism-tune, future prism-msg, etc.).
     // Best-effort: a bringup failure here would lock us out of calibration

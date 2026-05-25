@@ -282,6 +282,11 @@ pub struct PrismState {
     /// happens after the event loop is built, so this is a
     /// theoretical window).
     pub loop_handle: Option<LoopHandle<'static, PrismState>>,
+    /// xwayland-satellite integration: the bound X11 sockets and their
+    /// on-demand spawn watch. `None` when disabled by config, when the
+    /// installed satellite is too old, or before [`crate::xwayland`] setup
+    /// runs. See [`crate::xwayland::satellite::setup`].
+    pub satellite: Option<crate::xwayland::satellite::Satellite>,
     /// `wlr_layer_shell_unstable_v1` server state. MVP — see
     /// [`crate::layer_shell`] for the deliberate scope gaps.
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
@@ -698,6 +703,7 @@ impl PrismState {
             drm_syncobj_state: None,
             primary_gpu_id: primary_gpu,
             loop_handle: None,
+            satellite: None,
             layer_shell_state,
             session,
             cards: HashMap::new(),

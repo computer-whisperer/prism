@@ -51,7 +51,7 @@ gpu-allocator = { version = "0.27", default-features = false, features = ["vulka
 half = { version = "2.6", features = ["bytemuck"] }
 libc = "0.2"
 rspirv = "0.13"
-rustix = { version = "1.0.7", features = ["fs"] }
+rustix = { version = "1.0.7", features = ["fs", "process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0"
