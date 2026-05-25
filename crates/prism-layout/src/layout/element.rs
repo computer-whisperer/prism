@@ -19,11 +19,14 @@
 //! they'll be plumbed back in.
 
 use prism_config::CornerRadius;
-use prism_renderer::{vk, RenderEl, SurfaceColorParams};
+use prism_renderer::{vk, RenderEl, SurfaceColorParams, SurfaceEl};
+use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::Resource as _;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
-use smithay::wayland::compositor::SurfaceData;
+use smithay::wayland::compositor::{with_surface_tree_downward, SurfaceData, TraversalAction};
+use tracing::trace;
 
 /// Side-channel a `LayoutElement` needs to actually emit content during a
 /// render walk: how to project logical rects into clip space, and how to
@@ -116,6 +119,129 @@ impl<'a> RenderCtx<'a> {
     pub fn note_mirror(&self, surf: &WlSurface, states: &SurfaceData) {
         (self.report_mirror)(surf, states)
     }
+}
+
+/// Walk a `wl_surface` tree (root + subsurfaces) and emit one
+/// [`SurfaceEl`] per renderable surface into `out`, in prism's
+/// back-to-front draw order.
+///
+/// `buf_origin` is where the ROOT surface's buffer top-left lands in
+/// logical coordinates. Shared by toplevel windows
+/// ([`Mapped::render_normal`](crate::window::Mapped), which passes
+/// `location - window_geometry().loc`) and `wlr_layer_shell` surfaces
+/// (which pass the layer's arranged geometry origin from the smithay
+/// `LayerMap`) — so layer-shell chrome (bars, wallpapers, notifications)
+/// gets identical color management, cross-GPU mirror handling, and
+/// subsurface z-ordering as ordinary windows. There is no separate,
+/// unmanaged blit path for our own UI.
+pub fn push_surface_tree_elements(
+    surface: &WlSurface,
+    buf_origin: Point<f64, Logical>,
+    project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
+    ctx: &RenderCtx<'_>,
+    out: &mut Vec<RenderEl>,
+) {
+    // Paint-order fixup: `with_surface_tree_downward` visits surfaces
+    // top-to-bottom (it iterates the bottom-to-top child stack in reverse,
+    // emitting the topmost subsurface first) — niri/smithay's front-to-back
+    // render-element convention. prism's renderer is the opposite: it draws
+    // the element vec in order with src-over blend, so *earlier* entries
+    // paint behind. We collect the walk's emissions and append them to `out`
+    // reversed, so the bottommost subsurface lands first. Without this,
+    // overlapping subsurfaces composite in inverted z-order.
+    let mut surf_els: Vec<RenderEl> = Vec::new();
+
+    with_surface_tree_downward(
+        surface,
+        buf_origin,
+        // Descend predicate: gather child offsets if this surface has a view.
+        |_surf, states, &surf_loc| {
+            let data = states.data_map.get::<RendererSurfaceStateUserData>();
+            if let Some(data) = data {
+                if let Some(view) = data.lock().unwrap().view() {
+                    TraversalAction::DoChildren(surf_loc + view.offset.to_f64())
+                } else {
+                    TraversalAction::SkipChildren
+                }
+            } else {
+                TraversalAction::SkipChildren
+            }
+        },
+        // Visit: emit a SurfaceEl for this surface at `surf_loc + view.offset`.
+        |surf, states, &surf_loc| {
+            let data = states.data_map.get::<RendererSurfaceStateUserData>();
+            let Some(data) = data else {
+                trace!(
+                    target: "render_walk",
+                    id = ?surf.id(), role = ?states.role,
+                    "skip: no RendererSurfaceState"
+                );
+                return;
+            };
+            // Grab the view and the buffer's logical size under one lock
+            // (both Copy) — buffer_size is the normalization basis for the
+            // wp_viewport source crop below.
+            let (view, buffer_size) = {
+                let guard = data.lock().unwrap();
+                match guard.view() {
+                    Some(v) => (v, guard.buffer_size()),
+                    None => {
+                        trace!(
+                            target: "render_walk",
+                            id = ?surf.id(), role = ?states.role,
+                            "skip: no view (no buffer committed)"
+                        );
+                        return;
+                    }
+                }
+            };
+            // texture_for reads from `states` directly — DO NOT call
+            // with_states(surf) here. We're already inside
+            // with_surface_tree_downward's visit callback, which holds this
+            // surface's SurfaceData lock; re-acquiring it would deadlock.
+            let Some(texture_view) = ctx.texture_for(states) else {
+                // Committed buffer (view present) but no texture for this
+                // output's GPU yet — hand to the render-demand safety net
+                // (materialized after the walk). Blank for this one frame.
+                ctx.report_missing(surf);
+                trace!(
+                    target: "render_walk",
+                    id = ?surf.id(), role = ?states.role, dst = ?view.dst,
+                    "no texture for this output's GPU yet — queued for demand materialization"
+                );
+                return;
+            };
+            trace!(
+                target: "render_walk",
+                id = ?surf.id(), role = ?states.role, dst = ?view.dst,
+                "emit surface"
+            );
+            // If this surface's texture is a cross-GPU mirror for this
+            // output's GPU, note it so the integrator syncs the copy.
+            ctx.note_mirror(surf, states);
+
+            let pos = surf_loc + view.offset.to_f64();
+            let dst = Rectangle::new(pos, view.dst.to_f64());
+            let dst_rect_clip = project(dst);
+
+            let (chroma_view, yuv) = ctx.yuv_for(states);
+            surf_els.push(RenderEl::Surface(SurfaceEl {
+                texture_view,
+                chroma_view,
+                yuv,
+                dst_rect_clip,
+                src_rect_uv: crate::utils::src_rect_uv_from_view(&view, buffer_size),
+                color: ctx.color_for(states),
+            }));
+        },
+        |_, _, _| true,
+    );
+
+    // Reverse top-to-bottom walk order into prism's back-to-front draw
+    // order (see the note above the walk). The walk already baked each
+    // element's absolute position, so reversing only flips compositing
+    // order, not placement.
+    out.extend(surf_els.into_iter().rev());
 }
 
 use super::LayoutElementRenderSnapshot;
