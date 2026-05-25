@@ -1868,10 +1868,12 @@ impl XdgShellHandler for PrismState {
     fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
         // A client requests an explicit popup grab for a menu: while the
         // grab is active, pointer + keyboard events route through the popup
-        // tree, and a press outside the grabbing client dismisses it. This
-        // is also what stops plain cursor motion from leaking a wl_pointer
-        // enter into the parent toplevel — which is what made menus vanish
-        // on the first mouse move before this was wired up.
+        // tree, and a press outside the grabbing client dismisses it.
+        //
+        // Note: many clients (e.g. Firefox/GTK) manage their menus WITHOUT a
+        // grab, driving dismissal off the pointer-leave they receive on the
+        // parent toplevel; this path only runs for clients that do request a
+        // grab. It's still needed for those that do.
         let seat: Seat<Self> = Seat::from_resource(&seat).expect("seat from this display");
         let kind = PopupKind::Xdg(surface);
         let Ok(root) = find_popup_root_surface(&kind) else {
@@ -3053,13 +3055,26 @@ fn consumer_gpus_for_surface(state: &PrismState, surface: &WlSurface) -> Vec<Drm
     while let Some(parent) = get_parent(&root) {
         root = parent;
     }
-    let output_name = state
-        .layout
-        .find_window_and_output(&root)
-        .and_then(|(_, out)| out.map(|o| o.name()))
-        // Layer-shell surfaces aren't layout windows; resolve their output
-        // from the LayerMap so their textures materialize on the hosting GPU.
-        .or_else(|| state.layer_surface_output_id(&root));
+    let resolve = |state: &PrismState, s: &WlSurface| {
+        state
+            .layout
+            .find_window_and_output(s)
+            .and_then(|(_, out)| out.map(|o| o.name()))
+            // Layer-shell surfaces aren't layout windows; resolve their output
+            // from the LayerMap so their textures materialize on the hosting GPU.
+            .or_else(|| state.layer_surface_output_id(s))
+    };
+    // Popups aren't subsurfaces, so the parent walk above stops at the popup
+    // surface, which resolves to neither a window nor a layer — leaving the
+    // consumer-GPU set empty and `ensure_surface_textures` unable to refresh
+    // the popup's texture on re-commit (so menu hover/press frames never
+    // update). Follow the xdg_popup parent chain to the real root and resolve
+    // that, mirroring `queue_redraw_for_surface`.
+    let output_name = resolve(state, &root).or_else(|| {
+        let popup = state.popups.find_popup(&root)?;
+        let popup_root = find_popup_root_surface(&popup).ok()?;
+        resolve(state, &popup_root)
+    });
     let Some(name) = output_name else {
         return Vec::new();
     };
