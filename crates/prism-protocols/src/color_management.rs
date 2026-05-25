@@ -84,9 +84,13 @@ const SUPPORTED_TFS: &[TransferFunction] = &[
 ];
 
 /// Named primaries we advertise via `supported_primaries_named`.
-/// Spyder + general clients minimally need sRGB and BT.2020; more
-/// can be added as use cases arrive (DCI-P3 / Display P3 for video).
-const SUPPORTED_PRIMARIES: &[Primaries] = &[Primaries::Srgb, Primaries::Bt2020];
+/// sRGB/BT.709 (SDR), BT.2020 (HDR), and Display-P3 (P3-D65 — wide-gamut
+/// web/video, the increasingly common middle ground). Each MUST have an
+/// explicit arm in `chromaticities_for_named` — the catch-all there
+/// silently resolves to sRGB, so adding a primary here without its
+/// chromaticities would render it as the wrong gamut.
+const SUPPORTED_PRIMARIES: &[Primaries] =
+    &[Primaries::Srgb, Primaries::Bt2020, Primaries::DisplayP3];
 
 /// A complete, validated image description. Created by the params
 /// creator's `create` request after all required fields are set.
@@ -1166,7 +1170,22 @@ fn chromaticities_for_named(p: Primaries) -> PrimaryChromaticities {
             w_x: 312_700,
             w_y: 329_000,
         },
-        // sRGB / BT.709 + anything we don't have explicit values for.
+        // Display-P3 (P3-D65): wider than sRGB, D65 white (shared with
+        // BT.2020, so the conversion is a pure gamut rotation). Matches
+        // prism_frame::Chromaticities::DISPLAY_P3.
+        Primaries::DisplayP3 => PrimaryChromaticities {
+            r_x: 680_000,
+            r_y: 320_000,
+            g_x: 265_000,
+            g_y: 690_000,
+            b_x: 150_000,
+            b_y: 60_000,
+            w_x: 312_700,
+            w_y: 329_000,
+        },
+        // sRGB / BT.709 — also the safe fallback for any primary we don't
+        // tabulate. Every entry in SUPPORTED_PRIMARIES should have its own
+        // arm above so a wide-gamut surface never silently lands here.
         _ => PrimaryChromaticities {
             r_x: 640_000,
             r_y: 330_000,
