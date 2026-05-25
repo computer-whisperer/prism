@@ -59,12 +59,17 @@ pub enum RedrawState {
     WaitingForVBlank { redraw_needed: bool },
 }
 
-/// `wl_callback.frame` + `wp_presentation_feedback` objects extracted
-/// from a frame's surfaces at submit time, deferred until the kernel
-/// reports the corresponding vblank. Fired with the actual
-/// presentation time.
+/// `wp_presentation_feedback` objects extracted from a frame's surfaces at
+/// submit time, deferred until the kernel reports the corresponding vblank
+/// and fired with the actual presentation time.
+///
+/// Note: `wl_callback.frame` callbacks are *not* deferred here. They are
+/// delivered by [`crate::send_frame_callbacks`] (throttled per output refresh
+/// cycle via [`OutputRedrawState::frame_callback_sequence`]), decoupled from
+/// the page-flip so a frame skipped for lack of damage still unblocks clients.
+/// Presentation feedback genuinely means "your buffer reached the screen", so
+/// it stays tied to the real vblank.
 pub struct PendingFeedback {
-    pub frame_cbs: Vec<WlCallback>,
     pub presentation_cbs: Vec<PresentationFeedbackCallback>,
     /// The `target_presentation_time` we predicted via FrameClock when
     /// we did the render — kept for diagnostics / comparison against
@@ -79,6 +84,36 @@ pub struct OutputRedrawState {
     /// Feedback for the in-flight page-flip, if any. `Some` while in
     /// `WaitingForVBlank`; taken + fired by the vblank handler.
     pub pending_feedback: Option<PendingFeedback>,
+    /// Output refresh-cycle counter, advanced once per (real, and later
+    /// estimated) vblank. [`crate::send_frame_callbacks`] sends each surface a
+    /// `wl_callback.frame` at most once per value, so empty-damage commit
+    /// storms can't spin the frame-callback loop. Mirrors niri's
+    /// `frame_callback_sequence`.
+    pub frame_callback_sequence: u32,
+}
+
+/// Per-surface frame-callback throttle slot, stored in the surface's
+/// `data_map`. Records the `(output, frame_callback_sequence)` of the last
+/// `wl_callback.frame` we sent so [`crate::send_frame_callbacks`] sends at most
+/// one per output refresh cycle. (`Mutex` because the surface `data_map`
+/// requires `Send + Sync`; niri can use a `RefCell` only because its analogue
+/// lives behind a different storage.)
+#[derive(Default)]
+pub struct FrameCallbackThrottle(std::sync::Mutex<Option<(String, u32)>>);
+
+impl FrameCallbackThrottle {
+    /// True (and records the send) if no `frame` callback has gone to this
+    /// surface for `(output_id, sequence)` yet; false if one already has.
+    pub fn should_send(&self, output_id: &str, sequence: u32) -> bool {
+        let mut guard = self.0.lock().unwrap();
+        if let Some((out, seq)) = guard.as_ref() {
+            if out == output_id && *seq == sequence {
+                return false;
+            }
+        }
+        *guard = Some((output_id.to_owned(), sequence));
+        true
+    }
 }
 
 impl OutputRedrawState {
@@ -118,13 +153,17 @@ impl OutputRedrawState {
 /// `states` we already hold, as below.
 ///
 /// Used by the DRM submit path (feeds [`PendingFeedback`] + the
-/// release-after-submit wiring) and by the WLCS test harness, which
-/// consumes only `frame_cbs` — it fires them off a timer, with no scanout
-/// or explicit-sync behind the surfaces, so `presentation_cbs` and
-/// `release_trackers` come back empty there.
+/// release-after-submit wiring) and by the WLCS test harness.
+///
+/// `frame_cbs` is `Option`: the DRM path passes `None` because frame callbacks
+/// are now delivered separately by [`crate::send_frame_callbacks`] at vblank
+/// (draining them here would steal them before that runs). The WLCS harness
+/// passes `Some` — it has no scanout/sequence machinery and fires the harvested
+/// callbacks off a timer, so for it `presentation_cbs` / `release_trackers`
+/// come back empty.
 pub fn harvest_surface_feedback(
     root: &WlSurface,
-    frame_cbs: &mut Vec<WlCallback>,
+    mut frame_cbs: Option<&mut Vec<WlCallback>>,
     presentation_cbs: &mut Vec<PresentationFeedbackCallback>,
     release_trackers: &mut Vec<Arc<CommitReleaseTracker>>,
 ) {
@@ -140,13 +179,15 @@ pub fn harvest_surface_feedback(
         (),
         |_, _, &()| TraversalAction::DoChildren(()),
         |_surface, states, &()| {
-            frame_cbs.append(&mut std::mem::take(
-                &mut states
-                    .cached_state
-                    .get::<SurfaceAttributes>()
-                    .current()
-                    .frame_callbacks,
-            ));
+            if let Some(frame_cbs) = frame_cbs.as_deref_mut() {
+                frame_cbs.append(&mut std::mem::take(
+                    &mut states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .frame_callbacks,
+                ));
+            }
             presentation_cbs.append(&mut std::mem::take(
                 &mut states
                     .cached_state

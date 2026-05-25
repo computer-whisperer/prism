@@ -1760,9 +1760,19 @@ fn on_vblank(
         ctx.mark_vblank(presentation_time);
     }
 
-    // Step 2: take + fire stashed feedback. We split the take from the
-    // fire so the second part can hold immutable borrows into state for
-    // the smithay Output / refresh duration.
+    // Step 2: advance this output's refresh-cycle counter and deliver frame
+    // callbacks (throttled to one per surface per cycle), decoupled from the
+    // page-flip. The mutable borrow for the bump is scoped so the immutable
+    // `send_frame_callbacks(state, …)` borrow that follows doesn't conflict.
+    {
+        let entry = state.output_redraw.entry(output_id.clone()).or_default();
+        entry.frame_callback_sequence = entry.frame_callback_sequence.wrapping_add(1);
+    }
+    send_frame_callbacks(state, &output_id, presentation_time);
+
+    // Step 3: take + fire the stashed *presentation* feedback for the
+    // just-presented frame (this is the one thing that genuinely belongs on the
+    // real vblank). Split take-from-fire so the fire can hold immutable borrows.
     let pending = state
         .output_redraw
         .entry(output_id.clone())
@@ -1779,10 +1789,6 @@ fn on_vblank(
             let refresh = smithay::wayland::presentation::Refresh::fixed(Duration::from_nanos(
                 1_000_000_000 / hz as u64,
             ));
-            let time_ms = presentation_time.as_millis() as u32;
-            for cb in pending.frame_cbs {
-                cb.done(time_ms);
-            }
             use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
             for fb in pending.presentation_cbs {
                 fb.presented(
@@ -1800,7 +1806,7 @@ fn on_vblank(
         }
     }
 
-    // Step 3: transition the state machine. Damage-driven now —
+    // Step 4: transition the state machine. Damage-driven now —
     // commit handlers call `queue_redraw_for_surface` to flip a
     // WaitingForVBlank entry's `redraw_needed` to true; on this
     // vblank we honour that signal. If nothing requested a redraw
@@ -2277,14 +2283,15 @@ fn render_output_now(
         .map(|t| t.wl_surface().clone())
         .collect();
 
-    let mut frame_cbs = Vec::new();
     let mut presentation_cbs = Vec::new();
     let mut release_trackers = Vec::new();
 
-    // Harvest frame/presentation callbacks + drm_syncobj release trackers
-    // from each surface we rendered. The subsurface-descending walk and the
-    // deadlock-safe direct reads live in `redraw::harvest_surface_feedback`
-    // so the WLCS harness reuses the exact same traversal.
+    // Harvest presentation feedback + drm_syncobj release trackers from each
+    // surface we rendered. Frame callbacks are NOT harvested here (we pass
+    // `None`): they're delivered by `send_frame_callbacks` at vblank, throttled
+    // per refresh cycle — draining them now would steal them before that runs.
+    // The subsurface-descending walk and deadlock-safe direct reads live in
+    // `redraw::harvest_surface_feedback` so the WLCS harness reuses the traversal.
     for surface in &surfaces {
         let belongs_here = state
             .layout
@@ -2297,19 +2304,16 @@ fn render_output_now(
         }
         prism_protocols::redraw::harvest_surface_feedback(
             surface,
-            &mut frame_cbs,
+            None,
             &mut presentation_cbs,
             &mut release_trackers,
         );
         // Popups are separate surface trees parented to this toplevel, not
-        // part of its subsurface tree, so the walk above doesn't reach
-        // them. Harvest each popup's tree too — otherwise a popup client
-        // that throttles on frame callbacks (waits for one before drawing
-        // its next frame) stalls after its first frame.
+        // part of its subsurface tree, so the walk above doesn't reach them.
         for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(surface) {
             prism_protocols::redraw::harvest_surface_feedback(
                 popup.wl_surface(),
-                &mut frame_cbs,
+                None,
                 &mut presentation_cbs,
                 &mut release_trackers,
             );
@@ -2323,7 +2327,7 @@ fn render_output_now(
         for ls in map.layers() {
             prism_protocols::redraw::harvest_surface_feedback(
                 ls.wl_surface(),
-                &mut frame_cbs,
+                None,
                 &mut presentation_cbs,
                 &mut release_trackers,
             );
@@ -2352,10 +2356,97 @@ fn render_output_now(
     }
 
     Ok(Some(PendingFeedback {
-        frame_cbs,
         presentation_cbs,
         target_time,
     }))
+}
+
+/// Deliver `wl_callback.frame` callbacks to every surface mapped to `output_id`,
+/// throttled to at most one per surface per output refresh cycle (the output's
+/// `frame_callback_sequence`). Decoupled from the page-flip: callable from the
+/// vblank handler (Stage A) and, later, from the zero-damage skip path (Stage B)
+/// so a skipped frame still unblocks clients that throttle on frame callbacks.
+///
+/// `wp_presentation_feedback` is deliberately NOT sent here — it means "your
+/// buffer reached the screen", so it stays tied to the real vblank (see
+/// [`prism_protocols::PendingFeedback`]).
+///
+/// Resolution mirrors `render_output_now`'s harvest exactly (toplevels mapped to
+/// this output + their popup trees + layer-shell surfaces) so the same surfaces
+/// get callbacks. `throttle = None` neutralises smithay's own time-based
+/// throttle in `send_frames_surface_tree`, leaving our per-surface sequence
+/// check (the closure returning `Some(output)`) the sole send trigger.
+fn send_frame_callbacks(
+    state: &prism_protocols::PrismState,
+    output_id: &str,
+    time: std::time::Duration,
+) {
+    use prism_protocols::redraw::FrameCallbackThrottle;
+    use smithay::desktop::utils::send_frames_surface_tree;
+
+    let Some(smithay_output) = state.wl_outputs.get(output_id).cloned() else {
+        return;
+    };
+    let sequence = state
+        .output_redraw
+        .get(output_id)
+        .map(|s| s.frame_callback_sequence)
+        .unwrap_or(0);
+
+    let mut should_send =
+        |_surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+         states: &smithay::wayland::compositor::SurfaceData| {
+            states
+                .data_map
+                .insert_if_missing_threadsafe(FrameCallbackThrottle::default);
+            let throttle = states.data_map.get::<FrameCallbackThrottle>().unwrap();
+            if throttle.should_send(output_id, sequence) {
+                Some(smithay_output.clone())
+            } else {
+                None
+            }
+        };
+
+    // Toplevel windows mapped to this output, plus their popup trees.
+    let toplevels: Vec<_> = state
+        .xdg_shell
+        .toplevel_surfaces()
+        .iter()
+        .map(|t| t.wl_surface().clone())
+        .collect();
+    for surface in &toplevels {
+        let belongs_here = state
+            .layout
+            .find_window_and_output(surface)
+            .and_then(|(_, out)| out)
+            .map(|out| out == &smithay_output)
+            .unwrap_or(false);
+        if !belongs_here {
+            continue;
+        }
+        send_frames_surface_tree(surface, &smithay_output, time, None, &mut should_send);
+        for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(surface) {
+            send_frames_surface_tree(
+                popup.wl_surface(),
+                &smithay_output,
+                time,
+                None,
+                &mut should_send,
+            );
+        }
+    }
+
+    // Layer-shell surfaces composited on this output.
+    let map = smithay::desktop::layer_map_for_output(&smithay_output);
+    for ls in map.layers() {
+        send_frames_surface_tree(
+            ls.wl_surface(),
+            &smithay_output,
+            time,
+            None,
+            &mut should_send,
+        );
+    }
 }
 
 /// Convert smithay's `DrmEventTime` (monotonic or realtime) to the

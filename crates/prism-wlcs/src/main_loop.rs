@@ -177,7 +177,7 @@ fn send_frame_callbacks(state: &mut PrismState) {
     for root in &roots {
         prism_protocols::redraw::harvest_surface_feedback(
             root,
-            &mut frame_cbs,
+            Some(&mut frame_cbs),
             &mut presentation_cbs,
             &mut release_trackers,
         );
