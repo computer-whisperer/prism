@@ -194,15 +194,27 @@ impl ShmTexture {
         })
     }
 
-    /// Copy `bytes` (in tightly packed row order matching the texture extent)
-    /// into the image. Synchronous: waits for the GPU to idle before
-    /// returning, so the image is in SHADER_READ_ONLY_OPTIMAL and safe to
-    /// sample by the time this returns.
+    /// Copy `bytes` into the image, uploading only the rows covered by
+    /// `damage` (image/buffer pixel coords; for wl_shm the two grids coincide).
+    /// `bytes` is the full source buffer and `src_stride` its byte row stride
+    /// (the wl_shm pool stride).
     ///
-    /// `src_stride` is the byte stride between rows in `bytes` (the wl_shm
-    /// pool stride). If `src_stride == extent.width * bytes_per_pixel`, we
-    /// copy in one shot; otherwise we copy row by row.
-    pub fn upload_bytes(&mut self, bytes: &[u8], src_stride: usize) -> Result<()> {
+    /// Damage handling:
+    ///   - first upload (image uninitialized): `damage` is ignored and the
+    ///     whole extent is uploaded — a fresh image has no prior content and
+    ///     must be fully written (and left SHADER_READ_ONLY_OPTIMAL for
+    ///     sampling);
+    ///   - later uploads: only the `damage` rects are copied, preserving the
+    ///     rest of the persistent image. Empty `damage` is a no-op.
+    ///
+    /// Pass `&[]` to mean "no damage info": on a new texture that yields a
+    /// full upload, on an already-populated one a no-op.
+    pub fn upload_bytes(
+        &mut self,
+        bytes: &[u8],
+        src_stride: usize,
+        damage: &[vk::Rect2D],
+    ) -> Result<()> {
         let row_bytes = (self.extent.width as usize) * (self.bytes_per_pixel as usize);
         let needed = row_bytes * (self.extent.height as usize);
         if bytes.len() < needed.max(src_stride * (self.extent.height as usize)) {
@@ -217,6 +229,20 @@ impl ShmTexture {
             }
         }
 
+        // Effective upload regions. A fresh image must be fully written; an
+        // already-populated one with no damage needs no work at all.
+        let full = [vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: self.extent,
+        }];
+        let regions: &[vk::Rect2D] = if !self.initialized {
+            &full
+        } else if damage.is_empty() {
+            return Ok(());
+        } else {
+            damage
+        };
+
         // Gate staging-buffer reuse: wait for the previous upload's copy to
         // finish reading staging before we overwrite it. Signalled at create
         // and (in steady state) long before now, so this rarely blocks.
@@ -229,23 +255,41 @@ impl ShmTexture {
         unsafe { self.device.raw.reset_fences(&[self.upload_fence]) }
             .vk_ctx("reset_fences (shm upload)")?;
 
-        // SAFETY: staging is persistently mapped HOST_COHERENT, sized
-        // staging_size at construction; we never touch it concurrently
-        // (`&mut self`); the prior copy from staging has completed (the fence
-        // wait above), so the GPU isn't reading from it.
+        // Copy the damaged rows into staging at their tightly-packed offsets.
+        // Staging mirrors the image (row stride = row_bytes), so the GPU copy
+        // addresses each rect by (y*row_bytes + x*bpp). Non-damaged staging
+        // bytes may be stale — the GPU copy below only reads the damage rects.
+        //
+        // SAFETY: staging is persistently mapped HOST_COHERENT, sized for the
+        // full image; we never touch it concurrently (`&mut self`); the prior
+        // copy from staging has completed (the fence wait above). Source reads
+        // stay in-bounds: rects are clamped to the extent by the caller and
+        // `bytes` was bounds-checked against the full geometry above.
+        let bpp = self.bytes_per_pixel as usize;
         unsafe {
             let dst = self.staging_ptr;
-            if src_stride == row_bytes {
+            let is_full = regions.len() == 1
+                && regions[0].offset.x == 0
+                && regions[0].offset.y == 0
+                && regions[0].extent.width == self.extent.width
+                && regions[0].extent.height == self.extent.height;
+            if is_full && src_stride == row_bytes {
+                // Fast path: one contiguous copy.
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, needed);
             } else {
-                for row in 0..self.extent.height as usize {
-                    let src_off = row * src_stride;
-                    let dst_off = row * row_bytes;
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr().add(src_off),
-                        dst.add(dst_off),
-                        row_bytes,
-                    );
+                for r in regions {
+                    let x = r.offset.x as usize;
+                    let y = r.offset.y as usize;
+                    let span = r.extent.width as usize * bpp;
+                    for row in 0..r.extent.height as usize {
+                        let src_off = (y + row) * src_stride + x * bpp;
+                        let dst_off = (y + row) * row_bytes + x * bpp;
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr().add(src_off),
+                            dst.add(dst_off),
+                            span,
+                        );
+                    }
                 }
             }
         }
@@ -303,28 +347,44 @@ impl ShmTexture {
                 &vk::DependencyInfo::default().image_memory_barriers(&to_xfer),
             );
 
-            let region = [vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
+            // One copy region per damage rect. `buffer_row_length` is the
+            // staging row stride in texels (full image width, tightly packed);
+            // `buffer_offset` addresses the rect's top-left texel.
+            let bpp_u64 = self.bytes_per_pixel as u64;
+            let row_bytes_u64 = row_bytes as u64;
+            let copies: Vec<vk::BufferImageCopy> = regions
+                .iter()
+                .map(|r| {
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(
+                            r.offset.y as u64 * row_bytes_u64 + r.offset.x as u64 * bpp_u64,
+                        )
+                        .buffer_row_length(extent.width)
+                        .buffer_image_height(0)
+                        .image_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image_offset(vk::Offset3D {
+                            x: r.offset.x,
+                            y: r.offset.y,
+                            z: 0,
+                        })
+                        .image_extent(vk::Extent3D {
+                            width: r.extent.width,
+                            height: r.extent.height,
+                            depth: 1,
+                        })
                 })
-                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .image_extent(vk::Extent3D {
-                    width: extent.width,
-                    height: extent.height,
-                    depth: 1,
-                })];
+                .collect();
             self.device.raw.cmd_copy_buffer_to_image(
                 cb,
                 staging_buffer,
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &region,
+                &copies,
             );
 
             let to_sampled = [vk::ImageMemoryBarrier2::default()

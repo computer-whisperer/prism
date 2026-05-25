@@ -165,7 +165,8 @@ impl Renderer {
             },
             vk::Format::R8G8B8A8_UNORM,
         )?;
-        white_tex.upload_bytes(&[255, 255, 255, 255], 4)?;
+        // 1×1, uploaded once: pass &[] (new texture → full upload).
+        white_tex.upload_bytes(&[255, 255, 255, 255], 4, &[])?;
 
         // Per-output 3D LUT — only allocate when the configured encode
         // chain actually samples it. Identity content at construction so

@@ -34,7 +34,9 @@ use prism_layout::window::{Mapped, ResolvedWindowRules};
 use prism_renderer::{vk, DrmDevId};
 use smithay::backend::allocator::dmabuf::Dmabuf as SmithayDmabuf;
 use smithay::backend::allocator::Format as DrmFormat;
-use smithay::backend::renderer::utils::{on_commit_buffer_handler, RendererSurfaceStateUserData};
+use smithay::backend::renderer::utils::{
+    on_commit_buffer_handler, CommitCounter, RendererSurfaceStateUserData,
+};
 use smithay::delegate_compositor;
 use smithay::delegate_content_type;
 use smithay::delegate_cursor_shape;
@@ -2694,35 +2696,43 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
         match build_tex_source(state, wl_buffer) {
             Ok(source) => {
                 let mut guard = slot.0.lock().unwrap();
-                let carried: HashMap<DrmDevId, GpuTex> = match (guard.take(), &source) {
-                    (Some(old), TexSource::Shm { extent, format, .. })
-                        if matches!(
-                            &old.source,
-                            TexSource::Shm { extent: oe, format: of, .. }
-                                if oe == extent && of == format
-                        ) =>
-                    {
-                        old.by_gpu
-                    }
-                    (Some(old), TexSource::Dmabuf { dmabuf, format, .. })
-                        if matches!(
-                            &old.source,
-                            TexSource::Dmabuf { dmabuf: od, format: of, .. }
-                                if od.width == dmabuf.width
-                                    && od.height == dmabuf.height
-                                    && of == format
-                        ) =>
-                    {
-                        old.by_gpu
-                            .into_iter()
-                            .filter(|(_, gt)| matches!(gt, GpuTex::Mirror { .. }))
-                            .collect()
-                    }
-                    _ => HashMap::new(),
-                };
+                let (carried, carried_commit): (HashMap<DrmDevId, GpuTex>, Option<CommitCounter>) =
+                    match (guard.take(), &source) {
+                        (Some(old), TexSource::Shm { extent, format, .. })
+                            if matches!(
+                                &old.source,
+                                TexSource::Shm { extent: oe, format: of, .. }
+                                    if oe == extent && of == format
+                            ) =>
+                        {
+                            // shm geometry matches: keep the per-GPU ShmTextures
+                            // (and their initialized state) and the damage cursor,
+                            // so the next upload only touches what changed.
+                            (old.by_gpu, old.shm_upload_commit)
+                        }
+                        (Some(old), TexSource::Dmabuf { dmabuf, format, .. })
+                            if matches!(
+                                &old.source,
+                                TexSource::Dmabuf { dmabuf: od, format: of, .. }
+                                    if od.width == dmabuf.width
+                                        && od.height == dmabuf.height
+                                        && of == format
+                            ) =>
+                        {
+                            (
+                                old.by_gpu
+                                    .into_iter()
+                                    .filter(|(_, gt)| matches!(gt, GpuTex::Mirror { .. }))
+                                    .collect(),
+                                None,
+                            )
+                        }
+                        _ => (HashMap::new(), None),
+                    };
                 *guard = Some(SurfaceTexture {
                     source,
                     by_gpu: carried,
+                    shm_upload_commit: carried_commit,
                 });
             }
             Err(e) => tracing::warn!("surface buffer source build failed: {e:#}"),
@@ -3261,6 +3271,7 @@ fn ensure_surface_textures(state: &PrismState, surface: &WlSurface) {
             return;
         };
         let extent = tex.extent();
+        let shm_last_commit = tex.shm_upload_commit;
 
         match &tex.source {
             TexSource::Dmabuf { .. } => {
@@ -3282,10 +3293,25 @@ fn ensure_surface_textures(state: &PrismState, surface: &WlSurface) {
                 }
             }
             TexSource::Shm { .. } => {
-                // shm contents change every commit; re-upload to each
-                // consumer GPU (creating the per-GPU image if needed).
-                if let Err(e) = refresh_shm_uploads(state, tex, &consumer_gpus) {
-                    tracing::warn!("shm upload failed: {e:#}");
+                // Upload only the regions the client damaged this commit
+                // (buffer coords map 1:1 onto the per-GPU image). damage_since
+                // returns the whole buffer when the commit is unknown/too old,
+                // and a freshly created ShmTexture forces a full upload — so a
+                // new image is always fully written either way.
+                let mut regions: Vec<vk::Rect2D> = Vec::new();
+                let mut current_commit = shm_last_commit;
+                if let Some(rss) = states.data_map.get::<RendererSurfaceStateUserData>() {
+                    let rss = rss.lock().unwrap();
+                    current_commit = Some(rss.damage().current_commit());
+                    for rect in rss.damage_since(shm_last_commit).iter() {
+                        if let Some(r) = clamp_buffer_rect_to_extent(rect, extent) {
+                            regions.push(r);
+                        }
+                    }
+                }
+                match refresh_shm_uploads(state, tex, &consumer_gpus, &regions) {
+                    Ok(()) => tex.shm_upload_commit = current_commit,
+                    Err(e) => tracing::warn!("shm upload failed: {e:#}"),
                 }
             }
             // No texture to materialize — the render walk reads the color
@@ -3320,7 +3346,9 @@ pub fn materialize_surface_on_gpu(state: &PrismState, surface: &WlSurface, gpu: 
         }
         let result = match &tex.source {
             TexSource::Dmabuf { .. } => materialize_dmabuf_for_gpu(state, tex, gpu),
-            TexSource::Shm { .. } => refresh_shm_uploads(state, tex, &[gpu]),
+            // Fresh texture on this GPU (guarded by the contains_key check
+            // above) → full upload via the uninitialized rule; damage ignored.
+            TexSource::Shm { .. } => refresh_shm_uploads(state, tex, &[gpu], &[]),
             // Solid color: no per-GPU texture; the render walk lowers it.
             TexSource::SolidColor { .. } => Ok(()),
         };
@@ -3623,12 +3651,16 @@ fn refresh_dmabuf_mirrors(state: &PrismState, tex: &mut SurfaceTexture, _extent:
 }
 
 /// Upload the current shm bytes to each consuming GPU, creating or reusing
-/// a per-GPU [`ShmTexture`]. shm contents change every commit, so this runs
-/// each commit for shm-backed surfaces.
+/// a per-GPU [`ShmTexture`]. Runs each commit for shm-backed surfaces.
+///
+/// `regions` are the damaged image rects to upload (clamped buffer coords);
+/// a newly created `ShmTexture` ignores them and uploads its full extent. The
+/// same `regions` go to every consumer GPU — they share the source pixels.
 fn refresh_shm_uploads(
     state: &PrismState,
     tex: &mut SurfaceTexture,
     consumer_gpus: &[DrmDevId],
+    regions: &[vk::Rect2D],
 ) -> Result<()> {
     let (extent, format, buffer) = match &tex.source {
         TexSource::Shm {
@@ -3677,7 +3709,7 @@ fn refresh_shm_uploads(
                 tex.by_gpu.insert(g, GpuTex::Shm(t));
             }
             if let Some(GpuTex::Shm(t)) = tex.by_gpu.get_mut(&g) {
-                t.upload_bytes(bytes, stride).with_context(|| {
+                t.upload_bytes(bytes, stride, regions).with_context(|| {
                     format!("ShmTexture::upload_bytes on gpu {}:{}", g.major, g.minor)
                 })?;
             }
@@ -3685,6 +3717,29 @@ fn refresh_shm_uploads(
         Ok(())
     })
     .context("with_buffer_contents (shm upload)")?
+}
+
+/// Clamp a buffer-space damage rect to the texture extent and convert to a
+/// `vk::Rect2D`. shm buffer coords map 1:1 onto the uploaded image, so this is
+/// just a bounds clamp; returns `None` if the rect is empty after clamping.
+fn clamp_buffer_rect_to_extent(
+    rect: &Rectangle<i32, smithay::utils::Buffer>,
+    extent: vk::Extent2D,
+) -> Option<vk::Rect2D> {
+    let x0 = rect.loc.x.max(0);
+    let y0 = rect.loc.y.max(0);
+    let x1 = (rect.loc.x + rect.size.w).min(extent.width as i32);
+    let y1 = (rect.loc.y + rect.size.h).min(extent.height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        },
+    })
 }
 
 fn vk_format_for_shm(fmt: wl_shm::Format) -> Option<vk::Format> {

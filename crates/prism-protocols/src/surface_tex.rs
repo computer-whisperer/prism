@@ -34,6 +34,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use prism_renderer::{vk, DrmDevId, ExportableImage, ImportedImage, ShmTexture, YuvKind};
+use smithay::backend::renderer::utils::CommitCounter;
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 
@@ -170,6 +171,12 @@ impl GpuTex {
 pub struct SurfaceTexture {
     pub source: TexSource,
     pub by_gpu: HashMap<DrmDevId, GpuTex>,
+    /// Commit counter (from smithay's `RendererSurfaceState`) of the last shm
+    /// upload, so the next upload can fetch only the damage since then via
+    /// `damage_since`. `None` until the first shm upload, and carried across
+    /// buffer swaps that reuse the per-GPU `ShmTexture`s (see
+    /// `process_surface_buffer`). Unused for dmabuf/solid sources.
+    pub shm_upload_commit: Option<CommitCounter>,
 }
 
 impl SurfaceTexture {
@@ -177,6 +184,7 @@ impl SurfaceTexture {
         Self {
             source,
             by_gpu: HashMap::new(),
+            shm_upload_commit: None,
         }
     }
 
