@@ -52,8 +52,11 @@ use smithay::delegate_viewporter;
 use smithay::delegate_xdg_activation;
 use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
-use smithay::desktop::{find_popup_root_surface, PopupKind, PopupManager, Window};
-use smithay::input::pointer::{CursorIcon, CursorImageStatus};
+use smithay::desktop::{
+    find_popup_root_surface, PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab,
+    PopupUngrabStrategy, Window,
+};
+use smithay::input::pointer::{CursorIcon, CursorImageStatus, Focus};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -1862,11 +1865,54 @@ impl XdgShellHandler for PrismState {
         }
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
-        // No popup grab handling yet — popups render and track position,
-        // but click-outside dismissal and keyboard/pointer routing into
-        // popup surfaces are a follow-up (needs PopupKeyboardGrab /
-        // PopupPointerGrab + pointer hit-testing into the popup tree).
+    fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+        // A client requests an explicit popup grab for a menu: while the
+        // grab is active, pointer + keyboard events route through the popup
+        // tree, and a press outside the grabbing client dismisses it. This
+        // is also what stops plain cursor motion from leaking a wl_pointer
+        // enter into the parent toplevel — which is what made menus vanish
+        // on the first mouse move before this was wired up.
+        let seat: Seat<Self> = Seat::from_resource(&seat).expect("seat from this display");
+        let kind = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            return;
+        };
+
+        let mut grab = match self.popups.grab_popup(root, kind, &seat, serial) {
+            Ok(grab) => grab,
+            Err(err) => {
+                tracing::warn!(?err, "failed to start popup grab");
+                return;
+            }
+        };
+
+        // Hand the keyboard to the grab. If some unrelated grab already
+        // holds the keyboard (and it isn't this grab's chain), bail and
+        // dismiss rather than stomping it — mirrors anvil's guard.
+        if let Some(keyboard) = seat.get_keyboard() {
+            if keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial)
+                    || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+
+        // Same for the pointer. `Focus::Keep` leaves the current pointer
+        // focus in place; the grab's own motion handler takes over routing.
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
     }
 
     fn reposition_request(
