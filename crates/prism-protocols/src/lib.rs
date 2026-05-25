@@ -15,6 +15,7 @@ pub mod layer_shell;
 pub mod output_power;
 pub mod pointer_focus;
 pub mod redraw;
+pub mod rlimit;
 pub mod selection;
 pub mod server;
 pub mod state;
@@ -24,6 +25,7 @@ pub mod xwayland;
 pub use client::PrismClient;
 pub use input_state::{KeyboardFocus, PointerVisibility};
 pub use redraw::{OutputRedrawState, PendingFeedback, RedrawState};
+pub use rlimit::raise_nofile_to_max;
 pub use server::insert_wayland_sources;
 pub use state::{
     destroy_render_wait_semaphores, materialize_surface_on_gpu, new_display,

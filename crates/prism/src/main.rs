@@ -16,6 +16,13 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // Raise the open-files limit to the hard max before we (or any client)
+    // start allocating fds. A compositor holds an fd per client buffer
+    // (dmabuf planes, shm pools); the default ~1024 soft limit is exhausted by
+    // buffer-churning clients (Firefox/WebRender under scroll) → EMFILE on
+    // import → client crash. niri does the same at startup.
+    prism_protocols::raise_nofile_to_max();
+
     // Capture panic messages to the (fsync'd) breadcrumb file so we can
     // still see them after a hard process exit that loses stderr buffer
     // contents — happens during TTY runs where stderr goes to a file the

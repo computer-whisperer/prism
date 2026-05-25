@@ -320,6 +320,11 @@ fn spawn_and_wait(
 
     unsafe {
         process.pre_exec(move || {
+            // Don't hand xwayland-satellite (and the X clients it spawns via
+            // Xwayland) the compositor's raised open-files soft limit; legacy /
+            // select()-based X programs can misbehave with a giant limit.
+            crate::rlimit::restore_nofile();
+
             // We're about to exec xwl-s; perfect time to clear CLOEXEC on the file descriptors
             // that we want to pass it.
 
