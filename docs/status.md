@@ -37,6 +37,7 @@ the WLCS conformance harness.
 | Input: libinput via udev, keyboard + pointer capabilities, real dispatch; pointer hit-testing + focus tracking | ✅ |
 | `wlr_layer_shell`: 4 layers color-managed in z-order, anchors/margins/exclusive-zones via `LayerMap`, exclusive-zone work-area, keyboard interactivity (Exclusive/OnDemand/None) | ✅ — user-verified (waybar, swaybg, fuzzel) |
 | Idle / display sleep: `ext-idle-notify-v1` + `zwp_idle_inhibit` (swayidle), `zwlr_output_power_management` DPMS + `PowerOff/OnMonitors` actions; HDR/10-bit survives DPMS cycle | ✅ — user-verified (swayidle, wlopm, mpv inhibit) |
+| Cursor: client `set_cursor` (shm surface cursors) + `wp_cursor_shape` named shapes, themed from `cursor {}` config, hardware cursor plane, scale-matched per output | ✅ — user-verified |
 | Renderer: decode → fp16 BT.2020 intermediate → synthesized per-output encode | ✅ |
 | RGB decode (8/10-bit, RGBA/BGRA order), YUV decode (NV12/P010) | ✅ |
 | Per-surface primary conversion (sRGB/Display-P3/BT.2020 → BT.2020) | ✅ |

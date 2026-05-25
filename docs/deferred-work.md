@@ -154,6 +154,19 @@ No `wl_touch` — keyboard and pointer are wired (libinput → seat → focused 
 touch is not. (WLCS touch tests are skipped accordingly.) Add when a touch device
 or touch-driven client is in play.
 
+### Cursor: hardware-plane constraints
+
+Cursors render only via the hardware cursor plane (`update_output_cursors`). Client
+surface cursors are read from **shm** and uploaded to the plane BO; consequences:
+a client cursor larger than the BO can't be shown (logged, falls back to the theme
+cursor), dmabuf-backed cursor surfaces fall back too, and the sprite goes raw to
+scanout (bypasses color management — same as the themed cursor). Animated cursors
+show the committed frame, not timed multi-frame animation. A software-composite
+cursor path (through the color-managed render pass) would lift all of these but
+costs a full-frame redraw on cursor move; add if a real client needs it. Cursor
+hide-when-typing / hide-after-inactivity (`cursor {}` config fields exist) are also
+not yet wired.
+
 ## Wayland / protocol
 
 ### linux-dmabuf-v1 v4 (modifier-aware feedback)

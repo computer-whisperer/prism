@@ -37,6 +37,7 @@ use smithay::backend::allocator::Format as DrmFormat;
 use smithay::backend::renderer::utils::{on_commit_buffer_handler, RendererSurfaceStateUserData};
 use smithay::delegate_compositor;
 use smithay::delegate_content_type;
+use smithay::delegate_cursor_shape;
 use smithay::delegate_dmabuf;
 use smithay::delegate_drm_syncobj;
 use smithay::delegate_fractional_scale;
@@ -52,6 +53,7 @@ use smithay::delegate_xdg_activation;
 use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
 use smithay::desktop::Window;
+use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::LoopHandle;
@@ -69,6 +71,7 @@ use smithay::wayland::compositor::{
     CompositorHandler, CompositorState,
 };
 use smithay::wayland::content_type::ContentTypeState;
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{
     DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState,
     ImportNotifier, SurfaceDmabufFeedbackState,
@@ -408,6 +411,21 @@ pub struct PrismState {
     /// by (icon, scale); values are the per-frame ARGB8888 pixels +
     /// dimensions. Populated lazily on first need.
     pub cursor_texture_cache: CursorTextureCache,
+    /// Set when the cursor *sprite* changes (client `set_cursor`,
+    /// `wp_cursor_shape`, or a commit on the cursor surface) so
+    /// [`update_output_cursors`] re-uploads it to the hardware cursor
+    /// plane. Pointer *motion* alone only repositions (cheap), it doesn't
+    /// re-upload.
+    pub cursor_dirty: bool,
+    /// Which output's cursor plane currently holds the uploaded sprite, so
+    /// we re-upload when the pointer crosses to a different output (whose
+    /// plane may hold a stale / differently-scaled sprite). `None` until
+    /// the first upload (and while the cursor is hidden).
+    pub cursor_uploaded_to: Option<OutputId>,
+    /// Hotspot of the currently-uploaded sprite, in physical sprite pixels.
+    /// Cached so pointer-motion frames (which don't re-resolve the sprite)
+    /// can position the plane without re-reading a client cursor buffer.
+    pub cursor_hotspot: (i32, i32),
 }
 
 impl PrismState {
@@ -600,6 +618,20 @@ impl PrismState {
         // is kept alive by the display; nothing else to store.
         crate::output_power::create_output_power_global(&dh);
 
+        // wp_cursor_shape_v1 — clients request a named cursor shape (text,
+        // pointer, grab, …) instead of providing a buffer. smithay routes
+        // each request through `SeatHandler::cursor_image(Named(icon))`, so
+        // it reuses the themed-cursor render path. Global kept alive by the
+        // display.
+        let _cursor_shape = CursorShapeManagerState::new::<PrismState>(&dh);
+
+        // Cursor theme + base size from the `cursor { … }` config block (read
+        // now, before `config` is moved into the struct below).
+        let cursor_manager = {
+            let cfg = config.borrow();
+            CursorManager::new(&cfg.cursor.xcursor_theme, cfg.cursor.xcursor_size)
+        };
+
         // Modern clients (Firefox, GTK4, recent toolkits) probe these
         // globals at startup and either fall back loudly or take
         // degraded paths when missing. We advertise them now so the
@@ -668,8 +700,13 @@ impl PrismState {
             should_stop: false,
             pointer_pos: smithay::utils::Point::from((0.0, 0.0)),
             pointer_contents: None,
-            cursor_manager: CursorManager::new("default", 24),
+            cursor_manager,
             cursor_texture_cache: CursorTextureCache::default(),
+            // Upload on the first update_output_cursors (correct scale for
+            // whatever output the pointer starts on).
+            cursor_dirty: true,
+            cursor_uploaded_to: None,
+            cursor_hotspot: (0, 0),
         }
     }
 
@@ -798,24 +835,12 @@ impl PrismState {
     /// surfaces land on this output.
     pub fn attach_output(
         &mut self,
-        mut output: prism_drm::OutputContext,
+        output: prism_drm::OutputContext,
     ) -> Option<prism_drm::OutputContext> {
         let id: OutputId = output.connector_name.clone();
-        // Seed the cursor plane (if any) with the default sprite so a
-        // subsequent show won't flash. set_visible(false) keeps it off
-        // until update_output_cursors flips it.
-        if let Some(cursor_plane) = output.cursor.as_mut() {
-            if let Err(e) = upload_default_cursor(
-                &self.cursor_manager,
-                &self.cursor_texture_cache,
-                cursor_plane,
-            ) {
-                tracing::warn!(
-                    "cursor seed failed on {}: {e:#} — cursor will not appear on this output",
-                    output.connector_name
-                );
-            }
-        }
+        // The cursor plane is created hidden; `update_output_cursors`
+        // uploads the correct, scale-matched sprite before it makes the
+        // plane visible, so no seed upload is needed here.
         // Build the per-output dmabuf feedback before moving `output`.
         // Skipped (and logged) if the output's GPU isn't registered
         // (shouldn't happen — `gpus` is populated before bringup) or
@@ -1293,10 +1318,29 @@ impl SeatHandler for PrismState {
         set_data_device_focus(dh, seat, client.clone());
         set_primary_focus(dh, seat, client);
     }
-    // cursor_image / led_state_changed default to no-ops.
+
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        // The focused client set its cursor — via `wl_pointer.set_cursor`
+        // (a Surface or Hidden) or `wp_cursor_shape` (a Named icon, which
+        // smithay funnels through here). Stash it and re-resolve the sprite
+        // now, so the cursor changes even with the pointer stationary
+        // (hovering a link / text without moving).
+        self.cursor_manager.set_cursor_image(image);
+        self.cursor_dirty = true;
+        update_output_cursors(self);
+    }
+    // led_state_changed defaults to a no-op.
 }
 
 delegate_seat!(PrismState);
+
+// wp_cursor_shape attaches shape devices to both pointers and tablet tools,
+// so its delegate requires TabletSeatHandler even though we have no tablet
+// support yet. The default `tablet_tool_image` (a no-op) is all we need; a
+// tool's cursor will wire through here if/when tablet support lands.
+impl smithay::wayland::tablet_manager::TabletSeatHandler for PrismState {}
+
+delegate_cursor_shape!(PrismState);
 
 // ─── ext-idle-notify-v1 / zwp_idle_inhibit ───────────────────────────────────
 
@@ -1413,6 +1457,19 @@ impl CompositorHandler for PrismState {
         // role so subsurface commits of a layer don't re-trigger it.
         if let Some("zwlr_layer_surface_v1") = role {
             self.layer_shell_commit(surface);
+        }
+
+        // If this commit is on the current cursor surface (the client updated
+        // its cursor buffer — e.g. an animated cursor's next frame), re-upload
+        // the sprite. `on_commit_buffer_handler` above already refreshed its
+        // RendererSurfaceState, so update_output_cursors reads the new buffer.
+        let is_cursor_surface = matches!(
+            self.cursor_manager.cursor_image(),
+            CursorImageStatus::Surface(s) if s == surface
+        );
+        if is_cursor_surface {
+            self.cursor_dirty = true;
+            update_output_cursors(self);
         }
 
         // For xdg-shell toplevels, send an initial configure on first commit so
@@ -2434,104 +2491,208 @@ fn queue_redraw_for_surface(state: &mut PrismState, surface: &WlSurface) {
         .queue_redraw();
 }
 
-/// Upload the current default cursor sprite (frame 0) into a given
-/// cursor plane. Used at output attach + on icon changes.
-///
-/// Phase A: hardcoded to the Named/Default cursor at scale 1. Client
-/// surfaces and animation lands later.
-fn upload_default_cursor(
-    cursor_manager: &CursorManager,
-    cache: &CursorTextureCache,
-    cursor_plane: &mut prism_drm::CursorPlane,
-) -> Result<()> {
-    let render = cursor_manager.get_render_cursor(1);
-    let (icon, scale, xcursor) = match render {
-        RenderCursor::Named {
-            icon,
-            scale,
-            cursor,
-        } => (icon, scale, cursor),
-        RenderCursor::Hidden | RenderCursor::Surface { .. } => {
-            return Ok(());
-        }
-    };
-    let frame = cache.get(icon, scale, &xcursor, 0);
-    cursor_plane
-        .upload_sprite(&frame.pixels_rgba, frame.width, frame.height)
-        .context("CursorPlane::upload_sprite")?;
-    Ok(())
+/// A cursor sprite resolved for upload to the hardware cursor plane:
+/// tightly-packed RGBA8888 pixels (what [`prism_drm::CursorPlane::upload_sprite`]
+/// wants) plus dimensions and the hotspot in *sprite* (physical) pixels.
+struct CursorSprite {
+    pixels_rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    hotspot: (i32, i32),
 }
 
-/// Walk every output, update its cursor plane to show the cursor on
-/// the output containing the pointer (and hide on the rest), and
-/// queue redraws on outputs whose state changed.
+/// Resolve the current cursor into an uploadable sprite at `scale`, or
+/// `None` if the cursor is hidden.
 ///
-/// Called from the input pointer-motion path. Returns the hotspot
-/// offset of the current sprite (the cursor *position* on screen is
-/// the pointer position minus this hotspot).
-///
-/// Phase A: a single output ever shows the cursor at a time. Cursor
-/// position is computed CRTC-local (pointer global - output origin).
-/// The cursor only updates at vblank cadence — Phase B will add
-/// sub-vblank cursor-only commits.
-pub fn update_output_cursors(state: &mut PrismState) {
-    // Resolve the current sprite. If hidden / unsupported, just hide
-    // everywhere.
-    let render = state.cursor_manager.get_render_cursor(1);
-    let (hotspot, owning_output) = match &render {
-        RenderCursor::Hidden | RenderCursor::Surface { .. } => {
-            // Surface-backed cursor isn't supported yet; treat as
-            // hidden for hardware cursor purposes.
-            hide_all_cursors(state);
-            return;
-        }
+/// - `Named` (theme / `wp_cursor_shape`): frame 0 of the XCursor at the
+///   owning output's integer scale.
+/// - `Surface` (client `set_cursor`): the client's committed shm buffer,
+///   swizzled to RGBA8888, hotspot scaled by the buffer scale. A non-shm
+///   (dmabuf) or unreadable cursor buffer falls back to the default theme
+///   cursor so the pointer never silently vanishes.
+fn resolve_cursor_sprite(state: &PrismState, scale: i32) -> Option<CursorSprite> {
+    let named_sprite =
+        |icon: CursorIcon, scale: i32, cursor: &Rc<prism_layout::cursor::XCursor>| {
+            let frame = state.cursor_texture_cache.get(icon, scale, cursor, 0);
+            // The xcursor hotspot lives on the original Image (physical px at
+            // this scale), not on the decoded frame.
+            let (_idx, image) = cursor.frame(0);
+            CursorSprite {
+                pixels_rgba: (*frame.pixels_rgba).clone(),
+                width: frame.width,
+                height: frame.height,
+                hotspot: (image.xhot as i32, image.yhot as i32),
+            }
+        };
+
+    match state.cursor_manager.get_render_cursor(scale) {
+        RenderCursor::Hidden => None,
         RenderCursor::Named {
             icon,
             scale,
             cursor,
-        } => {
-            let frame = state.cursor_texture_cache.get(*icon, *scale, cursor, 0);
-            // xcursor hotspot lives on the original Image, not on
-            // CursorImageFrame — fish it back out via xcursor.frame(0).
-            let (_idx, image) = cursor.frame(0);
-            let hot = (image.xhot as i32, image.yhot as i32);
-            // Pick the output the pointer is in.
-            let owner =
-                state.output_containing((state.pointer_pos.x as i32, state.pointer_pos.y as i32));
-            let _ = frame; // sprite already seeded at attach_output
-            (hot, owner)
+        } => Some(named_sprite(icon, scale, &cursor)),
+        RenderCursor::Surface { hotspot, surface } => {
+            read_shm_cursor_sprite(&surface, (hotspot.x, hotspot.y)).or_else(|| {
+                let cursor = state.cursor_manager.get_default_cursor(scale);
+                Some(named_sprite(CursorIcon::Default, scale, &cursor))
+            })
         }
-    };
+    }
+}
 
-    // Apply visibility + position to each output.
+/// Read a client cursor surface's committed shm buffer into a tightly-packed
+/// RGBA8888 sprite. `None` for a non-shm (dmabuf) buffer, an unsupported
+/// pixel format, or a missing buffer — the caller falls back to a theme
+/// cursor. `hotspot_logical` is the protocol hotspot (surface-local); we
+/// scale it to physical sprite pixels by the surface's buffer scale.
+fn read_shm_cursor_sprite(
+    surface: &WlSurface,
+    hotspot_logical: (i32, i32),
+) -> Option<CursorSprite> {
+    let (buffer, buffer_scale) = with_states(surface, |states| {
+        let s = states.data_map.get::<RendererSurfaceStateUserData>()?;
+        let guard = s.lock().unwrap();
+        Some((guard.buffer().cloned()?, guard.buffer_scale().max(1)))
+    })?;
+
+    let sprite = with_buffer_contents(&buffer, |ptr, len, data| {
+        if data.width <= 0 || data.height <= 0 || data.stride <= 0 || data.offset < 0 {
+            return None;
+        }
+        let (w, h, stride, offset) = (
+            data.width as usize,
+            data.height as usize,
+            data.stride as usize,
+            data.offset as usize,
+        );
+        if offset.saturating_add(stride * h) > len {
+            return None;
+        }
+        // Swizzle each wl_shm format into RGBA8888 (R,G,B,A). Argb/Xrgb are
+        // B,G,R,A in memory (little-endian); Abgr/Xbgr are already R,G,B,A.
+        let swap_rb = match data.format {
+            wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 => true,
+            wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888 => false,
+            _ => return None,
+        };
+        let opaque = matches!(
+            data.format,
+            wl_shm::Format::Xrgb8888 | wl_shm::Format::Xbgr8888
+        );
+        // SAFETY: smithay holds the pool mapping for this callback; the
+        // offset+len bounds were checked above.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let mut out = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let row = offset + y * stride;
+            for x in 0..w {
+                let i = row + x * 4;
+                let o = (y * w + x) * 4;
+                let (b0, b1, b2) = (bytes[i], bytes[i + 1], bytes[i + 2]);
+                if swap_rb {
+                    out[o] = b2;
+                    out[o + 1] = b1;
+                    out[o + 2] = b0;
+                } else {
+                    out[o] = b0;
+                    out[o + 1] = b1;
+                    out[o + 2] = b2;
+                }
+                out[o + 3] = if opaque { 255 } else { bytes[i + 3] };
+            }
+        }
+        Some(CursorSprite {
+            pixels_rgba: out,
+            width: w as u32,
+            height: h as u32,
+            hotspot: (
+                hotspot_logical.0 * buffer_scale,
+                hotspot_logical.1 * buffer_scale,
+            ),
+        })
+    })
+    .ok()??;
+    Some(sprite)
+}
+
+/// Show the cursor on the output containing the pointer (hidden on the
+/// rest), re-uploading the sprite to that output's hardware cursor plane
+/// when it changed ([`PrismState::cursor_dirty`]) or the pointer crossed to
+/// a new output. Pointer motion within one output only repositions.
+///
+/// Theme cursors are loaded at the owning output's integer scale, so the
+/// cursor is correctly sized on HiDPI monitors. Only one output shows the
+/// cursor at a time. Cursor-only commits at sub-vblank cadence are still a
+/// future refinement (today it rides the next redraw).
+pub fn update_output_cursors(state: &mut PrismState) {
+    state.cursor_manager.check_cursor_image_surface_alive();
+
+    // Owner = the output the pointer is in. Off all outputs ⇒ hide.
+    let Some(owner_id) =
+        state.output_containing((state.pointer_pos.x as i32, state.pointer_pos.y as i32))
+    else {
+        hide_all_cursors(state);
+        return;
+    };
+    let owner_scale = state
+        .wl_outputs
+        .get(&owner_id)
+        .map(|o| o.current_scale().fractional_scale())
+        .unwrap_or(1.0)
+        .round()
+        .max(1.0) as i32;
+
+    // Re-resolve + upload only when the sprite content changed
+    // (`cursor_dirty`) or the pointer crossed onto an output whose plane
+    // holds a stale sprite. Plain motion within one output skips this — it
+    // just repositions using the cached hotspot, so we never re-read a
+    // client cursor buffer per motion event.
+    let need_upload = state.cursor_dirty || state.cursor_uploaded_to.as_ref() != Some(&owner_id);
+    if need_upload {
+        let Some(sprite) = resolve_cursor_sprite(state, owner_scale) else {
+            // Hidden cursor.
+            hide_all_cursors(state);
+            state.cursor_uploaded_to = None;
+            state.cursor_dirty = false;
+            return;
+        };
+        state.cursor_hotspot = sprite.hotspot;
+        if let Some(plane) = state
+            .outputs
+            .get_mut(&owner_id)
+            .and_then(|o| o.cursor.as_mut())
+        {
+            match plane.upload_sprite(&sprite.pixels_rgba, sprite.width, sprite.height) {
+                Ok(()) => {
+                    state.cursor_uploaded_to = Some(owner_id.clone());
+                    state.cursor_dirty = false;
+                }
+                // Leave dirty set so the next pass retries (e.g. a client
+                // cursor larger than the BO, or no plane yet).
+                Err(e) => tracing::warn!(connector = %owner_id, "cursor upload failed: {e:#}"),
+            }
+        }
+    }
+
+    let hotspot = state.cursor_hotspot;
     let pointer_pos = state.pointer_pos;
     for (id, output_ctx) in state.outputs.iter_mut() {
         let Some(cursor) = output_ctx.cursor.as_mut() else {
             continue;
         };
-        let wl_output = match state.wl_outputs.get(id) {
-            Some(o) => o,
-            None => {
-                cursor.set_visible(false);
-                continue;
-            }
+        let Some(wl_output) = state.wl_outputs.get(id) else {
+            cursor.set_visible(false);
+            continue;
         };
-        let is_owner = owning_output.as_ref() == Some(id);
         let was_visible = cursor.visible();
         let prev_pos = cursor.position();
 
-        if is_owner {
-            // pointer_pos and origin are both in logical coords; the
-            // delta is the logical offset within the output (0..logical_w).
-            // The DRM cursor plane wants physical CRTC pixels, so
-            // multiply by the output's fractional scale before placing.
-            // Hotspot is in cursor-sprite pixels (physical, since the
-            // sprite is uploaded at native size into the cursor BO) and
-            // subtracts from the physical position as-is.
-            //
-            // TODO: pick a per-output cursor sprite scale to match —
-            // today we always request scale=1 from CursorManager so on
-            // a scale=2 monitor the cursor is half its natural size.
+        if *id == owner_id {
+            // pointer_pos and origin are logical; the DRM cursor plane wants
+            // physical CRTC pixels, so scale the in-output offset by the
+            // output's fractional scale. The hotspot is already in sprite
+            // (physical) pixels and subtracts as-is.
             let origin = wl_output.current_location();
             let scale = wl_output.current_scale().fractional_scale().max(0.01);
             let lx = pointer_pos.x - origin.x as f64;
