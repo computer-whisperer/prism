@@ -40,6 +40,8 @@ use smithay::delegate_content_type;
 use smithay::delegate_dmabuf;
 use smithay::delegate_drm_syncobj;
 use smithay::delegate_fractional_scale;
+use smithay::delegate_idle_inhibit;
+use smithay::delegate_idle_notify;
 use smithay::delegate_output;
 use smithay::delegate_presentation;
 use smithay::delegate_seat;
@@ -60,7 +62,7 @@ use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource};
-use smithay::utils::{Serial, Transform};
+use smithay::utils::{IsAlive, Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     add_pre_commit_hook, get_parent, get_role, with_states, CompositorClientState,
@@ -73,6 +75,8 @@ use smithay::wayland::dmabuf::{
 };
 use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState};
 use smithay::wayland::fractional_scale::{FractionalScaleHandler, FractionalScaleManagerState};
+use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
+use smithay::wayland::idle_notify::{IdleNotifierHandler, IdleNotifierState};
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::selection::data_device::{set_data_device_focus, DataDeviceState};
@@ -263,6 +267,28 @@ pub struct PrismState {
     /// `wlr_layer_shell_unstable_v1` server state. MVP — see
     /// [`crate::layer_shell`] for the deliberate scope gaps.
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
+    /// `ext-idle-notify-v1` state — feeds idle/resume notifications to
+    /// clients like swayidle. Created lazily in [`Self::set_loop_handle`]
+    /// because [`IdleNotifierState::new`] needs the calloop `LoopHandle`
+    /// (its idle timers live on the event loop). `None` until then; no
+    /// global exists before it, so the handler getter is never hit early.
+    pub idle_notifier: Option<IdleNotifierState<PrismState>>,
+    /// `zwp_idle_inhibit_manager_v1` state — held to keep the global
+    /// alive. Inhibiting surfaces are tracked in [`Self::idle_inhibitors`];
+    /// [`Self::refresh_idle_inhibit`] folds them into the notifier.
+    pub idle_inhibit_manager: IdleInhibitManagerState,
+    /// Surfaces that currently hold an idle inhibitor (e.g. fullscreen
+    /// video). Non-empty ⇒ idle is inhibited. Dead surfaces are pruned on
+    /// refresh.
+    pub idle_inhibitors: std::collections::HashSet<WlSurface>,
+    /// Live `zwlr_output_power_v1` objects (wlopm & co.), each paired with
+    /// the `OutputId` it controls, so DPMS changes from any source can be
+    /// broadcast back as `mode` events. Dead objects are pruned on
+    /// broadcast. See [`crate::output_power`].
+    pub output_power_objects: Vec<(
+        OutputId,
+        smithay::reexports::wayland_protocols_wlr::output_power_management::v1::server::zwlr_output_power_v1::ZwlrOutputPowerV1,
+    )>,
     /// Per-output smithay `Output`, keyed by the same `OutputId`
     /// (connector name) as `outputs`. Populated by [`advertise_output`];
     /// logical positions assigned by [`layout_outputs`]. Drops before
@@ -564,6 +590,16 @@ impl PrismState {
         let layer_shell_state =
             smithay::wayland::shell::wlr_layer::WlrLayerShellState::new::<PrismState>(&dh);
 
+        // Idle: zwp_idle_inhibit_manager_v1 now (no loop handle needed);
+        // ext-idle-notify-v1 is created in set_loop_handle (it needs the
+        // event loop for its timers).
+        let idle_inhibit_manager = IdleInhibitManagerState::new::<PrismState>(&dh);
+
+        // zwlr_output_power_management_v1 — DPMS control for wlopm/swayidle.
+        // Hand-rolled (smithay has none); see crate::output_power. The global
+        // is kept alive by the display; nothing else to store.
+        crate::output_power::create_output_power_global(&dh);
+
         // Modern clients (Firefox, GTK4, recent toolkits) probe these
         // globals at startup and either fall back loudly or take
         // degraded paths when missing. We advertise them now so the
@@ -621,6 +657,10 @@ impl PrismState {
             keyboard_focus: KeyboardFocus::default(),
             layout_focus_surface: None,
             on_demand_layer_focus: None,
+            idle_notifier: None,
+            idle_inhibit_manager,
+            idle_inhibitors: std::collections::HashSet::new(),
+            output_power_objects: Vec::new(),
             pointer_visibility: PointerVisibility::default(),
             suppressed_keys: std::collections::HashSet::new(),
             libinput_devices: std::collections::HashSet::new(),
@@ -649,7 +689,80 @@ impl PrismState {
     /// dispatch loop starts servicing clients — `main.rs` does this
     /// once at startup.
     pub fn set_loop_handle(&mut self, handle: LoopHandle<'static, PrismState>) {
+        // ext-idle-notify-v1 keeps its idle timers on the event loop, so it
+        // can only be built once we have the loop handle. Build it here so
+        // the global is advertised before clients connect (set_loop_handle
+        // runs before the wayland socket is inserted).
+        self.idle_notifier = Some(IdleNotifierState::new(&self.display_handle, handle.clone()));
         self.loop_handle = Some(handle);
+    }
+
+    /// Reset the idle timers on every seat — call on any user input so an
+    /// idle client (swayidle) is told the user is active again. No-op until
+    /// the notifier is built (pre-loop) or if no seat input has occurred.
+    pub fn notify_idle_activity(&mut self) {
+        let seat = self.seat.clone();
+        if let Some(notifier) = self.idle_notifier.as_mut() {
+            notifier.notify_activity(&seat);
+        }
+    }
+
+    /// Recompute whether idle is inhibited (any live inhibitor surface ⇒
+    /// inhibited) and push it to the notifier. Prunes dead inhibitors.
+    ///
+    /// Note: this honors an inhibitor as long as its surface is alive, not
+    /// only while it is *visible* — a backgrounded inhibitor still blocks
+    /// idle. Visibility-gating (per the protocol's "ignore invisible
+    /// inhibitors" note) is a possible refinement.
+    pub fn refresh_idle_inhibit(&mut self) {
+        self.idle_inhibitors.retain(|s| s.alive());
+        let inhibited = !self.idle_inhibitors.is_empty();
+        tracing::debug!(
+            inhibited,
+            inhibitors = self.idle_inhibitors.len(),
+            "idle-inhibit refreshed"
+        );
+        if let Some(notifier) = self.idle_notifier.as_mut() {
+            notifier.set_is_inhibited(inhibited);
+        }
+    }
+
+    /// Drive one output's DPMS power state (see
+    /// [`prism_drm::OutputContext::power_off`]). On power-on, queues a
+    /// redraw so the next render pass re-establishes the mode. Notifies any
+    /// bound `zwlr_output_power_v1` clients of the change. No-op for an
+    /// unknown output. Used by the output-power protocol and the
+    /// `PowerOffMonitors` / `PowerOnMonitors` actions.
+    pub fn set_monitor_powered(&mut self, output_id: &OutputId, on: bool) {
+        let Some(ctx) = self.outputs.get_mut(output_id) else {
+            return;
+        };
+        if on {
+            ctx.power_on();
+        } else {
+            if let Err(e) = ctx.power_off() {
+                tracing::warn!(connector = %output_id, "DPMS power_off failed: {e:#}");
+                return;
+            }
+            self.broadcast_output_power_mode(output_id);
+            return;
+        }
+        // Power-on: re-render to re-establish the mode, then notify clients.
+        self.output_redraw
+            .entry(output_id.clone())
+            .or_default()
+            .queue_redraw();
+        self.broadcast_output_power_mode(output_id);
+    }
+
+    /// Drive every output's DPMS power state. Used by the `PowerOffMonitors`
+    /// / `PowerOnMonitors` IPC + bind actions (swayidle via `prism msg`, or
+    /// a keybind).
+    pub fn set_all_monitors_powered(&mut self, on: bool) {
+        let ids: Vec<OutputId> = self.outputs.keys().cloned().collect();
+        for id in ids {
+            self.set_monitor_powered(&id, on);
+        }
     }
 
     /// Bring up the `wp_linux_drm_syncobj_manager_v1` global using
@@ -1184,6 +1297,36 @@ impl SeatHandler for PrismState {
 }
 
 delegate_seat!(PrismState);
+
+// ─── ext-idle-notify-v1 / zwp_idle_inhibit ───────────────────────────────────
+
+impl IdleNotifierHandler for PrismState {
+    fn idle_notifier_state(&mut self) -> &mut IdleNotifierState<Self> {
+        // Built in set_loop_handle, before the wayland socket is inserted,
+        // so the global (and thus this getter) can't be reached earlier.
+        self.idle_notifier
+            .as_mut()
+            .expect("idle notifier built in set_loop_handle before clients connect")
+    }
+}
+
+delegate_idle_notify!(PrismState);
+
+impl IdleInhibitHandler for PrismState {
+    fn inhibit(&mut self, surface: WlSurface) {
+        tracing::debug!(surface = ?surface.id(), "idle-inhibit: client created an inhibitor");
+        self.idle_inhibitors.insert(surface);
+        self.refresh_idle_inhibit();
+    }
+
+    fn uninhibit(&mut self, surface: WlSurface) {
+        tracing::debug!(surface = ?surface.id(), "idle-inhibit: client removed an inhibitor");
+        self.idle_inhibitors.remove(&surface);
+        self.refresh_idle_inhibit();
+    }
+}
+
+delegate_idle_inhibit!(PrismState);
 
 // ─── wp_viewporter ──────────────────────────────────────────────────────────
 

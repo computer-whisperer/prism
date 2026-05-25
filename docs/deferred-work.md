@@ -177,7 +177,13 @@ monitor waits until that monitor is focused).
 ### Remaining optional protocols
 
 `wp_presentation`, `wp_viewporter`, `wp_fractional_scale_manager_v1`,
-`wp_content_type_v1`, `xdg_activation`, `xdg-decoration`, and single-pixel-buffer are
-wired. Still unwired (all graceful-degrade): `zwp_idle_inhibit` (prevent lock during
-playback), `relative_pointer` / `pointer_constraints` (games, drawing apps),
-`tablet_manager`. Add as specific clients need them.
+`wp_content_type_v1`, `xdg_activation`, `xdg-decoration`, single-pixel-buffer,
+`ext-idle-notify-v1`, `zwp_idle_inhibit`, and `zwlr_output_power_management_v1` are
+wired. Still unwired (all graceful-degrade): `relative_pointer` /
+`pointer_constraints` (games, drawing apps), `tablet_manager`. Add as specific clients
+need them.
+
+Idle-inhibit honors an inhibitor while its surface is *alive*, not gated on
+visibility (the protocol's "ignore invisible inhibitors" note) — a backgrounded
+inhibitor still blocks idle. Refine if it bites. (Firefox didn't request inhibition in
+testing; mpv does — that's a Firefox-side behavior, not prism.)

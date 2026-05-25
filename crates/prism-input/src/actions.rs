@@ -188,6 +188,14 @@ pub fn handle_action(state: &mut PrismState, action: Action) {
             state.layout.expel_from_column();
             queue_redraw_active_output(state);
         }
+        A::PowerOffMonitors => {
+            tracing::info!("action: PowerOffMonitors");
+            state.set_all_monitors_powered(false);
+        }
+        A::PowerOnMonitors => {
+            tracing::info!("action: PowerOnMonitors");
+            state.set_all_monitors_powered(true);
+        }
         // Stubs for actions whose subsystems aren't ported yet.
         other => {
             tracing::debug!("action: unhandled {other:?}");

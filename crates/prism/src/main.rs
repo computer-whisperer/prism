@@ -1856,6 +1856,22 @@ fn redraw_queued_outputs(state: &mut prism_protocols::PrismState) {
 /// `backend/drm/drm.c:2086 wlr_output_send_frame`.
 fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
     use prism_protocols::redraw::RedrawState;
+    // Powered-off (DPMS) outputs never render — rendering would re-modeset
+    // and wake the panel. Drop any queued redraw to Idle so a commit- or
+    // animation-driven queue doesn't spin (these outputs emit no vblanks, so
+    // nothing else clears the Queued state). power_on re-queues explicitly.
+    if state
+        .outputs
+        .get(output_id)
+        .is_some_and(|o| o.is_powered_off())
+    {
+        state
+            .output_redraw
+            .entry(output_id.to_owned())
+            .or_default()
+            .redraw = RedrawState::Idle;
+        return;
+    }
     match render_output_now(state, output_id) {
         Ok(Some(pending)) => {
             let entry = state.output_redraw.entry(output_id.to_owned()).or_default();

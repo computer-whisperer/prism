@@ -125,6 +125,12 @@ pub struct OutputContext {
     /// Submitting another flip while one is pending causes the kernel to
     /// reject with ENOMEM. Don't re-enter present() until `mark_vblank()`.
     frame_pending: bool,
+    /// DPMS power state. `true` after [`Self::power_off`] (CRTC cleared,
+    /// panel asleep) until [`Self::power_on`]. The render path skips
+    /// powered-off outputs so a stray commit-/animation-driven redraw can't
+    /// wake the panel; the next present after power-on re-modesets (because
+    /// `power_off` also resets `mode_set_done`).
+    powered_off: bool,
     /// VRR-aware predictor for the next vblank. Updated on every vblank
     /// with the actual presentation time the kernel reports; the redraw
     /// pass reads `next_presentation_time()` to pick the
@@ -379,6 +385,7 @@ impl OutputContext {
             kdl_black_point_xyz: None,
             mode_set_done: false,
             frame_pending: false,
+            powered_off: false,
             frame_clock,
             cursor,
             edid,
@@ -645,6 +652,50 @@ impl OutputContext {
     /// True if a flip is in flight (`present` will be a no-op).
     pub fn is_frame_pending(&self) -> bool {
         self.frame_pending
+    }
+
+    /// True while the output is in DPMS-off (see [`Self::power_off`]). The
+    /// render path skips powered-off outputs.
+    pub fn is_powered_off(&self) -> bool {
+        self.powered_off
+    }
+
+    /// DPMS-off this output: clear the CRTC (panel sleeps, all planes
+    /// disabled) and mark it powered-off. Idempotent. Resets the mode-set
+    /// flag so the next present after [`Self::power_on`] re-establishes the
+    /// mode via `commit` rather than a (now-invalid) page-flip.
+    ///
+    /// `DrmSurface::clear` re-enables on the next `commit`/`page_flip`, so a
+    /// powered-off surface is safe to leave until power-on. While off the
+    /// CRTC emits no vblanks, so the vblank-driven redraw loop stops on its
+    /// own; the explicit `powered_off` guard covers non-vblank redraw
+    /// sources (commit handlers, animation ticks).
+    pub fn power_off(&mut self) -> Result<()> {
+        if self.powered_off {
+            return Ok(());
+        }
+        self.surface
+            .clear()
+            .with_context(|| format!("DrmSurface::clear ({})", self.connector_name))?;
+        self.powered_off = true;
+        self.mode_set_done = false;
+        // A flip may have been in flight; clearing the CRTC means its vblank
+        // will never arrive, so drop the pending guard or present() would
+        // refuse to ever render again after power-on.
+        self.frame_pending = false;
+        tracing::info!(connector = %self.connector_name, "DPMS off");
+        Ok(())
+    }
+
+    /// DPMS-on this output. The actual mode-set happens on the next
+    /// `present` (driven by a queued redraw), which commits because
+    /// `power_off` reset `mode_set_done`. Idempotent.
+    pub fn power_on(&mut self) {
+        if !self.powered_off {
+            return;
+        }
+        self.powered_off = false;
+        tracing::info!(connector = %self.connector_name, "DPMS on (re-modeset on next present)");
     }
 
     /// Render the supplied `elements` (with the supplied encode parameters)

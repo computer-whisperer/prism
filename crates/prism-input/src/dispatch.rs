@@ -35,6 +35,12 @@ pub fn process_input_event<I: PrismInputBackend + 'static>(
     I::Device: 'static,
 {
     use InputEvent::*;
+    // Any real user input resets the idle timers (ext-idle-notify-v1), so
+    // swayidle & friends see the user as active. Device hotplug is not
+    // activity.
+    if !matches!(event, DeviceAdded { .. } | DeviceRemoved { .. }) {
+        state.notify_idle_activity();
+    }
     match event {
         DeviceAdded { device } => on_device_added(state, device),
         DeviceRemoved { device } => on_device_removed(state, device),
