@@ -156,9 +156,11 @@ launch_client() {
         return
     fi
     say " launching $label: $*"
-    # ${LAUNCH_WL_DEBUG:+...} adds WAYLAND_DEBUG=1 only when the caller set it
-    # (used for the bar via BAR_WAYLAND_DEBUG) — the trace goes to $log.
-    WAYLAND_DISPLAY="$SOCKET" XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    # Route through `env` so a conditionally-expanded `WAYLAND_DEBUG=1`
+    # (set by the caller via BAR_WAYLAND_DEBUG) is parsed as an assignment —
+    # a bare ${VAR:+NAME=val} in command-prefix position is otherwise treated
+    # as the command name. The trace goes to $log.
+    env WAYLAND_DISPLAY="$SOCKET" XDG_RUNTIME_DIR="$RUNTIME_DIR" \
         ${LAUNCH_WL_DEBUG:+WAYLAND_DEBUG=1} "$@" >"$log" 2>&1 &
     local pid=$!
     CLIENT_PIDS+=("$pid")
