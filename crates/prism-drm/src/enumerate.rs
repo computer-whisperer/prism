@@ -57,9 +57,14 @@ pub struct ConnectorSummary {
 }
 
 impl ConnectorSummary {
-    /// Display-friendly name (e.g. `DisplayPort-4`).
+    /// Kernel/wlroots connector name (e.g. `DP-4`, `HDMI-A-1`, `eDP-1`) — the
+    /// form clients (waybar `output`, sway-style configs) and our own
+    /// `output "..."` config blocks expect. `Interface::as_str()` is drm-rs's
+    /// kernel abbreviation (DisplayPort→DP, HDMIA→HDMI-A, eDP→eDP), matching
+    /// the kernel's `drm_connector_enum_list` and sysfs (`cardN-DP-4`). We do
+    /// NOT use `{:?}` (which yields the verbose `DisplayPort-4`).
     pub fn name(&self) -> String {
-        format!("{:?}-{}", self.kind, self.kind_id)
+        format!("{}-{}", self.kind.as_str(), self.kind_id)
     }
 
     /// The preferred mode if the EDID/driver tagged one; else the first mode.

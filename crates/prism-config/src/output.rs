@@ -334,28 +334,30 @@ impl Outputs {
 /// Tried in order:
 ///   1. Exact case-insensitive connector match OR EDID `<Make> <Model>
 ///      <Serial>` match (delegated to [`OutputName::matches`]).
-///   2. Short-form alias expansion: `output "DP-4"` matches connector
-///      `DisplayPort-4`; `output "HDMI-1"` matches `HDMI-A-1`. This
-///      catches legacy configs written before the long kernel-name
-///      convention; modern configs would use `DisplayPort-4` or the
-///      EDID triple directly.
+///   2. Spelling normalization onto the connector's kernel short form
+///      (`DP-4`, `HDMI-A-1`): a legacy `output "DisplayPort-4"` block still
+///      matches connector `DP-4`, and the bare `output "HDMI-1"` shorthand
+///      matches `HDMI-A-1`. Modern configs would just use `DP-4` or the
+///      EDID triple.
 ///
-/// Returns false if `block_name` is in short-alias form for an
-/// interface (`dp-`, `hdmi-`) that doesn't match the connector AND
-/// no EDID match succeeds — i.e. the alias check is additive, never
-/// substitutive for failed EDID checks.
+/// Returns false if the normalized `block_name` still doesn't match the
+/// connector AND no EDID match succeeds — i.e. the normalization is
+/// additive, never substitutive for failed EDID checks.
 pub fn block_matches_output(block_name: &str, output_name: &OutputName) -> bool {
     if output_name.matches(block_name) {
         return true;
     }
-    // Alias expansion only matters for the short forms `DP-N` and
-    // `HDMI-N` that legacy configs use. Anything else falls through
-    // to "no match" — we already tried the full set above.
+    // Fold legacy / shorthand spellings onto the kernel short form the
+    // connector now uses (`DisplayPort-4` → `dp-4`, `HDMI-1` → `hdmi-a-1`).
+    // Anything already canonical was handled by `matches` above.
     let lc = block_name.to_lowercase();
-    let expanded = if let Some(rest) = lc.strip_prefix("dp-") {
-        format!("displayport-{rest}")
-    } else if let Some(rest) = lc.strip_prefix("hdmi-") {
-        format!("hdmi-a-{rest}")
+    let expanded = if let Some(rest) = lc.strip_prefix("displayport-") {
+        format!("dp-{rest}")
+    } else if lc.starts_with("hdmi-")
+        && !lc.starts_with("hdmi-a-")
+        && !lc.starts_with("hdmi-b-")
+    {
+        format!("hdmi-a-{}", &lc["hdmi-".len()..])
     } else {
         return false;
     };
@@ -814,25 +816,25 @@ mod tests {
 
     /// `block_matches_output` is the superset matcher used by every
     /// bringup/scanout/protocol output-config lookup. Three behaviors:
-    /// long-form connector match, short-alias expansion (legacy
-    /// `output "DP-4"` ⇒ kernel `DisplayPort-4`), and EDID
+    /// kernel short-name match (`DP-4`), legacy verbose-spelling
+    /// normalization (`output "DisplayPort-4"` ⇒ connector `DP-4`), and EDID
     /// `Make Model Serial` match for portable per-monitor calibration.
     #[test]
     fn block_matches_long_short_and_edid() {
         let lu28r55 = make_output_name(
-            "DisplayPort-4",
+            "DP-4",
             Some("Samsung Electric Company"),
             Some("LU28R55"),
             Some("HCJT603937"),
         );
 
-        // Long-form connector (kernel name verbatim).
-        assert!(block_matches_output("DisplayPort-4", &lu28r55));
-        assert!(block_matches_output("displayport-4", &lu28r55));
-
-        // Short alias — legacy convenience for `output "DP-4"`.
+        // Kernel short name (what the connector is now named).
         assert!(block_matches_output("DP-4", &lu28r55));
         assert!(block_matches_output("dp-4", &lu28r55));
+
+        // Legacy verbose spelling still normalizes onto the short form.
+        assert!(block_matches_output("DisplayPort-4", &lu28r55));
+        assert!(block_matches_output("displayport-4", &lu28r55));
 
         // EDID-keyed (the form `prism-tune calibrate-lut3d` writes).
         assert!(block_matches_output(
@@ -864,7 +866,7 @@ mod tests {
     /// when EDID fields are None.
     #[test]
     fn block_matches_without_edid() {
-        let no_edid = make_output_name("DisplayPort-2", None, None, None);
+        let no_edid = make_output_name("DP-2", None, None, None);
         assert!(block_matches_output("DisplayPort-2", &no_edid));
         assert!(block_matches_output("DP-2", &no_edid));
         assert!(!block_matches_output("Samsung X Y", &no_edid));

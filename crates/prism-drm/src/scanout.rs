@@ -103,12 +103,19 @@ pub fn pick_by_name_with_config(
     .with_context(|| format!("no connected output matched {want:?}"))
 }
 
-/// Expand short-form connector aliases to the kernel-reported full names.
+/// Normalize a user-typed connector name to prism's canonical kernel short
+/// form. Connector names are now `DP-4` / `HDMI-A-1` (see
+/// [`ConnectorSummary::name`](crate::enumerate::ConnectorSummary::name)), so
+/// this folds the legacy verbose spelling (`DisplayPort-4`) and the bare
+/// `HDMI-1` shorthand onto it. Input is already lowercased.
 fn expand_alias(input: &str) -> String {
-    if let Some(rest) = input.strip_prefix("dp-") {
-        format!("displayport-{rest}")
-    } else if let Some(rest) = input.strip_prefix("hdmi-") {
-        format!("hdmi-a-{rest}")
+    if let Some(rest) = input.strip_prefix("displayport-") {
+        format!("dp-{rest}")
+    } else if input.starts_with("hdmi-")
+        && !input.starts_with("hdmi-a-")
+        && !input.starts_with("hdmi-b-")
+    {
+        format!("hdmi-a-{}", &input["hdmi-".len()..])
     } else {
         input.to_string()
     }
@@ -128,7 +135,7 @@ where
         if info.state() != connector::State::Connected {
             continue;
         }
-        let name = format!("{:?}-{}", info.interface(), info.interface_id());
+        let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
         if !matches(&name) {
             continue;
         }
@@ -196,7 +203,7 @@ pub fn pick_all_connected_with_config(
         if info.state() != connector::State::Connected {
             continue;
         }
-        let name = format!("{:?}-{}", info.interface(), info.interface_id());
+        let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
 
         let edid = crate::EdidInfo::read(drm, conn_h);
         let cfg = match_config_for_connector(&name, &edid, outputs_cfg);

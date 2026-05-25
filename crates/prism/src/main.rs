@@ -117,8 +117,8 @@ fn load_config() -> prism_config::Config {
 /// `DisplayPort-4`). Accepts the short alias (`DP-4`) by expanding both
 /// sides. Same logic as `prism_drm::scanout::match_config_for_connector`
 /// Look up the per-connector KDL `output "..."` block. Matches by:
-///   - Exact case-insensitive connector name (`output "DisplayPort-4"`)
-///   - Short alias (`output "DP-4"`, expanded to `DisplayPort-4`)
+///   - Exact case-insensitive connector name (`output "DP-4"`)
+///   - Legacy verbose spelling (`output "DisplayPort-4"`, normalized to `DP-4`)
 ///   - EDID `<Make> <Model> <Serial>` triple, when `edid` carries
 ///     all three fields — this is the form `prism-tune calibrate-lut3d`
 ///     writes for portable per-monitor calibration
