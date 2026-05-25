@@ -353,10 +353,7 @@ pub fn block_matches_output(block_name: &str, output_name: &OutputName) -> bool 
     let lc = block_name.to_lowercase();
     let expanded = if let Some(rest) = lc.strip_prefix("displayport-") {
         format!("dp-{rest}")
-    } else if lc.starts_with("hdmi-")
-        && !lc.starts_with("hdmi-a-")
-        && !lc.starts_with("hdmi-b-")
-    {
+    } else if lc.starts_with("hdmi-") && !lc.starts_with("hdmi-a-") && !lc.starts_with("hdmi-b-") {
         format!("hdmi-a-{}", &lc["hdmi-".len()..])
     } else {
         return false;

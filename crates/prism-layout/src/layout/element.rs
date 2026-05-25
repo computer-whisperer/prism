@@ -19,7 +19,9 @@
 //! they'll be plumbed back in.
 
 use prism_config::CornerRadius;
-use prism_renderer::{srgb_to_bt2020_nits, vk, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl};
+use prism_renderer::{
+    srgb_to_bt2020_nits, vk, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl,
+};
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;

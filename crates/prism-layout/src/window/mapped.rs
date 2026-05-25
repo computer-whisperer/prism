@@ -23,9 +23,7 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource as _;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
-use smithay::wayland::compositor::{
-    remove_pre_commit_hook, with_states, HookId, SurfaceData,
-};
+use smithay::wayland::compositor::{remove_pre_commit_hook, with_states, HookId, SurfaceData};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::xdg::{
     SurfaceCachedState, ToplevelCachedState, ToplevelConfigure, ToplevelSurface,
