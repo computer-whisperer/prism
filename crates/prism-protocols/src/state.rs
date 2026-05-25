@@ -60,6 +60,7 @@ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::reexports::wayland_server::backend::{ClientData, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
+use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -1341,6 +1342,34 @@ impl PrismState {
             }
         }
     }
+
+    /// Drive the layout's fullscreen state for the window backing a
+    /// client toplevel. Shared by the `set_fullscreen` xdg request
+    /// handlers; mirrors the keybind path in `prism-input::actions`.
+    fn set_window_fullscreen(&mut self, surface: &ToplevelSurface, fullscreen: bool) {
+        let window = self
+            .layout
+            .find_window_and_output(surface.wl_surface())
+            .map(|(mapped, _)| mapped.window.clone());
+        if let Some(w) = window {
+            self.layout.set_fullscreen(&w, fullscreen);
+            queue_redraw_for_surface(self, surface.wl_surface());
+        }
+    }
+
+    /// Drive the layout's maximized state for the window backing a
+    /// client toplevel. Shared by the `set_maximized` xdg request
+    /// handlers.
+    fn set_window_maximized(&mut self, surface: &ToplevelSurface, maximize: bool) {
+        let window = self
+            .layout
+            .find_window_and_output(surface.wl_surface())
+            .map(|(mapped, _)| mapped.window.clone());
+        if let Some(w) = window {
+            self.layout.set_maximized(&w, maximize);
+            queue_redraw_for_surface(self, surface.wl_surface());
+        }
+    }
 }
 
 // ─── wl_output / xdg-output ─────────────────────────────────────────────────
@@ -1798,6 +1827,39 @@ impl XdgShellHandler for PrismState {
         _positioner: PositionerState,
         _token: u32,
     ) {
+    }
+
+    // ─── Client-initiated state requests ────────────────────────────────
+    //
+    // These are the requests behind a client's own titlebar / window
+    // buttons (mpv's fullscreen button, a GTK app's maximize button,
+    // etc.) — `xdg_toplevel.set_fullscreen` and friends. Without these
+    // overrides smithay's default no-op runs and the button does nothing;
+    // only the compositor keybinds (which drive the layout directly via
+    // `actions.rs`) would work. We resolve the toplevel's surface back to
+    // its layout window and call the same directional layout API the
+    // keybinds use. `set_*` (not `toggle_*`) because these requests are
+    // directional, not toggles. `set_fullscreen` / `set_maximized` push a
+    // fresh configure to the client themselves, so we only owe a redraw.
+
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
+        // `_output`: a client may request fullscreen on a specific
+        // monitor. We fullscreen on the window's current output, matching
+        // the keybind behaviour; honouring a cross-output target would
+        // mean moving the window first and isn't wired up yet.
+        self.set_window_fullscreen(&surface, true);
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        self.set_window_fullscreen(&surface, false);
+    }
+
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        self.set_window_maximized(&surface, true);
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        self.set_window_maximized(&surface, false);
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
