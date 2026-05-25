@@ -24,6 +24,18 @@ use crate::renderer::ElementDraw;
 use ash::vk;
 use prism_frame::{ElementId, Logical, Point, Rectangle, Size};
 
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a over the bit patterns of a slice of `f32`s — a cheap content
+/// fingerprint for solid-colour / border elements. Exact-equality change
+/// detection: identical colours hash identically.
+fn fnv_f32s(xs: &[f32]) -> u64 {
+    xs.iter().fold(FNV_OFFSET, |h, x| {
+        (h ^ x.to_bits() as u64).wrapping_mul(FNV_PRIME)
+    })
+}
+
 /// Logical → Vulkan-clip-space projection for one output.
 ///
 /// Clip space is `[-1, 1] × [-1, 1]` over the full framebuffer, so the mapping
@@ -54,6 +66,11 @@ pub struct FrameElementMeta {
     /// Output rect in logical pixels (the element's bounding box; for a border,
     /// the outer rect). The tracker converts to physical for its diff.
     pub geometry: Rectangle<f64, Logical>,
+    /// Content fingerprint — changes iff the element's pixels changed without
+    /// its geometry moving (surface re-commit, focus-colour change). The
+    /// tracker re-damages the element's geometry when this differs from the
+    /// stored value.
+    pub content_token: u64,
 }
 
 /// One frame lowered for one output: the flat draw stream `render_frame`
@@ -84,6 +101,7 @@ pub fn lower_elements(
         meta.push(FrameElementMeta {
             id: el.id(),
             geometry: el.geometry(),
+            content_token: el.content_token(),
         });
     }
     LoweredFrame { draws, meta }
@@ -160,6 +178,10 @@ pub struct SurfaceEl {
     pub yuv: i32,
     /// Output rect in logical pixels; projected to clip space at lowering.
     pub geometry: Rectangle<f64, Logical>,
+    /// Content version: the surface's buffer commit count. The damage tracker
+    /// re-damages the surface when this advances (geometry unchanged but pixels
+    /// changed). The walk derives it from the `wl_surface`'s `CommitCounter`.
+    pub content_commit: u64,
     pub src_rect_uv: [f32; 4],
     pub color: SurfaceColorParams,
 }
@@ -365,6 +387,23 @@ impl RenderEl {
             Self::Surface(s) => s.geometry,
             Self::SolidColor(s) => s.geometry,
             Self::Border(b) => b.geometry,
+        }
+    }
+
+    /// Content fingerprint for the damage diff (see [`FrameElementMeta`]).
+    /// Surfaces use their buffer commit count; solids/borders fingerprint their
+    /// colour (and per-side thickness), so a focus-colour change re-damages the
+    /// ring even though its geometry is unchanged.
+    pub fn content_token(&self) -> u64 {
+        match self {
+            Self::Surface(s) => s.content_commit,
+            Self::SolidColor(s) => fnv_f32s(&s.color_bt2020_nits),
+            Self::Border(b) => {
+                let c = fnv_f32s(&b.color_bt2020_nits);
+                b.thickness
+                    .iter()
+                    .fold(c, |h, t| (h ^ t.to_bits()).wrapping_mul(FNV_PRIME))
+            }
         }
     }
 

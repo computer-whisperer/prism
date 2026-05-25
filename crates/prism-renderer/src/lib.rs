@@ -5,6 +5,7 @@
 //! produces scanout buffers for `prism_drm` to submit.
 
 pub mod cross_gpu;
+pub mod damage;
 pub mod device;
 pub mod diagnose;
 pub mod dmabuf;
@@ -20,6 +21,7 @@ pub mod renderer;
 pub mod upload;
 
 pub use cross_gpu::{ExportableImage, MirrorCopier, MirrorCopyOp};
+pub use damage::DamageTracker;
 pub use device::{Device, DrmDevId, DrmFormatModifierInfo, PhysicalDeviceInfo};
 pub use diagnose::{decode_scanout_texel, DiagnosedNits, EncodeDiagnoseProbe};
 pub use dmabuf::{ImportedImage, YuvKind};

@@ -26,14 +26,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use drm_fourcc::DrmModifier;
 use prism_renderer::{
-    synthesize_lut_from_matrix_curve, vk, Device, DrmDevId, EncodePush, ImportedImage,
-    LoweredFrame, Renderer,
+    synthesize_lut_from_matrix_curve, vk, DamageTracker, Device, DrmDevId, EncodePush,
+    ImportedImage, LoweredFrame, Renderer,
 };
 use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneState};
 use smithay::reexports::drm::control::{connector, crtc, framebuffer, Mode};
 
 use crate::frame_clock::FrameClock;
-use smithay::utils::{Rectangle, Transform};
+use smithay::utils::{Logical, Rectangle, Scale, Size, Transform};
 
 /// Headroom multiplier on the derived per-channel BT.2020 decode clamp.
 /// The clamp's purpose is to keep the BT.2020 fp16 intermediate honest
@@ -80,6 +80,9 @@ pub struct OutputContext {
     /// the buffer the display is actively reading.
     back_index: usize,
     pub renderer: Renderer,
+    /// Per-output region damage tracker — diffs each frame's element metadata
+    /// against the last to derive the changed region.
+    damage_tracker: DamageTracker,
     /// Width × height in pixels.
     pub extent: vk::Extent2D,
     /// Active DRM mode (size + vrefresh). Kept so the wayland side can
@@ -373,6 +376,7 @@ impl OutputContext {
             buffers,
             back_index: 0,
             renderer,
+            damage_tracker: DamageTracker::new(),
             extent,
             mode: pick.mode,
             connector_name: pick.connector_name,
@@ -719,6 +723,9 @@ impl OutputContext {
     pub fn present(
         &mut self,
         frame: &LoweredFrame,
+        // Output view size in logical pixels — converts the frame's logical
+        // element geometry to physical for the damage diff.
+        view_size: Size<f64, Logical>,
         encode_push: &EncodePush,
         // Cross-GPU mirror copy-done semaphores the render must wait on
         // before sampling. Empty for outputs with no mirrored surfaces.
@@ -727,6 +734,29 @@ impl OutputContext {
         if self.frame_pending {
             return Ok(None);
         }
+
+        // Region damage for this frame. Logged for now (Stage 1b); Stage 2
+        // scissors the decode/encode to it. Computed here — after the
+        // frame_pending early-out, so it only advances on an actual render —
+        // but note its state advances unconditionally; once it gates real
+        // work, the advance must move to after a successful flip.
+        let scale = Scale::from((
+            self.extent.width as f64 / view_size.w.max(1.0),
+            self.extent.height as f64 / view_size.h.max(1.0),
+        ));
+        let damage = self.damage_tracker.compute(&frame.meta, scale);
+        let damage_area: i64 = damage
+            .iter()
+            .map(|r| r.size.w as i64 * r.size.h as i64)
+            .sum();
+        tracing::debug!(
+            target: "damage",
+            output = %self.connector_name,
+            rects = damage.len(),
+            area_px = damage_area,
+            full_px = self.extent.width as i64 * self.extent.height as i64,
+            "frame damage",
+        );
 
         let back = &self.buffers[self.back_index];
         // render_frame returns the present-completion sync as a Linux

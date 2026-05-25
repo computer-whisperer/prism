@@ -2236,7 +2236,7 @@ fn render_output_now(
             .outputs
             .get_mut(output_id)
             .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
-        output.present(&frame, &encode_push, &render_waits)?
+        output.present(&frame, view_size, &encode_push, &render_waits)?
     };
     // The render submit has been queued with the waits in its dependency
     // list; the imported semaphores can be destroyed now.

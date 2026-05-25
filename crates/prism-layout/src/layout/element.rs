@@ -23,7 +23,7 @@ use prism_frame::ElementId;
 use prism_renderer::{
     srgb_to_bt2020_nits, vk, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl,
 };
-use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+use smithay::backend::renderer::utils::{CommitCounter, RendererSurfaceStateUserData};
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource as _;
@@ -160,6 +160,14 @@ impl<'a> RenderCtx<'a> {
 /// `ElementId` stays a cheap key with no wayland types in `prism-frame`.)
 struct SurfaceElementId(ElementId);
 
+/// Recover a `CommitCounter`'s monotonic count as a `u64` content token. The
+/// inner `usize` isn't exposed, but `distance` from the zero counter recovers
+/// it (zero ≤ any counter, so the result is always `Some`). Lets the renderer
+/// fingerprint surface content changes without depending on smithay.
+fn commit_token(c: CommitCounter) -> u64 {
+    c.distance(Some(CommitCounter::from(0))).unwrap_or(0) as u64
+}
+
 fn surface_element_id(states: &SurfaceData) -> ElementId {
     states
         .data_map
@@ -214,13 +222,14 @@ pub fn push_surface_tree_elements(
                 );
                 return;
             };
-            // Grab the view and the buffer's logical size under one lock
-            // (both Copy) — buffer_size is the normalization basis for the
-            // wp_viewport source crop below.
-            let (view, buffer_size) = {
+            // Grab the view, the buffer's logical size, and the buffer commit
+            // count under one lock (all Copy). buffer_size is the normalization
+            // basis for the wp_viewport source crop below; the commit is the
+            // surface's content version for damage tracking.
+            let (view, buffer_size, content_commit) = {
                 let guard = data.lock().unwrap();
                 match guard.view() {
-                    Some(v) => (v, guard.buffer_size()),
+                    Some(v) => (v, guard.buffer_size(), commit_token(guard.current_commit())),
                     None => {
                         trace!(
                             target: "render_walk",
@@ -290,6 +299,7 @@ pub fn push_surface_tree_elements(
                 chroma_view,
                 yuv,
                 geometry: dst,
+                content_commit,
                 src_rect_uv: crate::utils::src_rect_uv_from_view(&view, buffer_size),
                 color: ctx.color_for(states),
             }));
