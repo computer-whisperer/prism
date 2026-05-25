@@ -177,6 +177,14 @@ pub struct SurfaceTexture {
     /// buffer swaps that reuse the per-GPU `ShmTexture`s (see
     /// `process_surface_buffer`). Unused for dmabuf/solid sources.
     pub shm_upload_commit: Option<CommitCounter>,
+    /// Whether this surface's (native dmabuf) buffer has been written by the
+    /// client since the last time the render path waited on its implicit fence.
+    /// Set on every dmabuf commit (`ensure_surface_textures`), cleared when
+    /// `prepare_dmabuf_acquire_waits` imports the fence. Gates the acquire wait
+    /// to once per committed buffer — a written buffer only needs syncing on
+    /// its first sample, not every frame it stays on screen — which keeps the
+    /// per-frame sync_file/semaphore churn bounded. Unused for shm/solid.
+    pub acquire_pending: bool,
 }
 
 impl SurfaceTexture {
@@ -185,6 +193,7 @@ impl SurfaceTexture {
             source,
             by_gpu: HashMap::new(),
             shm_upload_commit: None,
+            acquire_pending: false,
         }
     }
 
@@ -207,6 +216,15 @@ impl SurfaceTexture {
     /// this to collect them for `prepare_mirror_waits`.
     pub fn is_mirror_for(&self, gpu: DrmDevId) -> bool {
         matches!(self.by_gpu.get(&gpu), Some(GpuTex::Mirror { .. }))
+    }
+
+    /// Whether this surface's texture on `gpu` is a zero-copy native dmabuf
+    /// import (vs a mirror or shm upload). The render path uses this to know
+    /// which surfaces need their client's implicit write fence imported as a
+    /// render wait — prism samples the client BO directly, so it must not read
+    /// it mid-write. See `prepare_dmabuf_acquire_waits`.
+    pub fn is_native_dmabuf_for(&self, gpu: DrmDevId) -> bool {
+        matches!(self.by_gpu.get(&gpu), Some(GpuTex::Native(_)))
     }
 
     /// Width × height of the source pixels (GPU-independent).

@@ -2026,28 +2026,33 @@ fn render_output_now(
         |s: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| {
             missing_textures.borrow_mut().push(s.clone());
         };
-    // Surfaces drawn on this output whose texture is a cross-GPU mirror for
-    // this GPU — collected during the walk, synced (async copy) before the
-    // present submit.
+    // Surfaces drawn on this output, collected during the walk for pre-present
+    // GPU-sync prep:
+    //   - `mirror_surfaces`: texture is a cross-GPU mirror → async home→scratch
+    //     copy before the present submit;
+    //   - `acquire_surfaces`: zero-copy native dmabuf → import the client's
+    //     implicit write fence as a render wait so we don't sample mid-write.
     let mirror_surfaces: std::cell::RefCell<
         Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
     > = std::cell::RefCell::new(Vec::new());
-    let report_mirror =
+    let acquire_surfaces: std::cell::RefCell<
+        Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    > = std::cell::RefCell::new(Vec::new());
+    let report_drawn_surface =
         |s: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
          states: &smithay::wayland::compositor::SurfaceData| {
-            let is_mirror = states
-                .data_map
-                .get::<prism_protocols::SurfaceTexSlot>()
-                .map(|slot| {
-                    slot.0
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .is_some_and(|t| t.is_mirror_for(output_gpu_id))
-                })
-                .unwrap_or(false);
-            if is_mirror {
+            let Some(slot) = states.data_map.get::<prism_protocols::SurfaceTexSlot>() else {
+                return;
+            };
+            let guard = slot.0.lock().unwrap();
+            let Some(tex) = guard.as_ref() else { return };
+            if tex.is_mirror_for(output_gpu_id) {
                 mirror_surfaces.borrow_mut().push(s.clone());
+            } else if tex.is_native_dmabuf_for(output_gpu_id) && tex.acquire_pending {
+                // Only surfaces written since their last acquire wait — keeps
+                // the per-frame sync_file/semaphore churn bounded to changed
+                // tiles (a static buffer's write is long done).
+                acquire_surfaces.borrow_mut().push(s.clone());
             }
         };
     // Solid color (wp_single_pixel_buffer) lookup — the walk lowers these to a
@@ -2065,7 +2070,7 @@ fn render_output_now(
         color_lookup: &color_lookup,
         sdr_reference_nits: output_sdr_reference_nits,
         report_missing_texture: &report_missing,
-        report_mirror: &report_mirror,
+        report_drawn_surface: &report_drawn_surface,
         solid_color_lookup: &solid_color_lookup,
     };
 
@@ -2224,24 +2229,32 @@ fn render_output_now(
         }
         p
     };
-    // Cross-GPU mirror sync: for surfaces drawn on this output whose texture
-    // is a mirror, submit their home→scratch copies asynchronously and get
-    // wait semaphores the render submit blocks on (GPU-side, not on the
-    // event loop). Empty for the native case. Computed before the mutable
-    // borrow of state.outputs for present.
+    // Pre-present GPU-sync waits the render submit blocks on (GPU-side, not on
+    // the event loop). Computed before the mutable borrow of state.outputs:
+    //   - cross-GPU mirror: submit home→scratch copies async, wait on them;
+    //   - native dmabuf: import each client's implicit write fence so we don't
+    //     sample a buffer the client's GPU is still writing (the Vulkan analog
+    //     of the implicit sync a GL compositor gets from Mesa for free).
+    // Both empty in the trivial single-GPU, all-shm case.
     let mirror_surfaces = mirror_surfaces.take();
-    let mirror_waits =
+    let acquire_surfaces = acquire_surfaces.take();
+    let mut render_waits =
         prism_protocols::prepare_mirror_waits(state, &mirror_surfaces, output_gpu_id);
+    render_waits.extend(prism_protocols::prepare_dmabuf_acquire_waits(
+        state,
+        &acquire_surfaces,
+        output_gpu_id,
+    ));
     let present_sync_fd = {
         let output = state
             .outputs
             .get_mut(output_id)
             .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
-        output.present(&elements, &encode_push, &mirror_waits)?
+        output.present(&elements, &encode_push, &render_waits)?
     };
     // The render submit has been queued with the waits in its dependency
     // list; the imported semaphores can be destroyed now.
-    prism_protocols::destroy_mirror_waits(state, output_gpu_id, mirror_waits);
+    prism_protocols::destroy_render_wait_semaphores(state, output_gpu_id, render_waits);
 
     let Some(present_sync_fd) = present_sync_fd else {
         // Flip still pending — caller will retry next pass.

@@ -2733,6 +2733,9 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
                     source,
                     by_gpu: carried,
                     shm_upload_commit: carried_commit,
+                    // Set per-commit in ensure_surface_textures (covers
+                    // same-buffer damage re-commits too); start false here.
+                    acquire_pending: false,
                 });
             }
             Err(e) => tracing::warn!("surface buffer source build failed: {e:#}"),
@@ -3291,6 +3294,10 @@ fn ensure_surface_textures(state: &PrismState, surface: &WlSurface) {
                         tracing::warn!(gpu = ?g, "dmabuf materialize failed: {e:#}");
                     }
                 }
+                // The client wrote this buffer this commit — the next render
+                // that samples it must wait on its implicit write fence once
+                // (cleared in prepare_dmabuf_acquire_waits).
+                tex.acquire_pending = true;
             }
             TexSource::Shm { .. } => {
                 // Upload only the regions the client damaged this commit
@@ -3438,14 +3445,84 @@ pub fn prepare_mirror_waits(
     waits
 }
 
-/// Destroy the wait semaphores returned by [`prepare_mirror_waits`], after
+/// Destroy the render-wait semaphores returned by [`prepare_mirror_waits`] /
+/// [`prepare_dmabuf_acquire_waits`] (both import SYNC_FDs the same way), after
 /// the render submit that waited on them has been queued.
-pub fn destroy_mirror_waits(state: &PrismState, target_gpu: DrmDevId, sems: Vec<vk::Semaphore>) {
+pub fn destroy_render_wait_semaphores(
+    state: &PrismState,
+    target_gpu: DrmDevId,
+    sems: Vec<vk::Semaphore>,
+) {
     if let Some(copier) = state.mirror_copiers.get(&target_gpu) {
         for sem in sems {
             copier.destroy_imported_semaphore(sem);
         }
     }
+}
+
+/// For each native-dmabuf surface drawn on `target_gpu` this frame, import the
+/// client's implicit write fence as a wait semaphore on `target_gpu`, so the
+/// render submit doesn't sample a buffer the client's GPU is still writing.
+///
+/// This is the Vulkan analog of the implicit sync a GL/EGL compositor gets for
+/// free from Mesa: we export the dmabuf's read-sync fence
+/// ([`dmabuf_sync::export_read_fence`]) and import it as a binary semaphore
+/// (same path as the cross-GPU mirror waits). Surfaces with no exportable fence
+/// (already-signalled, or kernel without `EXPORT_SYNC_FILE`) are skipped — that
+/// just degrades to the prior unsynchronized behavior for those.
+///
+/// Destroy the returned semaphores with [`destroy_render_wait_semaphores`]
+/// after the present submit.
+pub fn prepare_dmabuf_acquire_waits(
+    state: &PrismState,
+    surfaces: &[WlSurface],
+    target_gpu: DrmDevId,
+) -> Vec<vk::Semaphore> {
+    use std::os::fd::AsFd;
+
+    if surfaces.is_empty() {
+        return Vec::new();
+    }
+    let Some(copier) = state.mirror_copiers.get(&target_gpu) else {
+        return Vec::new();
+    };
+
+    let mut waits = Vec::new();
+    for surface in surfaces {
+        // Export the producer write fence under the surface lock (we need the
+        // dmabuf plane fd); import it as a semaphore after releasing the lock.
+        // Clear `acquire_pending` here — this committed buffer gets its one
+        // wait now, so subsequent frames displaying it won't re-export.
+        let fence_fd = with_states(surface, |states| {
+            let slot = states.data_map.get::<SurfaceTexSlot>()?;
+            let mut guard = slot.0.lock().unwrap();
+            let tex = guard.as_mut()?;
+            tex.acquire_pending = false;
+            let TexSource::Dmabuf { dmabuf, .. } = &tex.source else {
+                return None;
+            };
+            let plane = dmabuf.planes.first()?;
+            crate::dmabuf_sync::export_read_fence(plane.fd.as_fd()).ok()
+        });
+        let Some(fence_fd) = fence_fd else { continue };
+        match copier.import_wait_semaphore(fence_fd) {
+            Ok(sem) => waits.push(sem),
+            Err(e) => tracing::debug!(?target_gpu, "dmabuf acquire-fence import failed: {e:#}"),
+        }
+    }
+    // Quiet unless a drawn native surface had no exportable write fence — the
+    // expected case is one fence per surface (verified: Mesa attaches them).
+    // A shortfall means the client/driver attached no implicit fence for some
+    // buffer, leaving that sample unsynchronized.
+    if waits.len() != surfaces.len() {
+        tracing::debug!(
+            ?target_gpu,
+            surfaces = surfaces.len(),
+            imported = waits.len(),
+            "dmabuf acquire: some surfaces had no exportable write fence"
+        );
+    }
+    waits
 }
 
 /// Materialize a dmabuf-backed surface on GPU `g`: a zero-copy native
@@ -3477,6 +3554,10 @@ fn materialize_dmabuf_for_gpu(
         let img =
             import_dmabuf(&device_g, &dmabuf, true).context("native import on consumer GPU")?;
         tex.by_gpu.insert(g, GpuTex::Native(Arc::new(img)));
+        // Freshly imported (incl. via the render-demand path, which doesn't go
+        // through the per-commit ensure): its first sample must wait on the
+        // client's write fence.
+        tex.acquire_pending = true;
         return Ok(());
     }
 

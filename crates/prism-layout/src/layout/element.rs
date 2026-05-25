@@ -82,14 +82,18 @@ pub struct RenderCtx<'a> {
     /// and deadlock). The surface renders blank for this one frame, then
     /// draws on the next. Same `&WlSurface`-only contract as the lookups.
     pub report_missing_texture: &'a dyn Fn(&WlSurface),
-    /// Records a surface drawn on this output whose texture is a **cross-GPU
-    /// mirror** for this output's GPU. The integrator collects these and,
-    /// after the walk, submits their home→scratch copies asynchronously and
-    /// adds the resulting wait semaphores to this output's render submit
-    /// (prism-protocols' `prepare_mirror_waits`). Called with both the
-    /// surface and its already-locked `SurfaceData` so the integrator can
-    /// check the mirror flag without re-entering the lock.
-    pub report_mirror: &'a dyn Fn(&WlSurface, &SurfaceData),
+    /// Called once per surface actually drawn on this output (texture present),
+    /// with its already-locked `SurfaceData`, so the integrator can do
+    /// per-surface pre-present GPU-sync bookkeeping without re-entering the
+    /// lock. Two needs ride on this hook:
+    ///   - **cross-GPU mirror**: surfaces whose texture mirrors onto this
+    ///     output's GPU get their home→scratch copy submitted after the walk
+    ///     (`prepare_mirror_waits`);
+    ///   - **native dmabuf acquire**: surfaces sampled as a zero-copy native
+    ///     dmabuf get the client's implicit write fence imported as a render
+    ///     wait, so we don't sample a buffer mid-write
+    ///     (`prepare_dmabuf_acquire_waits`).
+    pub report_drawn_surface: &'a dyn Fn(&WlSurface, &SurfaceData),
     /// Premultiplied sRGB RGBA if the surface's current buffer is a
     /// `wp_single_pixel_buffer` solid color, else `None`. Such surfaces have
     /// no texture; the walk lowers them to a color-managed `SolidColorEl`.
@@ -120,11 +124,12 @@ impl<'a> RenderCtx<'a> {
     pub fn report_missing(&self, surf: &WlSurface) {
         (self.report_missing_texture)(surf)
     }
-    /// Note `surf` (with its locked `states`) as drawn on this output, so
-    /// the integrator can sync its cross-GPU mirror if it has one. See
-    /// [`RenderCtx::report_mirror`].
-    pub fn note_mirror(&self, surf: &WlSurface, states: &SurfaceData) {
-        (self.report_mirror)(surf, states)
+    /// Note `surf` (with its locked `states`) as drawn on this output, so the
+    /// integrator can do pre-present GPU-sync prep (cross-GPU mirror copy,
+    /// native dmabuf acquire-fence wait). See
+    /// [`RenderCtx::report_drawn_surface`].
+    pub fn note_drawn_surface(&self, surf: &WlSurface, states: &SurfaceData) {
+        (self.report_drawn_surface)(surf, states)
     }
     /// Premultiplied sRGB RGBA for a `wp_single_pixel_buffer` surface, else
     /// `None`. See [`RenderCtx::solid_color_lookup`].
@@ -251,9 +256,9 @@ pub fn push_surface_tree_elements(
                 id = ?surf.id(), role = ?states.role, dst = ?view.dst,
                 "emit surface"
             );
-            // If this surface's texture is a cross-GPU mirror for this
-            // output's GPU, note it so the integrator syncs the copy.
-            ctx.note_mirror(surf, states);
+            // Note this drawn surface so the integrator can do pre-present GPU
+            // sync prep (cross-GPU mirror copy, native dmabuf acquire wait).
+            ctx.note_drawn_surface(surf, states);
 
             let pos = surf_loc + view.offset.to_f64();
             let dst = Rectangle::new(pos, view.dst.to_f64());

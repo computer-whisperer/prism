@@ -461,19 +461,24 @@ impl MirrorCopier {
                 .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
         }
         .vk_ctx("create_semaphore (mirror wait import)")?;
+        let raw_fd = fd.into_raw_fd();
         let info = vk::ImportSemaphoreFdInfoKHR::default()
             .semaphore(sem)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
             .flags(vk::SemaphoreImportFlags::TEMPORARY)
-            .fd(fd.into_raw_fd());
+            .fd(raw_fd);
         match unsafe { self.sem_fd_loader.import_semaphore_fd(&info) } {
+            // Success: vkImportSemaphoreFdKHR took ownership of `raw_fd` (radv
+            // imports it into the semaphore's syncobj and closes it).
             Ok(()) => Ok(sem),
             Err(e) => {
-                // import_semaphore_fd consumed the fd; on failure the payload
-                // wasn't imported, so just destroy the empty semaphore.
-                unsafe { self.device.raw.destroy_semaphore(sem, None) };
+                self.destroy_imported_semaphore(sem);
+                // Failure: ownership was NOT transferred, so close `raw_fd`
+                // ourselves — otherwise it leaks (this path runs per sampled
+                // dmabuf per frame and would exhaust fds → EMFILE).
+                drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
                 Err(RendererError::Vk {
-                    context: "vkImportSemaphoreFdKHR (mirror wait, SYNC_FD)",
+                    context: "vkImportSemaphoreFdKHR (render wait, SYNC_FD)",
                     result: e,
                 })
             }

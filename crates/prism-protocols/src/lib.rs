@@ -8,6 +8,7 @@
 
 pub mod client;
 pub mod color_management;
+pub mod dmabuf_sync;
 pub mod drm_syncobj;
 pub mod input_state;
 pub mod layer_shell;
@@ -25,7 +26,8 @@ pub use input_state::{KeyboardFocus, PointerVisibility};
 pub use redraw::{OutputRedrawState, PendingFeedback, RedrawState};
 pub use server::insert_wayland_sources;
 pub use state::{
-    destroy_mirror_waits, materialize_surface_on_gpu, new_display, prepare_mirror_waits, PrismState,
+    destroy_render_wait_semaphores, materialize_surface_on_gpu, new_display,
+    prepare_dmabuf_acquire_waits, prepare_mirror_waits, PrismState,
 };
 pub use surface_tex::{
     GpuTex, SurfacePlacement, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture, TexSource,
