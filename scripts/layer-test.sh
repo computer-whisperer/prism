@@ -28,6 +28,10 @@
 #   WINDOW_BIN/ARGS    window client. Default: first of alacritty / foot, else
 #                       the in-tree prism-shmtest.
 #   NO_WALLPAPER / NO_BAR / NO_WINDOW   if set (any value), skip that client.
+#   BAR_WAYLAND_DEBUG  if set, run the bar with WAYLAND_DEBUG=1 so its protocol
+#                       trace (globals bound, requests/events, where it stalls)
+#                       lands in prism-layer-bar.log — for debugging a bar that
+#                       connects but never creates a layer surface.
 #   PRISM_CRUMBS       breadcrumb file (default: ./prism.crumbs).
 #   PRISM_WATCHDOG_SECS (default: seconds + 5).
 #
@@ -152,8 +156,10 @@ launch_client() {
         return
     fi
     say " launching $label: $*"
+    # ${LAUNCH_WL_DEBUG:+...} adds WAYLAND_DEBUG=1 only when the caller set it
+    # (used for the bar via BAR_WAYLAND_DEBUG) — the trace goes to $log.
     WAYLAND_DISPLAY="$SOCKET" XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-        "$@" >"$log" 2>&1 &
+        ${LAUNCH_WL_DEBUG:+WAYLAND_DEBUG=1} "$@" >"$log" 2>&1 &
     local pid=$!
     CLIENT_PIDS+=("$pid")
     say "   $label pid=$pid"
@@ -180,7 +186,8 @@ fi
 if [[ -z "${NO_BAR:-}" ]]; then
     # shellcheck disable=SC2206
     bar_args=(${BAR_ARGS:-})
-    launch_client bar "$BAR_LOG" "${BAR_BIN:-waybar}" "${bar_args[@]}"
+    LAUNCH_WL_DEBUG="${BAR_WAYLAND_DEBUG:-}" \
+        launch_client bar "$BAR_LOG" "${BAR_BIN:-waybar}" "${bar_args[@]}"
 fi
 
 # A normal window, so the layer Z-order is visible (wallpaper behind it, bar

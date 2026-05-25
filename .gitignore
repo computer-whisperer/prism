@@ -25,6 +25,12 @@ firefox-test.log
 firefox-moz.log*
 firefox.crumbs
 
+# Test-run artifacts from scripts/layer-test.sh
+layer-test.log
+prism-layer-bg.log
+prism-layer-bar.log
+prism-layer-win.log
+
 # Calibration / tuning run outputs (prism-tune writes these to the CWD)
 /prism-tune-*.csv
 /prism-calibrate-*.csv
