@@ -2045,6 +2045,36 @@ fn render_output_now(
     // immutably for the duration of render_workspaces; dropped before
     // the present below mutably re-borrows state.outputs.
     let mut render_els: Vec<RenderEl> = Vec::new();
+
+    // wlr_layer_shell: walk each mapped layer surface (main + subsurfaces)
+    // through the SAME color-managed surface-tree walk windows use, so layer
+    // chrome (bars, wallpapers, notification daemons) gets identical
+    // wp_color_management decode, cross-GPU mirror handling, and subsurface
+    // z-ordering — no separate unmanaged path. Geometry comes from the
+    // per-output LayerMap (anchors / margins / exclusive zones, arranged on
+    // commit). Cross-layer Z is the append order into the back-to-front
+    // render_els: Background + Bottom go BELOW the workspace, Top + Overlay
+    // ABOVE it (and above any interactive-move tile).
+    use smithay::wayland::shell::wlr_layer::Layer;
+    let push_layers = |layers: &[Layer], out: &mut Vec<RenderEl>| {
+        let map = smithay::desktop::layer_map_for_output(&smithay_output);
+        for &which in layers {
+            for ls in map.layers_on(which) {
+                let Some(geo) = map.layer_geometry(ls) else {
+                    continue;
+                };
+                prism_layout::layout::element::push_surface_tree_elements(
+                    ls.wl_surface(),
+                    geo.loc.to_f64(),
+                    &project,
+                    &ctx,
+                    out,
+                );
+            }
+        }
+    };
+    push_layers(&[Layer::Background, Layer::Bottom], &mut render_els);
+
     let monitor_found = if let Some(monitor) = state.layout.monitor_for_output(&smithay_output) {
         // focus_ring: this is the focused monitor's render — for
         // single-monitor configs it always is; multi-monitor focus
@@ -2070,6 +2100,12 @@ fn render_output_now(
         &mut render_els,
     );
 
+    // Top + Overlay layers: above the workspace walk and the interactive-move
+    // tile. Same color-managed walk as Background/Bottom. Done before the
+    // demand-materialize pass below so a layer surface missing a texture this
+    // frame is caught + retried exactly like a window.
+    push_layers(&[Layer::Top, Layer::Overlay], &mut render_els);
+
     // Render-demand safety net: materialize any surfaces the walk drew on
     // this output but had no texture for its GPU (spanning windows,
     // surfaces committed before placement, layer surfaces). They render
@@ -2090,59 +2126,6 @@ fn render_output_now(
             .entry(output_id.to_string())
             .or_default()
             .queue_redraw();
-    }
-
-    // wlr_layer_shell Overlay surfaces: drawn on top of the layout
-    // walk (and above any interactive-move tile). MVP only renders
-    // Overlay — the other layers (Background, Bottom, Top) are
-    // tracked but not yet composited. See crate::layer_shell for the
-    // deliberate scope gaps.
-    //
-    // Subsurfaces aren't walked here either: Spyder doesn't use
-    // them, and a fuller layer-shell client (bars, notifications)
-    // will arrive with its own pass that mirrors mapped.rs's
-    // with_surface_tree_downward.
-    let output_id_owned = output_id.to_string();
-    for (wl_surface, rect, layer) in state.layer_surfaces_for_output(&output_id_owned) {
-        if !matches!(layer, smithay::wayland::shell::wlr_layer::Layer::Overlay) {
-            continue;
-        }
-        let Some(texture_view) = smithay::wayland::compositor::with_states(wl_surface, |states| {
-            (ctx.texture_lookup)(states)
-        }) else {
-            continue;
-        };
-        let dst = smithay::utils::Rectangle::<f64, smithay::utils::Logical>::new(
-            (rect.loc.x as f64, rect.loc.y as f64).into(),
-            (rect.size.w as f64, rect.size.h as f64).into(),
-        );
-        let dst_rect_clip = project(dst);
-        // Use RenderCtx::color_for so layer-shell surfaces share the
-        // same per-output sdr_reference_nits fallback as toplevels.
-        // src_rect_uv honors any wp_viewport source crop (full texture when
-        // unset), read from the same RendererSurfaceState the walk uses.
-        let (color, (chroma_view, yuv), src_rect_uv) =
-            smithay::wayland::compositor::with_states(wl_surface, |states| {
-                let src_rect_uv = states
-                    .data_map
-                    .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
-                    .and_then(|d| {
-                        let guard = d.lock().unwrap();
-                        guard.view().map(|v| {
-                            prism_layout::utils::src_rect_uv_from_view(&v, guard.buffer_size())
-                        })
-                    })
-                    .unwrap_or([0.0, 0.0, 1.0, 1.0]);
-                (ctx.color_for(states), ctx.yuv_for(states), src_rect_uv)
-            });
-        render_els.push(RenderEl::Surface(prism_renderer::SurfaceEl {
-            texture_view,
-            chroma_view,
-            yuv,
-            dst_rect_clip,
-            src_rect_uv,
-            color,
-        }));
     }
 
     // Lower RenderEls (geometry + tint) → ElementDraws (texture + push
@@ -2277,20 +2260,19 @@ fn render_output_now(
             &mut release_trackers,
         );
     }
-    // Same harvest for Overlay layer-shell surfaces we just rendered.
-    // Bottom/Top layers aren't yet composited (see crate::layer_shell
-    // scope notes), so don't appear in the render walk and don't need
-    // release tracking here.
-    for (wl_surface, _rect, layer) in state.layer_surfaces_for_output(&output_id.to_string()) {
-        if !matches!(layer, smithay::wayland::shell::wlr_layer::Layer::Overlay) {
-            continue;
+    // Same harvest for every layer-shell surface we just rendered (all four
+    // layers now composite). harvest_surface_feedback descends each surface's
+    // subsurface tree itself, so the layer roots are all we pass in.
+    {
+        let map = smithay::desktop::layer_map_for_output(&smithay_output);
+        for ls in map.layers() {
+            prism_protocols::redraw::harvest_surface_feedback(
+                ls.wl_surface(),
+                &mut frame_cbs,
+                &mut presentation_cbs,
+                &mut release_trackers,
+            );
         }
-        prism_protocols::redraw::harvest_surface_feedback(
-            wl_surface,
-            &mut frame_cbs,
-            &mut presentation_cbs,
-            &mut release_trackers,
-        );
     }
 
     if let Some(loop_handle) = state.loop_handle.as_ref() {

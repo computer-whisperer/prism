@@ -263,11 +263,6 @@ pub struct PrismState {
     /// `wlr_layer_shell_unstable_v1` server state. MVP — see
     /// [`crate::layer_shell`] for the deliberate scope gaps.
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
-    /// Per-output layer-shell surfaces. Render order within a vec
-    /// is creation order; cross-layer Z is enforced at render time
-    /// (Background, Bottom, normal-layout, Top, Overlay).
-    pub layer_surfaces: HashMap<OutputId, Vec<crate::layer_shell::LayerEntry>>,
-
     /// Per-output smithay `Output`, keyed by the same `OutputId`
     /// (connector name) as `outputs`. Populated by [`advertise_output`];
     /// logical positions assigned by [`layout_outputs`]. Drops before
@@ -602,7 +597,6 @@ impl PrismState {
             primary_gpu_id: primary_gpu,
             loop_handle: None,
             layer_shell_state,
-            layer_surfaces: HashMap::new(),
             session,
             cards: HashMap::new(),
             mirror_copiers: build_mirror_copiers(&gpus),
@@ -1254,6 +1248,14 @@ impl CompositorHandler for PrismState {
         // data_map for the render path. Reads the buffer from the
         // `RendererSurfaceState` populated above.
         process_surface_buffer(self, surface);
+
+        // Layer-shell surfaces re-arrange their output's LayerMap on commit
+        // (so anchor / size / margin / exclusive-zone changes take effect)
+        // and get their initial configure here. Gated on the layer-surface
+        // role so subsurface commits of a layer don't re-trigger it.
+        if let Some("zwlr_layer_surface_v1") = role {
+            self.layer_shell_commit(surface);
+        }
 
         // For xdg-shell toplevels, send an initial configure on first commit so
         // the client knows it can start drawing. Skipped here once already
@@ -2250,7 +2252,7 @@ fn queue_redraw_for_surface(state: &mut PrismState, surface: &WlSurface) {
         .layout
         .find_window_and_output(&root)
         .and_then(|(_, out)| out.map(|o| o.name()))
-        .or_else(|| layer_surface_output(state, &root));
+        .or_else(|| state.layer_surface_output_id(&root));
 
     let Some(output_id) = output_name else {
         return;
@@ -2261,21 +2263,6 @@ fn queue_redraw_for_surface(state: &mut PrismState, surface: &WlSurface) {
         .entry(output_id)
         .or_default()
         .queue_redraw();
-}
-
-/// Search layer-shell tracking for a surface, returning the OutputId
-/// it's bound to. Used by queue_redraw_for_surface (and by
-/// dispatch_surface_output_from_layout's enter/leave logic) so a
-/// layer-surface commit drives a redraw on the right output.
-fn layer_surface_output(state: &PrismState, surface: &WlSurface) -> Option<OutputId> {
-    for (id, list) in &state.layer_surfaces {
-        for entry in list {
-            if entry.surface.wl_surface() == surface {
-                return Some(id.clone());
-            }
-        }
-    }
-    None
 }
 
 /// Upload the current default cursor sprite (frame 0) into a given

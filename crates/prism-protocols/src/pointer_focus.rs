@@ -12,8 +12,7 @@
 //! tuple smithay's `PointerHandle::motion` wants, so the deepest surface and
 //! its correct surface-local mapping fall straight out.
 
-use smithay::desktop::utils::under_from_surface_tree;
-use smithay::desktop::WindowSurfaceType;
+use smithay::desktop::{layer_map_for_output, WindowSurfaceType};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point};
 use smithay::wayland::shell::wlr_layer::Layer;
@@ -80,34 +79,25 @@ impl PrismState {
         Some((within_output.0, within_output.1 + output_loc))
     }
 
-    /// Hit-test the layer-shell surfaces on `output_id` belonging to `layer`,
-    /// most-recently-mapped first. Returns the deepest surface under the point
-    /// and its origin in output-local coordinates.
+    /// Hit-test the layer-shell surfaces on `output_id` belonging to `layer`.
+    /// Returns the deepest surface under the point and its origin in
+    /// output-local coordinates.
     ///
-    /// `LayerEntry::surface` is the raw `wlr_layer` handle (not smithay's
-    /// `desktop::LayerSurface`, which carries the popup-aware `surface_under`),
-    /// so we walk the surface tree from its root directly. That covers
-    /// subsurfaces; layer-shell popups aren't tracked yet and so aren't hit.
+    /// Delegates to the per-output `LayerMap`: `layer_under` picks the
+    /// top-most layer surface (by z-order) whose bbox-with-popups contains the
+    /// point, then `LayerSurface::surface_under` descends popups + subsurfaces
+    /// to the deepest input surface.
     fn layer_under(
         &self,
         output_id: &OutputId,
         pos_within_output: Point<f64, Logical>,
         layer: Layer,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        let entries = self.layer_surfaces.get(output_id)?;
-        entries
-            .iter()
-            .rev()
-            .filter(|entry| entry.layer == layer)
-            .find_map(|entry| {
-                let rect = entry.last_rect?;
-                under_from_surface_tree(
-                    entry.surface.wl_surface(),
-                    pos_within_output,
-                    rect.loc,
-                    WindowSurfaceType::ALL,
-                )
-                .map(|(surface, surface_pos)| (surface, surface_pos.to_f64()))
-            })
+        let output = self.wl_outputs.get(output_id)?;
+        let map = layer_map_for_output(output);
+        let ls = map.layer_under(layer, pos_within_output)?;
+        let loc = map.layer_geometry(ls)?.loc.to_f64();
+        ls.surface_under(pos_within_output - loc, WindowSurfaceType::ALL)
+            .map(|(surface, surface_pos)| (surface, surface_pos.to_f64() + loc))
     }
 }
