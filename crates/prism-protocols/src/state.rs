@@ -53,14 +53,15 @@ use smithay::delegate_xdg_activation;
 use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
 use smithay::desktop::{
-    find_popup_root_surface, PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab,
-    PopupUngrabStrategy, Window,
+    find_popup_root_surface, get_popup_toplevel_coords, PopupKeyboardGrab, PopupKind, PopupManager,
+    PopupPointerGrab, PopupUngrabStrategy, Window,
 };
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, Focus};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::ConstraintAdjustment;
 use smithay::reexports::wayland_server::backend::{ClientData, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
@@ -69,7 +70,7 @@ use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource};
-use smithay::utils::{IsAlive, Serial, Transform};
+use smithay::utils::{IsAlive, Logical, Rectangle, Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     add_pre_commit_hook, get_parent, get_role, with_states, CompositorClientState,
@@ -1833,6 +1834,84 @@ delegate_shm!(PrismState);
 
 // ─── xdg-shell ──────────────────────────────────────────────────────────────
 
+impl PrismState {
+    /// Reposition `popup`'s pending geometry so it stays within its parent's
+    /// on-screen working area, honoring the client's positioner
+    /// constraint_adjustment (flip / slide / resize). Mirrors niri's
+    /// `unconstrain_popup` for the window-popup case.
+    ///
+    /// Window popups only for now: layer-shell popups keep their requested
+    /// geometry (their working-area math differs and isn't ported yet).
+    fn unconstrain_popup(&self, popup: &PopupKind) {
+        let Ok(root) = find_popup_root_surface(popup) else {
+            return;
+        };
+        let Some(window) = self
+            .layout
+            .find_window_and_output(&root)
+            .map(|(mapped, _)| mapped.window.clone())
+        else {
+            return;
+        };
+
+        // `popup_target_rect` is relative to the parent window's geometry;
+        // shift it into the popup's own coordinate space (the positioner
+        // anchors against the parent, and the popup's own toplevel-coords
+        // offset must be subtracted to compare in the same frame).
+        let mut target = self.layout.popup_target_rect(&window);
+        target.loc -= get_popup_toplevel_coords(popup).to_f64();
+
+        let PopupKind::Xdg(popup) = popup else {
+            return;
+        };
+        popup.with_pending_state(|state| {
+            state.geometry = unconstrain_with_padding(state.positioner, target);
+        });
+    }
+}
+
+/// Unconstrain `positioner` against `target`, preferring an 8px inset (nicer
+/// looking) and falling back to the full target if the padded fit fails.
+/// Ported from niri's `unconstrain_with_padding`.
+fn unconstrain_with_padding(
+    positioner: PositionerState,
+    target: Rectangle<f64, Logical>,
+) -> Rectangle<i32, Logical> {
+    const PADDING: f64 = 8.;
+
+    let mut padded = target;
+    if PADDING * 2. < padded.size.w {
+        padded.loc.x += PADDING;
+        padded.size.w -= PADDING * 2.;
+    }
+    if PADDING * 2. < padded.size.h {
+        padded.loc.y += PADDING;
+        padded.size.h -= PADDING * 2.;
+    }
+
+    // Too small to pad — unconstrain against the raw target.
+    if padded == target {
+        return positioner.get_unconstrained_geometry(target.to_i32_round());
+    }
+
+    // Try the padded target without allowing a resize (resizing to fit the
+    // inset would defeat the cosmetic padding).
+    let mut no_resize = positioner;
+    no_resize
+        .constraint_adjustment
+        .remove(ConstraintAdjustment::ResizeX);
+    no_resize
+        .constraint_adjustment
+        .remove(ConstraintAdjustment::ResizeY);
+    let geo = no_resize.get_unconstrained_geometry(padded.to_i32_round());
+    if padded.contains_rect(geo.to_f64()) {
+        return geo;
+    }
+
+    // Padded fit failed; fall back to the full target.
+    positioner.get_unconstrained_geometry(target.to_i32_round())
+}
+
 impl XdgShellHandler for PrismState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell
@@ -1847,19 +1926,15 @@ impl XdgShellHandler for PrismState {
         // hook above (so the client has a chance to set title / app_id first).
     }
 
-    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
-        // Seed the popup's pending geometry from the positioner so the
-        // initial configure (sent on first commit, in the CompositorHandler)
-        // carries the placement the client asked for. `get_geometry`
-        // resolves the anchor rect + gravity + offset into a rect relative
-        // to the parent's window geometry.
-        //
-        // We don't unconstrain against the output work area yet, so a popup
-        // anchored near a screen edge can extend past it (no flip/slide
-        // adjustment). Acceptable for now — placement is otherwise correct.
-        surface.with_pending_state(|state| {
-            state.geometry = positioner.get_geometry();
-        });
+    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        // Set the popup's pending geometry, unconstrained against the
+        // parent's on-screen working area so it stays visible (flip/slide/
+        // resize per the client's positioner constraint_adjustment). This is
+        // sent with the initial configure on first commit. smithay has
+        // already stashed the positioner in the popup's pending state by the
+        // time this fires, so `unconstrain_popup` reads it back (we don't
+        // need the `_positioner` arg).
+        self.unconstrain_popup(&PopupKind::Xdg(surface.clone()));
         if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface)) {
             tracing::warn!(?err, "failed to track new xdg_popup");
         }
@@ -1923,13 +1998,17 @@ impl XdgShellHandler for PrismState {
         positioner: PositionerState,
         token: u32,
     ) {
-        // xdg_popup.reposition: recompute geometry from the new positioner
-        // and echo the token back via the repositioned event so the client
-        // can correlate. Used by menus that re-anchor (e.g. a submenu that
-        // would overflow). Redraw is queued from the subsequent commit.
+        // xdg_popup.reposition: recompute geometry from the new positioner,
+        // unconstrain it against the parent's working area, then echo the
+        // token back via the repositioned event so the client can correlate.
+        // Used by menus that re-anchor (e.g. a submenu that would overflow).
+        // Store the new positioner so `unconstrain_popup` adjusts against it.
+        // Redraw is queued from the subsequent commit.
         surface.with_pending_state(|state| {
             state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
         });
+        self.unconstrain_popup(&PopupKind::Xdg(surface.clone()));
         surface.send_repositioned(token);
     }
 
