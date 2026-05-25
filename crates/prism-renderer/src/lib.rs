@@ -1,6 +1,7 @@
 //! Vulkan (ash) renderer.
 //!
-//! One renderer instance per GPU. Consumes `prism_frame::FrameDescription`,
+//! One renderer instance per GPU. Consumes the Vulkan-native frame model in
+//! [`element`] (a back-to-front list of [`RenderEl`](element::RenderEl)s),
 //! produces scanout buffers for `prism_drm` to submit.
 
 pub mod cross_gpu;
