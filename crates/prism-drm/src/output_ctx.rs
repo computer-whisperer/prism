@@ -768,9 +768,13 @@ impl OutputContext {
         // below for the duration of the atomic commit; after the
         // commit ioctl returns, the kernel holds its own dup and
         // the `OwnedFd` is free to be returned to the caller.
-        let present_sync =
-            self.renderer
-                .render_frame(&back.image, &frame.draws, encode_push, wait_semaphores)?;
+        let present_sync = self.renderer.render_frame(
+            &back.image,
+            &frame.draws,
+            &damage,
+            encode_push,
+            wait_semaphores,
+        )?;
 
         let src =
             Rectangle::from_size((self.extent.width as i32, self.extent.height as i32).into())
@@ -839,6 +843,10 @@ impl OutputContext {
             res?;
         }
         self.frame_pending = true;
+        // The flip is submitted — this frame's damage has reached the scanout,
+        // so advance the tracker's baseline. (On the `?` early-returns above the
+        // commit is skipped, so a failed flip re-damages next frame.)
+        self.damage_tracker.commit();
         Ok(Some(present_sync))
     }
 }

@@ -542,7 +542,9 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     // Headless readback path — the SYNC_FD returned by render_frame is
     // dropped, and we device_wait_idle for completeness. (One-shot test
     // doesn't use the page-flip path the fd is meant for.)
-    let _present_sync = renderer.render_frame(&scanout, &[element], &encode_push, &[])?;
+    // Damage `&[]`: a freshly built Renderer forces a full first-frame paint
+    // regardless, so the empty damage list is moot here.
+    let _present_sync = renderer.render_frame(&scanout, &[element], &[], &encode_push, &[])?;
     unsafe {
         let _ = device.raw.device_wait_idle();
     }
@@ -2486,7 +2488,9 @@ fn run_gradient_scanout(output_name: Option<&str>, depth: prism_drm::ScanoutDept
     // committed by render_frame finishes before the page-flip; the
     // returned SYNC_FD is dropped (we don't use the IN_FENCE_FD path
     // here, the synchronous wait is simpler for a one-shot test).
-    let _present_sync = renderer.render_frame(&scanout_image, &[element], &encode_push, &[])?;
+    // Damage `&[]`: fresh Renderer → forced full first-frame paint anyway.
+    let _present_sync =
+        renderer.render_frame(&scanout_image, &[element], &[], &encode_push, &[])?;
     unsafe {
         let _ = device.raw.device_wait_idle();
     }

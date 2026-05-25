@@ -32,6 +32,11 @@ struct Snapshot {
 #[derive(Default)]
 pub struct DamageTracker {
     last: HashMap<ElementId, Snapshot>,
+    /// State staged by the most recent [`compute`](Self::compute), promoted to
+    /// `last` by [`commit`](Self::commit) once the frame is known to have been
+    /// presented. Kept separate so a dropped or failed flip re-damages next
+    /// frame instead of losing the damage.
+    pending: Option<HashMap<ElementId, Snapshot>>,
 }
 
 impl DamageTracker {
@@ -44,10 +49,10 @@ impl DamageTracker {
     /// pixels. `scale` converts logical → physical (the output has no rotation,
     /// so this is just per-axis scale + round).
     ///
-    /// Advances the stored state immediately. NOTE: once the render is actually
-    /// scissored to this result (Stage 2), the advance must move to *after* a
-    /// successful present — otherwise a dropped or failed page-flip would lose
-    /// the damage and leave stale pixels next frame.
+    /// Stages the new state in `pending` but does *not* advance `last` — the
+    /// caller must call [`commit`](Self::commit) after a successful present.
+    /// This keeps the diff baselined on the last frame that actually reached
+    /// the screen, so a skipped or failed flip re-damages rather than dropping.
     pub fn compute(
         &mut self,
         meta: &[FrameElementMeta],
@@ -91,8 +96,18 @@ impl DamageTracker {
             }
         }
 
-        self.last = current;
+        self.pending = Some(current);
         damage
+    }
+
+    /// Promote the most recent [`compute`](Self::compute)'s state to current.
+    /// Call only after the frame was actually presented (a successful flip); on
+    /// a skipped or failed present, don't call it so the damage is recomputed
+    /// against the same baseline next frame.
+    pub fn commit(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.last = pending;
+        }
     }
 }
 
@@ -137,6 +152,7 @@ mod tests {
         let mut t = DamageTracker::new();
         let frame = [meta(1, 0., 0., 100., 100., 7)];
         t.compute(&frame, scale1());
+        t.commit();
         assert!(t.compute(&frame, scale1()).is_empty());
     }
 
@@ -144,6 +160,7 @@ mod tests {
     fn content_change_damages_geometry() {
         let mut t = DamageTracker::new();
         t.compute(&[meta(1, 0., 0., 100., 100., 1)], scale1());
+        t.commit();
         let d = t.compute(&[meta(1, 0., 0., 100., 100., 2)], scale1());
         assert_eq!(d, vec![rect(0, 0, 100, 100)]);
     }
@@ -152,6 +169,7 @@ mod tests {
     fn move_damages_old_and_new() {
         let mut t = DamageTracker::new();
         t.compute(&[meta(1, 0., 0., 100., 100., 0)], scale1());
+        t.commit();
         let d = t.compute(&[meta(1, 50., 0., 100., 100., 0)], scale1());
         assert_eq!(d.len(), 2);
         assert!(d.contains(&rect(50, 0, 100, 100)));
@@ -168,6 +186,7 @@ mod tests {
             ],
             scale1(),
         );
+        t.commit();
         let d = t.compute(&[meta(1, 0., 0., 100., 100., 0)], scale1());
         assert_eq!(d, vec![rect(200, 0, 50, 50)]);
     }
@@ -178,8 +197,20 @@ mod tests {
         let a = meta(1, 0., 0., 10., 10., 0);
         let b = meta(2, 0., 0., 10., 10., 0);
         t.compute(&[a.clone(), b.clone()], scale1());
+        t.commit();
         // Swap z-order; geometry and content unchanged.
         assert!(!t.compute(&[b, a], scale1()).is_empty());
+    }
+
+    #[test]
+    fn uncommitted_frame_redamages_until_committed() {
+        let mut t = DamageTracker::new();
+        let frame = [meta(1, 0., 0., 100., 100., 7)];
+        assert_eq!(t.compute(&frame, scale1()).len(), 1); // new element
+                                                          // No commit → baseline unchanged → still damaged next compute.
+        assert_eq!(t.compute(&frame, scale1()).len(), 1);
+        t.commit();
+        assert!(t.compute(&frame, scale1()).is_empty()); // baseline advanced
     }
 
     #[test]

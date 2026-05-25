@@ -27,6 +27,7 @@ use crate::lut3d::{identity_lut, Lut3dTexture, LUT_CUBE_EDGE};
 use crate::pipeline::decode::{DecodePipeline, DecodePush};
 use crate::pipeline::encode::{EncodePipeline, EncodePush};
 use crate::upload::ShmTexture;
+use prism_frame::{Physical, Rectangle};
 
 /// Default 3D LUT cube edge. See `lut3d::LUT_CUBE_EDGE` for the
 /// renderer-wide constant; this is the per-output binding that mirrors
@@ -254,20 +255,23 @@ impl Renderer {
         self.intermediate_format
     }
 
-    fn ensure_intermediate(&mut self, extent: vk::Extent2D) -> Result<()> {
+    /// Ensure the persistent intermediate matches `extent`/format. Returns
+    /// `true` if it was (re)allocated this call — meaning its contents are
+    /// undefined and the caller must paint the full frame (no preservation).
+    fn ensure_intermediate(&mut self, extent: vk::Extent2D) -> Result<bool> {
         if self.intermediate.as_ref().is_some_and(|i| {
             i.extent.width == extent.width
                 && i.extent.height == extent.height
                 && i.format == self.intermediate_format
         }) {
-            return Ok(());
+            return Ok(false);
         }
         self.intermediate = Some(Intermediate::new(
             self.device.clone(),
             extent,
             self.intermediate_format,
         )?);
-        Ok(())
+        Ok(true)
     }
 
     /// Render one frame into `scanout` (which must match `scanout_format`).
@@ -287,6 +291,13 @@ impl Renderer {
         &mut self,
         scanout: &ImportedImage,
         elements: &[ElementDraw],
+        // Damaged regions in physical pixels (from the per-output DamageTracker).
+        // The decode pass repaints only their bounding box, preserving the rest
+        // of the persistent intermediate. Empty ⇒ nothing changed ⇒ the decode
+        // pass is skipped entirely (the intermediate already holds the correct
+        // composite). Ignored on the first frame / after a realloc, where the
+        // intermediate is uninitialized and must be painted in full.
+        damage: &[Rectangle<i32, Physical>],
         encode_push: &EncodePush,
         // Binary semaphores the render must wait on before sampling — used
         // for cross-GPU mirror copies (a home GPU's copy into the shared
@@ -296,7 +307,20 @@ impl Renderer {
         wait_semaphores: &[vk::Semaphore],
     ) -> Result<OwnedFd> {
         let extent = scanout.extent();
-        self.ensure_intermediate(extent)?;
+        // `force_full`: the intermediate was just (re)allocated, so its contents
+        // are undefined and the whole frame must be painted regardless of damage.
+        let force_full = self.ensure_intermediate(extent)?;
+        let full_area = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        };
+        // The region the decode pass repaints this frame. `None` ⇒ skip decode
+        // (no damage and the intermediate is already valid).
+        let decode_area: Option<vk::Rect2D> = if force_full {
+            Some(full_area)
+        } else {
+            damage_bbox(damage, extent)
+        };
         let intermediate = self.intermediate.as_ref().unwrap();
 
         let slot_idx = self.next_slot;
@@ -326,9 +350,141 @@ impl Renderer {
         unsafe { self.device.raw.begin_command_buffer(cb, &begin_info) }
             .vk_ctx("begin_command_buffer (renderer)")?;
 
-        // ── Decode pass ────────────────────────────────────────────────────
-        let pre_intermediate = [barrier_image(
-            intermediate.image,
+        // ── Decode pass (scissored to damage) ───────────────────────────────
+        // Repaint only `decode_area` of the persistent intermediate, preserving
+        // the rest (last frame's composite is still valid outside the damage).
+        // Skipped entirely when there's no damage and the intermediate is valid.
+        if let Some(area) = decode_area {
+            // Bring the intermediate to COLOR_ATTACHMENT. On the full-paint
+            // frame its prior contents are undefined (discard from UNDEFINED);
+            // otherwise preserve them — the previous frame's encode left it in
+            // SHADER_READ_ONLY_OPTIMAL, and we only overwrite `area`.
+            let (old_layout, src_stage, src_access) = if force_full {
+                (
+                    vk::ImageLayout::UNDEFINED,
+                    vk::PipelineStageFlags2::TOP_OF_PIPE,
+                    vk::AccessFlags2::empty(),
+                )
+            } else {
+                (
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                )
+            };
+            let pre_intermediate = [barrier_image(
+                intermediate.image,
+                old_layout,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                src_stage,
+                src_access,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            )];
+
+            // Global memory dependency picking up writes made outside our queue
+            // submission stream — specifically client-side writes to dmabuf BOs
+            // we're about to sample. The dmabuf's implicit-sync resv on radv
+            // already gates queue execution on producer fences, but the
+            // visibility barrier (MEMORY_WRITE → SHADER_SAMPLED_READ) is still
+            // required so the fragment shader sees fresh pixels rather than
+            // anything cached from a prior frame's sample.
+            let producer_sync = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
+            unsafe {
+                self.device.raw.cmd_pipeline_barrier2(
+                    cb,
+                    &vk::DependencyInfo::default()
+                        .memory_barriers(&producer_sync)
+                        .image_memory_barriers(&pre_intermediate),
+                );
+            }
+
+            // CLEAR scopes to `render_area`, so only the damaged box is cleared;
+            // pixels outside it keep last frame's composite.
+            let color_attach = [vk::RenderingAttachmentInfo::default()
+                .image_view(intermediate.view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 0.0],
+                    },
+                })];
+            let render_info = vk::RenderingInfo::default()
+                .render_area(area)
+                .layer_count(1)
+                .color_attachments(&color_attach);
+            unsafe {
+                self.device.raw.cmd_begin_rendering(cb, &render_info);
+
+                // Viewport spans the whole output (element vertices are in clip
+                // space for the full framebuffer); the scissor confines written
+                // fragments to the damaged box.
+                let viewport = vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: extent.width as f32,
+                    height: extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                self.device.raw.cmd_set_viewport(cb, 0, &[viewport]);
+                self.device.raw.cmd_set_scissor(cb, 0, &[area]);
+
+                self.device.raw.cmd_bind_pipeline(
+                    cb,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.decode.pipeline,
+                );
+
+                for el in elements {
+                    let luma_info = [vk::DescriptorImageInfo::default()
+                        .sampler(self.decode.sampler)
+                        .image_view(el.texture_view)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                    // Binding 1 = chroma for YUV; for RGB bind the same view as
+                    // binding 0 so the statically-referenced sampler stays valid.
+                    let chroma_info = [vk::DescriptorImageInfo::default()
+                        .sampler(self.decode.sampler)
+                        .image_view(el.chroma_view.unwrap_or(el.texture_view))
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                    let writes = [
+                        self.decode.write_texture_binding(0, &luma_info),
+                        self.decode.write_texture_binding(1, &chroma_info),
+                    ];
+                    self.decode.push_loader.cmd_push_descriptor_set(
+                        cb,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.decode.pipeline_layout,
+                        0,
+                        &writes,
+                    );
+                    self.device.raw.cmd_push_constants(
+                        cb,
+                        self.decode.pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        bytemuck::bytes_of(&el.push),
+                    );
+                    self.device.raw.cmd_draw(cb, 4, 1, 0, 0);
+                }
+
+                self.device.raw.cmd_end_rendering(cb);
+            }
+        }
+
+        // ── Barrier: scanout → COLOR_ATTACHMENT; intermediate → SHADER_READ ──
+        // The scanout always becomes the encode target. The intermediate only
+        // needs the COLOR→SHADER_READ transition when we actually decoded into
+        // it this frame; when the decode was skipped it is still in SHADER_READ
+        // from the previous frame.
+        let mut mid_barriers = vec![barrier_image(
+            scanout.image(),
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::PipelineStageFlags2::TOP_OF_PIPE,
@@ -336,107 +492,8 @@ impl Renderer {
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         )];
-
-        // Global memory dependency picking up writes made outside our queue
-        // submission stream — specifically client-side writes to dmabuf BOs
-        // we're about to sample. The dmabuf's implicit-sync resv on radv
-        // already gates queue execution on producer fences, but the
-        // visibility barrier (MEMORY_WRITE → SHADER_SAMPLED_READ) is still
-        // required so the fragment shader sees fresh pixels rather than
-        // anything cached from a prior frame's sample.
-        let producer_sync = [vk::MemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
-        unsafe {
-            self.device.raw.cmd_pipeline_barrier2(
-                cb,
-                &vk::DependencyInfo::default()
-                    .memory_barriers(&producer_sync)
-                    .image_memory_barriers(&pre_intermediate),
-            );
-        }
-
-        let color_attach = [vk::RenderingAttachmentInfo::default()
-            .image_view(intermediate.view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 0.0],
-                },
-            })];
-        let render_info = vk::RenderingInfo::default()
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent,
-            })
-            .layer_count(1)
-            .color_attachments(&color_attach);
-        unsafe {
-            self.device.raw.cmd_begin_rendering(cb, &render_info);
-
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: extent.width as f32,
-                height: extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            let scissor = vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent,
-            };
-            self.device.raw.cmd_set_viewport(cb, 0, &[viewport]);
-            self.device.raw.cmd_set_scissor(cb, 0, &[scissor]);
-
-            self.device.raw.cmd_bind_pipeline(
-                cb,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.decode.pipeline,
-            );
-
-            for el in elements {
-                let luma_info = [vk::DescriptorImageInfo::default()
-                    .sampler(self.decode.sampler)
-                    .image_view(el.texture_view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-                // Binding 1 = chroma for YUV; for RGB bind the same view as
-                // binding 0 so the statically-referenced sampler stays valid.
-                let chroma_info = [vk::DescriptorImageInfo::default()
-                    .sampler(self.decode.sampler)
-                    .image_view(el.chroma_view.unwrap_or(el.texture_view))
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-                let writes = [
-                    self.decode.write_texture_binding(0, &luma_info),
-                    self.decode.write_texture_binding(1, &chroma_info),
-                ];
-                self.decode.push_loader.cmd_push_descriptor_set(
-                    cb,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.decode.pipeline_layout,
-                    0,
-                    &writes,
-                );
-                self.device.raw.cmd_push_constants(
-                    cb,
-                    self.decode.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    bytemuck::bytes_of(&el.push),
-                );
-                self.device.raw.cmd_draw(cb, 4, 1, 0, 0);
-            }
-
-            self.device.raw.cmd_end_rendering(cb);
-        }
-
-        // ── Barrier: intermediate → SHADER_READ; scanout → COLOR_ATTACHMENT ─
-        let mid_barriers = [
-            barrier_image(
+        if decode_area.is_some() {
+            mid_barriers.push(barrier_image(
                 intermediate.image,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -444,17 +501,8 @@ impl Renderer {
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 vk::PipelineStageFlags2::FRAGMENT_SHADER,
                 vk::AccessFlags2::SHADER_SAMPLED_READ,
-            ),
-            barrier_image(
-                scanout.image(),
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags2::TOP_OF_PIPE,
-                vk::AccessFlags2::empty(),
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            ),
-        ];
+            ));
+        }
         unsafe {
             self.device.raw.cmd_pipeline_barrier2(
                 cb,
@@ -621,6 +669,36 @@ impl Drop for Renderer {
                 .destroy_command_pool(self.command_pool, None);
         }
     }
+}
+
+/// Bounding box of the damage rects, clipped to the output. `None` if there is
+/// no damage, or it lies entirely outside the output. The decode pass repaints
+/// this single box (per-rect scissoring is a later refinement).
+fn damage_bbox(damage: &[Rectangle<i32, Physical>], extent: vk::Extent2D) -> Option<vk::Rect2D> {
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    for r in damage {
+        min_x = min_x.min(r.loc.x);
+        min_y = min_y.min(r.loc.y);
+        max_x = max_x.max(r.loc.x + r.size.w);
+        max_y = max_y.max(r.loc.y + r.size.h);
+    }
+    let x0 = min_x.max(0);
+    let y0 = min_y.max(0);
+    let x1 = max_x.min(extent.width as i32);
+    let y1 = max_y.min(extent.height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        },
+    })
 }
 
 fn barrier_image(
