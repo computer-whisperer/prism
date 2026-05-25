@@ -107,4 +107,8 @@ GBM→Vulkan→clear→CPU readback (dmabuf import infra), the dmabuf-handler im
 - `scripts/firefox-test.sh` — `prism run` + Firefox in a TTY with
   `prism_protocols=debug` and Firefox `MOZ_LOG` for the HDR-video path. `NO_HDR=1`
   disables Firefox Wayland HDR (isolates the HDR path from plain SDR rendering).
+- `scripts/layer-test.sh [seconds]` — `prism run` + `swaybg` (Background
+  wallpaper) + `waybar` (Top bar) + a window, to verify `wlr_layer_shell`
+  Z-order and color management. Env: `OUTPUT`/`DEPTH`, `WALLPAPER`(_COLOR),
+  `BAR_BIN`/`WINDOW_BIN`, `NO_WALLPAPER`/`NO_BAR`/`NO_WINDOW`.
 - `crates/prism-wlcs/conformance/run.sh /path/to/wlcs` — protocol-conformance gate.
