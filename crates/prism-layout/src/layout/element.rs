@@ -19,6 +19,7 @@
 //! they'll be plumbed back in.
 
 use prism_config::CornerRadius;
+use prism_frame::ElementId;
 use prism_renderer::{
     srgb_to_bt2020_nits, vk, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl,
 };
@@ -152,6 +153,24 @@ impl<'a> RenderCtx<'a> {
 /// gets identical color management, cross-GPU mirror handling, and
 /// subsurface z-ordering as ordinary windows. There is no separate,
 /// unmanaged blit path for our own UI.
+/// Per-surface stable [`ElementId`], stored in the surface's `data_map` and
+/// allocated once on first access. Keyed on the surface so the damage tracker
+/// sees the same id every frame for a given surface. (smithay derives this
+/// from the `wl_surface` `ObjectId`; we keep our own `NonZeroU64` so
+/// `ElementId` stays a cheap key with no wayland types in `prism-frame`.)
+struct SurfaceElementId(ElementId);
+
+fn surface_element_id(states: &SurfaceData) -> ElementId {
+    states
+        .data_map
+        .insert_if_missing_threadsafe(|| SurfaceElementId(ElementId::alloc()));
+    states
+        .data_map
+        .get::<SurfaceElementId>()
+        .expect("just inserted")
+        .0
+}
+
 pub fn push_surface_tree_elements(
     surface: &WlSurface,
     buf_origin: Point<f64, Logical>,
@@ -224,6 +243,7 @@ pub fn push_surface_tree_elements(
                 let dst = Rectangle::new(pos, view.dst.to_f64());
                 let nits = ctx.color_for(states).sdr_white_nits;
                 surf_els.push(RenderEl::SolidColor(SolidColorEl {
+                    id: surface_element_id(states),
                     geometry: dst,
                     color_bt2020_nits: srgb_to_bt2020_nits(
                         rgba[0] as f32 / 255.0,
@@ -265,6 +285,7 @@ pub fn push_surface_tree_elements(
 
             let (chroma_view, yuv) = ctx.yuv_for(states);
             surf_els.push(RenderEl::Surface(SurfaceEl {
+                id: surface_element_id(states),
                 texture_view,
                 chroma_view,
                 yuv,

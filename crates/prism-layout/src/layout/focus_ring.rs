@@ -15,6 +15,7 @@
 //!
 //! API preserved so the layout port (`tile.rs`) compiles unchanged.
 
+use prism_frame::ElementId;
 use prism_renderer::{srgb_to_bt2020_nits, BorderEl, RenderEl};
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
@@ -32,6 +33,10 @@ pub struct FocusRing {
     /// Logical-pixel width of the ring (mirrors `config.width`). Cached
     /// because callers ask for it many times per frame.
     width: f64,
+    /// Stable cross-frame element id, allocated once per ring. Lives here (not
+    /// re-derived per frame) so the damage tracker sees the same id every
+    /// frame — niri's "id in the cached SolidColorBuffer" pattern.
+    id: ElementId,
     /// Geometry produced by the most recent `update_render_elements` call.
     /// `None` until first update or when the ring is off.
     cached: Option<CachedGeometry>,
@@ -61,6 +66,7 @@ impl FocusRing {
         Self {
             config,
             width,
+            id: ElementId::alloc(),
             cached: None,
         }
     }
@@ -157,12 +163,14 @@ impl FocusRing {
 
         if cached.is_border {
             out.push(RenderEl::Border(BorderEl {
+                id: self.id,
                 geometry: outer_logical,
                 thickness: cached.thickness_logical,
                 color_bt2020_nits: cached.color_bt2020_nits,
             }));
         } else {
             out.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
+                id: self.id,
                 geometry: outer_logical,
                 color_bt2020_nits: cached.color_bt2020_nits,
             }));

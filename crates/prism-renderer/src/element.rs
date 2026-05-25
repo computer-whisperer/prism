@@ -22,7 +22,7 @@
 use crate::pipeline::decode::DecodePush;
 use crate::renderer::ElementDraw;
 use ash::vk;
-use prism_frame::{Logical, Point, Rectangle, Size};
+use prism_frame::{ElementId, Logical, Point, Rectangle, Size};
 
 /// Logical → Vulkan-clip-space projection for one output.
 ///
@@ -121,6 +121,9 @@ impl Default for SurfaceColorParams {
 /// One per surface tree node; produced by walking the surface tree at
 /// frame-build time.
 pub struct SurfaceEl {
+    /// Stable cross-frame id (the owning surface's allocated id). Same id this
+    /// frame as last = same element, for the damage diff.
+    pub id: ElementId,
     /// Sampled texture. For YUV surfaces (`yuv != 0`) this is the luma plane.
     pub texture_view: vk::ImageView,
     /// Chroma plane for YUV surfaces; `None` for RGB. Pairs with `yuv`.
@@ -173,6 +176,9 @@ fn mat3_to_mat4_colmajor(m: prism_frame::Mat3) -> [f32; 16] {
 /// Uniformly-coloured rectangle. Backs window/layer backgrounds,
 /// fullscreen-padding fills, debug overlays.
 pub struct SolidColorEl {
+    /// Stable cross-frame id (surface id for single-pixel-buffer solids, or the
+    /// owning layout element's allocated id for backdrops / backgrounds).
+    pub id: ElementId,
     /// Output rect in logical pixels; projected to clip space at lowering.
     pub geometry: Rectangle<f64, Logical>,
     /// Colour in BT.2020 linear nits, RGBA. Use [`srgb_to_bt2020_nits`] to
@@ -226,6 +232,9 @@ fn solid_color_draw(
 /// variant or extra fields. For now the border is sharp-cornered, which
 /// matches niri's default config.
 pub struct BorderEl {
+    /// Stable cross-frame id (the owning `FocusRing`'s allocated id). The four
+    /// lowered stripes share it — the border is one element for damage.
+    pub id: ElementId,
     /// Outer rect (window + margin) in logical pixels.
     pub geometry: Rectangle<f64, Logical>,
     /// Per-side thickness in logical pixels, `[top, right, bottom, left]`

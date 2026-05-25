@@ -11,6 +11,7 @@ use std::time::Duration;
 use prism_animation::Clock;
 use prism_config::utils::MergeWith as _;
 use prism_config::{CenterFocusedColumn, CornerRadius, PresetSize, Workspace as WorkspaceConfig};
+use prism_frame::ElementId;
 use prism_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use prism_renderer::RenderEl;
 use smithay::desktop::{layer_map_for_output, Window};
@@ -92,6 +93,10 @@ pub struct Workspace<W: LayoutElement> {
     /// background rect directly in [`Self::render_background`], so the
     /// raw colour suffices.
     background_color: prism_config::Color,
+
+    /// Stable cross-frame id for the workspace background rect. Allocated once
+    /// so the damage tracker tracks it across frames.
+    background_id: ElementId,
 
     /// Clock for driving animations.
     pub(super) clock: Clock,
@@ -218,6 +223,7 @@ impl<W: LayoutElement> Workspace<W> {
             working_area,
             shadow: Shadow::new(shadow_config),
             background_color: options.layout.background_color,
+            background_id: ElementId::alloc(),
             output: Some(output),
             clock,
             base_options,
@@ -283,6 +289,7 @@ impl<W: LayoutElement> Workspace<W> {
             working_area,
             shadow: Shadow::new(shadow_config),
             background_color: options.layout.background_color,
+            background_id: ElementId::alloc(),
             clock,
             base_options,
             options,
@@ -1625,6 +1632,7 @@ impl<W: LayoutElement> Workspace<W> {
         let color_bt2020_nits =
             prism_renderer::srgb_to_bt2020_nits(rgba[0], rgba[1], rgba[2], rgba[3], 80.0);
         RenderEl::SolidColor(prism_renderer::SolidColorEl {
+            id: self.background_id,
             geometry: rect,
             color_bt2020_nits,
         })

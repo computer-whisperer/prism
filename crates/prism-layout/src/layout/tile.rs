@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use prism_animation::{Animation, Clock};
 use prism_config::utils::MergeWith as _;
+use prism_frame::ElementId;
 use prism_ipc::WindowLayout;
 use prism_renderer::RenderEl;
 use smithay::utils::{Logical, Point, Rectangle, Size};
@@ -55,6 +56,11 @@ pub struct Tile<W: LayoutElement> {
 
     /// The shadow around the window.
     shadow: Shadow,
+
+    /// Stable cross-frame id for the fullscreen black backdrop this tile emits
+    /// while fullscreen. Allocated once so the damage tracker tracks it across
+    /// frames (niri carries the id inside its cached `SolidColorBuffer`).
+    backdrop_id: ElementId,
 
     /// This tile's current sizing mode.
     ///
@@ -206,6 +212,7 @@ impl<W: LayoutElement> Tile<W> {
             border: FocusRing::new(border_config.into()),
             focus_ring: FocusRing::new(focus_ring_config),
             shadow: Shadow::new(shadow_config),
+            backdrop_id: ElementId::alloc(),
             sizing_mode,
             restore_to_floating: false,
             floating_window_size: None,
@@ -1093,6 +1100,7 @@ impl<W: LayoutElement> Tile<W> {
             let color_bt2020_nits =
                 prism_renderer::srgb_to_bt2020_nits(0., 0., 0., alpha, BACKDROP_SDR_WHITE_NITS);
             out.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
+                id: self.backdrop_id,
                 geometry: backdrop,
                 color_bt2020_nits,
             }));
