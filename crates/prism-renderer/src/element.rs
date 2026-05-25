@@ -152,7 +152,10 @@ fn cull_occluded(elements: &[RenderEl]) -> Vec<bool> {
         el.push_opaque_regions(&mut occluders);
     }
     if culled > 0 {
-        tracing::trace!(
+        // `debug!`, not `trace!`: release builds set `release_max_level_debug`,
+        // so a `trace!` here would compile out — and the test rig runs release.
+        // Opt in with `RUST_LOG=cull=debug` (mirrors the "damage" target).
+        tracing::debug!(
             target: "cull",
             total = elements.len(),
             culled,
