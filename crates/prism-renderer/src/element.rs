@@ -44,23 +44,49 @@ pub fn make_projector(
     }
 }
 
-/// Project + flatten a back-to-front `RenderEl` list into the `ElementDraw`
-/// stream `render_frame` consumes. Builds the per-output projector once from
-/// `view_size`, then lowers each element. `white_view` backs solid-colour and
-/// border draws; `output_peak_nits_rgb` is the per-output display-referred
-/// decode clamp threaded into every draw's push constants.
+/// Per-element metadata the damage tracker keys on — one entry per `RenderEl`
+/// (a border is one element even though it lowers to up to four stripe draws).
+/// Decoupled from the flat [`ElementDraw`] stream because the tracker works at
+/// element granularity while `render_frame` works at draw granularity.
+#[derive(Clone, Debug)]
+pub struct FrameElementMeta {
+    pub id: ElementId,
+    /// Output rect in logical pixels (the element's bounding box; for a border,
+    /// the outer rect). The tracker converts to physical for its diff.
+    pub geometry: Rectangle<f64, Logical>,
+}
+
+/// One frame lowered for one output: the flat draw stream `render_frame`
+/// consumes, plus the per-element metadata the damage tracker diffs. The two
+/// are intentionally *not* index-aligned (one border → one `meta`, four
+/// `draws`); they serve different consumers.
+pub struct LoweredFrame {
+    pub draws: Vec<ElementDraw>,
+    pub meta: Vec<FrameElementMeta>,
+}
+
+/// Project + flatten a back-to-front `RenderEl` list into a [`LoweredFrame`].
+/// Builds the per-output projector once from `view_size`, then lowers each
+/// element to its draws and records its metadata. `white_view` backs
+/// solid-colour and border draws; `output_peak_nits_rgb` is the per-output
+/// display-referred decode clamp threaded into every draw's push constants.
 pub fn lower_elements(
     elements: &[RenderEl],
     view_size: Size<f64, Logical>,
     white_view: vk::ImageView,
     output_peak_nits_rgb: [f32; 3],
-) -> Vec<ElementDraw> {
+) -> LoweredFrame {
     let project = make_projector(view_size);
-    let mut out = Vec::with_capacity(elements.len());
+    let mut draws = Vec::with_capacity(elements.len());
+    let mut meta = Vec::with_capacity(elements.len());
     for el in elements {
-        el.lower(&project, white_view, output_peak_nits_rgb, &mut out);
+        el.lower(&project, white_view, output_peak_nits_rgb, &mut draws);
+        meta.push(FrameElementMeta {
+            id: el.id(),
+            geometry: el.geometry(),
+        });
     }
-    out
+    LoweredFrame { draws, meta }
 }
 
 /// Color-decoding parameters for a [`SurfaceEl`]. Captures *what
@@ -324,6 +350,24 @@ pub enum RenderEl {
 }
 
 impl RenderEl {
+    /// Stable cross-frame id of this element.
+    pub fn id(&self) -> ElementId {
+        match self {
+            Self::Surface(s) => s.id,
+            Self::SolidColor(s) => s.id,
+            Self::Border(b) => b.id,
+        }
+    }
+
+    /// Output rect in logical pixels (bounding box; for a border, the outer rect).
+    pub fn geometry(&self) -> Rectangle<f64, Logical> {
+        match self {
+            Self::Surface(s) => s.geometry,
+            Self::SolidColor(s) => s.geometry,
+            Self::Border(b) => b.geometry,
+        }
+    }
+
     pub fn lower(
         &self,
         project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],

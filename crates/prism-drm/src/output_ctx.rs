@@ -26,8 +26,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use drm_fourcc::DrmModifier;
 use prism_renderer::{
-    synthesize_lut_from_matrix_curve, vk, Device, DrmDevId, ElementDraw, EncodePush, ImportedImage,
-    Renderer,
+    synthesize_lut_from_matrix_curve, vk, Device, DrmDevId, EncodePush, ImportedImage,
+    LoweredFrame, Renderer,
 };
 use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneState};
 use smithay::reexports::drm::control::{connector, crtc, framebuffer, Mode};
@@ -718,7 +718,7 @@ impl OutputContext {
     ///     if not needed.
     pub fn present(
         &mut self,
-        elements: &[ElementDraw],
+        frame: &LoweredFrame,
         encode_push: &EncodePush,
         // Cross-GPU mirror copy-done semaphores the render must wait on
         // before sampling. Empty for outputs with no mirrored surfaces.
@@ -740,7 +740,7 @@ impl OutputContext {
         // the `OwnedFd` is free to be returned to the caller.
         let present_sync =
             self.renderer
-                .render_frame(&back.image, elements, encode_push, wait_semaphores)?;
+                .render_frame(&back.image, &frame.draws, encode_push, wait_semaphores)?;
 
         let src =
             Rectangle::from_size((self.extent.width as i32, self.extent.height as i32).into())

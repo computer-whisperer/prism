@@ -2149,13 +2149,14 @@ fn render_output_now(
             .queue_redraw();
     }
 
-    // Lower RenderEls (output-space logical geometry + tint) → ElementDraws
-    // (clip-space + push constants). The renderer owns the logical → clip
-    // projection (built once from `view_size`); SolidColor/Border elements
-    // bind the white texel, Surface elements bind the per-surface view. The
-    // per-output panel peak is threaded through so the decoder's
-    // display-referred clamp lands at the right value for each output.
-    let elements = prism_renderer::lower_elements(
+    // Lower RenderEls (output-space logical geometry + tint) into a
+    // LoweredFrame: the flat ElementDraw stream (clip-space + push constants)
+    // render_frame consumes, plus the per-element metadata the damage tracker
+    // diffs. The renderer owns the logical → clip projection (built once from
+    // `view_size`); SolidColor/Border elements bind the white texel, Surface
+    // elements bind the per-surface view. The per-output panel peak is threaded
+    // through so the decoder's display-referred clamp lands at the right value.
+    let frame = prism_renderer::lower_elements(
         &render_els,
         view_size,
         white_view,
@@ -2183,7 +2184,7 @@ fn render_output_now(
                 view_h = view_size.h,
                 monitor_found,
                 n_render_els = render_els.len(),
-                n_draws = elements.len(),
+                n_draws = frame.draws.len(),
                 ?first_surface,
                 "FIRST present with tiles for output"
             );
@@ -2235,7 +2236,7 @@ fn render_output_now(
             .outputs
             .get_mut(output_id)
             .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
-        output.present(&elements, &encode_push, &render_waits)?
+        output.present(&frame, &encode_push, &render_waits)?
     };
     // The render submit has been queued with the waits in its dependency
     // list; the imported semaphores can be destroyed now.
