@@ -16,7 +16,7 @@ use prism_config::{Config, WindowRule};
 use prism_renderer::RenderEl;
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::desktop::space::SpaceElement as _;
-use smithay::desktop::Window;
+use smithay::desktop::{PopupManager, Window};
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -644,14 +644,40 @@ impl LayoutElement for Mapped {
     fn render_popups(
         &self,
         location: Point<f64, Logical>,
-        scale: Scale<f64>,
-        alpha: f32,
+        _scale: Scale<f64>,
+        _alpha: f32,
         project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
         ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
-        let _ = (location, scale, alpha, project, ctx, out);
         let _ = &self.blur_config;
+
+        // Parent surface buffer top-left in logical coords. Same conversion
+        // as `render_normal`: the layout gives us the window CONTENT origin,
+        // so subtract the window geometry offset to get the buffer origin.
+        let parent = self.toplevel().wl_surface();
+        let parent_buf_origin = location - self.window_geometry().loc.to_f64();
+
+        // `popups_for_surface` reads the popup tree off the parent surface's
+        // own data_map (it's an associated fn, no PopupManager handle
+        // needed), yielding every popup in the subtree with its offset
+        // accumulated down the chain — so nested submenus come through with
+        // the correct cumulative placement.
+        for (popup, popup_offset) in PopupManager::popups_for_surface(parent) {
+            // `popup_offset` places the popup's window-geometry top-left
+            // relative to the parent surface origin; subtract the popup's
+            // own geometry inset to land its BUFFER top-left, mirroring
+            // smithay's own popup render math.
+            let popup_buf_origin =
+                parent_buf_origin + (popup_offset - popup.geometry().loc).to_f64();
+            crate::layout::element::push_surface_tree_elements(
+                popup.wl_surface(),
+                popup_buf_origin,
+                project,
+                ctx,
+                out,
+            );
+        }
     }
 
     // niri's `render_background_effect` is not in prism's

@@ -358,8 +358,12 @@ pub trait LayoutElement {
     /// element's visual top-left.
     fn is_in_input_region(&self, point: Point<f64, Logical>) -> bool;
 
-    /// Emit all this element's draw calls into `out`. Default impl
-    /// emits popups then the normal surface.
+    /// Emit all this element's draw calls into `out`. Normal surface
+    /// first, then popups — `out` is back-to-front (the renderer draws it
+    /// in order with src-over blend, so earlier entries paint behind), so
+    /// popups appended last land on top of the window they belong to.
+    /// (niri emits popups first because its element lists are front-to-back;
+    /// prism's are the opposite, so the order is flipped here.)
     fn render(
         &self,
         location: Point<f64, Logical>,
@@ -369,8 +373,8 @@ pub trait LayoutElement {
         ctx: &RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
-        self.render_popups(location, scale, alpha, project, ctx, out);
         self.render_normal(location, scale, alpha, project, ctx, out);
+        self.render_popups(location, scale, alpha, project, ctx, out);
     }
 
     /// Emit the non-popup parts of the element. Default = no-op.

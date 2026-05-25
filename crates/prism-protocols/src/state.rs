@@ -52,7 +52,7 @@ use smithay::delegate_viewporter;
 use smithay::delegate_xdg_activation;
 use smithay::delegate_xdg_decoration;
 use smithay::delegate_xdg_shell;
-use smithay::desktop::Window;
+use smithay::desktop::{find_popup_root_surface, PopupKind, PopupManager, Window};
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
@@ -146,6 +146,15 @@ pub struct PrismState {
     pub display_handle: DisplayHandle,
     pub compositor: CompositorState,
     pub xdg_shell: XdgShellState,
+    /// xdg_popup bookkeeping (menus, dropdowns, tooltips). Popups are
+    /// not layout windows and not subsurfaces — they're a separate
+    /// surface tree parented to a toplevel (or another popup) and
+    /// positioned by an xdg_positioner. `PopupManager` owns the parent
+    /// chain and the per-popup positioner geometry; the render path
+    /// reads it back via `PopupManager::popups_for_surface` (an
+    /// associated fn keyed on the parent surface, so the layout walk
+    /// doesn't need a handle to this field).
+    pub popups: PopupManager,
     /// zxdg-decoration-manager-v1 — lets us negotiate SSD with
     /// clients that support it. We advertise the global; the
     /// [`XdgDecorationHandler`] decides per-toplevel whether to push
@@ -662,6 +671,7 @@ impl PrismState {
             display_handle: dh,
             compositor,
             xdg_shell,
+            popups: PopupManager::default(),
             xdg_decoration,
             shm,
             dmabuf_state,
@@ -1750,6 +1760,27 @@ impl CompositorHandler for PrismState {
             }
         }
 
+        // xdg_popup: advance the popup tree's committed state (re-resolves
+        // the positioner geometry against the latest parent geometry) and
+        // send the initial configure on the first commit so the client can
+        // attach a buffer and map. Mirrors the toplevel initial-configure
+        // dance above; `PopupManager::commit` is the popup analogue of the
+        // layout's `update_window`.
+        if let Some("xdg_popup") = role {
+            self.popups.commit(surface);
+            if let Some(PopupKind::Xdg(ref xdg)) = self.popups.find_popup(surface) {
+                if !xdg.is_initial_configure_sent() {
+                    // PopupSurface::send_configure only errors if the
+                    // positioner violated the protocol's constraint-
+                    // adjustment rules; with an untouched positioner it
+                    // can't, so surface the error loudly if it ever fires.
+                    if let Err(err) = xdg.send_configure() {
+                        tracing::warn!(?err, "failed to send initial xdg_popup configure");
+                    }
+                }
+            }
+        }
+
         // Surface→output assignment + wl_surface.enter/leave. Runs after
         // both process_surface_buffer (in case the new buffer is what
         // produced a layout-visible window) and the optional add_window
@@ -1813,20 +1844,45 @@ impl XdgShellHandler for PrismState {
         // hook above (so the client has a chance to set title / app_id first).
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
-        tracing::info!("new xdg_popup (not yet handled)");
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        // Seed the popup's pending geometry from the positioner so the
+        // initial configure (sent on first commit, in the CompositorHandler)
+        // carries the placement the client asked for. `get_geometry`
+        // resolves the anchor rect + gravity + offset into a rect relative
+        // to the parent's window geometry.
+        //
+        // We don't unconstrain against the output work area yet, so a popup
+        // anchored near a screen edge can extend past it (no flip/slide
+        // adjustment). Acceptable for now — placement is otherwise correct.
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+        });
+        if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface)) {
+            tracing::warn!(?err, "failed to track new xdg_popup");
+        }
     }
 
     fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
-        // No popup grab handling yet — no input plumbing.
+        // No popup grab handling yet — popups render and track position,
+        // but click-outside dismissal and keyboard/pointer routing into
+        // popup surfaces are a follow-up (needs PopupKeyboardGrab /
+        // PopupPointerGrab + pointer hit-testing into the popup tree).
     }
 
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
     ) {
+        // xdg_popup.reposition: recompute geometry from the new positioner
+        // and echo the token back via the repositioned event so the client
+        // can correlate. Used by menus that re-anchor (e.g. a submenu that
+        // would overflow). Redraw is queued from the subsequent commit.
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+        });
+        surface.send_repositioned(token);
     }
 
     // ─── Client-initiated state requests ────────────────────────────────
@@ -2607,11 +2663,24 @@ fn queue_redraw_for_surface(state: &mut PrismState, surface: &WlSurface) {
     // toplevels) then layer-shell tracking. Surfaces with no layout
     // binding yet (initial commit before add_window) silently skip —
     // the subsequent add_window path queues the redraw itself.
-    let output_name = state
-        .layout
-        .find_window_and_output(&root)
-        .and_then(|(_, out)| out.map(|o| o.name()))
-        .or_else(|| state.layer_surface_output_id(&root));
+    //
+    // Popups are not subsurfaces, so the `get_parent` walk above stops at
+    // the popup's own surface rather than its toplevel — that resolves to
+    // neither a layout window nor a layer. Follow the xdg_popup parent
+    // chain to the real root surface (toplevel or layer) and resolve that,
+    // so a popup commit repaints the output its parent sits on.
+    let resolve = |state: &PrismState, s: &WlSurface| {
+        state
+            .layout
+            .find_window_and_output(s)
+            .and_then(|(_, out)| out.map(|o| o.name()))
+            .or_else(|| state.layer_surface_output_id(s))
+    };
+    let output_name = resolve(state, &root).or_else(|| {
+        let popup = state.popups.find_popup(&root)?;
+        let popup_root = find_popup_root_surface(&popup).ok()?;
+        resolve(state, &popup_root)
+    });
 
     let Some(output_id) = output_name else {
         return;

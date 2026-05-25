@@ -2285,6 +2285,19 @@ fn render_output_now(
             &mut presentation_cbs,
             &mut release_trackers,
         );
+        // Popups are separate surface trees parented to this toplevel, not
+        // part of its subsurface tree, so the walk above doesn't reach
+        // them. Harvest each popup's tree too — otherwise a popup client
+        // that throttles on frame callbacks (waits for one before drawing
+        // its next frame) stalls after its first frame.
+        for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(surface) {
+            prism_protocols::redraw::harvest_surface_feedback(
+                popup.wl_surface(),
+                &mut frame_cbs,
+                &mut presentation_cbs,
+                &mut release_trackers,
+            );
+        }
     }
     // Same harvest for every layer-shell surface we just rendered (all four
     // layers now composite). harvest_surface_feedback descends each surface's
