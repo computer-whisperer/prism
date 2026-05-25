@@ -15,6 +15,7 @@
 use smithay::desktop::{layer_map_for_output, WindowSurfaceType};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point};
+use smithay::wayland::compositor::get_parent;
 use smithay::wayland::shell::wlr_layer::Layer;
 
 use prism_layout::layout::HitType;
@@ -23,6 +24,24 @@ use prism_layout::window::Mapped;
 use crate::state::{OutputId, PrismState};
 
 impl PrismState {
+    /// Whether `surface` is part of an xdg_popup tree (the popup surface
+    /// itself or a subsurface of one).
+    ///
+    /// Used to suppress window keyboard-focus changes (click-to-focus,
+    /// focus-follows-mouse) when the pointer is over a popup. Moving the
+    /// keyboard focus onto a popup surface sends `wl_keyboard.leave` to its
+    /// parent toplevel, and clients like Firefox dismiss their own (grab-less)
+    /// menus when the toplevel loses keyboard focus — so doing it on every
+    /// hover/click over the menu made menu items impossible to use. Popups
+    /// take keyboard focus only through a real popup grab, which prism honors
+    /// separately in `XdgShellHandler::grab`.
+    pub fn surface_is_popup(&self, surface: &WlSurface) -> bool {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        self.popups.find_popup(&root).is_some()
+    }
     /// The topmost surface under `pos` (global logical coords) together with
     /// that surface's origin in global logical coords, or `None` if nothing
     /// accepts input there.

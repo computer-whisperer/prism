@@ -133,14 +133,24 @@ pub fn on_pointer_button<I: PrismInputBackend>(
     // input handlers.
     if state_pressed && !pointer.is_grabbed() {
         if let Some((surface, _)) = surface_under_pointer(state) {
-            // Resolve the surface's output for focus_output.
-            let output_for_focus = state
-                .layout
-                .find_window_and_output(&surface)
-                .and_then(|(_, out)| out.cloned());
-            set_keyboard_focus(state, Some(surface));
-            if let Some(out) = output_for_focus {
-                state.layout.focus_output(&out);
+            // Click-to-focus is for switching between WINDOWS. Clicking a
+            // popup (menu item) must NOT move keyboard focus onto the popup:
+            // that sends wl_keyboard.leave to the parent toplevel, and
+            // grab-less clients like Firefox dismiss their own menu when the
+            // toplevel loses focus — so the click would tear the menu down
+            // before its item activates. The pointer button is still
+            // delivered below; we just skip the focus switch. Popup keyboard
+            // focus, when a client wants it, comes from a real popup grab.
+            if !state.surface_is_popup(&surface) {
+                // Resolve the surface's output for focus_output.
+                let output_for_focus = state
+                    .layout
+                    .find_window_and_output(&surface)
+                    .and_then(|(_, out)| out.cloned());
+                set_keyboard_focus(state, Some(surface));
+                if let Some(out) = output_for_focus {
+                    state.layout.focus_output(&out);
+                }
             }
         }
 
@@ -424,6 +434,13 @@ fn maybe_focus_follows_mouse(state: &mut PrismState) {
     // motion event inside the same window).
     let under = surface_under_pointer(state);
     if let Some((surface, _)) = under {
+        // Don't let focus-follows-mouse refocus while the pointer is over a
+        // popup: moving keyboard focus onto a popup surface (or away from the
+        // toplevel that owns it) makes grab-less clients like Firefox dismiss
+        // their own menus. The menu stays the user's focus until it closes.
+        if state.surface_is_popup(&surface) {
+            return;
+        }
         let window = state
             .layout
             .find_window_and_output(&surface)
