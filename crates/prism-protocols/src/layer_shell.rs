@@ -45,8 +45,18 @@ impl PrismState {
                 }
             }
             tracing::warn!(
-                "layer_shell: client requested an output we don't own; falling back to first"
+                "layer_shell: client requested an output we don't own; falling back to focused"
             );
+        }
+        // `output = None` (launchers like fuzzel/wofi, notification daemons):
+        // place on the *focused* output so the surface appears on the monitor
+        // the user is actually on, not an arbitrary `HashMap` entry. Fall back
+        // to any output only if nothing is focused yet.
+        if let Some(active) = self.active_output() {
+            let id = active.name();
+            if let Some(output) = self.wl_outputs.get(&id) {
+                return Some((id, output.clone()));
+            }
         }
         self.wl_outputs
             .iter()
