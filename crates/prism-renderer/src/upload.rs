@@ -5,11 +5,23 @@
 //! Fixed extent + format at construction. If the client resizes its surface,
 //! drop the old `ShmTexture` and create a new one.
 //!
-//! Upload is synchronous: the one-shot command buffer that runs the
-//! buffer→image copy waits for the queue to go idle before returning. That
-//! keeps each upload race-free against any in-flight render that may still
-//! be sampling the previous content. Cost: one queue stall per commit. Cheap
-//! at the workloads we care about; revisit if commit rates grow.
+//! Upload is asynchronous: the buffer→image copy is recorded into a
+//! per-texture command buffer and submitted with a per-texture fence — no
+//! `queue_wait_idle`. Correctness rests on the single per-device graphics
+//! queue being submitted only from the main thread, with the upload always
+//! submitted before the render that samples it (commit handlers run before
+//! `redraw_queued_outputs` in the same loop iteration):
+//!
+//!   - vs the *next* render reading the new pixels: ordered by submission
+//!     order plus the renderer's producer barrier (MEMORY_WRITE →
+//!     SHADER_SAMPLED_READ) at frame start.
+//!   - vs the *previous* render still sampling the old pixels: the copy's
+//!     acquire barrier sources from FRAGMENT_SHADER / SHADER_READ_ONLY_OPTIMAL
+//!     (after the first upload), which on a single queue synchronizes against
+//!     all prior-submitted commands — so the copy waits for that sampling.
+//!   - vs the CPU clobbering staging while a prior copy still reads it: the
+//!     per-texture fence, waited before the next memcpy. Signalled long ago
+//!     in steady state (one upload per frame), so the wait is free.
 
 use std::sync::Arc;
 
@@ -18,12 +30,21 @@ use ash::vk;
 use crate::device::Device;
 use crate::error::{RendererError, Result, VkResultExt};
 use crate::intermediate::create_view;
-use crate::oneshot::OneshotPool;
 
 /// A sampled VkImage uploaded from CPU bytes via a persistent staging buffer.
 pub struct ShmTexture {
     device: Arc<Device>,
-    oneshot: OneshotPool,
+    /// Per-texture command pool + one reused command buffer for the copy:
+    /// one allocation, reset each upload (no per-commit allocate/free).
+    command_pool: vk::CommandPool,
+    cmd_buffer: vk::CommandBuffer,
+    /// Signalled by each upload's submit; waited at the start of the next
+    /// upload to gate staging-buffer reuse. Created signalled.
+    upload_fence: vk::Fence,
+    /// False until the first upload has initialized the image contents and
+    /// layout. The first upload is always full-extent and acquires from
+    /// UNDEFINED; later uploads acquire from SHADER_READ_ONLY_OPTIMAL.
+    initialized: bool,
 
     image: vk::Image,
     view: vk::ImageView,
@@ -132,11 +153,34 @@ impl ShmTexture {
         }
         .vk_ctx("map_memory (shm staging)")? as *mut u8;
 
-        let oneshot = OneshotPool::new(device.clone())?;
+        // Per-texture command pool + one reusable command buffer for the
+        // copy. RESET_COMMAND_BUFFER lets us reset the buffer each upload
+        // rather than reallocating.
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(device.physical.graphics_queue_family)
+            .flags(
+                vk::CommandPoolCreateFlags::TRANSIENT
+                    | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+            );
+        let command_pool = unsafe { device.raw.create_command_pool(&pool_info, None) }
+            .vk_ctx("create_command_pool (shm upload)")?;
+        let cb_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd_buffer = unsafe { device.raw.allocate_command_buffers(&cb_alloc) }
+            .vk_ctx("allocate_command_buffers (shm upload)")?[0];
+        // Created signalled so the first upload's wait is a no-op.
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+        let upload_fence = unsafe { device.raw.create_fence(&fence_info, None) }
+            .vk_ctx("create_fence (shm upload)")?;
 
         Ok(Self {
             device,
-            oneshot,
+            command_pool,
+            cmd_buffer,
+            upload_fence,
+            initialized: false,
             image,
             view,
             image_memory,
@@ -173,10 +217,22 @@ impl ShmTexture {
             }
         }
 
+        // Gate staging-buffer reuse: wait for the previous upload's copy to
+        // finish reading staging before we overwrite it. Signalled at create
+        // and (in steady state) long before now, so this rarely blocks.
+        unsafe {
+            self.device
+                .raw
+                .wait_for_fences(&[self.upload_fence], true, u64::MAX)
+        }
+        .vk_ctx("wait_for_fences (shm upload)")?;
+        unsafe { self.device.raw.reset_fences(&[self.upload_fence]) }
+            .vk_ctx("reset_fences (shm upload)")?;
+
         // SAFETY: staging is persistently mapped HOST_COHERENT, sized
         // staging_size at construction; we never touch it concurrently
-        // (`&mut self`); the GPU side of any prior upload has been waited on
-        // by the oneshot's queue_wait_idle, so the GPU isn't reading from it.
+        // (`&mut self`); the prior copy from staging has completed (the fence
+        // wait above), so the GPU isn't reading from it.
         unsafe {
             let dst = self.staging_ptr;
             if src_stride == row_bytes {
@@ -194,24 +250,55 @@ impl ShmTexture {
             }
         }
 
-        // Record + submit + wait. UNDEFINED as the old layout discards
-        // previous content, which is fine because we're about to overwrite
-        // every texel.
+        // Record the copy into our reusable command buffer and submit with
+        // our fence — no queue idle. See the module doc for why this is
+        // race-free on the single main-thread graphics queue.
         let image = self.image;
         let staging_buffer = self.staging_buffer;
         let extent = self.extent;
-        self.oneshot.record_and_submit(|raw, cb| unsafe {
+        let cb = self.cmd_buffer;
+
+        // First upload: acquire from UNDEFINED (no prior content to preserve
+        // or to synchronize against). Later uploads: acquire from
+        // SHADER_READ_ONLY_OPTIMAL with a FRAGMENT_SHADER source scope, so the
+        // copy waits for any prior render still sampling this image.
+        let (old_layout, src_stage, src_access) = if self.initialized {
+            (
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+            )
+        } else {
+            (
+                vk::ImageLayout::UNDEFINED,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                vk::AccessFlags2::empty(),
+            )
+        };
+
+        unsafe {
+            self.device
+                .raw
+                .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
+        }
+        .vk_ctx("reset_command_buffer (shm upload)")?;
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { self.device.raw.begin_command_buffer(cb, &begin_info) }
+            .vk_ctx("begin_command_buffer (shm upload)")?;
+        unsafe {
             let to_xfer = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .src_stage_mask(src_stage)
+                .src_access_mask(src_access)
                 .dst_stage_mask(vk::PipelineStageFlags2::COPY)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
+                .old_layout(old_layout)
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
                 .subresource_range(color_subresource_range())];
-            raw.cmd_pipeline_barrier2(
+            self.device.raw.cmd_pipeline_barrier2(
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&to_xfer),
             );
@@ -232,7 +319,7 @@ impl ShmTexture {
                     height: extent.height,
                     depth: 1,
                 })];
-            raw.cmd_copy_buffer_to_image(
+            self.device.raw.cmd_copy_buffer_to_image(
                 cb,
                 staging_buffer,
                 image,
@@ -251,12 +338,24 @@ impl ShmTexture {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
                 .subresource_range(color_subresource_range())];
-            raw.cmd_pipeline_barrier2(
+            self.device.raw.cmd_pipeline_barrier2(
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&to_sampled),
             );
-        })?;
+        }
+        unsafe { self.device.raw.end_command_buffer(cb) }
+            .vk_ctx("end_command_buffer (shm upload)")?;
 
+        let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+        let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
+        unsafe {
+            self.device
+                .raw
+                .queue_submit2(self.device.graphics_queue, &submit, self.upload_fence)
+        }
+        .vk_ctx("queue_submit2 (shm upload)")?;
+
+        self.initialized = true;
         let _ = self.staging_size; // silence dead-code on this field; useful for future asserts
         Ok(())
     }
@@ -266,6 +365,10 @@ impl Drop for ShmTexture {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.raw.device_wait_idle();
+            self.device.raw.destroy_fence(self.upload_fence, None);
+            self.device
+                .raw
+                .destroy_command_pool(self.command_pool, None);
             self.device.raw.unmap_memory(self.staging_memory);
             self.device.raw.destroy_buffer(self.staging_buffer, None);
             self.device.raw.free_memory(self.staging_memory, None);
