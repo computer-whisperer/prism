@@ -35,6 +35,7 @@ the WLCS conformance harness.
 | dmabuf import → VkImage, modifier-negotiated; per-GPU replication; cross-GPU mirror | ✅ |
 | shm upload, per-GPU | ✅ |
 | Input: libinput via udev, keyboard + pointer capabilities, real dispatch; pointer hit-testing + focus tracking | ✅ |
+| `wlr_layer_shell`: 4 layers color-managed in z-order, anchors/margins/exclusive-zones via `LayerMap`, exclusive-zone work-area, keyboard interactivity (Exclusive/OnDemand/None) | ✅ — user-verified (waybar, swaybg, fuzzel) |
 | Renderer: decode → fp16 BT.2020 intermediate → synthesized per-output encode | ✅ |
 | RGB decode (8/10-bit, RGBA/BGRA order), YUV decode (NV12/P010) | ✅ |
 | Per-surface primary conversion (sRGB/Display-P3/BT.2020 → BT.2020) | ✅ |

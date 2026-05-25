@@ -23,7 +23,6 @@ use smithay::backend::input::{
 };
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER};
 
 use crate::backend_ext::PrismInputBackend;
@@ -62,7 +61,7 @@ pub fn on_pointer_motion<I: PrismInputBackend>(
         },
     );
     pointer.frame(state);
-    maybe_focus_follows_mouse(state, serial);
+    maybe_focus_follows_mouse(state);
     // Walk the cursor plane on every output: show on the output the
     // pointer is in, hide on the rest, queue redraws on changes.
     prism_protocols::state::update_output_cursors(state);
@@ -103,7 +102,7 @@ pub fn on_pointer_motion_absolute<I: PrismInputBackend>(
         },
     );
     pointer.frame(state);
-    maybe_focus_follows_mouse(state, serial);
+    maybe_focus_follows_mouse(state);
     prism_protocols::state::update_output_cursors(state);
 }
 
@@ -139,7 +138,7 @@ pub fn on_pointer_button<I: PrismInputBackend>(
                 .layout
                 .find_window_and_output(&surface)
                 .and_then(|(_, out)| out.cloned());
-            set_keyboard_focus(state, Some(surface), serial);
+            set_keyboard_focus(state, Some(surface));
             if let Some(out) = output_for_focus {
                 state.layout.focus_output(&out);
             }
@@ -396,7 +395,7 @@ pub fn refresh_pointer_focus(state: &mut PrismState) {
 /// `max_scroll_amount` (ignore the focus update while the cursor is
 /// inside a scrolling viewport beyond N% of one screen) is not yet
 /// honored — needs scroll-amount tracking that we don't have.
-fn maybe_focus_follows_mouse(state: &mut PrismState, serial: smithay::utils::Serial) {
+fn maybe_focus_follows_mouse(state: &mut PrismState) {
     let ffm = state.config.borrow().input.focus_follows_mouse;
     if ffm.is_none() {
         return;
@@ -432,36 +431,50 @@ fn maybe_focus_follows_mouse(state: &mut PrismState, serial: smithay::utils::Ser
         if let Some(w) = window {
             state.layout.activate_window_without_raising(&w);
         }
-        set_keyboard_focus(state, Some(surface), serial);
+        set_keyboard_focus(state, Some(surface));
     }
 }
 
-/// Move keyboard focus to `surface` (or clear it if None), sending
-/// the usual enter/leave dance via smithay's KeyboardHandle.
-fn set_keyboard_focus(
-    state: &mut PrismState,
-    surface: Option<WlSurface>,
-    serial: smithay::utils::Serial,
-) {
-    use prism_protocols::input_state::KeyboardFocus;
+/// Route a click / focus-follows-mouse hit to the focus arbiter.
+///
+/// `surface` is whatever lies under the pointer — a window, a layer-shell
+/// surface, or one of their subsurfaces/popups (or `None` for empty space).
+/// We don't set keyboard focus directly; we update the arbiter's inputs and
+/// let [`PrismState::update_keyboard_focus`] decide:
+///   - a layout window (or empty space) becomes the layout's focus and drops
+///     any transient on-demand layer focus;
+///   - an `OnDemand` layer surface is remembered as the on-demand focus;
+///   - an `Exclusive` layer surface already holds focus via the arbiter, and
+///     a `None`-interactivity surface (bar, wallpaper) is left alone — neither
+///     disturbs the layout's focused window.
+///
+/// The arbiter handles the enter/leave round-trip (and skips it when the
+/// effective surface is unchanged).
+fn set_keyboard_focus(state: &mut PrismState, surface: Option<WlSurface>) {
+    use smithay::wayland::shell::wlr_layer::KeyboardInteractivity;
 
-    // Quick equality check: if focus is already on this surface,
-    // skip the syscalls.
-    let already_focused = match (&state.keyboard_focus, &surface) {
-        (KeyboardFocus::Layout { surface: Some(a) }, Some(b)) => a.id() == b.id(),
-        (KeyboardFocus::Layout { surface: None }, None) => true,
-        _ => false,
-    };
-    if already_focused {
-        return;
+    match surface {
+        Some(surf) => match state.layer_surface_for(&surf) {
+            Some(ls) => {
+                if ls.cached_state().keyboard_interactivity == KeyboardInteractivity::OnDemand {
+                    state.on_demand_layer_focus = Some(ls.wl_surface().clone());
+                }
+                // Exclusive surfaces already hold focus via the arbiter;
+                // None-interactivity surfaces never take the keyboard. Either
+                // way, leave the layout's focused window untouched.
+            }
+            None => {
+                // A layout window (or a child surface of one).
+                state.layout_focus_surface = Some(surf);
+                state.on_demand_layer_focus = None;
+            }
+        },
+        None => {
+            state.layout_focus_surface = None;
+            state.on_demand_layer_focus = None;
+        }
     }
-
-    state.keyboard_focus = KeyboardFocus::Layout {
-        surface: surface.clone(),
-    };
-    if let Some(kb) = state.seat.get_keyboard() {
-        kb.set_focus(state, surface, serial);
-    }
+    state.update_keyboard_focus();
 }
 
 // ─── WLCS test-harness entry points ──────────────────────────────
@@ -513,7 +526,7 @@ fn wlcs_pointer_reposition(state: &mut PrismState, time: u32) {
         },
     );
     pointer.frame(state);
-    maybe_focus_follows_mouse(state, serial);
+    maybe_focus_follows_mouse(state);
     prism_protocols::state::update_output_cursors(state);
 }
 
@@ -532,7 +545,7 @@ pub fn wlcs_pointer_button(state: &mut PrismState, button: u32, pressed: bool, t
                 .layout
                 .find_window_and_output(&surface)
                 .and_then(|(_, out)| out.cloned());
-            set_keyboard_focus(state, Some(surface), serial);
+            set_keyboard_focus(state, Some(surface));
             if let Some(out) = output_for_focus {
                 state.layout.focus_output(&out);
             }

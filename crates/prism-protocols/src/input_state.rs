@@ -6,21 +6,33 @@
 //! declares the types the dispatcher mutates.
 //!
 //! Currently slim because most of niri's `KeyboardFocus` variants
-//! correspond to subsystems prism does not yet have (layer-shell, lock
-//! screen, screenshot UI, exit-confirm dialog, overview, MRU). We
-//! keep the enum form rather than collapsing to `Option<WlSurface>`
-//! so the grow path back to parity is mechanical.
+//! correspond to subsystems prism does not yet have (lock screen,
+//! screenshot UI, exit-confirm dialog, overview, MRU). We keep the enum
+//! form rather than collapsing to `Option<WlSurface>` so the grow path
+//! back to parity is mechanical.
 
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 /// What the keyboard's events should be routed to.
+///
+/// This is the *effective* focus — the surface smithay's keyboard handle
+/// is pointed at right now. It is computed by
+/// [`PrismState::update_keyboard_focus`](crate::state::PrismState::update_keyboard_focus),
+/// which arbitrates between layer-shell surfaces and the layout's focused
+/// window. The layout's *desired* focus is tracked separately in
+/// `PrismState::layout_focus_surface` so it can be restored when a layer
+/// surface releases the keyboard.
 #[derive(Debug, Clone)]
 pub enum KeyboardFocus {
     /// The layout owns focus. `surface` is the focused window's
     /// toplevel surface (if any window is mapped), else `None`.
     Layout { surface: Option<WlSurface> },
+    /// A `wlr_layer_shell` surface owns focus — either it advertised
+    /// `Exclusive` interactivity (launcher / lock-style grab) or the user
+    /// clicked an `OnDemand` surface. `surface` is the layer surface's
+    /// role wl_surface.
+    LayerShell { surface: WlSurface },
     // Variants to re-add as the corresponding subsystems land:
-    //   LayerShell { surface: WlSurface }      — wlr-layer-shell
     //   LockScreen { surface: Option<WlSurface> } — ext-session-lock
     //   ScreenshotUi                            — niri-style overlay
     //   ExitConfirmDialog                       — niri-style overlay
@@ -38,17 +50,23 @@ impl KeyboardFocus {
     pub fn surface(&self) -> Option<&WlSurface> {
         match self {
             KeyboardFocus::Layout { surface } => surface.as_ref(),
+            KeyboardFocus::LayerShell { surface } => Some(surface),
         }
     }
 
     pub fn into_surface(self) -> Option<WlSurface> {
         match self {
             KeyboardFocus::Layout { surface } => surface,
+            KeyboardFocus::LayerShell { surface } => Some(surface),
         }
     }
 
     pub fn is_layout(&self) -> bool {
         matches!(self, KeyboardFocus::Layout { .. })
+    }
+
+    pub fn is_layer_shell(&self) -> bool {
+        matches!(self, KeyboardFocus::LayerShell { .. })
     }
 }
 

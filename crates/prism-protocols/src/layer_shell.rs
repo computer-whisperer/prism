@@ -13,22 +13,32 @@
 //! same cross-GPU mirror handling, same subsurface z-ordering. There is no
 //! separate unmanaged-sRGB blit path for it.
 //!
-//! **Stage-1 scope (deliberate gaps):** all four layers render + arrange,
-//! and exclusive zones shrink the tiling work area (via
+//! **Keyboard interactivity** is honored: [`Self::update_keyboard_focus`]
+//! arbitrates focus between layer surfaces and the layout. An `Exclusive`
+//! surface (launcher / lock-style) on the focused output grabs the keyboard
+//! on map and releases it on unmap; an `OnDemand` surface takes focus when
+//! clicked; a `None` surface (bars, wallpapers) never receives keyboard
+//! input. See that method for the priority order.
+//!
+//! **Scope (deliberate gaps):** all four layers render + arrange, and
+//! exclusive zones shrink the tiling work area (via
 //! `LayerMap::non_exclusive_zone`, consumed by `compute_working_area` in
-//! prism-layout). Not yet: layer *popups*, layer *shadows*, and
-//! `KeyboardInteractivity` (treated as `None` — `OnDemand`/`Exclusive`
-//! land with the keyboard-focus work).
+//! prism-layout). Not yet: layer *popups* and layer *shadows*. Exclusive
+//! grab is scoped to the *focused* output (a surface on a non-focused
+//! monitor waits until that monitor is focused).
 
 use smithay::desktop::{layer_map_for_output, LayerSurface, WindowSurfaceType};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::{wl_output::WlOutput, wl_surface::WlSurface};
+use smithay::reexports::wayland_server::Resource as _;
+use smithay::utils::{IsAlive, SERIAL_COUNTER};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::wlr_layer::{
-    Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
-    WlrLayerShellState,
+    KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData,
+    WlrLayerShellHandler, WlrLayerShellState,
 };
 
+use crate::input_state::KeyboardFocus;
 use crate::state::{OutputId, PrismState};
 
 impl PrismState {
@@ -78,6 +88,89 @@ impl PrismState {
             }
         }
         None
+    }
+
+    /// The mapped [`LayerSurface`] that owns `surface` (or a subsurface /
+    /// popup of it), scanning every output's `LayerMap`. Used by the focus
+    /// arbiter and click-to-focus to read a surface's keyboard-interactivity.
+    pub fn layer_surface_for(&self, surface: &WlSurface) -> Option<LayerSurface> {
+        self.wl_outputs.values().find_map(|output| {
+            layer_map_for_output(output)
+                .layer_for_surface(surface, WindowSurfaceType::ALL)
+                .cloned()
+        })
+    }
+
+    /// The top-most `Exclusive`-interactivity layer surface on the *focused*
+    /// output, searching Overlay above Top (the only layers we let grab the
+    /// keyboard, matching niri). `None` if no exclusive surface is mapped
+    /// there. Topmost-first mirrors [`LayerMap::layer_under`]'s `.rev()`.
+    fn exclusive_layer_focus(&self) -> Option<WlSurface> {
+        let output = self.active_output()?;
+        let map = layer_map_for_output(&output);
+        for layer in [Layer::Overlay, Layer::Top] {
+            if let Some(ls) = map.layers_on(layer).rev().find(|ls| {
+                ls.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive
+            }) {
+                return Some(ls.wl_surface().clone());
+            }
+        }
+        None
+    }
+
+    /// The remembered `OnDemand` layer-shell focus, but only if it is still
+    /// mapped and still advertises `OnDemand` (a surface can change its
+    /// interactivity or unmap out from under us).
+    fn active_on_demand_layer_focus(&self) -> Option<WlSurface> {
+        let surface = self.on_demand_layer_focus.as_ref()?;
+        let ls = self.layer_surface_for(surface)?;
+        (ls.cached_state().keyboard_interactivity == KeyboardInteractivity::OnDemand)
+            .then(|| surface.clone())
+    }
+
+    /// Recompute the effective keyboard focus and push it to the seat.
+    ///
+    /// The single arbiter of [`Self::keyboard_focus`]. Priority (Stage-3
+    /// layer-shell focus model, mirroring niri's `update_keyboard_focus`):
+    ///   1. The top-most `Exclusive` layer surface on the focused output
+    ///      (a launcher / lock-style surface grabs the keyboard on map).
+    ///   2. A layer surface the user clicked while it was `OnDemand`, as
+    ///      long as it is still mapped + still `OnDemand`.
+    ///   3. The layout's focused window ([`Self::layout_focus_surface`]).
+    ///
+    /// `None`-interactivity surfaces (bars, wallpapers) are never candidates,
+    /// so they never steal the keyboard — even when clicked. Idempotent:
+    /// no-ops (no enter/leave round-trip) when the effective surface is
+    /// unchanged, so it is cheap to call on every focus-affecting event.
+    pub fn update_keyboard_focus(&mut self) {
+        let target = self
+            .exclusive_layer_focus()
+            .or_else(|| self.active_on_demand_layer_focus())
+            .or_else(|| self.layout_focus_surface.clone().filter(IsAlive::alive));
+
+        let same = match (self.keyboard_focus.surface(), &target) {
+            (Some(a), Some(b)) => a.id() == b.id(),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+
+        let from_layer = target
+            .as_ref()
+            .is_some_and(|s| self.layer_surface_for(s).is_some());
+        self.keyboard_focus = match (&target, from_layer) {
+            (Some(s), true) => KeyboardFocus::LayerShell { surface: s.clone() },
+            _ => KeyboardFocus::Layout {
+                surface: target.clone(),
+            },
+        };
+
+        if let Some(kb) = self.seat.get_keyboard() {
+            let serial = SERIAL_COUNTER.next_serial();
+            kb.set_focus(self, target, serial);
+        }
     }
 
     /// Map a freshly-created layer surface into its output's `LayerMap`.
@@ -130,6 +223,9 @@ impl PrismState {
             .entry(output_id)
             .or_default()
             .queue_redraw();
+        // An `Exclusive` surface (launcher / lock) grabs the keyboard the
+        // moment it maps; recompute focus so it does.
+        self.update_keyboard_focus();
     }
 
     /// Commit-time arrange for a layer surface: recompute the per-output
@@ -173,6 +269,9 @@ impl PrismState {
         if let Some(id) = self.layer_surface_output_id(surface) {
             self.output_redraw.entry(id).or_default().queue_redraw();
         }
+        // A commit can change `keyboard_interactivity` (e.g. None → Exclusive
+        // once the client is ready), so re-arbitrate focus.
+        self.update_keyboard_focus();
     }
 
     /// Unmap a destroyed layer surface from whichever output's `LayerMap`
@@ -190,6 +289,13 @@ impl PrismState {
             layer_map_for_output(&output).unmap_layer(&layer);
             self.output_redraw.entry(id).or_default().queue_redraw();
         }
+        // Drop a stale on-demand reference to the destroyed surface, then
+        // re-arbitrate so the keyboard returns to the layout (or the next
+        // exclusive surface) now that this one is gone.
+        if self.on_demand_layer_focus.as_ref() == Some(surface.wl_surface()) {
+            self.on_demand_layer_focus = None;
+        }
+        self.update_keyboard_focus();
     }
 }
 

@@ -162,12 +162,17 @@ We use v3 with a negotiated format list. v4 lets us advertise per-display *prefe
 modifiers and is the path that closes off direct-scanout with tiled modifiers.
 Bundle with direct-scanout / overlay-plane work.
 
-### Full layer-shell rendering
+### Layer-shell remaining gaps
 
-The layer-shell calibration/full-output pattern (Spyder's: a surface sized to the
-output, rendered on top of the workspace) works. The full version — status bars,
-notification daemons, wallpapers with proper anchoring/exclusive-zones/layers — is a
-follow-up. (Noted at `crates/prism-protocols/src/layer_shell.rs`.)
+`wlr_layer_shell` is largely done (`crates/prism-protocols/src/layer_shell.rs`):
+all four layers render in z-order through the shared color-managed surface-tree
+walk (bars, wallpapers, notification daemons, launchers — no unmanaged-sRGB blit
+path), anchors/margins/exclusive-zones arrange via smithay's `LayerMap`, exclusive
+zones shrink the tiling work area, and keyboard interactivity is honored
+(Exclusive grabs on map / releases on unmap, OnDemand on click, None never
+focuses). Remaining: layer **popups** and layer **shadows**; exclusive keyboard
+grab is scoped to the *focused* output (an exclusive surface on a non-focused
+monitor waits until that monitor is focused).
 
 ### Remaining optional protocols
 

@@ -316,9 +316,22 @@ pub struct PrismState {
     pub session: Option<prism_drm::SeatSession>,
 
     // ── Input state ────────────────────────────────────────────────────────
-    /// Where the next keyboard event should land. Defaults to
+    /// The *effective* keyboard focus — the surface smithay's keyboard is
+    /// pointed at right now. Computed by [`Self::update_keyboard_focus`],
+    /// which arbitrates layer-shell focus against the layout. Defaults to
     /// `Layout { surface: None }` until a window maps.
     pub keyboard_focus: KeyboardFocus,
+    /// The layout's *desired* keyboard focus (the focused window's
+    /// surface), maintained by click-to-focus / focus-follows-mouse. Kept
+    /// separate from [`Self::keyboard_focus`] so it can be restored when a
+    /// layer surface (launcher / lock) releases the keyboard. `None` when
+    /// no window is focused.
+    pub layout_focus_surface: Option<WlSurface>,
+    /// The layer surface the user clicked while it advertised `OnDemand`
+    /// keyboard interactivity, if any. The focus arbiter keeps the keyboard
+    /// here until the surface unmaps, stops being `OnDemand`, or focus moves
+    /// elsewhere. `None` for the common case (no on-demand layer focused).
+    pub on_demand_layer_focus: Option<WlSurface>,
     /// Cursor visibility tri-state — `Visible` normally, `Hidden`
     /// during auto-hide grace, `Disabled` after touch input. See
     /// [`PointerVisibility`].
@@ -606,6 +619,8 @@ impl PrismState {
             dmabuf_sources: HashMap::new(),
             output_redraw: HashMap::new(),
             keyboard_focus: KeyboardFocus::default(),
+            layout_focus_surface: None,
+            on_demand_layer_focus: None,
             pointer_visibility: PointerVisibility::default(),
             suppressed_keys: std::collections::HashSet::new(),
             libinput_devices: std::collections::HashSet::new(),
