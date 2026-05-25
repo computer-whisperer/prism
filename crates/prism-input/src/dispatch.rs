@@ -41,6 +41,19 @@ pub fn process_input_event<I: PrismInputBackend + 'static>(
     if !matches!(event, DeviceAdded { .. } | DeviceRemoved { .. }) {
         state.notify_idle_activity();
     }
+    // Pointer activity reveals an auto-hidden cursor and (re)arms the
+    // hide-after-inactivity timer (`cursor { hide-after-inactive-ms }`).
+    // Keyboard hides it (`hide-when-typing`) — handled in `on_keyboard`,
+    // which knows press vs release.
+    if matches!(
+        event,
+        PointerMotion { .. }
+            | PointerMotionAbsolute { .. }
+            | PointerButton { .. }
+            | PointerAxis { .. }
+    ) {
+        state.note_pointer_activity();
+    }
     match event {
         DeviceAdded { device } => on_device_added(state, device),
         DeviceRemoved { device } => on_device_removed(state, device),
@@ -224,6 +237,13 @@ fn on_keyboard<I: PrismInputBackend>(state: &mut PrismState, event: I::KeyboardK
         // TODO: cooldown enforcement, key-repeat timer for bind.repeat,
         // allow_when_locked once we have a lock state, etc.
         actions::handle_action(state, bind.action);
+    }
+
+    // hide-when-typing: a key *press* hides the cursor (reappears on the
+    // next pointer activity). Press-only so releasing a modifier held during
+    // a drag doesn't hide it mid-gesture.
+    if pressed {
+        state.hide_pointer_for_typing();
     }
 }
 

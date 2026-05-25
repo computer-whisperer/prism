@@ -56,7 +56,8 @@ use smithay::desktop::Window;
 use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel};
-use smithay::reexports::calloop::LoopHandle;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::reexports::wayland_server::backend::{ClientData, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
@@ -363,8 +364,13 @@ pub struct PrismState {
     pub on_demand_layer_focus: Option<WlSurface>,
     /// Cursor visibility tri-state — `Visible` normally, `Hidden`
     /// during auto-hide grace, `Disabled` after touch input. See
-    /// [`PointerVisibility`].
+    /// [`PointerVisibility`]. Consulted by [`update_output_cursors`] to
+    /// auto-hide the cursor (`cursor { hide-when-typing / hide-after-inactive-ms }`).
     pub pointer_visibility: PointerVisibility,
+    /// Pending `cursor { hide-after-inactive-ms }` timer, (re)armed on each
+    /// pointer activity by [`Self::note_pointer_activity`]. `None` when no
+    /// timer is pending (option unset, or it already fired).
+    pub pointer_inactivity_timer: Option<RegistrationToken>,
     /// Keycodes whose press was swallowed by a compositor binding;
     /// release events for these are filtered out so the focused
     /// client never sees a dangling release. Keyed by raw keycode
@@ -694,6 +700,7 @@ impl PrismState {
             idle_inhibitors: std::collections::HashSet::new(),
             output_power_objects: Vec::new(),
             pointer_visibility: PointerVisibility::default(),
+            pointer_inactivity_timer: None,
             suppressed_keys: std::collections::HashSet::new(),
             libinput_devices: std::collections::HashSet::new(),
             monitors_active: true,
@@ -762,6 +769,61 @@ impl PrismState {
         if let Some(notifier) = self.idle_notifier.as_mut() {
             notifier.set_is_inhibited(inhibited);
         }
+    }
+
+    /// Note pointer activity (motion / button / axis): reveal the cursor if
+    /// it was auto-hidden, and (re)arm the hide-after-inactivity timer.
+    pub fn note_pointer_activity(&mut self) {
+        if !self.pointer_visibility.is_visible() {
+            self.pointer_visibility = PointerVisibility::Visible;
+            update_output_cursors(self);
+        }
+        self.arm_pointer_inactivity_timer();
+    }
+
+    /// Hide the cursor because the user is typing, if `cursor {
+    /// hide-when-typing }` is set. Called on key press; the cursor reappears
+    /// on the next pointer activity. No-op if the option is off or the
+    /// cursor is already hidden.
+    pub fn hide_pointer_for_typing(&mut self) {
+        if !self.config.borrow().cursor.hide_when_typing {
+            return;
+        }
+        if self.pointer_visibility.is_visible() {
+            self.pointer_visibility = PointerVisibility::Hidden;
+            update_output_cursors(self);
+        }
+    }
+
+    /// (Re)arm the `cursor { hide-after-inactive-ms }` timer, cancelling any
+    /// pending one first. No-op (just cancels) when the option is unset or
+    /// no event loop is bound yet.
+    fn arm_pointer_inactivity_timer(&mut self) {
+        if let (Some(tok), Some(lh)) = (
+            self.pointer_inactivity_timer.take(),
+            self.loop_handle.as_ref(),
+        ) {
+            lh.remove(tok);
+        }
+        let Some(ms) = self.config.borrow().cursor.hide_after_inactive_ms else {
+            return;
+        };
+        let Some(lh) = self.loop_handle.clone() else {
+            return;
+        };
+        self.pointer_inactivity_timer = lh
+            .insert_source(
+                Timer::from_duration(std::time::Duration::from_millis(ms as u64)),
+                |_instant, _, state| {
+                    state.pointer_inactivity_timer = None;
+                    if state.pointer_visibility.is_visible() {
+                        state.pointer_visibility = PointerVisibility::Hidden;
+                        update_output_cursors(state);
+                    }
+                    TimeoutAction::Drop
+                },
+            )
+            .ok();
     }
 
     /// Drive one output's DPMS power state (see
@@ -1321,10 +1383,19 @@ impl SeatHandler for PrismState {
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         // The focused client set its cursor — via `wl_pointer.set_cursor`
-        // (a Surface or Hidden) or `wp_cursor_shape` (a Named icon, which
-        // smithay funnels through here). Stash it and re-resolve the sprite
-        // now, so the cursor changes even with the pointer stationary
-        // (hovering a link / text without moving).
+        // (a Surface, or Hidden when it passes a null surface) or
+        // `wp_cursor_shape` (a Named icon, which smithay funnels through
+        // here). Stash it and re-resolve the sprite now, so the cursor
+        // changes even with the pointer stationary (hovering a link / text).
+        // The `kind` log is a breadcrumb for "does app X hide on keystroke?"
+        // — apps hide by passing a null surface (⇒ Hidden), there is no
+        // separate hide protocol.
+        let kind = match &image {
+            CursorImageStatus::Hidden => "hidden",
+            CursorImageStatus::Named(_) => "named",
+            CursorImageStatus::Surface(_) => "surface",
+        };
+        tracing::debug!(kind, "client set cursor image");
         self.cursor_manager.set_cursor_image(image);
         self.cursor_dirty = true;
         update_output_cursors(self);
@@ -2627,6 +2698,14 @@ fn read_shm_cursor_sprite(
 /// future refinement (today it rides the next redraw).
 pub fn update_output_cursors(state: &mut PrismState) {
     state.cursor_manager.check_cursor_image_surface_alive();
+
+    // Auto-hidden (typing / inactivity) ⇒ hide the plane, but leave the
+    // uploaded sprite intact so revealing it again (on pointer motion) is a
+    // cheap reposition rather than a re-upload.
+    if !state.pointer_visibility.is_visible() {
+        hide_all_cursors(state);
+        return;
+    }
 
     // Owner = the output the pointer is in. Off all outputs ⇒ hide.
     let Some(owner_id) =

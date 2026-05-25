@@ -163,9 +163,22 @@ cursor), dmabuf-backed cursor surfaces fall back too, and the sprite goes raw to
 scanout (bypasses color management — same as the themed cursor). Animated cursors
 show the committed frame, not timed multi-frame animation. A software-composite
 cursor path (through the color-managed render pass) would lift all of these but
-costs a full-frame redraw on cursor move; add if a real client needs it. Cursor
-hide-when-typing / hide-after-inactivity (`cursor {}` config fields exist) are also
-not yet wired.
+costs a full-frame redraw on cursor move; add if a real client needs it.
+
+### Cursor: app-driven hide-on-keystroke (Firefox)
+
+Under niri, typing in Firefox's URL bar hides the cursor; under prism it doesn't
+(alacritty hides under neither — so it's app-driven, not a global setting). Apps
+hide the cursor via core `wl_pointer.set_cursor` with a *null* surface (⇒
+`CursorImageStatus::Hidden`) — there is no separate hide protocol, and prism's
+`cursor_image(Hidden)` path *should* disable the plane (`resolve None →
+hide_all_cursors`). Since the I-beam (set_cursor with a real surface) *does* work
+on prism, `cursor_image` is reached; so either Firefox isn't sending null on
+keystroke on this setup, or the `Hidden` path has a bug a code-read didn't catch.
+Not yet chased down — the `debug!(kind, "client set cursor image")` in
+`cursor_image` will show what the app actually sends (`RUST_LOG=…=debug`). The
+`cursor { hide-when-typing }` option hides compositor-side regardless, so it's the
+practical workaround.
 
 ## Wayland / protocol
 
