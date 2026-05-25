@@ -23,7 +23,7 @@
 //! size, attaches a buffer, gets rendered on top of the workspace.
 //!
 //! The full layer-shell version (status bars, notification daemons,
-//! wallpapers) is a follow-up — see `docs/phase-2-scanout-followups.md`.
+//! wallpapers) is a follow-up — see `docs/deferred-work.md`.
 
 use smithay::reexports::wayland_server::protocol::{wl_output::WlOutput, wl_surface::WlSurface};
 use smithay::utils::{Logical, Rectangle, Size};

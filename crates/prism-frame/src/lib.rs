@@ -10,7 +10,7 @@
 //! to maintain. Opaque `TextureHandle` / `ShaderHandle` types keep renderer
 //! resource types from leaking out.
 //!
-//! See `docs/phase-2-backend-notes.md` and `docs/phase-2-reuse-map.md` for
+//! See `docs/color-management.md` and `docs/reuse-map.md` for
 //! the design rationale.
 
 pub mod color;

@@ -20,12 +20,12 @@
 //! [`HdrProps::clear`] sets metadata→0 and Colorspace→Default so the
 //! desktop session that takes over after we exit doesn't inherit
 //! stale HDR signaling — that's the "phase-1 hung-on PQ" failure
-//! mode documented in `phase-2-progress.md`.
+//! mode documented in `docs/color-management.md`.
 //!
-//! **Stage-1 feedforward.** Per `project_hdr_strategy.md`, the only
-//! validation here is "the kernel accepted the property set". We
-//! don't measure the resulting panel output — that requires the
-//! Spyder loop, which needs `wp_color_management_v1` first.
+//! **Stage-1 feedforward.** The only validation here is "the kernel
+//! accepted the property set". We don't measure the resulting panel
+//! output — closed-loop measurement against a colorimeter is
+//! `prism-tune`'s job, not this path's.
 
 use anyhow::{Context, Result};
 use smithay::reexports::drm::control::{connector, property, Device as ControlDevice};
@@ -248,7 +248,7 @@ impl HdrProps {
     /// this the connector keeps the last metadata blob across master
     /// handoffs and the desktop session that takes over interprets
     /// its sRGB pixels as PQ — visible as crushed shadows. This was
-    /// the "DP-4 stickiness" bug logged in `phase-2-progress.md`.
+    /// the "DP-4 stickiness" bug; see `docs/color-management.md`.
     pub fn clear<D: ControlDevice>(&mut self, drm: &D) -> Result<()> {
         // Set metadata blob to 0 (kernel: "no HDR infoframe").
         let _ = drm

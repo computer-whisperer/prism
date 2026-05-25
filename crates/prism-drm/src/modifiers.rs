@@ -14,7 +14,7 @@
 //! that to ~400 MB/s effective fetch (cache-line aligned tile bursts vs
 //! row-major scattered reads) and the issue disappears.
 //!
-//! See `docs/phase-2-scanout-followups.md` for deferred follow-ups —
+//! See `docs/deferred-work.md` for deferred follow-ups —
 //! multi-plane (DCC) compression import, per-plane damage clips, and
 //! atomic test commits before mode-changing operations.
 
