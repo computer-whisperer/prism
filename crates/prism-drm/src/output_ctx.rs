@@ -798,8 +798,6 @@ impl OutputContext {
             tracing::debug!(target: "damage", output = %self.connector_name, "skip: no damage");
             return Ok(PresentOutcome::SkippedNoDamage);
         }
-        // Committing to a render — consume the one-shot force flag.
-        self.force_present = false;
 
         let back = &self.buffers[self.back_index];
         // render_frame returns the present-completion sync as a Linux
@@ -890,6 +888,11 @@ impl OutputContext {
         // so advance the tracker's baseline. (On the `?` early-returns above the
         // commit is skipped, so a failed flip re-damages next frame.)
         self.damage_tracker.commit();
+        // Consume the one-shot force flag only now that the flip actually
+        // succeeded — clearing it earlier would drop a forced cursor/recolor
+        // present on a transient page-flip error (the `?`s above), with nothing
+        // to retry it until the next independent damage.
+        self.force_present = false;
         Ok(PresentOutcome::Presented(present_sync))
     }
 }

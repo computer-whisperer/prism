@@ -885,6 +885,15 @@ impl PrismState {
                 tracing::warn!(connector = %output_id, "DPMS power_off failed: {e:#}");
                 return;
             }
+            // A zero-damage skip may have left an estimated-vblank timer armed.
+            // Drop the redraw state to Idle so its now-stale fire is a no-op
+            // (`on_estimated_vblank`'s guard early-returns) instead of waking
+            // clients on a powered-off output. The calloop source self-reaps on
+            // that single fire.
+            self.output_redraw
+                .entry(output_id.clone())
+                .or_default()
+                .redraw = crate::redraw::RedrawState::Idle;
             self.broadcast_output_power_mode(output_id);
             return;
         }

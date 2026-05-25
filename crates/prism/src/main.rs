@@ -1863,19 +1863,19 @@ fn redraw_queued_outputs(state: &mut prism_protocols::PrismState) {
 }
 
 /// Render one queued output, stash its presentation feedback, and
-/// transition its redraw state to `WaitingForVBlank { redraw_needed:
-/// false }`. Called both from the per-vblank handler (so each output's
-/// next frame is submitted at the moment of its own vblank — natural
-/// staggering across the wall-clock, no burst-submit of N outputs in a
-/// single tight loop) and from `redraw_queued_outputs` as a backstop
-/// for outputs queued from non-vblank sources (commit handlers,
-/// animation ticks, bootstrap).
+/// transition its redraw state (`WaitingForVBlank` on a real flip,
+/// `WaitingForEstimatedVBlank` on a zero-damage skip).
 ///
-/// Without per-vblank dispatch we had all per-card outputs page-flipping
-/// inside one ~150µs window per main-loop tick, which on Vega 20 + fp16
-/// scanout overflowed amdgpu's atomic-commit allocator ceiling
-/// (ENOMEM on the next submit). wlroots/sway run per-output commits
-/// from their own per-CRTC vblank handler for the same reason —
+/// Called only from [`redraw_queued_outputs`] (once per main-loop iteration,
+/// draining every `Queued` output). Outputs typically reach `Queued` at their
+/// own vblank (`on_vblank`), with non-vblank sources too (commit handlers,
+/// animation ticks, bootstrap). Because per-CRTC vblanks are staggered across
+/// the wall-clock, N outputs rarely become `Queued` for the same pass.
+///
+/// That staggering matters: bursting all per-card page-flips into one ~150µs
+/// window overflowed amdgpu's atomic-commit allocator ceiling on Vega 20 + fp16
+/// scanout (ENOMEM on the next submit). wlroots/sway commit per-output from
+/// their own per-CRTC vblank handler for the same reason —
 /// `backend/drm/drm.c:2086 wlr_output_send_frame`.
 fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
     use prism_protocols::redraw::RedrawState;
@@ -2381,12 +2381,12 @@ fn render_output_now(
         prism_drm::PresentOutcome::SkippedNoDamage => return Ok(RenderOutcome::SkippedNoDamage),
     };
 
-    // Extract pending frame_callbacks + presentation_feedback from
-    // every surface mapped to this output so we can fire them at the
-    // next vblank with the kernel-reported presentation time. Firing
-    // them now (at submit, before scanout) would lie to clients about
-    // when the buffer hit the screen and cause over-production / stalls
-    // — see the redraw module's docs.
+    // Extract pending `wp_presentation_feedback` from every surface mapped to
+    // this output so we can fire it at the next vblank with the kernel-reported
+    // presentation time. Firing it now (at submit, before scanout) would lie to
+    // clients about when the buffer hit the screen and cause over-production /
+    // stalls — see the redraw module's docs. (Frame callbacks are delivered
+    // separately by `send_frame_callbacks`, throttled per refresh cycle.)
     //
     // Same walk also harvests `wp_linux_drm_syncobj` release trackers
     // for surfaces that opted into explicit sync: every surface we
