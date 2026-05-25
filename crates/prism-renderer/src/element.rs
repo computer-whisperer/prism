@@ -87,6 +87,12 @@ pub struct LoweredFrame {
 /// element to its draws and records its metadata. `white_view` backs
 /// solid-colour and border draws; `output_peak_nits_rgb` is the per-output
 /// display-referred decode clamp threaded into every draw's push constants.
+///
+/// **Occlusion culling.** Elements fully hidden behind opaque content drawn in
+/// front of them emit no draws (see [`cull_occluded`]). This only affects the
+/// `draws` stream (the decode work); `meta` still describes *every* element, so
+/// the damage tracker keeps seeing hidden elements — when an occluder later
+/// moves away, its old region is damaged and the now-revealed element repaints.
 pub fn lower_elements(
     elements: &[RenderEl],
     view_size: Size<f64, Logical>,
@@ -94,17 +100,66 @@ pub fn lower_elements(
     output_peak_nits_rgb: [f32; 3],
 ) -> LoweredFrame {
     let project = make_projector(view_size);
+    let visible = cull_occluded(elements);
     let mut draws = Vec::with_capacity(elements.len());
     let mut meta = Vec::with_capacity(elements.len());
-    for el in elements {
-        el.lower(&project, white_view, output_peak_nits_rgb, &mut draws);
+    for (i, el) in elements.iter().enumerate() {
+        // Metadata covers every element (visible or culled) so the damage diff
+        // tracks occluded elements too.
         meta.push(FrameElementMeta {
             id: el.id(),
             geometry: el.geometry(),
             content_token: el.content_token(),
         });
+        if visible[i] {
+            el.lower(&project, white_view, output_peak_nits_rgb, &mut draws);
+        }
     }
     LoweredFrame { draws, meta }
+}
+
+/// Decide which elements are visible, by the painter's-algorithm occlusion test
+/// smithay's `OutputDamageTracker` uses: walk front-to-back, accumulate the
+/// opaque regions of everything in front, and mark an element culled when its
+/// geometry is fully covered (`subtract_rects` leaves nothing).
+///
+/// `elements` is in prism's back-to-front draw order (earlier paints behind),
+/// so we iterate in reverse to go front-to-back. Returns a visibility mask
+/// index-aligned to `elements`.
+///
+/// Coordinate space is logical `f64` — the same space the geometry is projected
+/// from. Abutting tiles share exact logical edges, so they rasterise to
+/// adjacent pixels with no seam; culling here can't open a gap the draw path
+/// wouldn't also close.
+fn cull_occluded(elements: &[RenderEl]) -> Vec<bool> {
+    let mut visible = vec![true; elements.len()];
+    let mut occluders: Vec<Rectangle<f64, Logical>> = Vec::new();
+    let mut culled = 0usize;
+    for (i, el) in elements.iter().enumerate().rev() {
+        let geometry = el.geometry();
+        // Fully covered by the opaque content already collected from in front?
+        if !occluders.is_empty()
+            && geometry
+                .subtract_rects(occluders.iter().copied())
+                .is_empty()
+        {
+            visible[i] = false;
+            culled += 1;
+            // A hidden element contributes no new occlusion (we don't draw it),
+            // so don't add its opaque regions.
+            continue;
+        }
+        el.push_opaque_regions(&mut occluders);
+    }
+    if culled > 0 {
+        tracing::trace!(
+            target: "cull",
+            total = elements.len(),
+            culled,
+            "occlusion culling"
+        );
+    }
+    visible
 }
 
 /// Color-decoding parameters for a [`SurfaceEl`]. Captures *what
@@ -182,6 +237,19 @@ pub struct SurfaceEl {
     /// re-damages the surface when this advances (geometry unchanged but pixels
     /// changed). The walk derives it from the `wl_surface`'s `CommitCounter`.
     pub content_commit: u64,
+    /// Fully-opaque sub-rects of this surface, in **absolute output-space
+    /// logical** pixels (the walk offsets the surface-relative regions from
+    /// smithay's `RendererSurfaceState::opaque_regions()` by `geometry.loc`).
+    /// Used only for occlusion culling: elements drawn behind these rects can
+    /// be skipped. Empty when the buffer has (or may have) alpha and the client
+    /// declared no opaque region — the conservative case that never culls.
+    ///
+    /// NOTE: this reflects only the *buffer's* opacity. The per-element fade
+    /// `alpha` animation multiplier is not yet plumbed into the decode path
+    /// (mapped.rs drops it); once it is, a surface with effective `alpha < 1.0`
+    /// must report no opaque regions, or culling will hide content behind a
+    /// translucent fading tile.
+    pub opaque: Vec<Rectangle<f64, Logical>>,
     pub src_rect_uv: [f32; 4],
     pub color: SurfaceColorParams,
 }
@@ -390,6 +458,28 @@ impl RenderEl {
         }
     }
 
+    /// Append this element's fully-opaque rects (absolute output-space logical)
+    /// to `out`, for occlusion culling. An element drawn behind the union of
+    /// these rects contributes nothing visible and can be skipped.
+    ///
+    /// - `Surface`: the buffer's opaque regions (already absolute; see
+    ///   [`SurfaceEl::opaque`]). Empty for translucent / unknown-alpha buffers.
+    /// - `SolidColor`: the whole geometry iff the colour is fully opaque
+    ///   (`alpha == 1.0`); a translucent fill occludes nothing.
+    /// - `Border`: nothing — a border is hollow stripes, so its bounding box is
+    ///   mostly transparent and never a safe occluder.
+    pub fn push_opaque_regions(&self, out: &mut Vec<Rectangle<f64, Logical>>) {
+        match self {
+            Self::Surface(s) => out.extend_from_slice(&s.opaque),
+            Self::SolidColor(s) => {
+                if s.color_bt2020_nits[3] >= 1.0 {
+                    out.push(s.geometry);
+                }
+            }
+            Self::Border(_) => {}
+        }
+    }
+
     /// Content fingerprint for the damage diff (see [`FrameElementMeta`]).
     /// Surfaces use their buffer commit count; solids/borders fingerprint their
     /// colour (and per-side thickness), so a focus-colour change re-damages the
@@ -449,4 +539,116 @@ pub fn srgb_to_bt2020_nits(r: f32, g: f32, b: f32, a: f32, sdr_white_nits: f32) 
         (m[2][0] * lin[0] + m[2][1] * lin[1] + m[2][2] * lin[2]) * sdr_white_nits,
         a,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> Rectangle<f64, Logical> {
+        Rectangle::new(Point::from((x, y)), Size::from((w, h)))
+    }
+
+    fn solid(geo: Rectangle<f64, Logical>, alpha: f32) -> RenderEl {
+        RenderEl::SolidColor(SolidColorEl {
+            id: ElementId::alloc(),
+            geometry: geo,
+            color_bt2020_nits: [10.0, 10.0, 10.0, alpha],
+        })
+    }
+
+    fn surface(geo: Rectangle<f64, Logical>, opaque: Vec<Rectangle<f64, Logical>>) -> RenderEl {
+        RenderEl::Surface(SurfaceEl {
+            id: ElementId::alloc(),
+            texture_view: vk::ImageView::null(),
+            chroma_view: None,
+            yuv: 0,
+            geometry: geo,
+            content_commit: 0,
+            opaque,
+            src_rect_uv: [0.0, 0.0, 1.0, 1.0],
+            color: SurfaceColorParams::default(),
+        })
+    }
+
+    fn border(geo: Rectangle<f64, Logical>) -> RenderEl {
+        RenderEl::Border(BorderEl {
+            id: ElementId::alloc(),
+            geometry: geo,
+            thickness: [2.0; 4],
+            color_bt2020_nits: [10.0, 10.0, 10.0, 1.0],
+        })
+    }
+
+    // Element vecs are back-to-front: index 0 paints behind the last.
+
+    #[test]
+    fn opaque_front_culls_fully_covered_back() {
+        let els = vec![
+            solid(rect(0.0, 0.0, 100.0, 100.0), 1.0),
+            solid(rect(0.0, 0.0, 100.0, 100.0), 1.0),
+        ];
+        assert_eq!(cull_occluded(&els), vec![false, true]);
+    }
+
+    #[test]
+    fn partial_cover_keeps_back() {
+        let els = vec![
+            solid(rect(0.0, 0.0, 100.0, 100.0), 1.0),
+            solid(rect(0.0, 0.0, 50.0, 100.0), 1.0),
+        ];
+        assert_eq!(cull_occluded(&els), vec![true, true]);
+    }
+
+    #[test]
+    fn translucent_front_occludes_nothing() {
+        let els = vec![
+            solid(rect(0.0, 0.0, 100.0, 100.0), 1.0),
+            solid(rect(0.0, 0.0, 100.0, 100.0), 0.5),
+        ];
+        assert_eq!(cull_occluded(&els), vec![true, true]);
+    }
+
+    #[test]
+    fn border_never_occludes() {
+        let els = vec![
+            solid(rect(0.0, 0.0, 100.0, 100.0), 1.0),
+            border(rect(0.0, 0.0, 100.0, 100.0)),
+        ];
+        assert_eq!(cull_occluded(&els), vec![true, true]);
+    }
+
+    #[test]
+    fn surface_opaque_region_culls_back() {
+        let els = vec![
+            solid(rect(0.0, 0.0, 100.0, 100.0), 1.0),
+            surface(
+                rect(0.0, 0.0, 100.0, 100.0),
+                vec![rect(0.0, 0.0, 100.0, 100.0)],
+            ),
+        ];
+        assert_eq!(cull_occluded(&els), vec![false, true]);
+    }
+
+    #[test]
+    fn surface_without_opaque_region_occludes_nothing() {
+        let els = vec![
+            solid(rect(0.0, 0.0, 100.0, 100.0), 1.0),
+            surface(rect(0.0, 0.0, 100.0, 100.0), vec![]),
+        ];
+        assert_eq!(cull_occluded(&els), vec![true, true]);
+    }
+
+    /// Two opaque halves sharing an exact edge tile the background; their union
+    /// fully covers it, so the background is culled even though no single
+    /// occluder covers it alone.
+    #[test]
+    fn abutting_occluders_union_covers_background() {
+        let els = vec![
+            solid(rect(0.0, 0.0, 100.0, 100.0), 1.0),
+            solid(rect(0.0, 0.0, 50.0, 100.0), 1.0),
+            solid(rect(50.0, 0.0, 50.0, 100.0), 1.0),
+        ];
+        assert_eq!(cull_occluded(&els), vec![false, true, true]);
+    }
 }

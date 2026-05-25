@@ -222,14 +222,26 @@ pub fn push_surface_tree_elements(
                 );
                 return;
             };
-            // Grab the view, the buffer's logical size, and the buffer commit
-            // count under one lock (all Copy). buffer_size is the normalization
-            // basis for the wp_viewport source crop below; the commit is the
-            // surface's content version for damage tracking.
-            let (view, buffer_size, content_commit) = {
+            // Grab the view, the buffer's logical size, the buffer commit
+            // count, and the surface's opaque regions under one lock.
+            // buffer_size is the normalization basis for the wp_viewport source
+            // crop below; the commit is the surface's content version for damage
+            // tracking; opaque_rel feeds occlusion culling (surface-relative
+            // logical rects, made absolute below). `opaque_regions()` returns
+            // `None` for translucent / unknown-alpha buffers — the conservative
+            // empty case that never culls.
+            let (view, buffer_size, content_commit, opaque_rel) = {
                 let guard = data.lock().unwrap();
                 match guard.view() {
-                    Some(v) => (v, guard.buffer_size(), commit_token(guard.current_commit())),
+                    Some(v) => (
+                        v,
+                        guard.buffer_size(),
+                        commit_token(guard.current_commit()),
+                        guard
+                            .opaque_regions()
+                            .map(|r| r.to_vec())
+                            .unwrap_or_default(),
+                    ),
                     None => {
                         trace!(
                             target: "render_walk",
@@ -292,6 +304,13 @@ pub fn push_surface_tree_elements(
             let pos = surf_loc + view.offset.to_f64();
             let dst = Rectangle::new(pos, view.dst.to_f64());
 
+            // Opaque regions are surface-view-relative (origin = `pos`); offset
+            // them into absolute output-space logical for occlusion culling.
+            let opaque: Vec<Rectangle<f64, Logical>> = opaque_rel
+                .iter()
+                .map(|r| Rectangle::new(pos + r.loc.to_f64(), r.size.to_f64()))
+                .collect();
+
             let (chroma_view, yuv) = ctx.yuv_for(states);
             surf_els.push(RenderEl::Surface(SurfaceEl {
                 id: surface_element_id(states),
@@ -300,6 +319,7 @@ pub fn push_surface_tree_elements(
                 yuv,
                 geometry: dst,
                 content_commit,
+                opaque,
                 src_rect_uv: crate::utils::src_rect_uv_from_view(&view, buffer_size),
                 color: ctx.color_for(states),
             }));
