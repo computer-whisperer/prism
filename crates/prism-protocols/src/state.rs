@@ -1671,23 +1671,10 @@ impl CompositorHandler for PrismState {
         // Process the buffer: import (dmabuf) or upload (shm) into our
         // Vulkan-side SurfaceTexture and stash it on the surface's
         // data_map for the render path. Reads the buffer from the
-        // `RendererSurfaceState` populated above.
-        //
-        // Do this for the whole committed subsurface tree, not just this
-        // surface. `on_commit_buffer_handler` above walks the tree and applies
-        // each *synchronized* subsurface's cached buffer state (advancing its
-        // committed buffer + commit counter) on this — the parent's — commit.
-        // If we refreshed only `surface`, those children would keep last
-        // commit's import while their content version advanced, so the render
-        // walk samples a buffer one commit stale and the damage tracker, keyed
-        // on the advanced commit, never re-damages it — a stale region frozen
-        // in the persistent intermediate (e.g. Firefox tile subsurfaces that
-        // update only partially). Per-child reuse guards make unchanged
-        // children no-ops. Collected once and reused for `ensure_surface_textures`.
-        let committed_tree = surface_tree_surfaces(surface);
-        for s in &committed_tree {
-            process_surface_buffer(self, s);
-        }
+        // `RendererSurfaceState` populated above. (Subsurface descendants are
+        // refreshed after output resolution below — only the ones whose content
+        // actually advanced this commit.)
+        process_surface_buffer(self, surface);
 
         // Layer-shell surfaces re-arrange their output's LayerMap on commit
         // (so anchor / size / margin / exclusive-zone changes take effect)
@@ -1921,13 +1908,28 @@ impl CompositorHandler for PrismState {
         // (consumer set from the placement resolved just above), and do the
         // per-commit refresh (mirror copies, shm re-uploads). Deferred to
         // here so the consumer-GPU set is known; a window on a single
-        // monitor only ever imports on that monitor's GPU. Walks the same
-        // subsurface tree as the buffer-processing step above so children
-        // applied on this commit materialize in lockstep with their content
-        // version (`consumer_gpus_for_surface` resolves each child via its
-        // root, so subsurfaces pick up the parent window's output/GPU).
-        for s in &committed_tree {
-            ensure_surface_textures(self, s);
+        // monitor only ever imports on that monitor's GPU.
+        ensure_surface_textures(self, surface);
+        // Record this surface's refreshed version so the gated descendant pass
+        // (here or on a future ancestor commit) doesn't redundantly refresh it.
+        mark_texture_refreshed(surface);
+
+        // Refresh subsurface descendants whose content advanced on this commit.
+        // `on_commit_buffer_handler` applies *synchronized* subsurfaces' cached
+        // buffers (advancing their commit counter) on the parent's commit, so
+        // their GPU import must refresh here or the render walk samples a stale
+        // buffer (the bug behind partially-updating Firefox widgets). But doing
+        // it for the *whole* tree every commit re-armed work for unchanged
+        // children — each `ensure_surface_textures` re-sets `acquire_pending`
+        // (re-importing the client's implicit fence next render) and repeats a
+        // layout lookup. So gate per child on its content version actually
+        // advancing. The commit counter is the robust signal: a buffer-identity
+        // check would miss same-`wl_buffer` content changes (in-place dmabuf
+        // damage, shm reuse) and leave those children stale.
+        for s in surface_tree_surfaces(surface) {
+            if &s != surface {
+                refresh_subsurface_texture_if_changed(self, &s);
+            }
         }
 
         // Damage-driven redraw scheduling: a commit that lands renderable
@@ -2705,6 +2707,84 @@ fn surface_tree_surfaces(surface: &WlSurface) -> Vec<WlSurface> {
         |_, _, _| true,
     );
     out
+}
+
+/// Per-surface record of the `RendererSurfaceState` commit counter at the last
+/// texture refresh, so the commit handler can skip re-refreshing a subsurface
+/// descendant whose content didn't advance. Stored in the surface's `data_map`
+/// (independent of the `SurfaceTexture`, which is rebuilt on buffer swap).
+#[derive(Default)]
+struct LastTexRefreshCommit(Mutex<Option<CommitCounter>>);
+
+/// Re-import/upload `surface`'s texture iff its content version advanced since
+/// the last refresh. For subsurface descendants on a parent commit: smithay
+/// applies synchronized children's buffers here (advancing their commit
+/// counter), so a changed child must refresh in lockstep — but an *unchanged*
+/// child must be left alone, or every parent commit re-arms its acquire-fence
+/// wait and repeats a consumer-GPU layout lookup for nothing.
+///
+/// Gating on the commit counter (vs the imported buffer's identity) is what
+/// makes this safe across every buffer-reuse pattern: a client that re-commits
+/// the same `wl_buffer` with new pixels (in-place dmabuf damage, shm reuse)
+/// advances the counter but keeps the buffer id, so an identity check would
+/// wrongly skip it and leave the child stale.
+fn refresh_subsurface_texture_if_changed(state: &mut PrismState, surface: &WlSurface) {
+    // Decide under one lock: the current content version (None ⇒ no buffer
+    // committed yet, nothing to refresh), and whether it differs from the last
+    // version we refreshed. `Some(cur)` ⇒ refresh, then record `cur`.
+    let to_refresh = with_states(surface, |states| -> Option<CommitCounter> {
+        let cur = {
+            let data = states.data_map.get::<RendererSurfaceStateUserData>()?;
+            let guard = data.lock().unwrap();
+            guard.view()?; // no view ⇒ no committed buffer
+            guard.current_commit()
+        };
+        states
+            .data_map
+            .insert_if_missing_threadsafe(LastTexRefreshCommit::default);
+        let last = states.data_map.get::<LastTexRefreshCommit>().unwrap();
+        (*last.0.lock().unwrap() != Some(cur)).then_some(cur)
+    });
+    if to_refresh.is_none() {
+        return;
+    }
+
+    process_surface_buffer(state, surface);
+    ensure_surface_textures(state, surface);
+    // Record the version we just refreshed at — after the work, so a failed
+    // import re-attempts next commit rather than being marked done.
+    mark_texture_refreshed(surface);
+}
+
+/// Record that `surface`'s texture is current as of its committed content
+/// version, so [`refresh_subsurface_texture_if_changed`] skips it until it
+/// advances again. Called both after a surface's own unconditional refresh in
+/// `commit()` (so a desync subsurface that already refreshed itself isn't
+/// re-refreshed by its parent's gated descendant pass) and after a gated child
+/// refresh. No-op for a surface with no committed buffer.
+fn mark_texture_refreshed(surface: &WlSurface) {
+    with_states(surface, |states| {
+        let cur = {
+            let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() else {
+                return;
+            };
+            let guard = data.lock().unwrap();
+            if guard.view().is_none() {
+                return;
+            }
+            guard.current_commit()
+        };
+        states
+            .data_map
+            .insert_if_missing_threadsafe(LastTexRefreshCommit::default);
+        *states
+            .data_map
+            .get::<LastTexRefreshCommit>()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap() = Some(cur);
+    });
 }
 
 /// Pull the most-recently-attached buffer out of a surface's pending state,
