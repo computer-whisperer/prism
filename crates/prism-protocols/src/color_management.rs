@@ -5,10 +5,12 @@
 //! generated bindings re-exported by smithay under
 //! `smithay::reexports::wayland_protocols::wp::color_management::v1::server`).
 //!
-//! **Scope:** parametric image descriptions only. We deliberately defer:
+//! **Scope:** parametric image descriptions plus the pre-defined
+//! `create_windows_scrgb` description (sRGB primaries + extended-linear
+//! transfer — how Mesa's Vulkan WSI, and thus DXVK/vkd3d-proton, drive
+//! HDR). We deliberately defer:
 //! - ICC profiles (`wp_image_description_creator_icc_v1`) — needs file
 //!   I/O + ICC parser; calibration use case doesn't need it.
-//! - `create_windows_scrgb` — niche; can add when needed.
 //!
 //! Output color advertising (`wp_color_management_output_v1`) and surface
 //! feedback (`wp_color_management_surface_feedback_v1`) are implemented:
@@ -63,13 +65,30 @@ use crate::surface_tex::SurfacePlacementSlot;
 const SUPPORTED_INTENTS: &[RenderIntent] = &[RenderIntent::Perceptual];
 
 /// Features we advertise via `supported_feature`. Notable absences:
-/// `IccV2V4` (ICC creator deferred), `SetTfPower` (no use case yet),
-/// `ExtendedTargetVolume` (renderer can't represent it), `WindowsScrgb`.
+/// `IccV2V4` (ICC creator deferred), `SetTfPower` (no use case yet).
+///
+/// `WindowsScrgb` enables the `create_windows_scrgb` request — sRGB /
+/// BT.709 primaries with the extended-linear transfer.
+///
+/// `ExtendedTargetVolume` is load-bearing for the scRGB swapchain path,
+/// even though we don't act on an extended *target* volume per se: Mesa's
+/// Vulkan WSI gates `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` behind it
+/// (`wsi_wl_display_determine_colorspaces`: the scRGB row is the only one
+/// with `needs_extended_range`, skipped unless `extended_target_volume` is
+/// advertised). Without it the WSI never offers fp16 + extended-sRGB, so no
+/// accelerated client — wgpu, DXVK, vkd3d-proton — can create an HDR
+/// swapchain. We can honour it because the decode path already represents
+/// extended range: surfaces decode onto an fp16 intermediate via the
+/// `ExtLinear` → linear (`transfer = 0`) path + sRGB→BT.2020 matrix, with
+/// per-channel clamping deferred to output. (An earlier "renderer can't
+/// represent it" note predated that fp16 decode path.)
 const SUPPORTED_FEATURES: &[Feature] = &[
     Feature::Parametric,
     Feature::SetPrimaries,
     Feature::SetLuminances,
     Feature::SetMasteringDisplayPrimaries,
+    Feature::ExtendedTargetVolume,
+    Feature::WindowsScrgb,
 ];
 
 /// Named transfer functions we advertise via `supported_tf_named`.
@@ -647,11 +666,45 @@ impl Dispatch<WpColorManagerV1, ()> for PrismState {
                 let _ = data_init.init(obj, ParamsCreatorData::default());
             }
             Request::CreateWindowsScrgb { image_description } => {
-                resource.post_error(
-                    wp_color_manager_v1::Error::UnsupportedFeature,
-                    "windows_scrgb not supported".to_string(),
+                // Pre-defined Windows-scRGB stimulus encoding (see
+                // `create_windows_scrgb` in color-management-v1.xml): sRGB /
+                // BT.709 primaries, extended-linear transfer with negative
+                // and >1.0 values, where 0.0 = 0 cd/m², 1.0 = 80 cd/m², and
+                // 125.0 = 10000 cd/m². No parametric building — the
+                // description is fully spec-fixed.
+                let desc = Arc::new(ImageDescription {
+                    identity: state.color_management.next_identity(),
+                    tf: TransferFunction::ExtLinear,
+                    primaries: PrimaryVolume::Named(Primaries::Srgb),
+                    // 0 / 10000 / 80 cd/m². `reference_lum` drives the
+                    // decode shader's `sdr_white_nits` (it scales signal 1.0
+                    // to that many nits), so it MUST be 80 — that is the
+                    // signal anchor, not the perceptual reference white. The
+                    // spec's "if a reference white must be assumed, use 203
+                    // cd/m²" note is about compositor *processing*, not a
+                    // rescale; putting 203 here would map 125.0 to 25375
+                    // nits and break the absolute luminance mapping.
+                    luminances: Some(Luminances {
+                        min_lum_ticks: 0,
+                        max_lum: 10_000,
+                        reference_lum: 80,
+                    }),
+                    mastering_primaries: None,
+                    mastering_luminance: None,
+                    max_cll: None,
+                    max_fall: None,
+                });
+                // Spec: the result allows no `get_information`; just go
+                // straight to `ready` (low 32 bits of the identity).
+                let identity = desc.identity;
+                let d = data_init.init(
+                    image_description,
+                    ImageDescriptionData {
+                        description: Some(desc),
+                    },
                 );
-                let _ = image_description;
+                let lo = (identity & 0xffff_ffff) as u32;
+                d.ready(lo);
             }
             Request::GetImageDescription {
                 image_description,
