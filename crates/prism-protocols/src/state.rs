@@ -77,8 +77,8 @@ use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource};
 use smithay::utils::{IsAlive, Logical, Rectangle, Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    add_pre_commit_hook, get_parent, get_role, with_states, CompositorClientState,
-    CompositorHandler, CompositorState,
+    add_pre_commit_hook, get_parent, get_role, with_states, with_surface_tree_downward,
+    CompositorClientState, CompositorHandler, CompositorState, TraversalAction,
 };
 use smithay::wayland::content_type::ContentTypeState;
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
@@ -1645,7 +1645,22 @@ impl CompositorHandler for PrismState {
         // Vulkan-side SurfaceTexture and stash it on the surface's
         // data_map for the render path. Reads the buffer from the
         // `RendererSurfaceState` populated above.
-        process_surface_buffer(self, surface);
+        //
+        // Do this for the whole committed subsurface tree, not just this
+        // surface. `on_commit_buffer_handler` above walks the tree and applies
+        // each *synchronized* subsurface's cached buffer state (advancing its
+        // committed buffer + commit counter) on this — the parent's — commit.
+        // If we refreshed only `surface`, those children would keep last
+        // commit's import while their content version advanced, so the render
+        // walk samples a buffer one commit stale and the damage tracker, keyed
+        // on the advanced commit, never re-damages it — a stale region frozen
+        // in the persistent intermediate (e.g. Firefox tile subsurfaces that
+        // update only partially). Per-child reuse guards make unchanged
+        // children no-ops. Collected once and reused for `ensure_surface_textures`.
+        let committed_tree = surface_tree_surfaces(surface);
+        for s in &committed_tree {
+            process_surface_buffer(self, s);
+        }
 
         // Layer-shell surfaces re-arrange their output's LayerMap on commit
         // (so anchor / size / margin / exclusive-zone changes take effect)
@@ -1879,8 +1894,14 @@ impl CompositorHandler for PrismState {
         // (consumer set from the placement resolved just above), and do the
         // per-commit refresh (mirror copies, shm re-uploads). Deferred to
         // here so the consumer-GPU set is known; a window on a single
-        // monitor only ever imports on that monitor's GPU.
-        ensure_surface_textures(self, surface);
+        // monitor only ever imports on that monitor's GPU. Walks the same
+        // subsurface tree as the buffer-processing step above so children
+        // applied on this commit materialize in lockstep with their content
+        // version (`consumer_gpus_for_surface` resolves each child via its
+        // root, so subsurfaces pick up the parent window's output/GPU).
+        for s in &committed_tree {
+            ensure_surface_textures(self, s);
+        }
 
         // Damage-driven redraw scheduling: a commit that lands renderable
         // pixels (new buffer, geometry change, popup attach…) needs the
@@ -2631,6 +2652,25 @@ fn import_dmabuf(
             .context("ImportedImage::transition_for_sampling")?;
     }
     Ok(image)
+}
+
+/// Collect `surface` and every subsurface beneath it (the full committed
+/// surface tree) into a flat list. Used by the commit handler to refresh
+/// textures across the whole tree: smithay's `on_commit_buffer_handler` applies
+/// synchronized subsurfaces' buffers on the *parent's* commit, so the per-commit
+/// texture refresh must reach those children too, not just the committed
+/// surface. Read-only walk (no state borrow); ordering is irrelevant since each
+/// surface is processed independently.
+fn surface_tree_surfaces(surface: &WlSurface) -> Vec<WlSurface> {
+    let mut out = Vec::new();
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, _| TraversalAction::DoChildren(()),
+        |s, _, _| out.push(s.clone()),
+        |_, _, _| true,
+    );
+    out
 }
 
 /// Pull the most-recently-attached buffer out of a surface's pending state,
