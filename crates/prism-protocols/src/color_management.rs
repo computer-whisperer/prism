@@ -497,6 +497,25 @@ pub fn build_output_preferred(
     }
 }
 
+/// A neutral SDR sRGB preferred description. Used as the `get_preferred`
+/// fallback when a surface is not yet mapped to any output *and* there is
+/// no active output to borrow a description from. The spec forbids failing
+/// `get_preferred` in this case, so we must always have something `ready`
+/// to return; `preferred_changed2` refines it once the surface maps. Same
+/// shape as `build_output_preferred`'s SDR branch (gamma22 + sRGB).
+fn default_sdr_description(cm: &ColorManagementState) -> Arc<ImageDescription> {
+    Arc::new(ImageDescription {
+        identity: cm.next_identity(),
+        tf: TransferFunction::Gamma22,
+        primaries: PrimaryVolume::Named(Primaries::Srgb),
+        luminances: None,
+        mastering_primaries: None,
+        mastering_luminance: None,
+        max_cll: None,
+        max_fall: None,
+    })
+}
+
 // ─── User data attached to resources ───────────────────────────────────────
 
 /// User data for `WpImageDescriptionCreatorParamsV1`. Mutex-guarded
@@ -809,49 +828,47 @@ impl Dispatch<WpColorManagementSurfaceFeedbackV1, ColorSurfaceFeedbackData> for 
             Request::GetPreferred { image_description }
             | Request::GetPreferredParametric { image_description } => {
                 // Both variants behave the same for us — every
-                // description we mint is parametric. Resolve the
-                // surface's current output, look up the cached
-                // preferred description, init the resource with it,
-                // send `ready` (low 32 bits of identity).
+                // description we mint is parametric.
                 let Ok(surface) = data.surface.upgrade() else {
-                    let desc = data_init.init(
-                        image_description,
-                        ImageDescriptionData { description: None },
+                    // The wl_surface was destroyed, so this feedback object is
+                    // inert. Spec: get_preferred on an inert object raises the
+                    // `inert` protocol error (a `failed`/`no_output` event would
+                    // be wrong — `no_output` is for a vanished output, not a
+                    // vanished surface).
+                    resource.post_error(
+                        wp_color_management_surface_feedback_v1::Error::Inert,
+                        "wl_surface destroyed".to_string(),
                     );
-                    desc.failed(
-                        wp_image_description_v1::Cause::NoOutput,
-                        "wl_surface gone".to_string(),
-                    );
-                    let _ = resource;
+                    let _ = image_description;
                     return;
                 };
+                // Resolve the surface's preferred description. The spec
+                // requires get_preferred to always return `ready` (only
+                // `low_version` may fail) — `no_output` means "the relevant
+                // output no longer exists", not "not mapped yet" — so we
+                // never fail for an unmapped surface. Fall back from the
+                // surface's current output to the active (focused) output it
+                // will most likely map to, and finally to a neutral SDR
+                // default when there are no outputs at all. `preferred_changed2`
+                // refines it once the surface actually maps.
                 let preferred = compositor::with_states(&surface, |states| {
                     states
                         .data_map
                         .get::<SurfacePlacementSlot>()
                         .and_then(|s| s.0.lock().unwrap().current_output.clone())
                 })
-                .and_then(|out_id| state.color_management.output_preferred(&out_id));
-                let Some(desc) = preferred else {
-                    // Surface isn't on any known output (unmapped or
-                    // pre-first-commit). Spec wants us to still
-                    // produce a description — emit failed so the
-                    // client knows.
-                    let d = data_init.init(
-                        image_description,
-                        ImageDescriptionData { description: None },
-                    );
-                    d.failed(
-                        wp_image_description_v1::Cause::NoOutput,
-                        "surface not yet mapped to an output".to_string(),
-                    );
-                    return;
-                };
-                let identity = desc.identity;
+                .and_then(|out_id| state.color_management.output_preferred(&out_id))
+                .or_else(|| {
+                    state
+                        .active_output()
+                        .and_then(|o| state.color_management.output_preferred(&o.name()))
+                })
+                .unwrap_or_else(|| default_sdr_description(&state.color_management));
+                let identity = preferred.identity;
                 let d = data_init.init(
                     image_description,
                     ImageDescriptionData {
-                        description: Some(desc),
+                        description: Some(preferred),
                     },
                 );
                 let lo = (identity & 0xffff_ffff) as u32;
