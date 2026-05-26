@@ -22,7 +22,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use prism_animation::Clock;
@@ -122,6 +122,34 @@ use crate::surface_tex::{
 /// support a backend that reuses connector names per device, switch to
 /// `(DrmDevId, connector::Handle)`.
 pub type OutputId = String;
+
+/// A client dmabuf `wl_buffer`'s GPU-agnostic source (dup'd fds) plus its
+/// memoized per-GPU native imports. Stored in [`PrismState::dmabuf_sources`]
+/// keyed by `wl_buffer` id and dropped when the buffer is destroyed.
+///
+/// `native_imports` lets a client that re-commits the same `wl_buffer` (a
+/// pool/swapchain — the well-behaved pattern most toolkits use) reuse its
+/// `VkImage` instead of rebuilding it on every swap back to that buffer. It's
+/// the per-buffer analogue of smithay's renderer dmabuf cache
+/// (`HashMap<WeakDmabuf, Texture>`): same lifetime (entry dropped with the
+/// buffer), so it doesn't keep buffers alive. Interior `Mutex` because the
+/// import runs on the per-commit / render-demand path, which holds
+/// `&PrismState`; uncontended (main thread), so the lock is ~free. Mirror
+/// (cross-GPU) imports are not cached here — their scratch+target already
+/// survive buffer swaps via the `SurfaceTexture` carry.
+pub struct DmabufSourceEntry {
+    pub source: Arc<prism_frame::Dmabuf>,
+    native_imports: Mutex<HashMap<DrmDevId, Arc<prism_renderer::ImportedImage>>>,
+}
+
+impl DmabufSourceEntry {
+    fn new(source: prism_frame::Dmabuf) -> Self {
+        Self {
+            source: Arc::new(source),
+            native_imports: Mutex::new(HashMap::new()),
+        }
+    }
+}
 
 /// Field declaration order is load-bearing within this struct (outputs
 /// before cards before gpus, since outputs hold strong references to
@@ -331,13 +359,12 @@ pub struct PrismState {
     // Reference Vulkan devices (via Arc); drop before `gpus` so we don't
     // double-free or hit "device destroyed while images outstanding" paths.
     /// GPU-agnostic source description of every accepted dmabuf-backed
-    /// `wl_buffer`, keyed by wl_buffer object id. Holds the dup'd fds so we
-    /// can import the buffer *lazily* on whichever GPU(s) actually display
-    /// the surface (`ensure_surface_textures`), rather than eagerly on every
-    /// registered GPU. Populated in `dmabuf_imported`; dropped in
-    /// `buffer_destroyed`. The per-GPU `VkImage` materializations live on
-    /// the surface's `SurfaceTexSlot`, not here.
-    pub dmabuf_sources: HashMap<ObjectId, Arc<prism_frame::Dmabuf>>,
+    /// `wl_buffer`, keyed by wl_buffer object id, plus its memoized per-GPU
+    /// native imports. Holds the dup'd fds so we can import the buffer
+    /// *lazily* on whichever GPU(s) actually display the surface
+    /// (`ensure_surface_textures`), rather than eagerly on every registered
+    /// GPU. Populated in `dmabuf_imported`; dropped in `buffer_destroyed`.
+    pub dmabuf_sources: HashMap<ObjectId, Arc<DmabufSourceEntry>>,
 
     /// Per-GPU command infrastructure for the cross-GPU mirror copy
     /// (`GpuTex::Mirror`). One reusable copier per registered GPU, used
@@ -2358,14 +2385,21 @@ impl DmabufHandler for PrismState {
 
         match notifier.successful::<PrismState>() {
             Ok(buffer) => {
-                tracing::info!(
+                // `trace`, not `info`: this fires once per client dmabuf buffer
+                // *creation* (create_immed), which a tiling client like Firefox
+                // does hundreds of times per second — at `info` the synchronous
+                // formatting + write was a measurable smoothness drag. Format /
+                // modifier negotiation is already visible at startup
+                // ("dmabuf advertised fourccs" / "candidate format").
+                tracing::trace!(
                     w = src.width,
                     h = src.height,
                     fmt = ?src.format,
                     modifier = format!("{modifier:#x}"),
                     "accepted client dmabuf source (lazy per-GPU import)"
                 );
-                self.dmabuf_sources.insert(buffer.id(), Arc::new(src));
+                self.dmabuf_sources
+                    .insert(buffer.id(), Arc::new(DmabufSourceEntry::new(src)));
             }
             Err(_) => {
                 tracing::warn!("dmabuf successful() failed — client may be dead");
@@ -3220,7 +3254,8 @@ fn hide_all_cursors(state: &mut PrismState) {
 /// (looked up in `dmabuf_sources`) or an shm source (geometry read from
 /// the buffer). No GPU work.
 fn build_tex_source(state: &PrismState, buffer: &WlBuffer) -> Result<TexSource> {
-    if let Some(dmabuf) = state.dmabuf_sources.get(&buffer.id()) {
+    if let Some(entry) = state.dmabuf_sources.get(&buffer.id()) {
+        let dmabuf = &entry.source;
         // For YUV (NV12/P010), `format` is the luma-plane format (R8/R16) — a
         // proxy used only by the per-GPU native-vs-mirror gate in
         // `materialize_dmabuf_for_gpu`. The real two-plane import keys off
@@ -3615,12 +3650,38 @@ fn materialize_dmabuf_for_gpu(
     let modifier = u64::from(dmabuf.modifier);
 
     if gpu_supports_dmabuf(&device_g, format, modifier) {
-        let img =
-            import_dmabuf(&device_g, &dmabuf, true).context("native import on consumer GPU")?;
-        tex.by_gpu.insert(g, GpuTex::Native(Arc::new(img)));
-        // Freshly imported (incl. via the render-demand path, which doesn't go
+        // Reuse a memoized import for this (buffer, GPU) when present: a
+        // pool-reusing client re-commits the same wl_buffer, and rebuilding the
+        // VkImage each swap-back is wasted driver work. The cache lives in the
+        // buffer's `dmabuf_sources` entry, so it's dropped when the buffer is
+        // destroyed (no dangling import). Mirrors smithay's renderer dmabuf
+        // cache. The entry should exist for any live dmabuf (inserted in
+        // `dmabuf_imported`); fall back to an uncached import if it's somehow
+        // gone rather than failing.
+        let img = match state.dmabuf_sources.get(&buffer_id) {
+            Some(entry) => {
+                let mut cache = entry.native_imports.lock().unwrap();
+                match cache.get(&g) {
+                    Some(img) => img.clone(),
+                    None => {
+                        let img = Arc::new(
+                            import_dmabuf(&device_g, &dmabuf, true)
+                                .context("native import on consumer GPU")?,
+                        );
+                        cache.insert(g, img.clone());
+                        img
+                    }
+                }
+            }
+            None => Arc::new(
+                import_dmabuf(&device_g, &dmabuf, true).context("native import on consumer GPU")?,
+            ),
+        };
+        tex.by_gpu.insert(g, GpuTex::Native(img));
+        // Freshly attached (incl. via the render-demand path, which doesn't go
         // through the per-commit ensure): its first sample must wait on the
-        // client's write fence.
+        // client's write fence. (Set even on a cache hit — the client may have
+        // rewritten this buffer's pixels since we last sampled it.)
         tex.acquire_pending = true;
         return Ok(());
     }
