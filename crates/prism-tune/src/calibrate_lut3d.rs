@@ -723,7 +723,8 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         "\n--- phase 3: invert {}³ forward grid → {}³ inverse LUT ---",
         args.cube_edge_cmd, args.cube_edge
     );
-    let bt2020_input_max_nits = estimate_bt2020_input_max_nits(&grid, seed_gain, black_floor_xyz);
+    let bt2020_input_max_nits =
+        lut_input_max_nits_for_output(&baseline, &grid, seed_gain, black_floor_xyz);
     eprintln!(
         "  calibrated BT.2020 input max: R={:.1} G={:.1} B={:.1} cd/m²",
         bt2020_input_max_nits[0], bt2020_input_max_nits[1], bt2020_input_max_nits[2],
@@ -1541,6 +1542,24 @@ fn estimate_bt2020_input_max_nits(
     out
 }
 
+fn lut_input_max_nits_for_output(
+    baseline: &OutputBaseline,
+    grid: &ResponseGrid,
+    seed_gain: [f64; 3],
+    black_floor_xyz: [f64; 3],
+) -> [f32; 3] {
+    if baseline.hdr_active {
+        estimate_bt2020_input_max_nits(grid, seed_gain, black_floor_xyz)
+    } else {
+        // SDR source patches are authored against `sdr_reference_nits`: RGB=1
+        // decodes to D65 white at this luminance. The per-primary reachable
+        // gamut estimate can be much lower than that on weak-red/blue panels,
+        // but using it as a componentwise pre-LUT clamp clips neutral white
+        // before the LUT has a chance to use cross-channel compensation.
+        [baseline.sdr_reference_nits as f32; 3]
+    }
+}
+
 fn bt2020_axis_emission_target(axis: usize, nits: f64, black_floor_xyz: [f64; 3]) -> [f64; 3] {
     let mut rgb = [0.0_f64; 3];
     rgb[axis] = nits;
@@ -1966,5 +1985,23 @@ mod tests {
             xyz.x,
             mid_r,
         );
+    }
+
+    #[test]
+    fn sdr_lut_input_max_uses_reference_white() {
+        let grid = synth_grid(5, [1.0, 0.2, 0.0], [0.0, 1.0, 0.0], [0.0, 0.1, 1.0], 20.0);
+        let baseline = OutputBaseline {
+            hdr_active: false,
+            sdr_reference_nits: 74.0,
+            initial_panel_peak_nits: [20.0, 20.0, 20.0],
+            initial_response_curve: None,
+            make: None,
+            model: None,
+            serial: None,
+        };
+
+        let max = lut_input_max_nits_for_output(&baseline, &grid, [0.2, 1.0, 0.1], [0.0; 3]);
+
+        assert_eq!(max, [74.0, 74.0, 74.0]);
     }
 }
