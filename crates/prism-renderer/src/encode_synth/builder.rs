@@ -164,7 +164,7 @@ impl ShaderCtx {
             mat4,  // 0: cal_matrix
             vec4,  // 1: response_gain (rgb + reserved)
             vec4,  // 2: response_gamma (rgb + reserved)
-            vec4,  // 3: aux2_reserved
+            vec4,  // 3: lut_input_max_nits
             f32_t, // 4: sdr_white_nits
             f32_t, // 5: target_peak_nits
             f32_t, // 6: dither_strength
@@ -194,7 +194,7 @@ impl ShaderCtx {
         for (member, offset) in [
             (MEMBER_RESPONSE_GAIN, OFFSET_RESPONSE_GAIN),
             (MEMBER_RESPONSE_GAMMA, OFFSET_RESPONSE_GAMMA),
-            (MEMBER_AUX2_RESERVED, OFFSET_AUX2_RESERVED),
+            (MEMBER_LUT_INPUT_MAX_NITS, OFFSET_LUT_INPUT_MAX_NITS),
             (MEMBER_SDR_WHITE_NITS, OFFSET_SDR_WHITE_NITS),
             (MEMBER_TARGET_PEAK_NITS, OFFSET_TARGET_PEAK_NITS),
             (MEMBER_DITHER_STRENGTH, OFFSET_DITHER_STRENGTH),

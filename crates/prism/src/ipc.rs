@@ -287,9 +287,10 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                 panel_peak_nits_rgb = ?[r, g, b],
                 "ipc: set panel-peak-nits override"
             );
-            // Honest mid-session: push a fresh HDR infoframe so the sink
-            // tonemaps against the new ceiling rather than the stale KDL
-            // value. No-op for SDR outputs.
+            // Honest mid-session: re-push the configured HDR infoframe
+            // after the runtime color state changes. The infoframe uses
+            // the KDL HDR signaling values, not measured subpixel peaks.
+            // No-op for SDR outputs.
             if let Err(e) = output_ctx.rebuild_hdr_infoframe() {
                 tracing::warn!(
                     connector = %name,
@@ -335,6 +336,9 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                     loaded.cube_edge, renderer_edge,
                 ));
             }
+            let cube_edge = loaded.cube_edge;
+            let bp = loaded.black_point_xyz;
+            let lut_input_max_nits = loaded.bt2020_input_max_nits;
             output_ctx.color_override.lut3d_entries = Some(loaded.entries);
             // Carry the measured black-point alongside — the v2 file
             // format pairs them and the compositor uses the floor for
@@ -342,15 +346,16 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             // zero ⇒ unmeasured; we treat that as "leave the override
             // unset" so the KDL-loaded value (if any) still shows
             // through via effective_black_point_xyz.
-            let bp = loaded.black_point_xyz;
             if bp[0] != 0.0 || bp[1] != 0.0 || bp[2] != 0.0 {
                 output_ctx.color_override.black_point_xyz = Some(bp);
             }
+            output_ctx.color_override.lut_input_max_nits = Some(lut_input_max_nits);
             tracing::info!(
                 connector = %name,
                 path = %path,
-                cube_edge = loaded.cube_edge,
+                cube_edge,
                 black_point_xyz = ?bp,
+                lut_input_max_nits = ?lut_input_max_nits,
                 "ipc: loaded color LUT from file"
             );
             lut_dirty = true;
@@ -365,6 +370,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             }
             let entries = prism_renderer::identity_lut(cube_edge);
             output_ctx.color_override.lut3d_entries = Some(entries);
+            output_ctx.color_override.lut_input_max_nits = Some([10_000.0, 10_000.0, 10_000.0]);
             tracing::info!(
                 connector = %name,
                 cube_edge,
@@ -395,6 +401,9 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             }
             if let Some(m) = output_ctx.effective_ctm() {
                 p.set_ctm(m);
+            }
+            if let Some(max_nits) = output_ctx.effective_lut_input_max_nits() {
+                p.set_lut_input_max_nits(max_nits);
             }
             let result = output_ctx
                 .renderer

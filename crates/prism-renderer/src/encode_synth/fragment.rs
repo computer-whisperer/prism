@@ -326,7 +326,8 @@ pub fn emit_per_channel_response_gain_gamma(
 /// pair. The math is:
 ///
 /// ```text
-/// coord  = pq_oetf(max(in_nits, 0))         // [0, 10000] nits → [0, 1] LUT coord
+/// clamped = clamp(in_nits, 0, push.lut_input_max_nits)
+/// coord   = pq_oetf(clamped)                // [0, 10000] nits → [0, 1] LUT coord
 /// out    = texture(u_lut, coord).rgb         // trilinear sample; nits
 /// ```
 ///
@@ -363,7 +364,9 @@ pub fn emit_lut3d(ctx: &mut ShaderCtx, in_nits: spirv::Word) -> spirv::Word {
     // upstream CTMs that contain negatives, accumulation noise, etc.) —
     // pow on negative bases is undefined and we'd get NaN coords.
     let zero_vec = ctx.vec3_splat(f_zero);
-    let in_clamped = ctx.glsl_call_vec3(GLSL_FMAX, [in_nits, zero_vec]);
+    let max_vec4 = load_push_vec4(ctx, MEMBER_LUT_INPUT_MAX_NITS);
+    let max_vec = vec4_xyz(ctx, max_vec4);
+    let in_clamped = ctx.glsl_call_vec3(GLSL_FCLAMP, [in_nits, zero_vec, max_vec]);
 
     let inv_10k = ctx.const_f32(1.0 / 10000.0);
     let inv_10k_vec = ctx.vec3_splat(inv_10k);

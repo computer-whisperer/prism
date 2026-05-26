@@ -1,11 +1,11 @@
 //! `prism-tune calibrate-lut3d` — measurement-driven 3D LUT calibration.
 //!
-//! Forward model: measure the panel's response on a 3D grid in
-//! command space — every combination of (cmd_R, cmd_G, cmd_B) at
-//! `cube_edge_cmd` log-spaced values per axis. The inverse 3D LUT
-//! is built by Newton-Raphson against this measured grid: for each
-//! grid point in BT.2020 target space, find the cmd triple that
-//! produces the target XYZ.
+//! Forward model: request patches on a 3D grid, diagnose the actual
+//! scanout nits prism emits for each request, then measure the panel's
+//! XYZ response at those diagnosed coordinates. The inverse 3D LUT is
+//! built by Newton-Raphson against this measured grid: for each grid
+//! point in BT.2020 target space, find the scanout triple that produces
+//! the target XYZ.
 //!
 //! Why the 3D forward grid (vs. an additive per-channel model):
 //! Real LCDs don't actually obey `panel(R+G+B) = panel(R) +
@@ -23,12 +23,14 @@
 //!      emission + ambient + dark current at black; folding that
 //!      into per-channel data triple-counts it in the additive sum.
 //!   1. Per-channel saturation discovery: short sweep per channel
-//!      to find peak emission. Used to bound the 3D cmd-axis ranges
-//!      (no wasted samples above saturation) and to seed Newton.
+//!      to find peak emission. Used to bound the 3D request-axis ranges
+//!      (no wasted samples above saturation) and to seed Newton from
+//!      diagnosed scanout nits.
 //!   2. 3D grid sweep: `cube_edge_cmd³` patches at log-spaced
-//!      per-axis cmds — black-subtracted, stored as `ResponseGrid`.
+//!      per-axis requests. Each vertex stores diagnosed scanout nits
+//!      plus black-subtracted XYZ in `ResponseGrid`.
 //!   3. Inversion: Newton-Raphson against `grid.forward(cmd)` →
-//!      17³ cmd-space inverse LUT.
+//!      17³ scanout-space inverse LUT.
 //!   4. Verify: D65 white sweep through the live-pushed LUT,
 //!      compare measured Y / Δu'v' to target.
 //!
@@ -136,25 +138,34 @@ pub struct CalibrateLut3dArgs {
     pub no_verify: bool,
 }
 
-/// One (commanded, XYZ) measurement from a per-channel sweep.
+/// One (requested, diagnosed-scanout, XYZ) measurement from a per-channel sweep.
 #[derive(Clone, Copy, Debug)]
 struct ChannelSample {
-    /// Commanded value handed to the patch surface (cd/m² for HDR PQ,
+    /// Requested value handed to the patch surface (cd/m² for HDR PQ,
     /// nits-equivalent for SDR sRGB encode at patch time).
-    commanded: f64,
+    requested: f64,
+    /// Actual scanout nits reported by `EncodeDiagnose`. In HDR this is
+    /// the coordinate used by the forward model; in SDR it equals
+    /// the requested value because `EncodeDiagnose` bypasses source-surface
+    /// decode.
+    scanout: f64,
     xyz: Xyz,
 }
 
-/// Forward 1D response LUT for one primary — sorted by commanded value
-/// and capped at the highest commanded value where the panel was still
+/// Forward 1D response LUT for one primary — sorted by diagnosed scanout value
+/// and capped at the highest scanout value where the panel was still
 /// responding (saturation cutoff).
 #[derive(Clone, Debug)]
 struct ChannelResponse {
     samples: Vec<ChannelSample>,
-    /// Inclusive upper bound on `commanded` past which we treat the
+    /// Inclusive upper bound on diagnosed scanout past which we treat the
     /// panel as saturated. Used to clamp the Newton-Raphson search
     /// space so we don't extrapolate into the cliff.
     max_cmd: f64,
+    /// Requested patch value that produced `max_cmd`. Phase 2 uses this
+    /// as the request-space sweep bound, then re-diagnoses the actual
+    /// scanout coordinate for every vertex.
+    max_requested: f64,
     /// Peak emitted Y observed during the sweep. Stored alongside so
     /// the final panel-peak push uses measured-emitted values rather
     /// than commanded (the latter would over-promise on weak subpixels).
@@ -173,15 +184,51 @@ impl ChannelResponse {
             .samples
             .iter()
             .rev()
-            .find(|s| s.commanded <= self.max_cmd)
+            .find(|s| s.scanout <= self.max_cmd)
             .unwrap_or(self.samples.last().unwrap());
-        last.xyz.y / last.commanded.max(1e-6)
+        last.xyz.y / last.scanout.max(1e-6)
     }
 }
 
-/// 3D forward measurement grid in cmd-space. Each entry stores the
+fn request_axis_for_scanout(response: &ChannelResponse, cube_edge: usize) -> Vec<f64> {
+    let scanout_lo = response.samples.first().unwrap().scanout.max(1e-3);
+    let scanout_axis = log_spaced_targets(scanout_lo, response.max_cmd, cube_edge);
+    let mut requested_axis: Vec<f64> = scanout_axis
+        .into_iter()
+        .map(|target_scanout| request_for_scanout(response, target_scanout))
+        .collect();
+    if let Some(last) = requested_axis.last_mut() {
+        *last = response.max_requested;
+    }
+    requested_axis
+}
+
+fn request_for_scanout(response: &ChannelResponse, target_scanout: f64) -> f64 {
+    let samples = &response.samples;
+    let first = samples.first().unwrap();
+    if target_scanout <= first.scanout {
+        return first.requested;
+    }
+
+    for pair in samples.windows(2) {
+        let a = pair[0];
+        let b = pair[1];
+        if target_scanout <= b.scanout {
+            let span = b.scanout - a.scanout;
+            if span <= 1e-6 {
+                return a.requested;
+            }
+            let t = ((target_scanout - a.scanout) / span).clamp(0.0, 1.0);
+            return a.requested + t * (b.requested - a.requested);
+        }
+    }
+
+    response.max_requested
+}
+
+/// 3D forward measurement grid in diagnosed scanout-space. Each entry stores the
 /// panel's true emission (black already subtracted) at a specific
-/// (cmd_R, cmd_G, cmd_B) command triple. Per-axis cmd values are
+/// (R, G, B) scanout triple. Per-axis values are
 /// log-spaced from `args.min_cmd` up to each channel's discovered
 /// saturation peak — so all `cube_edge³` measurements land in the
 /// useful range and none are wasted above saturation.
@@ -196,8 +243,9 @@ impl ChannelResponse {
 /// `(i, j, k)`. X-fastest matches the existing LUT layout convention.
 struct ResponseGrid {
     cube_edge: usize,
-    /// Per-axis sorted ascending list of commanded values. `axis_cmds[c][i]`
-    /// is the cmd handed to channel `c` for the slice at axis-c index `i`.
+    /// Per-axis sorted ascending list of diagnosed scanout values.
+    /// `axis_cmds[c][i]` is the actual scanout coordinate for channel `c`
+    /// at the slice with axis-c index `i`.
     /// Each list has exactly `cube_edge` entries; entries are positive
     /// (no zero corner — handled at the inversion edge case instead).
     axis_cmds: [Vec<f64>; 3],
@@ -480,7 +528,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     // panel output (post-clip). Sampling that flat region would put
     // degenerate data into the 3D grid — Newton could converge to
     // phantom cmds the encode pipeline can't actually deliver. Cap
-    // the sweep at sdr_reference_nits so the per_channel_peaks (and
+    // the sweep at sdr_reference_nits so the request-space sweep bounds (and
     // therefore the 3D sweep axis bounds) stay in the unclipped
     // regime. HDR has no equivalent clamp; full args.max_cmd applies.
     let effective_max_cmd = if baseline.hdr_active {
@@ -495,9 +543,14 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         eprintln!("\n--- {} channel sweep ---", channel.label());
         let mut samples: Vec<ChannelSample> = Vec::with_capacity(targets.len());
         let mut max_cmd = targets[0];
+        let mut max_requested = targets[0];
         let mut peak_y = 0.0_f64;
         for (i, &cmd) in targets.iter().enumerate() {
             set_channel_patch(&mut patch, &baseline, channel, cmd)?;
+            let mut requested_rgb = [0.0_f64; 3];
+            requested_rgb[channel.idx()] = cmd;
+            let scanout_rgb = diagnose_scanout_cmd(&args.output, &baseline, requested_rgb)?;
+            let scanout_cmd = scanout_rgb[channel.idx()];
             thread::sleep(settle);
             let raw = device.measure_raw(&setup).context("measure")?;
             let raw_xyz = raw_to_xyz(&raw, &setup, &cal);
@@ -510,9 +563,10 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
                 z: (raw_xyz.z - black_xyz.z).max(0.0),
             };
             eprintln!(
-                "  {} cmd {:>8.2} → X={:>8.3}  Y={:>8.3}  Z={:>8.3}  (raw Y={:.3}, less black {:.3})",
+                "  {} cmd {:>8.2} scanout {:>8.2} → X={:>8.3}  Y={:>8.3}  Z={:>8.3}  (raw Y={:.3}, less black {:.3})",
                 channel.label(),
                 cmd,
+                scanout_cmd,
                 xyz.x,
                 xyz.y,
                 xyz.z,
@@ -526,10 +580,11 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
                 // the header line written above).
                 writeln!(
                     w,
-                    "{},{},{:.4},{:.4},{:.4},{:.4}",
+                    "{},{},{:.4},{:.4},{:.4},{:.4},{:.4}",
                     channel.label(),
                     i + 1,
                     cmd,
+                    scanout_cmd,
                     xyz.x,
                     xyz.y,
                     xyz.z,
@@ -550,25 +605,35 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             const SATURATION_NOISE_FLOOR_Y: f64 = 1.0;
             if let Some(prev) = samples.last() {
                 let ratio = xyz.y / prev.xyz.y.max(0.01);
-                let cmd_ratio = cmd / prev.commanded.max(0.01);
+                let requested_ratio = cmd / prev.requested.max(0.01);
+                let scanout_ratio = scanout_cmd / prev.scanout.max(0.01);
                 let both_above_floor =
                     xyz.y > SATURATION_NOISE_FLOOR_Y && prev.xyz.y > SATURATION_NOISE_FLOOR_Y;
-                if samples.len() >= 3 && cmd_ratio >= 1.2 && ratio < 1.05 && both_above_floor {
+                let scanout_plateaued = requested_ratio >= 1.2 && scanout_ratio < 1.01;
+                let panel_plateaued = requested_ratio >= 1.2 && ratio < 1.05 && both_above_floor;
+                if samples.len() >= 3 && (scanout_plateaued || panel_plateaued) {
                     eprintln!(
-                        "  {} saturation detected at cmd {:.1} (Y ratio {:.2} vs cmd ratio {:.2}); \
+                        "  {} saturation detected at cmd {:.1} (Y ratio {:.2}, requested ratio {:.2}, scanout ratio {:.2}); \
                          stopping sweep early",
-                        channel.label(), cmd, ratio, cmd_ratio,
+                        channel.label(),
+                        cmd,
+                        ratio,
+                        requested_ratio,
+                        scanout_ratio,
                     );
-                    max_cmd = prev.commanded;
+                    max_cmd = prev.scanout;
+                    max_requested = prev.requested;
                     break;
                 }
             }
             if xyz.y > peak_y {
                 peak_y = xyz.y;
             }
-            max_cmd = cmd;
+            max_cmd = scanout_cmd;
+            max_requested = cmd;
             samples.push(ChannelSample {
-                commanded: cmd,
+                requested: cmd,
+                scanout: scanout_cmd,
                 xyz,
             });
         }
@@ -580,18 +645,20 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             );
         }
         eprintln!(
-            "  {} forward LUT: {} samples, max_cmd={:.1}, peak_y={:.2}",
+            "  {} forward LUT: {} samples, max_request={:.1}, max_scanout={:.1}, peak_y={:.2}",
             channel.label(),
             samples.len(),
+            max_requested,
             max_cmd,
             peak_y,
         );
         if let Some((_, w)) = log.as_mut() {
             writeln!(
                 w,
-                "# {} forward LUT: samples={} max_cmd={:.3} peak_y={:.3}",
+                "# {} forward LUT: samples={} max_requested={:.3} max_scanout={:.3} peak_y={:.3}",
                 channel.label(),
                 samples.len(),
+                max_requested,
                 max_cmd,
                 peak_y,
             )?;
@@ -599,6 +666,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         responses[channel.idx()] = Some(ChannelResponse {
             samples,
             max_cmd,
+            max_requested,
             peak_y,
         });
     }
@@ -607,10 +675,10 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         responses[1].take().unwrap(),
         responses[2].take().unwrap(),
     ];
-    let per_channel_peaks = [
-        responses[0].max_cmd,
-        responses[1].max_cmd,
-        responses[2].max_cmd,
+    let phase2_request_axes = [
+        request_axis_for_scanout(&responses[0], args.cube_edge_cmd),
+        request_axis_for_scanout(&responses[1], args.cube_edge_cmd),
+        request_axis_for_scanout(&responses[2], args.cube_edge_cmd),
     ];
     let seed_gain = [
         responses[0].approx_gain_y_per_cmd(),
@@ -638,12 +706,12 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     );
     let grid = sweep_3d_grid(
         args.cube_edge_cmd,
-        args.min_cmd,
-        per_channel_peaks,
+        phase2_request_axes,
         black_xyz,
         settle,
         &mut device,
         &mut patch,
+        &args.output,
         &baseline,
         &setup,
         &cal,
@@ -654,6 +722,11 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     eprintln!(
         "\n--- phase 3: invert {}³ forward grid → {}³ inverse LUT ---",
         args.cube_edge_cmd, args.cube_edge
+    );
+    let bt2020_input_max_nits = estimate_bt2020_input_max_nits(&grid, seed_gain, black_floor_xyz);
+    eprintln!(
+        "  calibrated BT.2020 input max: R={:.1} G={:.1} B={:.1} cd/m²",
+        bt2020_input_max_nits[0], bt2020_input_max_nits[1], bt2020_input_max_nits[2],
     );
     let (entries, residuals) = build_inverse_lut(args.cube_edge, &grid, seed_gain, black_floor_xyz);
     if let Some((_, w)) = log.as_mut() {
@@ -737,15 +810,17 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         args.cube_edge,
         peak_nits,
         black_point_f32,
+        bt2020_input_max_nits,
         &entries,
     )
     .with_context(|| format!("write LUT file {}", lut_path.display()))?;
     eprintln!(
-        "\nWrote {} (cube_edge={}, peaks={:?}, black_xyz={:?})",
+        "\nWrote {} (cube_edge={}, peaks={:?}, black_xyz={:?}, bt2020_input_max={:?})",
         lut_path.display(),
         args.cube_edge,
         peak_nits,
         black_point_f32,
+        bt2020_input_max_nits,
     );
 
     // Apply discovered peaks (HDR mode only) so the IR clamp matches
@@ -811,6 +886,11 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             peak_nits[2],
             black_point_f32[0], black_point_f32[1], black_point_f32[2],
         )?;
+        writeln!(
+            w,
+            "# bt2020_input_max_nits=R={:.3} G={:.3} B={:.3}",
+            bt2020_input_max_nits[0], bt2020_input_max_nits[1], bt2020_input_max_nits[2],
+        )?;
         w.flush().ok();
         eprintln!("Measurement log: {}", path.display());
     }
@@ -846,6 +926,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         baseline.hdr_active,
         peak_nits,
         black_point_f32,
+        bt2020_input_max_nits,
         &lut_path,
     );
 
@@ -871,27 +952,28 @@ struct VerifyResult {
 }
 
 /// Drive the panel through the cube_edge³ Cartesian product of per-
-/// axis log-spaced cmds and record one (cmd, XYZ) measurement at each
-/// vertex. Returns the populated [`ResponseGrid`], with the black
-/// floor already subtracted from every sample.
+/// axis log-spaced requests and record one (diagnosed scanout, XYZ)
+/// measurement at each vertex. Returns the populated [`ResponseGrid`],
+/// with the black floor already subtracted from every sample.
 ///
-/// Axis bounds: per-channel `[args_min_cmd, per_channel_peaks[c]]`.
-/// Putting peaks-from-Phase-1 in as the upper bound means no
-/// measurements are wasted above each channel's saturation, regardless
-/// of how much they differ (typical LCD: R≈300, G≈420, B≈420).
+/// Request axes are chosen from the Phase 1 request→diagnosed-scanout
+/// curve so the measured grid is log-spaced in actual emitted scanout
+/// coordinates, not in raw requests that may plateau under compositor
+/// clamps.
 ///
-/// CSV log: each row is `3D,i,j,k,cmd_r,cmd_g,cmd_b,X,Y,Z` —
+/// CSV log: each row is
+/// `3D,i,j,k,requested_r,requested_g,requested_b,scanout_r,scanout_g,scanout_b,X,Y,Z` —
 /// distinct prefix from the Phase 1 `R/G/B` rows so a log reader
 /// can tell which phase each sample is from. XYZ is black-subtracted.
 #[allow(clippy::too_many_arguments)]
 fn sweep_3d_grid(
     cube_edge: usize,
-    min_cmd: f64,
-    per_channel_peaks: [f64; 3],
+    requested_axis_cmds: [Vec<f64>; 3],
     black_xyz: Xyz,
     settle: Duration,
     device: &mut Colorimeter,
     patch: &mut PatchSurface,
+    output: &str,
     baseline: &OutputBaseline,
     setup: &Setup,
     cal: &Calibration,
@@ -900,19 +982,20 @@ fn sweep_3d_grid(
     if cube_edge < 2 {
         anyhow::bail!("cube_edge_cmd must be ≥ 2 (degenerate 1D grid not supported)");
     }
-    let axis_cmds = [
-        log_spaced_targets(min_cmd, per_channel_peaks[0], cube_edge),
-        log_spaced_targets(min_cmd, per_channel_peaks[1], cube_edge),
-        log_spaced_targets(min_cmd, per_channel_peaks[2], cube_edge),
-    ];
+    if requested_axis_cmds
+        .iter()
+        .any(|axis| axis.len() != cube_edge)
+    {
+        anyhow::bail!("internal error: phase 2 request axis length does not match cube_edge_cmd");
+    }
     eprintln!(
         "  per-axis cmd ranges: R[{:.2}..{:.2}] G[{:.2}..{:.2}] B[{:.2}..{:.2}]",
-        axis_cmds[0][0],
-        axis_cmds[0][cube_edge - 1],
-        axis_cmds[1][0],
-        axis_cmds[1][cube_edge - 1],
-        axis_cmds[2][0],
-        axis_cmds[2][cube_edge - 1],
+        requested_axis_cmds[0][0],
+        requested_axis_cmds[0][cube_edge - 1],
+        requested_axis_cmds[1][0],
+        requested_axis_cmds[1][cube_edge - 1],
+        requested_axis_cmds[2][0],
+        requested_axis_cmds[2][cube_edge - 1],
     );
     if let Some((_, w)) = log.as_mut() {
         writeln!(
@@ -920,23 +1003,40 @@ fn sweep_3d_grid(
             "# phase 2: 3D forward grid sweep, cube_edge_cmd={cube_edge} ({} patches)",
             cube_edge.pow(3),
         )?;
-        writeln!(w, "phase,i,j,k,cmd_r,cmd_g,cmd_b,X,Y,Z")?;
+        writeln!(
+            w,
+            "phase,i,j,k,requested_r,requested_g,requested_b,scanout_r,scanout_g,scanout_b,X,Y,Z"
+        )?;
     }
 
     let total = cube_edge.pow(3);
     let mut xyz: Vec<Xyz> = Vec::with_capacity(total);
+    let mut axis_scanout_sum: [Vec<f64>; 3] = std::array::from_fn(|_| vec![0.0_f64; cube_edge]);
+    let mut axis_scanout_count: [Vec<usize>; 3] = std::array::from_fn(|_| vec![0_usize; cube_edge]);
+    let mut axis_scanout_min: [Vec<f64>; 3] =
+        std::array::from_fn(|_| vec![f64::INFINITY; cube_edge]);
+    let mut axis_scanout_max: [Vec<f64>; 3] =
+        std::array::from_fn(|_| vec![f64::NEG_INFINITY; cube_edge]);
     let mut patches_done = 0usize;
     // Progress heartbeat at 10% increments — the 729-patch sweep takes
     // long enough that a silent stretch reads as a hang.
     let progress_step = (total / 10).max(1);
     let start = std::time::Instant::now();
     for k in 0..cube_edge {
-        let cmd_b = axis_cmds[2][k];
+        let cmd_b = requested_axis_cmds[2][k];
         for j in 0..cube_edge {
-            let cmd_g = axis_cmds[1][j];
+            let cmd_g = requested_axis_cmds[1][j];
             for i in 0..cube_edge {
-                let cmd_r = axis_cmds[0][i];
+                let cmd_r = requested_axis_cmds[0][i];
                 set_rgb_patch(patch, baseline, [cmd_r, cmd_g, cmd_b])?;
+                let scanout_rgb = diagnose_scanout_cmd(output, baseline, [cmd_r, cmd_g, cmd_b])?;
+                for (axis, idx) in [(0, i), (1, j), (2, k)] {
+                    let v = scanout_rgb[axis];
+                    axis_scanout_sum[axis][idx] += v;
+                    axis_scanout_count[axis][idx] += 1;
+                    axis_scanout_min[axis][idx] = axis_scanout_min[axis][idx].min(v);
+                    axis_scanout_max[axis][idx] = axis_scanout_max[axis][idx].max(v);
+                }
                 thread::sleep(settle);
                 let raw = device.measure_raw(setup).context("3D-sweep measure")?;
                 let raw_xyz = raw_to_xyz(&raw, setup, cal);
@@ -949,10 +1049,13 @@ fn sweep_3d_grid(
                 if let Some((_, w)) = log.as_mut() {
                     writeln!(
                         w,
-                        "3D,{i},{j},{k},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
+                        "3D,{i},{j},{k},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
                         cmd_r,
                         cmd_g,
                         cmd_b,
+                        scanout_rgb[0],
+                        scanout_rgb[1],
+                        scanout_rgb[2],
                         xyz_above_black.x,
                         xyz_above_black.y,
                         xyz_above_black.z,
@@ -980,11 +1083,100 @@ fn sweep_3d_grid(
         total,
         start.elapsed().as_secs_f64(),
     );
+    let axis_cmds = diagnosed_axes_from_stats(
+        axis_scanout_sum,
+        axis_scanout_count,
+        axis_scanout_min,
+        axis_scanout_max,
+    )?;
+    eprintln!(
+        "  diagnosed scanout ranges: R[{:.2}..{:.2}] G[{:.2}..{:.2}] B[{:.2}..{:.2}]",
+        axis_cmds[0][0],
+        axis_cmds[0][cube_edge - 1],
+        axis_cmds[1][0],
+        axis_cmds[1][cube_edge - 1],
+        axis_cmds[2][0],
+        axis_cmds[2][cube_edge - 1],
+    );
     Ok(ResponseGrid {
         cube_edge,
         axis_cmds,
         xyz,
     })
+}
+
+fn diagnose_scanout_cmd(
+    output: &str,
+    baseline: &OutputBaseline,
+    requested_rgb: [f64; 3],
+) -> Result<[f64; 3]> {
+    if !baseline.hdr_active {
+        // SDR calibration patches start as source-surface sRGB and are decoded
+        // before entering BT.2020. EncodeDiagnose starts after that decode, so
+        // using it as the coordinate would silently change domains.
+        return Ok(requested_rgb);
+    }
+    let resp = send_action_for_reply(
+        output,
+        OutputAction::EncodeDiagnose {
+            r: requested_rgb[0],
+            g: requested_rgb[1],
+            b: requested_rgb[2],
+        },
+    )
+    .context("EncodeDiagnose IPC during calibration sweep")?;
+    match resp {
+        Response::EncodeDiagnose(r) => Ok(r.scanout_nits),
+        other => anyhow::bail!("unexpected reply to EncodeDiagnose: {other:?}"),
+    }
+}
+
+fn diagnosed_axes_from_stats(
+    sum: [Vec<f64>; 3],
+    count: [Vec<usize>; 3],
+    min: [Vec<f64>; 3],
+    max: [Vec<f64>; 3],
+) -> Result<[Vec<f64>; 3]> {
+    let out: [Vec<f64>; 3] = std::array::from_fn(|axis| {
+        (0..sum[axis].len())
+            .map(|idx| {
+                let n = count[axis][idx].max(1) as f64;
+                sum[axis][idx] / n
+            })
+            .collect()
+    });
+
+    for axis in 0..3 {
+        for idx in 0..out[axis].len() {
+            if count[axis][idx] == 0 {
+                anyhow::bail!("missing EncodeDiagnose samples for axis {axis} index {idx}");
+            }
+            let spread = max[axis][idx] - min[axis][idx];
+            let tolerance = (out[axis][idx].abs() * 0.002).max(0.05);
+            if spread > tolerance {
+                anyhow::bail!(
+                    "EncodeDiagnose scanout is not separable for axis {axis} index {idx}: \
+                     min={:.4}, max={:.4}, spread={:.4}, tolerance={:.4}",
+                    min[axis][idx],
+                    max[axis][idx],
+                    spread,
+                    tolerance,
+                );
+            }
+        }
+        for idx in 1..out[axis].len() {
+            if out[axis][idx] <= out[axis][idx - 1] {
+                anyhow::bail!(
+                    "EncodeDiagnose scanout axis {axis} is not strictly increasing at index {idx}: \
+                     prev={:.4}, current={:.4}",
+                    out[axis][idx - 1],
+                    out[axis][idx],
+                );
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 /// Render BT.2020 D65 white at a range of luminances through the
@@ -1313,6 +1505,53 @@ fn build_inverse_lut(
     (entries, residuals)
 }
 
+/// Estimate the per-channel linear BT.2020 input bounds the generated LUT
+/// is calibrated to handle. This is intentionally derived directly from
+/// the measured forward grid and inverter, not from panel-native peaks or
+/// an external CTM. For each pure BT.2020 axis, increase luminance until
+/// the inverse solution starts parking any panel command at its measured
+/// maximum; the previous value is the highest input that still has useful
+/// LUT headroom.
+fn estimate_bt2020_input_max_nits(
+    grid: &ResponseGrid,
+    seed_gain: [f64; 3],
+    black_floor_xyz: [f64; 3],
+) -> [f32; 3] {
+    let max_cmd = grid.max_cmd();
+    let mut out = [10_000.0_f32; 3];
+    for axis in 0..3 {
+        let mut lo = 0.0_f64;
+        let mut hi = 10_000.0_f64;
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            let target = bt2020_axis_emission_target(axis, mid, black_floor_xyz);
+            let (cmd, _) = invert_one(grid, seed_gain, target);
+            let saturated = (0..3).any(|c| cmd[c] >= max_cmd[c] * 0.995);
+            if saturated {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        // Leave a small numerical margin below the measured saturation
+        // boundary so tiny interpolation/settle drift does not push the
+        // shader into the LUT's terminal cells during normal rendering.
+        out[axis] = (lo * 0.98).clamp(1.0, 10_000.0) as f32;
+    }
+    out
+}
+
+fn bt2020_axis_emission_target(axis: usize, nits: f64, black_floor_xyz: [f64; 3]) -> [f64; 3] {
+    let mut rgb = [0.0_f64; 3];
+    rgb[axis] = nits;
+    let xyz = bt2020_to_xyz(rgb[0], rgb[1], rgb[2]);
+    [
+        (xyz[0] - black_floor_xyz[0]).max(0.0),
+        (xyz[1] - black_floor_xyz[1]).max(0.0),
+        (xyz[2] - black_floor_xyz[2]).max(0.0),
+    ]
+}
+
 /// Damped-Newton-with-backtracking-line-search inversion of one
 /// target XYZ against the 3D measured forward grid. Returns the
 /// commanded triple plus the residual norm.
@@ -1487,11 +1726,11 @@ fn open_log(
         args.window,
     )?;
     // Phase 1 rows use this header (channel-axis per-channel sweep);
-    // Phase 2 rows use the `3D,i,j,k,cmd_r,cmd_g,cmd_b,X,Y,Z` shape
-    // declared at the top of that block. Verify rows are tagged
-    // `verify,W,…`. All XYZ values are black-subtracted (raw floor
-    // recoverable from the `# black_floor` comment line below).
-    writeln!(w, "channel,sample_idx,commanded_nits,X,Y,Z")?;
+    // Phase 2 rows declare their own wider 3D header at the top of that
+    // block. Verify rows are tagged `verify,W,…`. All XYZ values are
+    // black-subtracted (raw floor recoverable from the `# black_floor`
+    // comment line below).
+    writeln!(w, "channel,sample_idx,requested_nits,scanout_nits,X,Y,Z")?;
     eprintln!("Logging per-sample CSV to {}", path.display());
     Ok(Some((path, w)))
 }
@@ -1503,6 +1742,7 @@ fn print_kdl_block(
     hdr_active: bool,
     peaks: [f32; 3],
     black_xyz: [f32; 3],
+    bt2020_input_max_nits: [f32; 3],
     lut_path: &std::path::Path,
 ) {
     println!();
@@ -1512,6 +1752,10 @@ fn print_kdl_block(
     );
     println!(
         "# (carried in the LUT file header; compositor exposes it via OutputContext for tone mapping)",
+    );
+    println!(
+        "# Calibrated BT.2020 LUT input max: R={:.1} G={:.1} B={:.1} cd/m²",
+        bt2020_input_max_nits[0], bt2020_input_max_nits[1], bt2020_input_max_nits[2],
     );
     match edid_id {
         Some(_) => println!(

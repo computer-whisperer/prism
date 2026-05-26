@@ -121,6 +121,9 @@ pub struct OutputContext {
     /// measurement). Read via [`Self::effective_black_point_xyz`],
     /// which prefers the IPC override.
     pub kdl_black_point_xyz: Option<[f32; 3]>,
+    /// Linear BT.2020 input clamp parsed out of the KDL-loaded LUT file.
+    /// This is the calibrated domain of the LUT, not a panel-native value.
+    pub kdl_lut_input_max_nits: Option<[f32; 3]>,
     /// Set on first present to switch from `commit` (mode-set) to `page_flip`
     /// (just-swap-fb) for subsequent frames.
     mode_set_done: bool,
@@ -395,6 +398,7 @@ impl OutputContext {
             color_override: ColorOverride::default(),
             kdl_lut3d_entries: None,
             kdl_black_point_xyz: None,
+            kdl_lut_input_max_nits: None,
             mode_set_done: false,
             force_present: false,
             frame_pending: false,
@@ -451,6 +455,21 @@ impl OutputContext {
         self.color_override
             .black_point_xyz
             .or(self.kdl_black_point_xyz)
+    }
+
+    /// Effective linear BT.2020 input clamp for the active encode LUT.
+    /// Returns `None` when the active color path is synthesized from CTM /
+    /// response-curve rather than a concrete LUT file or IPC LUT override.
+    pub fn effective_lut_input_max_nits(&self) -> Option<[f32; 3]> {
+        if self.color_override.lut3d_entries.is_some() {
+            return self.color_override.lut_input_max_nits;
+        }
+        let ipc_curve_override_active =
+            self.color_override.ctm.is_some() || self.color_override.response_curve.is_some();
+        if !ipc_curve_override_active && self.kdl_lut3d_entries.is_some() {
+            return self.kdl_lut_input_max_nits;
+        }
+        None
     }
 
     /// Rebuild this output's 3D LUT from the legacy `(CTM, response curve)`
@@ -560,10 +579,13 @@ impl OutputContext {
     }
 
     /// Per-channel BT.2020-domain clamp the decoder applies to the fp16
-    /// intermediate. See [`derive_bt2020_decode_clamp`] for the math;
-    /// this is a thin getter that plumbs in the effective panel peak,
-    /// effective CTM, and standard margin.
+    /// intermediate. A concrete 3D LUT carries its own calibrated
+    /// BT.2020 input bounds and wins here; otherwise see
+    /// [`derive_bt2020_decode_clamp`] for the legacy CTM-based math.
     pub fn effective_decode_clamp_bt2020_rgb(&self) -> [f32; 3] {
+        if let Some(max_nits) = self.effective_lut_input_max_nits() {
+            return max_nits;
+        }
         derive_bt2020_decode_clamp(
             self.effective_panel_peak_nits_rgb(),
             self.effective_ctm(),
@@ -642,6 +664,8 @@ pub struct ColorOverride {
     /// XYZ units as the LUT file header. Overrides `kdl_black_point_xyz`
     /// when present.
     pub black_point_xyz: Option<[f32; 3]>,
+    /// Linear BT.2020 input clamp that came in alongside `lut3d_entries`.
+    pub lut_input_max_nits: Option<[f32; 3]>,
 }
 
 /// Outcome of [`OutputContext::present`].

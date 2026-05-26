@@ -428,7 +428,17 @@ pub const LUT_FILE_MAGIC: u32 = 0x54554C50;
 /// honest tone mapping and accurate wp_color_management `min_luminance`
 /// signaling. v1 had no way to express "the panel can't render below
 /// X" so the compositor pretended the floor was zero.
-pub const LUT_FILE_VERSION: u32 = 2;
+///
+/// v3 adds `bt2020_input_max_nits`: the per-channel linear BT.2020
+/// input bound this LUT was calibrated for. This is the domain the
+/// intermediate and LUT shaper operate in, so it is a better clamp
+/// source than trying to re-derive limits later from panel-native peaks
+/// and whatever CTM state happens to be configured.
+pub const LUT_FILE_VERSION: u32 = 3;
+/// Old format version with no `bt2020_input_max_nits`. Kept readable so
+/// existing calibrations do not fail at bringup; callers get a permissive
+/// `[10000, 10000, 10000]` clamp and should regenerate when possible.
+pub const LUT_FILE_VERSION_V2: u32 = 2;
 /// `in_tf` enum value for the PQ shaper. The compositor's encode shader
 /// always PQ-encodes its input before sampling the LUT, so files written
 /// for a different shaper would mis-index. Stored explicitly so a future
@@ -436,8 +446,8 @@ pub const LUT_FILE_VERSION: u32 = 2;
 pub const LUT_FILE_IN_TF_PQ: u32 = 1;
 
 /// Binary header that precedes the data payload in a `.lut` file. All
-/// fields little-endian. 44 bytes total — the data payload immediately
-/// follows.
+/// fields little-endian. v3 is 56 bytes total — the data payload
+/// immediately follows.
 ///
 /// Field-by-field:
 /// ```text
@@ -452,6 +462,9 @@ pub const LUT_FILE_IN_TF_PQ: u32 = 1;
 /// black_x   f32  panel black-point CIE X (cd/m²)
 /// black_y   f32  panel black-point CIE Y (cd/m²)  ← min luminance
 /// black_z   f32  panel black-point CIE Z (cd/m²)
+/// bt2020_max_r f32  calibrated linear BT.2020 input max, R axis (cd/m²)
+/// bt2020_max_g f32  calibrated linear BT.2020 input max, G axis (cd/m²)
+/// bt2020_max_b f32  calibrated linear BT.2020 input max, B axis (cd/m²)
 /// ```
 ///
 /// Data payload: `cube_edge³` RGB triples (3 × f32 each), X-fastest then
@@ -479,10 +492,15 @@ pub struct LutFileHeader {
     pub black_x: f32,
     pub black_y: f32,
     pub black_z: f32,
+    pub bt2020_max_r: f32,
+    pub bt2020_max_g: f32,
+    pub bt2020_max_b: f32,
 }
 
-/// Header byte size — guaranteed by the file format and verified at load.
-pub const LUT_FILE_HEADER_BYTES: usize = 44;
+/// v3 header byte size — guaranteed by the file format and verified at load.
+pub const LUT_FILE_HEADER_BYTES: usize = 56;
+/// v2 header byte size — same as v3 minus BT.2020 input bounds.
+pub const LUT_FILE_HEADER_BYTES_V2: usize = 44;
 
 /// Bytes per data triple (3 × f32, little-endian).
 pub const LUT_FILE_TRIPLE_BYTES: usize = 12;
@@ -498,6 +516,10 @@ pub struct LoadedLut {
     /// Measured panel black emission (X, Y, Z in cd/m²). All-zero if
     /// the calibration tool didn't have a meaningful measurement.
     pub black_point_xyz: [f32; 3],
+    /// Per-channel maximum linear BT.2020 input this LUT was calibrated
+    /// to accept. Old v2 files did not carry this metadata and load as
+    /// `[10000, 10000, 10000]`.
+    pub bt2020_input_max_nits: [f32; 3],
     pub entries: Vec<[f32; 3]>,
 }
 
@@ -510,9 +532,9 @@ pub fn load_lut3d_file(path: &Path) -> Result<LoadedLut> {
         tracing::warn!(path = %path.display(), "failed to read LUT file: {e}");
         RendererError::MissingFeature("Lut3d: file read failed")
     })?;
-    if bytes.len() < LUT_FILE_HEADER_BYTES {
+    if bytes.len() < LUT_FILE_HEADER_BYTES_V2 {
         return Err(RendererError::MissingFeature(
-            "Lut3d: file shorter than 32-byte header",
+            "Lut3d: file shorter than minimum header",
         ));
     }
     let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
@@ -522,9 +544,19 @@ pub fn load_lut3d_file(path: &Path) -> Result<LoadedLut> {
         ));
     }
     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-    if version != LUT_FILE_VERSION {
+    if version != LUT_FILE_VERSION && version != LUT_FILE_VERSION_V2 {
         return Err(RendererError::MissingFeature(
             "Lut3d: unsupported file version",
+        ));
+    }
+    let header_bytes = if version == LUT_FILE_VERSION {
+        LUT_FILE_HEADER_BYTES
+    } else {
+        LUT_FILE_HEADER_BYTES_V2
+    };
+    if bytes.len() < header_bytes {
+        return Err(RendererError::MissingFeature(
+            "Lut3d: file shorter than declared header",
         ));
     }
     let cube_edge = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
@@ -546,16 +578,25 @@ pub fn load_lut3d_file(path: &Path) -> Result<LoadedLut> {
     let black_x = f32::from_le_bytes(bytes[32..36].try_into().unwrap());
     let black_y = f32::from_le_bytes(bytes[36..40].try_into().unwrap());
     let black_z = f32::from_le_bytes(bytes[40..44].try_into().unwrap());
+    let bt2020_input_max_nits = if version == LUT_FILE_VERSION {
+        [
+            f32::from_le_bytes(bytes[44..48].try_into().unwrap()),
+            f32::from_le_bytes(bytes[48..52].try_into().unwrap()),
+            f32::from_le_bytes(bytes[52..56].try_into().unwrap()),
+        ]
+    } else {
+        [10_000.0, 10_000.0, 10_000.0]
+    };
 
     let n = cube_edge as usize;
     let expected_data = n * n * n * LUT_FILE_TRIPLE_BYTES;
-    if bytes.len() < LUT_FILE_HEADER_BYTES + expected_data {
+    if bytes.len() < header_bytes + expected_data {
         return Err(RendererError::MissingFeature(
             "Lut3d: file payload shorter than cube_edge³ × 12 bytes",
         ));
     }
     let mut entries = Vec::with_capacity(n * n * n);
-    let mut off = LUT_FILE_HEADER_BYTES;
+    let mut off = header_bytes;
     for _ in 0..(n * n * n) {
         let r = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
         let g = f32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
@@ -567,22 +608,24 @@ pub fn load_lut3d_file(path: &Path) -> Result<LoadedLut> {
         cube_edge,
         peak_nits: [peak_r, peak_g, peak_b],
         black_point_xyz: [black_x, black_y, black_z],
+        bt2020_input_max_nits,
         entries,
     })
 }
 
 /// Write the entries + metadata as a binary LUT file. Header values
-/// other than `cube_edge`, `peak_nits`, and `black_point_xyz` are
-/// filled in from the canonical constants. `entries` must have length
-/// `cube_edge³` and be laid out X-fastest. Pass all-zero
-/// `black_point_xyz` if the calibration tool didn't have a
-/// measurement; downstream consumers treat that as "unknown / assume
+/// other than `cube_edge`, `peak_nits`, `black_point_xyz`, and
+/// `bt2020_input_max_nits` are filled in from the canonical constants.
+/// `entries` must have length `cube_edge³` and be laid out X-fastest.
+/// Pass all-zero `black_point_xyz` if the calibration tool didn't have
+/// a measurement; downstream consumers treat that as "unknown / assume
 /// zero floor".
 pub fn save_lut3d_file(
     path: &Path,
     cube_edge: u32,
     peak_nits: [f32; 3],
     black_point_xyz: [f32; 3],
+    bt2020_input_max_nits: [f32; 3],
     entries: &[[f32; 3]],
 ) -> std::io::Result<()> {
     let n = cube_edge as usize;
@@ -604,6 +647,9 @@ pub fn save_lut3d_file(
     out.extend_from_slice(&black_point_xyz[0].to_le_bytes());
     out.extend_from_slice(&black_point_xyz[1].to_le_bytes());
     out.extend_from_slice(&black_point_xyz[2].to_le_bytes());
+    out.extend_from_slice(&bt2020_input_max_nits[0].to_le_bytes());
+    out.extend_from_slice(&bt2020_input_max_nits[1].to_le_bytes());
+    out.extend_from_slice(&bt2020_input_max_nits[2].to_le_bytes());
     for rgb in entries {
         out.extend_from_slice(&rgb[0].to_le_bytes());
         out.extend_from_slice(&rgb[1].to_le_bytes());
@@ -771,6 +817,7 @@ mod tests {
         let path = dir.join(format!("prism-lut-test-{}.lut", std::process::id()));
         let cube_edge = 5u32;
         let peak_nits = [38.9, 113.9, 15.7];
+        let bt2020_max = [185.0, 211.0, 219.0];
         // LCD-shaped black: small Y, slight blue tint (Z > X).
         let black_point = [0.21f32, 0.18, 0.34];
         let entries = synthesize_lut_from_matrix_curve(
@@ -782,7 +829,15 @@ mod tests {
             ]),
             Some(([0.5, 0.7, 0.3], [1.05, 1.0, 1.02])),
         );
-        save_lut3d_file(&path, cube_edge, peak_nits, black_point, &entries).expect("save");
+        save_lut3d_file(
+            &path,
+            cube_edge,
+            peak_nits,
+            black_point,
+            bt2020_max,
+            &entries,
+        )
+        .expect("save");
         let loaded = load_lut3d_file(&path).expect("load");
         assert_eq!(loaded.cube_edge, cube_edge);
         for c in 0..3 {
@@ -792,6 +847,12 @@ mod tests {
                 "black ch {c}: orig={} got={}",
                 black_point[c],
                 loaded.black_point_xyz[c],
+            );
+            assert!(
+                (loaded.bt2020_input_max_nits[c] - bt2020_max[c]).abs() < 1e-6,
+                "bt2020 max ch {c}: orig={} got={}",
+                bt2020_max[c],
+                loaded.bt2020_input_max_nits[c],
             );
         }
         assert_eq!(loaded.entries.len(), entries.len());
@@ -808,13 +869,45 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// v2 LUT files remain readable; they did not carry BT.2020 input
+    /// bounds, so the loader supplies the permissive PQ-domain clamp.
+    #[test]
+    fn lut_file_v2_defaults_bt2020_input_max() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("prism-lut-v2-{}.lut", std::process::id()));
+        let cube_edge = 2u32;
+        let entries = identity_lut(cube_edge);
+        let mut out =
+            Vec::with_capacity(LUT_FILE_HEADER_BYTES_V2 + entries.len() * LUT_FILE_TRIPLE_BYTES);
+        out.extend_from_slice(&LUT_FILE_MAGIC.to_le_bytes());
+        out.extend_from_slice(&LUT_FILE_VERSION_V2.to_le_bytes());
+        out.extend_from_slice(&cube_edge.to_le_bytes());
+        out.extend_from_slice(&LUT_FILE_IN_TF_PQ.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&80.0f32.to_le_bytes());
+        out.extend_from_slice(&80.0f32.to_le_bytes());
+        out.extend_from_slice(&80.0f32.to_le_bytes());
+        out.extend_from_slice(&0.1f32.to_le_bytes());
+        out.extend_from_slice(&0.1f32.to_le_bytes());
+        out.extend_from_slice(&0.1f32.to_le_bytes());
+        for rgb in &entries {
+            out.extend_from_slice(&rgb[0].to_le_bytes());
+            out.extend_from_slice(&rgb[1].to_le_bytes());
+            out.extend_from_slice(&rgb[2].to_le_bytes());
+        }
+        std::fs::write(&path, &out).unwrap();
+        let loaded = load_lut3d_file(&path).expect("load v2");
+        assert_eq!(loaded.bt2020_input_max_nits, [10_000.0; 3]);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Bad magic / version / shaper TF / oversized cube edge all reject
     /// the file cleanly rather than allocate nonsense.
     #[test]
     fn lut_file_validates_header_fields() {
         let mut buf = Vec::with_capacity(LUT_FILE_HEADER_BYTES);
         // Wrong magic. Header layout still has to match LUT_FILE_HEADER_BYTES
-        // (44) or we'd reject for the wrong reason.
+        // or we'd reject for the wrong reason.
         buf.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
         buf.extend_from_slice(&LUT_FILE_VERSION.to_le_bytes());
         buf.extend_from_slice(&5u32.to_le_bytes());
@@ -826,6 +919,9 @@ mod tests {
         buf.extend_from_slice(&0.0f32.to_le_bytes());
         buf.extend_from_slice(&0.0f32.to_le_bytes());
         buf.extend_from_slice(&0.0f32.to_le_bytes());
+        buf.extend_from_slice(&10_000.0f32.to_le_bytes());
+        buf.extend_from_slice(&10_000.0f32.to_le_bytes());
+        buf.extend_from_slice(&10_000.0f32.to_le_bytes());
         let dir = std::env::temp_dir();
         let path = dir.join(format!("prism-lut-bad-{}.lut", std::process::id()));
         std::fs::write(&path, &buf).unwrap();
@@ -833,9 +929,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// v1 files (pre-black-point format) are rejected with the version
-    /// check, not silently mis-parsed. The format only just landed so
-    /// there's no migration path — calibrate-lut3d must be re-run.
+    /// v1 files (pre-black-point format) are rejected, not silently
+    /// mis-parsed. v2 is still readable; v1 must be regenerated.
     #[test]
     fn lut_file_rejects_v1() {
         let mut buf = Vec::with_capacity(32);

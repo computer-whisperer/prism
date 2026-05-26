@@ -1224,11 +1224,13 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                                     );
                                 } else {
                                     let bp = loaded.black_point_xyz;
+                                    let lut_input_max_nits = loaded.bt2020_input_max_nits;
                                     tracing::info!(
                                         connector = %output.connector_name,
                                         path = %lut3d_cfg.path,
                                         cube_edge = loaded.cube_edge,
                                         black_point_xyz = ?bp,
+                                        lut_input_max_nits = ?lut_input_max_nits,
                                         "loaded color LUT from file"
                                     );
                                     output.kdl_lut3d_entries = Some(loaded.entries);
@@ -1240,6 +1242,7 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                                     if bp[0] != 0.0 || bp[1] != 0.0 || bp[2] != 0.0 {
                                         output.kdl_black_point_xyz = Some(bp);
                                     }
+                                    output.kdl_lut_input_max_nits = Some(lut_input_max_nits);
                                 }
                             }
                             Err(e) => {
@@ -2347,11 +2350,15 @@ fn render_output_now(
             }
             None => EncodePush::sdr_identity(),
         };
+        p.sdr_white_nits = output.effective_sdr_reference_nits();
         if let Some((gain, gamma)) = output.effective_response_curve() {
             p.set_response_gain_gamma(gain, gamma);
         }
         if let Some(m) = output.effective_ctm() {
             p.set_ctm(m);
+        }
+        if let Some(max_nits) = output.effective_lut_input_max_nits() {
+            p.set_lut_input_max_nits(max_nits);
         }
         p
     };

@@ -12,8 +12,9 @@
 //!     unused but reserved.)
 //!   - `vec4 response_gamma` at offset 80 (per-channel response gamma
 //!     exponent. `.w` unused but reserved.)
-//!   - `vec4 aux2_reserved` at offset 96 (placeholder for future FIR
-//!     weights or a small inline LUT segment.)
+//!   - `vec4 lut_input_max_nits` at offset 96 (linear BT.2020 nits;
+//!     clamps the LUT shaper input to the range calibrated for this
+//!     output. `.w` unused.)
 //!   - `float sdr_white_nits` at offset 112
 //!   - `float target_peak_nits` at offset 116
 //!   - `float dither_strength` at offset 120
@@ -42,9 +43,10 @@ pub struct EncodePushSynth {
     pub response_gain: [f32; 4],
     /// Per-channel response gamma — exponent. Identity = `[1.0, 1.0, 1.0, 0.0]`.
     pub response_gamma: [f32; 4],
-    /// Reserved vec4 slot. Originally allocated for FIR weights; not
-    /// currently used. Future FIR or small LUT segment can live here.
-    pub aux2_reserved: [f32; 4],
+    /// Per-channel max input to the 3D LUT shaper, in linear BT.2020
+    /// nits. This is the post-composite clamp for LUT-backed outputs;
+    /// identity/default is the PQ domain ceiling.
+    pub lut_input_max_nits: [f32; 4],
     /// For SDR encode: how many nits is the input value `1.0`.
     pub sdr_white_nits: f32,
     /// For PQ encode and linear scanout: clip / normalize ceiling.
@@ -62,7 +64,7 @@ impl EncodePushSynth {
             cal_matrix: mat4_identity(),
             response_gain: identity_response_vec(),
             response_gamma: identity_response_vec(),
-            aux2_reserved: [0.0; 4],
+            lut_input_max_nits: [10_000.0, 10_000.0, 10_000.0, 0.0],
             sdr_white_nits: 80.0,
             target_peak_nits: 80.0,
             dither_strength: 0.0,
@@ -76,7 +78,7 @@ impl EncodePushSynth {
             cal_matrix: mat4_identity(),
             response_gain: identity_response_vec(),
             response_gamma: identity_response_vec(),
-            aux2_reserved: [0.0; 4],
+            lut_input_max_nits: [10_000.0, 10_000.0, 10_000.0, 0.0],
             sdr_white_nits: 80.0,
             target_peak_nits: 10000.0,
             dither_strength: 0.0,
@@ -92,6 +94,17 @@ impl EncodePushSynth {
     pub fn set_response_gain_gamma(&mut self, gain: [f32; 3], gamma: [f32; 3]) {
         self.response_gain = [gain[0], gain[1], gain[2], 0.0];
         self.response_gamma = [gamma[0], gamma[1], gamma[2], 0.0];
+    }
+
+    /// Set the linear BT.2020 per-channel clamp applied before LUT
+    /// sampling. Values are defensively clamped to the PQ domain.
+    pub fn set_lut_input_max_nits(&mut self, max_nits: [f32; 3]) {
+        self.lut_input_max_nits = [
+            max_nits[0].clamp(1.0, 10_000.0),
+            max_nits[1].clamp(1.0, 10_000.0),
+            max_nits[2].clamp(1.0, 10_000.0),
+            0.0,
+        ];
     }
 
     /// Set the 3×3 calibration matrix from row-major rows. The shader
@@ -127,7 +140,7 @@ pub const PUSH_CONSTANTS_SIZE: u32 = std::mem::size_of::<EncodePushSynth>() as u
 pub const OFFSET_CAL_MATRIX: u32 = 0;
 pub const OFFSET_RESPONSE_GAIN: u32 = 64;
 pub const OFFSET_RESPONSE_GAMMA: u32 = 80;
-pub const OFFSET_AUX2_RESERVED: u32 = 96;
+pub const OFFSET_LUT_INPUT_MAX_NITS: u32 = 96;
 pub const OFFSET_SDR_WHITE_NITS: u32 = 112;
 pub const OFFSET_TARGET_PEAK_NITS: u32 = 116;
 pub const OFFSET_DITHER_STRENGTH: u32 = 120;
@@ -137,7 +150,7 @@ pub const OFFSET_PAD: u32 = 124;
 pub const MEMBER_CAL_MATRIX: u32 = 0;
 pub const MEMBER_RESPONSE_GAIN: u32 = 1;
 pub const MEMBER_RESPONSE_GAMMA: u32 = 2;
-pub const MEMBER_AUX2_RESERVED: u32 = 3;
+pub const MEMBER_LUT_INPUT_MAX_NITS: u32 = 3;
 pub const MEMBER_SDR_WHITE_NITS: u32 = 4;
 pub const MEMBER_TARGET_PEAK_NITS: u32 = 5;
 pub const MEMBER_DITHER_STRENGTH: u32 = 6;
@@ -168,8 +181,8 @@ mod tests {
             OFFSET_RESPONSE_GAMMA
         );
         assert_eq!(
-            (&zero.aux2_reserved as *const _ as usize - base) as u32,
-            OFFSET_AUX2_RESERVED
+            (&zero.lut_input_max_nits as *const _ as usize - base) as u32,
+            OFFSET_LUT_INPUT_MAX_NITS
         );
         assert_eq!(
             (&zero.sdr_white_nits as *const _ as usize - base) as u32,
