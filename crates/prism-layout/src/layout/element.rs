@@ -21,7 +21,7 @@
 use prism_config::CornerRadius;
 use prism_frame::ElementId;
 use prism_renderer::{
-    srgb_to_bt2020_nits, vk, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl,
+    srgb_to_bt2020_nits, vk, AlphaMode, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl,
 };
 use smithay::backend::renderer::utils::{CommitCounter, RendererSurfaceStateUserData};
 use smithay::output::{self, Output};
@@ -60,6 +60,12 @@ pub struct RenderCtx<'a> {
     /// contract as `texture_lookup`; `(None, 0)` for RGB surfaces. Pairs
     /// with `texture_lookup` (the luma/primary plane).
     pub yuv_lookup: &'a dyn Fn(&SurfaceData) -> (Option<vk::ImageView>, i32),
+    /// Look up how the surface's buffer alpha must be interpreted (opaque
+    /// X-format/YUV vs premultiplied A-format). A buffer-format property the
+    /// decode shader needs because `vk::Format` can't distinguish `Xrgb` from
+    /// `Argb`. Same `&SurfaceData` contract as the other lookups; defaults to
+    /// `Opaque` when there's no texture slot.
+    pub alpha_mode_lookup: &'a dyn Fn(&SurfaceData) -> AlphaMode,
     /// Look up the surface's color-decoding parameters (TF +
     /// reference white) from its `wp_color_management_v1` image
     /// description. Same shape as `texture_lookup`: closure over
@@ -111,6 +117,10 @@ impl<'a> RenderCtx<'a> {
     /// See [`RenderCtx::yuv_lookup`].
     pub fn yuv_for(&self, states: &SurfaceData) -> (Option<vk::ImageView>, i32) {
         (self.yuv_lookup)(states)
+    }
+    /// Sampled-alpha interpretation for `states`. See [`RenderCtx::alpha_mode_lookup`].
+    pub fn alpha_mode_for(&self, states: &SurfaceData) -> AlphaMode {
+        (self.alpha_mode_lookup)(states)
     }
     pub fn color_for(&self, states: &SurfaceData) -> SurfaceColorParams {
         (self.color_lookup)(states).unwrap_or(SurfaceColorParams {
@@ -322,6 +332,7 @@ pub fn push_surface_tree_elements(
                 opaque,
                 src_rect_uv: crate::utils::src_rect_uv_from_view(&view, buffer_size),
                 color: ctx.color_for(states),
+                alpha_mode: ctx.alpha_mode_for(states),
             }));
         },
         |_, _, _| true,

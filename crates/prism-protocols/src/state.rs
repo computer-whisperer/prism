@@ -3346,10 +3346,13 @@ fn build_tex_source(state: &PrismState, buffer: &WlBuffer) -> Result<TexSource> 
             None => vk_format_for(dmabuf.format)
                 .with_context(|| format!("no Vulkan format mapping for {:?}", dmabuf.format))?,
         };
+        // YUV is opaque; otherwise the fourcc's A-vs-X variant decides.
+        let has_alpha = yuv_kind_for(dmabuf.format).is_none() && fourcc_has_alpha(dmabuf.format);
         return Ok(TexSource::Dmabuf {
             dmabuf: dmabuf.clone(),
             format,
             buffer: buffer.clone(),
+            has_alpha,
         });
     }
     // wp_single_pixel_buffer: a 1x1 solid color (swaybg `-c`, solid
@@ -3363,7 +3366,7 @@ fn build_tex_source(state: &PrismState, buffer: &WlBuffer) -> Result<TexSource> 
         });
     }
     // shm: read geometry (uploads happen lazily per consuming GPU).
-    let (extent, format) = with_buffer_contents(buffer, |_ptr, _len, data| {
+    let (extent, format, has_alpha) = with_buffer_contents(buffer, |_ptr, _len, data| {
         let format = vk_format_for_shm(data.format)
             .with_context(|| format!("no Vulkan format mapping for wl_shm::{:?}", data.format))?;
         if data.width <= 0 || data.height <= 0 {
@@ -3375,6 +3378,7 @@ fn build_tex_source(state: &PrismState, buffer: &WlBuffer) -> Result<TexSource> 
                 height: data.height as u32,
             },
             format,
+            shm_format_has_alpha(data.format),
         ))
     })
     .context("with_buffer_contents (shm geometry)")??;
@@ -3382,6 +3386,7 @@ fn build_tex_source(state: &PrismState, buffer: &WlBuffer) -> Result<TexSource> 
         extent,
         format,
         buffer: buffer.clone(),
+        has_alpha,
     })
 }
 
@@ -3719,6 +3724,7 @@ fn materialize_dmabuf_for_gpu(
             dmabuf,
             format,
             buffer,
+            ..
         } => (dmabuf.clone(), *format, buffer.id()),
         TexSource::Shm { .. } | TexSource::SolidColor { .. } => return Ok(()),
     };
@@ -3953,6 +3959,7 @@ fn refresh_shm_uploads(
             extent,
             format,
             buffer,
+            ..
         } => (*extent, *format, buffer.clone()),
         TexSource::Dmabuf { .. } | TexSource::SolidColor { .. } => return Ok(()),
     };
@@ -4026,6 +4033,34 @@ fn clamp_buffer_rect_to_extent(
             height: (y1 - y0) as u32,
         },
     })
+}
+
+/// Whether a `wl_shm` format carries meaningful alpha (`A`-format) vs an
+/// undefined `X` byte. `vk_format_for_shm` maps both to the same alpha-bearing
+/// `vk::Format`, so this is the only place the distinction survives — the
+/// decode shader needs it to force opaque alpha for `X` buffers (otherwise a
+/// client that leaves the `X` byte at 0 renders invisible) and to treat `A`
+/// buffers as premultiplied.
+fn shm_format_has_alpha(fmt: wl_shm::Format) -> bool {
+    matches!(
+        fmt,
+        wl_shm::Format::Argb8888 | wl_shm::Format::Abgr8888 | wl_shm::Format::Abgr16161616f
+    )
+}
+
+/// Whether a DRM fourcc carries meaningful alpha (`A`-format) vs an undefined
+/// `X` byte. See [`shm_format_has_alpha`]; YUV is handled by the caller (always
+/// opaque). `vk_format_for` conflates `Xrgb`/`Argb`, so this is the alpha
+/// source of truth for dmabuf sources.
+fn fourcc_has_alpha(fourcc: DrmFourcc) -> bool {
+    matches!(
+        fourcc,
+        DrmFourcc::Argb8888
+            | DrmFourcc::Abgr8888
+            | DrmFourcc::Argb2101010
+            | DrmFourcc::Abgr2101010
+            | DrmFourcc::Abgr16161616f
+    )
 }
 
 fn vk_format_for_shm(fmt: wl_shm::Format) -> Option<vk::Format> {

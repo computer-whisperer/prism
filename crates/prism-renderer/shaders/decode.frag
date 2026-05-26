@@ -53,6 +53,16 @@ layout(push_constant) uniform Push {
     // overhead). Set per output by the calibration pipeline; default
     // broadcasts hdr.max_luminance / sdr_reference_nits to all three.
     vec4 output_peak_nits_rgba;
+    // Sampled-alpha handling (mirrors prism_renderer::AlphaMode):
+    //   0 = opaque        — ignore the sampled alpha, force it to 1.0. For
+    //                       X-formats (the X byte is undefined per the DRM /
+    //                       wl_shm contract) and YUV video.
+    //   1 = premultiplied — the Wayland wl_surface contract for A-formats. The
+    //                       color is already multiplied by alpha, so we
+    //                       un-premultiply before the transfer EOTF (which must
+    //                       run on straight color) and re-premultiply at output.
+    // Trailing scalar after the vec4, so no std430 padding is needed.
+    int alpha_mode;
 } push;
 
 layout(location = 0) in vec2 v_uv;
@@ -136,8 +146,22 @@ void main() {
         ? vec4(ycbcr_to_nonlinear_rgb(), 1.0)
         : texture(u_texture, v_uv);
 
-    // Decode transfer → linear-light. Linear path leaves alpha-unmultiplied
-    // values where they are.
+    // Alpha handling — BEFORE the transfer decode, which must operate on
+    // straight (non-premultiplied) color. Opaque buffers (X-formats, YUV)
+    // carry no meaningful alpha, so force it to 1.0 rather than trust the
+    // undefined X byte. Premultiplied buffers (the Wayland A-format contract)
+    // get un-premultiplied here; the `* alpha` at output re-premultiplies for
+    // the pipeline's premultiplied src-over blend. The solid-color path samples
+    // an opaque white texel, so it lands in either branch as a no-op and keeps
+    // its color/opacity in `tint`.
+    if (push.alpha_mode == 0) {
+        sampled.a = 1.0;
+    } else if (sampled.a > 0.0) {
+        sampled.rgb /= sampled.a;
+    }
+
+    // Decode transfer → linear-light. Linear path leaves the (now straight)
+    // color where it is.
     vec3 linear;
     if (push.transfer == 1) {
         linear = srgb_eotf(sampled.rgb);

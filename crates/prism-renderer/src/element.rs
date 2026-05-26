@@ -218,6 +218,37 @@ impl Default for SurfaceColorParams {
     }
 }
 
+/// How the decode shader must interpret a sampled texture's alpha channel.
+/// A buffer-format property (X-format vs A-format, YUV), not a per-element
+/// opacity — see `shaders/decode.frag`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AlphaMode {
+    /// No meaningful alpha: opaque `X`-formats (the `X` byte is undefined per
+    /// the DRM/wl_shm contract) and YUV video. The shader ignores the sampled
+    /// alpha and treats the texel as fully opaque (alpha = 1.0). Default so a
+    /// surface whose format we can't classify never leaks garbage alpha.
+    #[default]
+    Opaque,
+    /// Premultiplied alpha — the Wayland `wl_surface` contract for `A`-formats.
+    /// Color channels are already multiplied by alpha, so the shader
+    /// un-premultiplies before the transfer EOTF (which must run on straight
+    /// color) and re-premultiplies at output for the premultiplied src-over
+    /// blend. (The solid-color path also rides this: its sampled white texel
+    /// has alpha = 1.0, so un-premultiply is a no-op.)
+    Premultiplied,
+}
+
+impl AlphaMode {
+    /// Shader code for `DecodePush::alpha_mode`. Keep in sync with
+    /// `shaders/decode.frag`.
+    pub fn code(self) -> i32 {
+        match self {
+            Self::Opaque => 0,
+            Self::Premultiplied => 1,
+        }
+    }
+}
+
 /// Sampled-texture surface element. Used for wl_surface content (xdg-shell
 /// toplevels, popups, layer-shell content, subsurfaces) and for the cursor.
 /// One per surface tree node; produced by walking the surface tree at
@@ -255,6 +286,10 @@ pub struct SurfaceEl {
     pub opaque: Vec<Rectangle<f64, Logical>>,
     pub src_rect_uv: [f32; 4],
     pub color: SurfaceColorParams,
+    /// How to interpret the sampled alpha (X-format/YUV → opaque; A-format →
+    /// premultiplied). Set from the buffer's DRM/wl_shm fourcc at frame-build
+    /// time, since `vk::Format` alone can't distinguish `Xrgb` from `Argb`.
+    pub alpha_mode: AlphaMode,
 }
 
 impl SurfaceEl {
@@ -269,6 +304,7 @@ impl SurfaceEl {
         push.decode_matrix = mat3_to_mat4_colmajor(self.color.primaries_to_bt2020);
         push.yuv = self.yuv;
         push.yuv_matrix = self.color.yuv_matrix;
+        push.alpha_mode = self.alpha_mode.code();
         let [r, g, b] = output_peak_nits_rgb;
         push.output_peak_nits_rgba = [r, g, b, 0.0];
         ElementDraw {
@@ -571,6 +607,7 @@ mod tests {
             opaque,
             src_rect_uv: [0.0, 0.0, 1.0, 1.0],
             color: SurfaceColorParams::default(),
+            alpha_mode: AlphaMode::Opaque,
         })
     }
 

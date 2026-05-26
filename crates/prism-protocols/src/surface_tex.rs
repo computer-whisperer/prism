@@ -33,7 +33,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use prism_renderer::{vk, DrmDevId, ExportableImage, ImportedImage, ShmTexture, YuvKind};
+use prism_renderer::{
+    vk, AlphaMode, DrmDevId, ExportableImage, ImportedImage, ShmTexture, YuvKind,
+};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
@@ -50,6 +52,10 @@ pub enum TexSource {
         dmabuf: Arc<prism_frame::Dmabuf>,
         format: vk::Format,
         buffer: WlBuffer,
+        /// Whether the source fourcc carries meaningful alpha (`A`-format) vs
+        /// none (`X`-format or YUV). Tracked from the fourcc because
+        /// `vk::Format` conflates `Xrgb`/`Argb` (both `B8G8R8A8_UNORM`).
+        has_alpha: bool,
     },
     /// shm-backed. We don't hold a CPU copy of the bytes; uploads read the
     /// live buffer (`buffer`) via `with_buffer_contents` at materialization
@@ -58,6 +64,9 @@ pub enum TexSource {
         extent: vk::Extent2D,
         format: vk::Format,
         buffer: WlBuffer,
+        /// Whether the source `wl_shm` format carries meaningful alpha — see
+        /// the `Dmabuf` variant's `has_alpha`.
+        has_alpha: bool,
     },
     /// A `wp_single_pixel_buffer` solid color (e.g. swaybg `-c`, GTK/Qt solid
     /// backgrounds). There is no texture to upload — the render walk lowers it
@@ -73,6 +82,18 @@ impl TexSource {
             Self::Dmabuf { buffer, .. }
             | Self::Shm { buffer, .. }
             | Self::SolidColor { buffer, .. } => buffer,
+        }
+    }
+
+    /// Whether the source's pixels carry meaningful alpha. `A`-format
+    /// dmabuf/shm buffers do (premultiplied per the Wayland contract);
+    /// `X`-format and YUV buffers don't. `SolidColor` reports `true` —
+    /// `wp_single_pixel_buffer` is premultiplied — though it never samples a
+    /// texture (the walk lowers it to a `SolidColorEl`).
+    fn has_alpha(&self) -> bool {
+        match self {
+            Self::Dmabuf { has_alpha, .. } | Self::Shm { has_alpha, .. } => *has_alpha,
+            Self::SolidColor { .. } => true,
         }
     }
     fn extent(&self) -> vk::Extent2D {
@@ -244,6 +265,19 @@ impl SurfaceTexture {
         match &self.source {
             TexSource::SolidColor { rgba, .. } => Some(*rgba),
             _ => None,
+        }
+    }
+
+    /// How the decode shader should interpret this surface's sampled alpha.
+    /// A GPU-independent buffer-format property: `A`-format buffers are
+    /// premultiplied (the Wayland contract), `X`-format and YUV buffers are
+    /// opaque. (YUV is recorded with `has_alpha = false` at build time, so it
+    /// falls into `Opaque` here without a per-GPU lookup.)
+    pub fn alpha_mode(&self) -> AlphaMode {
+        if self.source.has_alpha() {
+            AlphaMode::Premultiplied
+        } else {
+            AlphaMode::Opaque
         }
     }
 }

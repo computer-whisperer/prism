@@ -2119,6 +2119,16 @@ fn render_output_now(
                 })
                 .unwrap_or((None, 0))
         };
+    // How to interpret each surface's sampled alpha (opaque X-format/YUV vs
+    // premultiplied A-format). A buffer-format property, GPU-independent.
+    let alpha_mode_lookup =
+        |states: &smithay::wayland::compositor::SurfaceData| -> prism_renderer::AlphaMode {
+            states
+                .data_map
+                .get::<prism_protocols::SurfaceTexSlot>()
+                .and_then(|s| s.0.lock().unwrap().as_ref().map(|t| t.alpha_mode()))
+                .unwrap_or_default()
+        };
     // Per-surface decode params from wp_color_management_v1. Falls
     // through to RenderCtx::color_for's default (sRGB + the output's
     // sdr_reference_nits) for surfaces with no description set —
@@ -2182,6 +2192,7 @@ fn render_output_now(
     let ctx = RenderCtx {
         texture_lookup: &texture_lookup,
         yuv_lookup: &yuv_lookup,
+        alpha_mode_lookup: &alpha_mode_lookup,
         color_lookup: &color_lookup,
         sdr_reference_nits: output_sdr_reference_nits,
         report_missing_texture: &report_missing,

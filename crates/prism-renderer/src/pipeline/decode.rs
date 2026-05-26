@@ -52,6 +52,13 @@ pub struct DecodePush {
     /// get effectively-no-op behaviour; the render-path constructor
     /// overrides per-output with the effective per-channel peaks.
     pub output_peak_nits_rgba: [f32; 4],
+    /// Sampled-alpha handling (see [`crate::AlphaMode`] and
+    /// `shaders/decode.frag`): 0 = opaque (ignore sampled alpha, force 1.0;
+    /// `X`-formats and YUV), 1 = premultiplied (Wayland `A`-format default;
+    /// un-premultiply before the transfer EOTF, re-premultiply at output).
+    /// Placed last (after the trailing `vec4`) so it needs no std430 alignment
+    /// padding.
+    pub alpha_mode: i32,
 }
 
 impl DecodePush {
@@ -68,6 +75,10 @@ impl DecodePush {
             yuv: 0,
             yuv_matrix: 0,
             output_peak_nits_rgba: [10_000.0, 10_000.0, 10_000.0, 0.0],
+            // Opaque base; the surface path overrides via `SurfaceEl::to_draw`
+            // from the buffer fourcc. Direct callers (the #48 smoke test) feed
+            // an opaque texture, where forcing alpha = 1.0 is a no-op.
+            alpha_mode: 0,
         }
     }
 
@@ -85,6 +96,9 @@ impl DecodePush {
             yuv: 0,
             yuv_matrix: 0,
             output_peak_nits_rgba: [10_000.0, 10_000.0, 10_000.0, 0.0],
+            // 1×1 white texel is opaque (alpha = 1.0); the element's own alpha
+            // rides `tint.a`, which is applied independently of this mode.
+            alpha_mode: 0,
         }
     }
 }

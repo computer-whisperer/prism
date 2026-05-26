@@ -26,8 +26,8 @@ pub use device::{Device, DrmDevId, DrmFormatModifierInfo, PhysicalDeviceInfo};
 pub use diagnose::{decode_scanout_texel, DiagnosedNits, EncodeDiagnoseProbe};
 pub use dmabuf::{ImportedImage, YuvKind};
 pub use element::{
-    lower_elements, make_projector, srgb_to_bt2020_nits, BorderEl, FrameElementMeta, LoweredFrame,
-    RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl,
+    lower_elements, make_projector, srgb_to_bt2020_nits, AlphaMode, BorderEl, FrameElementMeta,
+    LoweredFrame, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl,
 };
 pub use encode_synth::{EncodeConfig, EncodeFragment, EncodePushSynth};
 pub use error::{RendererError, Result};
