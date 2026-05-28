@@ -7,11 +7,12 @@
 //! subcommand can pass values from its own arg surface without
 //! cross-coupling.
 
+use crate::calibrate_lut3d::pq_oetf_f64;
 use anyhow::{Context, Result};
 use prism_ipc::socket::Socket;
 use prism_ipc::{ColorState, OutputAction, Request, Response};
 use std::collections::HashMap;
-use tristim_display::{PatchSurface, PqDescriptionParams};
+use tristim_display::{BufferFormat, DescriptionRequest, Mastering, PatchSurface};
 
 // ─── Channel ──────────────────────────────────────────────────────────────────
 
@@ -144,33 +145,59 @@ pub fn query_output_baseline(name: &str) -> Result<OutputBaseline> {
 // ─── Patch surface lifecycle ──────────────────────────────────────────────────
 
 /// Open an HDR or SDR patch surface on the chosen output, mode-aware.
-/// For HDR, declares a generous mastering envelope (10000 nits) so the
-/// patch buffer's nits aren't pre-clipped by the descriptor before
-/// reaching the panel.
+/// HDR uses an fp16 buffer with a PQ + BT.2020 description and a generous
+/// mastering envelope (10000 nits) so the patch nits aren't pre-clipped
+/// by the descriptor before reaching the panel. SDR is an unmanaged
+/// 8-bit xRGB surface — the compositor's default sRGB interpretation
+/// matches what our `srgb_oetf` helper produces.
 pub fn open_patch_surface(output: &str, hdr_active: bool) -> Result<PatchSurface> {
     if hdr_active {
-        let probe_peak = 10_000;
-        let params = PqDescriptionParams {
-            mastering_min_lum_ticks: 5,
-            mastering_max_lum: probe_peak,
-            max_cll: probe_peak,
-            max_fall: probe_peak / 2,
+        let probe_peak = 10_000.0;
+        let desc = DescriptionRequest {
+            transfer_function: "st2084_pq".into(),
+            primaries: "bt2020".into(),
+            luminances: None,
+            mastering: Some(Mastering {
+                min_nits: 0.0005,
+                max_nits: probe_peak,
+                max_cll_nits: probe_peak,
+                max_fall_nits: probe_peak / 2.0,
+            }),
         };
-        PatchSurface::open_hdr(output, params)
+        PatchSurface::open(output, BufferFormat::Xbgr16161616f, Some(desc))
             .with_context(|| format!("open HDR patch on {output}"))
     } else {
-        PatchSurface::open(output).with_context(|| format!("open SDR patch on {output}"))
+        PatchSurface::open_sdr(output).with_context(|| format!("open SDR patch on {output}"))
     }
 }
 
-/// Drive the patch to black using the right setter for the current mode.
-/// Used at start/end of runs so the panel isn't left glaring.
-pub fn set_patch_off(patch: &mut PatchSurface, hdr_active: bool) -> Result<()> {
-    if hdr_active {
-        patch.set_nits([0.0, 0.0, 0.0]).context("set black (HDR)")
+/// Encode a nits triple to the patch surface's `[0, 1]` code-value space
+/// for the current mode. HDR uses PQ OETF (10000-nit peak); SDR uses
+/// sRGB OETF anchored at `sdr_reference_nits`. The compositor decodes
+/// from this same convention.
+pub fn code_values_for_nits(baseline: &OutputBaseline, nits_rgb: [f64; 3]) -> [f64; 3] {
+    if baseline.hdr_active {
+        [
+            pq_oetf_f64(nits_rgb[0].clamp(0.0, 10_000.0)),
+            pq_oetf_f64(nits_rgb[1].clamp(0.0, 10_000.0)),
+            pq_oetf_f64(nits_rgb[2].clamp(0.0, 10_000.0)),
+        ]
     } else {
-        patch.set_color([0.0, 0.0, 0.0]).context("set black (SDR)")
+        let ref_nits = baseline.sdr_reference_nits.max(1e-6);
+        [
+            srgb_oetf((nits_rgb[0] / ref_nits).clamp(0.0, 1.0)),
+            srgb_oetf((nits_rgb[1] / ref_nits).clamp(0.0, 1.0)),
+            srgb_oetf((nits_rgb[2] / ref_nits).clamp(0.0, 1.0)),
+        ]
     }
+}
+
+/// Drive the patch to black. Used at start/end of runs so the panel
+/// isn't left glaring.
+pub fn set_patch_off(patch: &mut PatchSurface, _hdr_active: bool) -> Result<()> {
+    patch
+        .set_code_values([0.0, 0.0, 0.0])
+        .context("set black patch")
 }
 
 /// Configure the patch's surround colour at a fixed luminance, mode-aware.
@@ -179,17 +206,14 @@ pub fn apply_border(
     baseline: &OutputBaseline,
     border_nits: f64,
 ) -> Result<()> {
-    if baseline.hdr_active {
-        patch
-            .set_border_nits([border_nits, border_nits, border_nits])
-            .context("set HDR border")
-    } else {
-        let linear = (border_nits / baseline.sdr_reference_nits).clamp(0.0, 1.0);
-        let encoded = srgb_oetf(linear);
-        patch
-            .set_border_color([encoded, encoded, encoded])
-            .context("set SDR border")
-    }
+    let cv = code_values_for_nits(baseline, [border_nits, border_nits, border_nits]);
+    patch.set_border(cv).with_context(|| {
+        format!(
+            "set border to {:.2} cd/m² ({} mode)",
+            border_nits,
+            if baseline.hdr_active { "HDR" } else { "SDR" },
+        )
+    })
 }
 
 /// Paint a clearly-visible gray patch in the centred window so the
@@ -200,111 +224,64 @@ pub fn show_alignment_patch(
     baseline: &OutputBaseline,
     alignment_nits: f64,
 ) -> Result<()> {
-    if baseline.hdr_active {
-        patch
-            .set_nits([alignment_nits, alignment_nits, alignment_nits])
-            .context("alignment patch (HDR)")
-    } else {
-        let linear = (alignment_nits / baseline.sdr_reference_nits).clamp(0.0, 1.0);
-        let encoded = srgb_oetf(linear);
-        patch
-            .set_color([encoded, encoded, encoded])
-            .context("alignment patch (SDR)")
-    }
+    let cv = code_values_for_nits(baseline, [alignment_nits, alignment_nits, alignment_nits]);
+    patch
+        .set_code_values(cv)
+        .with_context(|| format!("alignment patch at {alignment_nits:.2} cd/m²"))
 }
 
-/// Drive a single-channel patch using the right setter for the mode.
-/// SDR uses sRGB OETF to convert target nits → RGB 0..=1.
+/// Drive a single-channel patch at `target_nits` on the named channel,
+/// other channels at zero.
 pub fn set_channel_patch(
     patch: &mut PatchSurface,
     baseline: &OutputBaseline,
     channel: Channel,
     target_nits: f64,
 ) -> Result<()> {
-    if baseline.hdr_active {
-        let mut rgb = [0.0_f64; 3];
-        rgb[channel.idx()] = target_nits;
-        patch
-            .set_nits(rgb)
-            .with_context(|| format!("set HDR nits for {} = {:.2}", channel.label(), target_nits))
-    } else {
-        let linear = (target_nits / baseline.sdr_reference_nits).clamp(0.0, 1.0);
-        let encoded = srgb_oetf(linear);
-        let mut rgb = [0.0_f64; 3];
-        rgb[channel.idx()] = encoded;
-        patch.set_color(rgb).with_context(|| {
-            format!(
-                "set SDR RGB for {} = {:.4} (target {:.2} cd/m²)",
-                channel.label(),
-                encoded,
-                target_nits
-            )
-        })
-    }
+    let mut nits = [0.0_f64; 3];
+    nits[channel.idx()] = target_nits;
+    let cv = code_values_for_nits(baseline, nits);
+    patch.set_code_values(cv).with_context(|| {
+        format!(
+            "set {} channel patch = {:.2} cd/m²",
+            channel.label(),
+            target_nits,
+        )
+    })
 }
 
-/// Drive an arbitrary RGB patch in panel-native units. The 3D-sweep
+/// Drive an arbitrary RGB patch in panel-native nits. The 3D-sweep
 /// calibration needs to command independent per-channel values
-/// (cmd_R, cmd_G, cmd_B), which neither `set_channel_patch` (single
-/// channel only) nor `set_white_patch` (locked to D65) covers.
-///
-/// HDR: cmd values are linear cd/m² per channel, handed straight to
-/// the patch surface (which signals PQ-encoded over the wire).
-/// SDR: each channel is normalized against `sdr_reference_nits` and
-/// sRGB-OETF encoded — same convention as `set_channel_patch` /
-/// `set_white_patch` so all three setters produce consistent output
-/// in either mode.
+/// (cmd_R, cmd_G, cmd_B) — encoded to the surface's code-value space
+/// via the same mode-aware helper as the single-channel and white
+/// setters so the conventions stay consistent.
 pub fn set_rgb_patch(
     patch: &mut PatchSurface,
     baseline: &OutputBaseline,
     cmd_rgb: [f64; 3],
 ) -> Result<()> {
-    if baseline.hdr_active {
-        patch.set_nits(cmd_rgb).with_context(|| {
-            format!(
-                "set HDR RGB nits ({:.2}, {:.2}, {:.2})",
-                cmd_rgb[0], cmd_rgb[1], cmd_rgb[2],
-            )
-        })
-    } else {
-        let ref_nits = baseline.sdr_reference_nits;
-        let encoded = [
-            srgb_oetf((cmd_rgb[0] / ref_nits).clamp(0.0, 1.0)),
-            srgb_oetf((cmd_rgb[1] / ref_nits).clamp(0.0, 1.0)),
-            srgb_oetf((cmd_rgb[2] / ref_nits).clamp(0.0, 1.0)),
-        ];
-        patch.set_color(encoded).with_context(|| {
-            format!(
-                "set SDR RGB encoded ({:.4}, {:.4}, {:.4})",
-                encoded[0], encoded[1], encoded[2],
-            )
-        })
-    }
+    let cv = code_values_for_nits(baseline, cmd_rgb);
+    patch.set_code_values(cv).with_context(|| {
+        format!(
+            "set RGB patch ({:.2}, {:.2}, {:.2}) cd/m²",
+            cmd_rgb[0], cmd_rgb[1], cmd_rgb[2],
+        )
+    })
 }
 
 /// Render BT.2020 D65 reference white at `target_nits` in the centred
-/// patch. HDR mode: `(R=L, G=L, B=L)` in linear nits — BT.2020 is
-/// defined such that equal R/G/B produces D65 by construction. SDR mode:
-/// convert to sRGB-encoded white where RGB=1.0 maps to
-/// `sdr_reference_nits`.
+/// patch. HDR: equal R/G/B in linear nits — BT.2020 is defined such that
+/// equal R/G/B produces D65 by construction. SDR: equal sRGB-encoded
+/// values where RGB=1.0 maps to `sdr_reference_nits`.
 pub fn set_white_patch(
     patch: &mut PatchSurface,
     baseline: &OutputBaseline,
     target_nits: f64,
 ) -> Result<()> {
-    if baseline.hdr_active {
-        patch
-            .set_nits([target_nits, target_nits, target_nits])
-            .with_context(|| format!("set HDR white = {target_nits:.2}"))
-    } else {
-        let linear = (target_nits / baseline.sdr_reference_nits).clamp(0.0, 1.0);
-        let encoded = srgb_oetf(linear);
-        patch
-            .set_color([encoded, encoded, encoded])
-            .with_context(|| {
-                format!("set SDR white = {encoded:.4} (target {target_nits:.2} cd/m²)")
-            })
-    }
+    let cv = code_values_for_nits(baseline, [target_nits, target_nits, target_nits]);
+    patch
+        .set_code_values(cv)
+        .with_context(|| format!("set white patch = {target_nits:.2} cd/m²"))
 }
 
 /// sRGB OETF (linear → encoded). Inverse of the EOTF in the decode shader.

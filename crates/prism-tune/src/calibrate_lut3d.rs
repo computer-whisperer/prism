@@ -136,6 +136,12 @@ pub struct CalibrateLut3dArgs {
     /// catch math regressions or panel-state surprises.
     #[arg(long)]
     pub no_verify: bool,
+    /// Repeats per gamut-probe vertex. The probe burst-measures each
+    /// cube-surface boundary point and builds `MeasurementConfidence`
+    /// from the burst — repeats reduce temporal noise and feed the
+    /// `LowTrust → stop refining` rule. 8 mirrors tristim's default.
+    #[arg(long, default_value_t = 8)]
+    pub gamut_repeats: usize,
 }
 
 /// One (requested, diagnosed-scanout, XYZ) measurement from a per-channel sweep.
@@ -338,8 +344,10 @@ impl ResponseGrid {
     }
 
     /// Smallest emission anywhere in the grid — at the (min_cmd, min_cmd,
-    /// min_cmd) corner. Used by the inverter to short-circuit "target is
-    /// below what the panel can render above black" cases to cmd=0.
+    /// min_cmd) corner. The bake's sub-floor projection uses the gamut
+    /// mesh's measured `(0, 0, 0)` vertex (= true black including bleed)
+    /// rather than this; kept for debug introspection.
+    #[allow(dead_code)]
     fn min_emission(&self) -> Xyz {
         self.lookup(0, 0, 0)
     }
@@ -686,6 +694,85 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         responses[2].approx_gain_y_per_cmd(),
     ];
 
+    // ─── Phase 1.5: cube-surface gamut probe ──────────────────────────────
+    // Adaptive 14-point coarse + quadtree-refined boundary survey of
+    // the reachable solid. Each vertex is a burst of repeats reduced
+    // to a `MeasurementConfidence`; the refinement uses Lab-ΔE76 in
+    // the measured-white frame to detect flat / folded / max-depth
+    // / low-trust leaves. Low-trust corners stop subdivision so we
+    // never chase a noise read into refinement.
+    //
+    // The mesh's `(0, 0, 0)` vertex is the panel's true bleed floor
+    // — measured absolute, with the same burst confidence — and
+    // supersedes the standalone phase-0 black measurement for the
+    // bake's bottom-side projection.
+    eprintln!("\n--- phase 1.5: cube-surface gamut probe ---");
+    let probe_config = crate::gamut::ProbeConfig {
+        cmd_axis_max_nits: [
+            responses[0].max_requested,
+            responses[1].max_requested,
+            responses[2].max_requested,
+        ],
+        repeats: args.gamut_repeats,
+        settle,
+        settle_black,
+    };
+    let probe_params = crate::gamut::RefineParams::default();
+    let gamut_mesh = crate::gamut::probe_gamut_refined(
+        &probe_config,
+        &probe_params,
+        &baseline,
+        &mut device,
+        &mut patch,
+        &setup,
+        &cal,
+        |evt| {
+            let crate::gamut::GamutProbeEvent::Measured {
+                index,
+                code_value,
+                cmd_nits,
+                measured,
+                flags,
+            } = evt;
+            let flag_str = if flags.is_empty() {
+                "ok".to_string()
+            } else {
+                flags
+                    .iter()
+                    .map(|f| match f {
+                        tristim_driver::TrustFlag::Floor => "FLOOR",
+                        tristim_driver::TrustFlag::Noisy => "NOISY",
+                        tristim_driver::TrustFlag::Chroma => "DUV",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            eprintln!(
+                "  vertex {index:>3} cv=({:.2},{:.2},{:.2}) cmd=({:>6.1},{:>6.1},{:>6.1}) → \
+                 XYZ=({:>7.3},{:>7.3},{:>7.3}) {flag_str}",
+                code_value[0],
+                code_value[1],
+                code_value[2],
+                cmd_nits[0],
+                cmd_nits[1],
+                cmd_nits[2],
+                measured.x,
+                measured.y,
+                measured.z,
+            );
+        },
+    )
+    .context("gamut probe")?;
+    eprintln!(
+        "  gamut mesh: {} vertices, {} patches ({} flat, {} folded, {} max-depth, {} low-trust)",
+        gamut_mesh.vertices.len(),
+        gamut_mesh.patches.len(),
+        gamut_mesh.count(crate::gamut::PatchStatus::Flat),
+        gamut_mesh.count(crate::gamut::PatchStatus::Folded),
+        gamut_mesh.count(crate::gamut::PatchStatus::MaxDepth),
+        gamut_mesh.count(crate::gamut::PatchStatus::LowTrust),
+    );
+
     // ─── Phase 2: 3D forward grid sweep ───────────────────────────────────
     // The per-channel data above just sized the cmd-axis bounds and
     // seeded Newton — it's deliberately not the forward model. Real
@@ -707,7 +794,6 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     let grid = sweep_3d_grid(
         args.cube_edge_cmd,
         phase2_request_axes,
-        black_xyz,
         settle,
         &mut device,
         &mut patch,
@@ -723,13 +809,13 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         "\n--- phase 3: invert {}³ forward grid → {}³ inverse LUT ---",
         args.cube_edge_cmd, args.cube_edge
     );
-    let bt2020_input_max_nits =
-        lut_input_max_nits_for_output(&baseline, &grid, seed_gain, black_floor_xyz);
-    eprintln!(
-        "  calibrated BT.2020 input max: R={:.1} G={:.1} B={:.1} cd/m²",
-        bt2020_input_max_nits[0], bt2020_input_max_nits[1], bt2020_input_max_nits[2],
+    let (entries, residuals) = build_inverse_lut(
+        args.cube_edge,
+        &grid,
+        &gamut_mesh,
+        seed_gain,
+        black_floor_xyz,
     );
-    let (entries, residuals) = build_inverse_lut(args.cube_edge, &grid, seed_gain, black_floor_xyz);
     if let Some((_, w)) = log.as_mut() {
         // Split residual stats by whether the target was in-gamut for
         // the panel (target_Y ≤ panel total peak). Out-of-gamut grids
@@ -811,17 +897,32 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         args.cube_edge,
         peak_nits,
         black_point_f32,
-        bt2020_input_max_nits,
         &entries,
     )
     .with_context(|| format!("write LUT file {}", lut_path.display()))?;
     eprintln!(
-        "\nWrote {} (cube_edge={}, peaks={:?}, black_xyz={:?}, bt2020_input_max={:?})",
+        "\nWrote {} (cube_edge={}, peaks={:?}, black_xyz={:?})",
         lut_path.display(),
         args.cube_edge,
         peak_nits,
         black_point_f32,
-        bt2020_input_max_nits,
+    );
+
+    // Persist the measured gamut mesh as a sidecar JSON so the cube-
+    // surface boundary travels with the LUT for inspection, validation,
+    // and any future runtime consumers (tone-mapping, IPC).
+    let gamut_path = lut_path.with_extension("gamut.json");
+    save_gamut_json(&gamut_path, &gamut_mesh)
+        .with_context(|| format!("write gamut sidecar {}", gamut_path.display()))?;
+    eprintln!(
+        "Wrote gamut sidecar {} ({} vertices, {} patches: {} flat, {} folded, {} max-depth, {} low-trust)",
+        gamut_path.display(),
+        gamut_mesh.vertices.len(),
+        gamut_mesh.patches.len(),
+        gamut_mesh.count(crate::gamut::PatchStatus::Flat),
+        gamut_mesh.count(crate::gamut::PatchStatus::Folded),
+        gamut_mesh.count(crate::gamut::PatchStatus::MaxDepth),
+        gamut_mesh.count(crate::gamut::PatchStatus::LowTrust),
     );
 
     // Apply discovered peaks (HDR mode only) so the IR clamp matches
@@ -861,7 +962,6 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             &peak_nits,
             &entries,
             &grid,
-            black_floor_xyz,
             &mut device,
             &mut patch,
             &setup,
@@ -886,11 +986,6 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             peak_nits[1],
             peak_nits[2],
             black_point_f32[0], black_point_f32[1], black_point_f32[2],
-        )?;
-        writeln!(
-            w,
-            "# bt2020_input_max_nits=R={:.3} G={:.3} B={:.3}",
-            bt2020_input_max_nits[0], bt2020_input_max_nits[1], bt2020_input_max_nits[2],
         )?;
         w.flush().ok();
         eprintln!("Measurement log: {}", path.display());
@@ -927,7 +1022,6 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         baseline.hdr_active,
         peak_nits,
         black_point_f32,
-        bt2020_input_max_nits,
         &lut_path,
     );
 
@@ -965,12 +1059,12 @@ struct VerifyResult {
 /// CSV log: each row is
 /// `3D,i,j,k,requested_r,requested_g,requested_b,scanout_r,scanout_g,scanout_b,X,Y,Z` —
 /// distinct prefix from the Phase 1 `R/G/B` rows so a log reader
-/// can tell which phase each sample is from. XYZ is black-subtracted.
+/// can tell which phase each sample is from. XYZ is absolute (no
+/// black subtraction); the bake operates in absolute throughout.
 #[allow(clippy::too_many_arguments)]
 fn sweep_3d_grid(
     cube_edge: usize,
     requested_axis_cmds: [Vec<f64>; 3],
-    black_xyz: Xyz,
     settle: Duration,
     device: &mut Colorimeter,
     patch: &mut PatchSurface,
@@ -1041,12 +1135,11 @@ fn sweep_3d_grid(
                 thread::sleep(settle);
                 let raw = device.measure_raw(setup).context("3D-sweep measure")?;
                 let raw_xyz = raw_to_xyz(&raw, setup, cal);
-                let xyz_above_black = Xyz {
-                    x: (raw_xyz.x - black_xyz.x).max(0.0),
-                    y: (raw_xyz.y - black_xyz.y).max(0.0),
-                    z: (raw_xyz.z - black_xyz.z).max(0.0),
-                };
-                xyz.push(xyz_above_black);
+                // Absolute emission — the reformed bake works in
+                // absolute XYZ and projects sub-floor requests onto
+                // the gamut mesh's measured bleed surface (cmd=0 ≡
+                // true black). No black subtraction here.
+                xyz.push(raw_xyz);
                 if let Some((_, w)) = log.as_mut() {
                     writeln!(
                         w,
@@ -1057,9 +1150,9 @@ fn sweep_3d_grid(
                         scanout_rgb[0],
                         scanout_rgb[1],
                         scanout_rgb[2],
-                        xyz_above_black.x,
-                        xyz_above_black.y,
-                        xyz_above_black.z,
+                        raw_xyz.x,
+                        raw_xyz.y,
+                        raw_xyz.z,
                     )?;
                 }
                 patches_done += 1;
@@ -1196,7 +1289,6 @@ fn verify_white_point(
     peak_nits: &[f32; 3],
     lut_entries: &[[f32; 3]],
     grid: &ResponseGrid,
-    black_floor_xyz: [f64; 3],
     device: &mut tristim_driver::Colorimeter,
     patch: &mut PatchSurface,
     setup: &Setup,
@@ -1273,8 +1365,10 @@ fn verify_white_point(
         // capturing reality and the LUT inversion is sound; large
         // gap means drift (thermal, time-since-calibration, ABL
         // behaving differently for this specific verify pattern).
+        // Grid stores absolute XYZ post-reform, so `grid.forward.y` is
+        // the absolute luminance prediction directly — no floor add-back.
         let grid_pred = grid.forward(scanout_decoded);
-        let grid_predicted_y = grid_pred.y + black_floor_xyz[1];
+        let grid_predicted_y = grid_pred.y;
 
         eprintln!(
             "  W target {:>7.1} cd/m² → Y={:>7.2}  xy=({:.4},{:.4})  Δu'v'={:.4}  Y_err={:+.1}%",
@@ -1431,25 +1525,38 @@ fn log_spaced_targets(lo: f64, hi: f64, n: usize) -> Vec<f64> {
         .collect()
 }
 
-/// Build the inverse 3D LUT from the measured 3D forward grid.
-/// Iteration order is X-fastest then Y then Z — matches the binary
-/// file format + the GPU image memory walk.
+/// Build the inverse 3D LUT by projecting each BT.2020 grid input onto
+/// the panel's measured reachable volume and inverting against the
+/// absolute-XYZ forward grid.
 ///
-/// `black_floor_xyz` is the panel's emission at (R=G=B=0). The grid
-/// stores emission above black; the user-facing target is the panel's
-/// TOTAL reading (emission + black). So each grid point's invert
-/// target is `target_xyz - black_floor_xyz`, floor-clamped to zero.
+/// The reform vs. the older bake:
 ///
-/// Fast path for sub-floor targets: if the requested emission is
-/// below what the grid's smallest cmd produces, the panel can't
-/// render any darker, so we emit cmd = (0, 0, 0) directly — the
-/// panel renders its black floor and that's the closest we get.
+/// - **Absolute XYZ throughout.** The forward grid stores absolute
+///   emission (no separate black subtraction). Sub-floor requests
+///   project to the gamut mesh's measured `(0, 0, 0)` vertex — the
+///   panel's actual bleed XYZ — rather than the old "subtract floor,
+///   clamp to 0, hard-map to cmd=0" short-circuit. LCD backlight bleed
+///   chromaticity now survives into rendered near-black.
+///
+/// - **Hue-preserving boundary projection.** Out-of-gamut requests
+///   (Newton parks any cmd channel at its measured max) bisect a chroma
+///   scale toward the measured white in `u'v'` space at fixed luminance,
+///   re-invert at each candidate, and take the highest-chroma scale
+///   that lands in-gamut. Compared with the older XYZ-Euclidean Newton
+///   clamp (which silently shifted hue at the gamut boundary), this
+///   pulls saturated requests toward neutral instead of toward whatever
+///   nearest-XYZ corner the panel could reach.
+///
+/// `black_floor_xyz` is kept as a Newton sub-floor fallback for the rare
+/// case the gamut mesh's `(0, 0, 0)` vertex didn't measure (unlikely on
+/// hardware but possible in tests with synthetic data).
 ///
 /// Returns `(entries, per-grid residual L2 norms)`. Caller reports
 /// convergence stats so a bad inversion can't sneak through silently.
 fn build_inverse_lut(
     cube_edge: u32,
     grid: &ResponseGrid,
+    mesh: &crate::gamut::GamutMesh,
     seed_gain: [f64; 3],
     black_floor_xyz: [f64; 3],
 ) -> (Vec<[f32; 3]>, Vec<f64>) {
@@ -1459,7 +1566,12 @@ fn build_inverse_lut(
     let mut residuals = Vec::with_capacity(n * n * n);
     let mut total_residual = 0.0_f64;
     let mut worst_residual = 0.0_f64;
-    let grid_floor = grid.min_emission();
+    let floor = mesh
+        .black()
+        .map(|b| [b.x, b.y, b.z])
+        .unwrap_or(black_floor_xyz);
+    let white = [mesh.white.x, mesh.white.y, mesh.white.z];
+    let white_uv = uv_prime(white);
     for k in 0..n {
         let bz_in = pq_eotf(k as f32 / denom) as f64;
         for j in 0..n {
@@ -1467,28 +1579,8 @@ fn build_inverse_lut(
             for i in 0..n {
                 let r_in = pq_eotf(i as f32 / denom) as f64;
                 let target_xyz = bt2020_to_xyz(r_in, g_in, bz_in);
-                let emission_target = [
-                    (target_xyz[0] - black_floor_xyz[0]).max(0.0),
-                    (target_xyz[1] - black_floor_xyz[1]).max(0.0),
-                    (target_xyz[2] - black_floor_xyz[2]).max(0.0),
-                ];
-                // Sub-floor short-circuit: if all three target components
-                // are below what the grid's dimmest cmd produces, the
-                // panel can only render down to that floor. cmd=0 gets
-                // us the panel's black emission, which is the closest
-                // we can come — no Newton needed.
-                let (cmd, residual) = if emission_target[0] <= grid_floor.x
-                    && emission_target[1] <= grid_floor.y
-                    && emission_target[2] <= grid_floor.z
-                {
-                    let residual = (emission_target[0].powi(2)
-                        + emission_target[1].powi(2)
-                        + emission_target[2].powi(2))
-                    .sqrt();
-                    ([0.0, 0.0, 0.0], residual)
-                } else {
-                    invert_one(grid, seed_gain, emission_target)
-                };
+                let (cmd, residual) =
+                    project_and_invert(grid, seed_gain, target_xyz, floor, white_uv);
                 total_residual += residual;
                 if residual > worst_residual {
                     worst_residual = residual;
@@ -1506,69 +1598,104 @@ fn build_inverse_lut(
     (entries, residuals)
 }
 
-/// Estimate the per-channel linear BT.2020 input bounds the generated LUT
-/// is calibrated to handle. This is intentionally derived directly from
-/// the measured forward grid and inverter, not from panel-native peaks or
-/// an external CTM. For each pure BT.2020 axis, increase luminance until
-/// the inverse solution starts parking any panel command at its measured
-/// maximum; the previous value is the highest input that still has useful
-/// LUT headroom.
-fn estimate_bt2020_input_max_nits(
+/// Tolerance for "in-gamut": residual XYZ error in cd/m². 0.5 cd/m² is
+/// well below the colorimeter's noise floor, so it admits any honest
+/// Newton convergence but rejects the "parked at max_cmd" residuals
+/// that indicate the panel can't reach the target.
+const PROJECT_TOL_NITS: f64 = 0.5;
+/// Saturation margin: a cmd within this fraction of `max_cmd` is treated
+/// as out-of-gamut so the bisection pulls chroma toward white rather
+/// than baking the terminal cell's hue-shifted clip.
+const PROJECT_SATURATION_FRAC: f64 = 0.995;
+/// Chroma-compression bisection step count. 16 halvings ⇒ ~1e-5 fraction,
+/// far below any meaningful u'v' precision.
+const PROJECT_BISECTION_STEPS: usize = 16;
+
+/// Project an absolute-XYZ target into the panel's reachable volume and
+/// invert. Three cases:
+///
+/// 1. **Below floor** (`target_y ≤ floor_y`): hard-map to cmd=0 — the
+///    panel can't go darker than its bleed point. The achieved emission
+///    is `floor`; residual is the XYZ distance to it. Preserves bleed
+///    chromaticity rather than crushing to neutral zero.
+///
+/// 2. **In-gamut on first try**: take it.
+///
+/// 3. **Out-of-gamut**: bisect a chroma scale `s ∈ [0, 1]` where
+///    `chromaticity(s) = lerp(white_uv, target_uv, s)` at fixed luminance.
+///    Keep the largest `s` whose inversion lands in-gamut. `s = 0` is
+///    neutral (always reachable); `s = 1` is the full requested chroma.
+fn project_and_invert(
     grid: &ResponseGrid,
     seed_gain: [f64; 3],
-    black_floor_xyz: [f64; 3],
-) -> [f32; 3] {
+    target_abs: [f64; 3],
+    floor: [f64; 3],
+    white_uv: Option<(f64, f64)>,
+) -> ([f64; 3], f64) {
+    // Below-floor: emit panel black with its measured chromaticity.
+    if target_abs[1] <= floor[1] {
+        let residual = ((target_abs[0] - floor[0]).powi(2)
+            + (target_abs[1] - floor[1]).powi(2)
+            + (target_abs[2] - floor[2]).powi(2))
+        .sqrt();
+        return ([0.0, 0.0, 0.0], residual);
+    }
+
     let max_cmd = grid.max_cmd();
-    let mut out = [10_000.0_f32; 3];
-    for axis in 0..3 {
-        let mut lo = 0.0_f64;
-        let mut hi = 10_000.0_f64;
-        for _ in 0..40 {
-            let mid = 0.5 * (lo + hi);
-            let target = bt2020_axis_emission_target(axis, mid, black_floor_xyz);
-            let (cmd, _) = invert_one(grid, seed_gain, target);
-            let saturated = (0..3).any(|c| cmd[c] >= max_cmd[c] * 0.995);
-            if saturated {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
+    let in_gamut = |cmd: &[f64; 3], residual: f64| -> bool {
+        residual < PROJECT_TOL_NITS
+            && !(0..3).any(|c| cmd[c] >= max_cmd[c] * PROJECT_SATURATION_FRAC)
+    };
+
+    let (cmd0, residual0) = invert_one(grid, seed_gain, target_abs);
+    if in_gamut(&cmd0, residual0) {
+        return (cmd0, residual0);
+    }
+
+    // Bisect chroma toward neutral at fixed luminance.
+    let target_uv = uv_prime(target_abs);
+    let (Some((u_t, v_t)), Some((u_w, v_w))) = (target_uv, white_uv) else {
+        return (cmd0, residual0);
+    };
+    let mut lo = 0.0_f64;
+    let mut hi = 1.0_f64;
+    let mut best_cmd = cmd0;
+    let mut best_residual = residual0;
+    for _ in 0..PROJECT_BISECTION_STEPS {
+        let scale = 0.5 * (lo + hi);
+        let u = u_w + scale * (u_t - u_w);
+        let v = v_w + scale * (v_t - v_w);
+        let compressed = xyz_from_uv_y(u, v, target_abs[1]);
+        let (cmd, residual) = invert_one(grid, seed_gain, compressed);
+        if in_gamut(&cmd, residual) {
+            best_cmd = cmd;
+            best_residual = residual;
+            lo = scale;
+        } else {
+            hi = scale;
         }
-        // Leave a small numerical margin below the measured saturation
-        // boundary so tiny interpolation/settle drift does not push the
-        // shader into the LUT's terminal cells during normal rendering.
-        out[axis] = (lo * 0.98).clamp(1.0, 10_000.0) as f32;
     }
-    out
+    (best_cmd, best_residual)
 }
 
-fn lut_input_max_nits_for_output(
-    baseline: &OutputBaseline,
-    grid: &ResponseGrid,
-    seed_gain: [f64; 3],
-    black_floor_xyz: [f64; 3],
-) -> [f32; 3] {
-    if baseline.hdr_active {
-        estimate_bt2020_input_max_nits(grid, seed_gain, black_floor_xyz)
+/// CIE 1976 `u'v'` chromaticity coordinates from absolute XYZ. Returns
+/// `None` at true black, where the ratios are undefined.
+fn uv_prime(xyz: [f64; 3]) -> Option<(f64, f64)> {
+    let denom = xyz[0] + 15.0 * xyz[1] + 3.0 * xyz[2];
+    if denom <= 1e-9 {
+        None
     } else {
-        // SDR source patches are authored against `sdr_reference_nits`: RGB=1
-        // decodes to D65 white at this luminance. The per-primary reachable
-        // gamut estimate can be much lower than that on weak-red/blue panels,
-        // but using it as a componentwise pre-LUT clamp clips neutral white
-        // before the LUT has a chance to use cross-channel compensation.
-        [baseline.sdr_reference_nits as f32; 3]
+        Some((4.0 * xyz[0] / denom, 9.0 * xyz[1] / denom))
     }
 }
 
-fn bt2020_axis_emission_target(axis: usize, nits: f64, black_floor_xyz: [f64; 3]) -> [f64; 3] {
-    let mut rgb = [0.0_f64; 3];
-    rgb[axis] = nits;
-    let xyz = bt2020_to_xyz(rgb[0], rgb[1], rgb[2]);
-    [
-        (xyz[0] - black_floor_xyz[0]).max(0.0),
-        (xyz[1] - black_floor_xyz[1]).max(0.0),
-        (xyz[2] - black_floor_xyz[2]).max(0.0),
-    ]
+/// XYZ at a given `u'v'` chromaticity and luminance Y. Standard inversion
+/// of the `u'v'` definition; degenerate at `v' ≈ 0` so we guard.
+fn xyz_from_uv_y(u: f64, v: f64, y: f64) -> [f64; 3] {
+    let v = v.max(1e-9);
+    let x = 9.0 * y * u / (4.0 * v);
+    let z = y * (12.0 - 3.0 * u - 20.0 * v) / (4.0 * v);
+    [x.max(0.0), y, z.max(0.0)]
 }
 
 /// Damped-Newton-with-backtracking-line-search inversion of one
@@ -1754,6 +1881,51 @@ fn open_log(
     Ok(Some((path, w)))
 }
 
+/// Persist a `GamutMesh` as a JSON sidecar alongside the LUT file. The
+/// schema is hand-rolled with `serde_json::json!` so we don't pull a
+/// `Serialize` derive onto `Xyz` (which lives in tristim-driver and
+/// might evolve at its own pace). Human-readable and easy to load from
+/// any tool that wants the cube-surface boundary later.
+fn save_gamut_json(path: &std::path::Path, mesh: &crate::gamut::GamutMesh) -> Result<()> {
+    let vertices: Vec<serde_json::Value> = mesh
+        .vertices
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "code_value": v.code_value,
+                "cmd_nits": v.cmd_nits,
+                "xyz": [v.xyz.x, v.xyz.y, v.xyz.z],
+                "lab": v.lab,
+                "trustworthy": v.trustworthy,
+            })
+        })
+        .collect();
+    let patches: Vec<serde_json::Value> = mesh
+        .patches
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "face": p.face_label(),
+                "axis": p.axis,
+                "value": p.value,
+                "corners": p.corners,
+                "status": p.status.as_str(),
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({
+        "schema": "prism-gamut-mesh.v1",
+        "white_xyz": [mesh.white.x, mesh.white.y, mesh.white.z],
+        "cmd_axis_max_nits": mesh.cmd_axis_max_nits,
+        "vertices": vertices,
+        "patches": patches,
+    });
+    let f = File::create(path).with_context(|| format!("create {}", path.display()))?;
+    serde_json::to_writer_pretty(BufWriter::new(f), &doc)
+        .with_context(|| format!("serialize gamut mesh to {}", path.display()))?;
+    Ok(())
+}
+
 fn print_kdl_block(
     kdl_name: &str,
     connector: &str,
@@ -1761,7 +1933,6 @@ fn print_kdl_block(
     hdr_active: bool,
     peaks: [f32; 3],
     black_xyz: [f32; 3],
-    bt2020_input_max_nits: [f32; 3],
     lut_path: &std::path::Path,
 ) {
     println!();
@@ -1771,10 +1942,6 @@ fn print_kdl_block(
     );
     println!(
         "# (carried in the LUT file header; compositor exposes it via OutputContext for tone mapping)",
-    );
-    println!(
-        "# Calibrated BT.2020 LUT input max: R={:.1} G={:.1} B={:.1} cd/m²",
-        bt2020_input_max_nits[0], bt2020_input_max_nits[1], bt2020_input_max_nits[2],
     );
     match edid_id {
         Some(_) => println!(
@@ -1985,23 +2152,5 @@ mod tests {
             xyz.x,
             mid_r,
         );
-    }
-
-    #[test]
-    fn sdr_lut_input_max_uses_reference_white() {
-        let grid = synth_grid(5, [1.0, 0.2, 0.0], [0.0, 1.0, 0.0], [0.0, 0.1, 1.0], 20.0);
-        let baseline = OutputBaseline {
-            hdr_active: false,
-            sdr_reference_nits: 74.0,
-            initial_panel_peak_nits: [20.0, 20.0, 20.0],
-            initial_response_curve: None,
-            make: None,
-            model: None,
-            serial: None,
-        };
-
-        let max = lut_input_max_nits_for_output(&baseline, &grid, [0.2, 1.0, 0.1], [0.0; 3]);
-
-        assert_eq!(max, [74.0, 74.0, 74.0]);
     }
 }

@@ -28,6 +28,7 @@ mod calibrate;
 mod calibrate_lut3d;
 mod characterize;
 mod common;
+mod gamut;
 mod validate_lut3d;
 
 use anyhow::{Context, Result};

@@ -12,16 +12,20 @@
 //!     unused but reserved.)
 //!   - `vec4 response_gamma` at offset 80 (per-channel response gamma
 //!     exponent. `.w` unused but reserved.)
-//!   - `vec4 lut_input_max_nits` at offset 96 (linear BT.2020 nits;
-//!     clamps the LUT shaper input to the range calibrated for this
-//!     output. `.w` unused.)
-//!   - `float sdr_white_nits` at offset 112
-//!   - `float target_peak_nits` at offset 116
-//!   - `float dither_strength` at offset 120
-//!   - `float _pad` at offset 124
+//!   - `float sdr_white_nits` at offset 96
+//!   - `float target_peak_nits` at offset 100
+//!   - `float dither_strength` at offset 104
+//!   - `float _pad` at offset 108
 //!
-//! Total 128 bytes — at the Vulkan minimum push-constant size, intentionally,
-//! so any conformant driver accepts this layout.
+//! Total 112 bytes — comfortably below the 128-byte Vulkan minimum
+//! push-constant size, so any conformant driver accepts this layout.
+//!
+//! A per-channel `lut_input_max_nits` vec4 used to sit at offset 96; v4
+//! of the LUT pipeline removed it. The bake now projects out-of-gamut
+//! and below-floor requests onto the measured reachable surface, so the
+//! shader no longer needs a pre-LUT axis-aligned box clamp. The PQ
+//! shaper still implicitly bounds inputs to `[0, 10000]` cd/m² via the
+//! sampler's clamp-to-edge addressing.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -43,10 +47,6 @@ pub struct EncodePushSynth {
     pub response_gain: [f32; 4],
     /// Per-channel response gamma — exponent. Identity = `[1.0, 1.0, 1.0, 0.0]`.
     pub response_gamma: [f32; 4],
-    /// Per-channel max input to the 3D LUT shaper, in linear BT.2020
-    /// nits. This is the post-composite clamp for LUT-backed outputs;
-    /// identity/default is the PQ domain ceiling.
-    pub lut_input_max_nits: [f32; 4],
     /// For SDR encode: how many nits is the input value `1.0`.
     pub sdr_white_nits: f32,
     /// For PQ encode and linear scanout: clip / normalize ceiling.
@@ -64,7 +64,6 @@ impl EncodePushSynth {
             cal_matrix: mat4_identity(),
             response_gain: identity_response_vec(),
             response_gamma: identity_response_vec(),
-            lut_input_max_nits: [10_000.0, 10_000.0, 10_000.0, 0.0],
             sdr_white_nits: 80.0,
             target_peak_nits: 80.0,
             dither_strength: 0.0,
@@ -78,7 +77,6 @@ impl EncodePushSynth {
             cal_matrix: mat4_identity(),
             response_gain: identity_response_vec(),
             response_gamma: identity_response_vec(),
-            lut_input_max_nits: [10_000.0, 10_000.0, 10_000.0, 0.0],
             sdr_white_nits: 80.0,
             target_peak_nits: 10000.0,
             dither_strength: 0.0,
@@ -94,17 +92,6 @@ impl EncodePushSynth {
     pub fn set_response_gain_gamma(&mut self, gain: [f32; 3], gamma: [f32; 3]) {
         self.response_gain = [gain[0], gain[1], gain[2], 0.0];
         self.response_gamma = [gamma[0], gamma[1], gamma[2], 0.0];
-    }
-
-    /// Set the linear BT.2020 per-channel clamp applied before LUT
-    /// sampling. Values are defensively clamped to the PQ domain.
-    pub fn set_lut_input_max_nits(&mut self, max_nits: [f32; 3]) {
-        self.lut_input_max_nits = [
-            max_nits[0].clamp(1.0, 10_000.0),
-            max_nits[1].clamp(1.0, 10_000.0),
-            max_nits[2].clamp(1.0, 10_000.0),
-            0.0,
-        ];
     }
 
     /// Set the 3×3 calibration matrix from row-major rows. The shader
@@ -140,28 +127,28 @@ pub const PUSH_CONSTANTS_SIZE: u32 = std::mem::size_of::<EncodePushSynth>() as u
 pub const OFFSET_CAL_MATRIX: u32 = 0;
 pub const OFFSET_RESPONSE_GAIN: u32 = 64;
 pub const OFFSET_RESPONSE_GAMMA: u32 = 80;
-pub const OFFSET_LUT_INPUT_MAX_NITS: u32 = 96;
-pub const OFFSET_SDR_WHITE_NITS: u32 = 112;
-pub const OFFSET_TARGET_PEAK_NITS: u32 = 116;
-pub const OFFSET_DITHER_STRENGTH: u32 = 120;
-pub const OFFSET_PAD: u32 = 124;
+pub const OFFSET_SDR_WHITE_NITS: u32 = 96;
+pub const OFFSET_TARGET_PEAK_NITS: u32 = 100;
+pub const OFFSET_DITHER_STRENGTH: u32 = 104;
+pub const OFFSET_PAD: u32 = 108;
 
 // Member indices within the SPIR-V struct (same order as Rust struct).
 pub const MEMBER_CAL_MATRIX: u32 = 0;
 pub const MEMBER_RESPONSE_GAIN: u32 = 1;
 pub const MEMBER_RESPONSE_GAMMA: u32 = 2;
-pub const MEMBER_LUT_INPUT_MAX_NITS: u32 = 3;
-pub const MEMBER_SDR_WHITE_NITS: u32 = 4;
-pub const MEMBER_TARGET_PEAK_NITS: u32 = 5;
-pub const MEMBER_DITHER_STRENGTH: u32 = 6;
+pub const MEMBER_SDR_WHITE_NITS: u32 = 3;
+pub const MEMBER_TARGET_PEAK_NITS: u32 = 4;
+pub const MEMBER_DITHER_STRENGTH: u32 = 5;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn push_constant_size_at_minimum_limit() {
-        assert_eq!(PUSH_CONSTANTS_SIZE, 128);
+    fn push_constant_size_under_minimum_limit() {
+        // 112 < 128 (Vulkan minimum). Plenty of headroom if future
+        // fragments need more slots — adjust _pad to align.
+        assert_eq!(PUSH_CONSTANTS_SIZE, 112);
     }
 
     #[test]
@@ -179,10 +166,6 @@ mod tests {
         assert_eq!(
             (&zero.response_gamma as *const _ as usize - base) as u32,
             OFFSET_RESPONSE_GAMMA
-        );
-        assert_eq!(
-            (&zero.lut_input_max_nits as *const _ as usize - base) as u32,
-            OFFSET_LUT_INPUT_MAX_NITS
         );
         assert_eq!(
             (&zero.sdr_white_nits as *const _ as usize - base) as u32,

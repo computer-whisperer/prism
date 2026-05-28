@@ -2208,11 +2208,10 @@ dependencies = [
 [[package]]
 name = "tristim-display"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/tristim.git?rev=17a4966#17a49666b76c85aaead44947e8695c3abb1a5c13"
+source = "git+https://github.com/computer-whisperer/tristim.git?rev=bf5ef44#bf5ef44d9e4535d15305a4f9a4dafd8daecb02ed"
 dependencies = [
  "half",
- "memmap2 0.9.10",
- "rustix 0.38.44",
+ "libc",
  "smithay-client-toolkit",
  "thiserror 1.0.69",
  "wayland-client",
@@ -2222,7 +2221,7 @@ dependencies = [
 [[package]]
 name = "tristim-driver"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/tristim.git?rev=17a4966#17a49666b76c85aaead44947e8695c3abb1a5c13"
+source = "git+https://github.com/computer-whisperer/tristim.git?rev=bf5ef44#bf5ef44d9e4535d15305a4f9a4dafd8daecb02ed"
 dependencies = [
  "rand 0.8.6",
  "rusb",

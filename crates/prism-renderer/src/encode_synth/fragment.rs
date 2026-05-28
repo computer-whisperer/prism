@@ -326,9 +326,9 @@ pub fn emit_per_channel_response_gain_gamma(
 /// pair. The math is:
 ///
 /// ```text
-/// clamped = clamp(in_nits, 0, push.lut_input_max_nits)
-/// coord   = pq_oetf(clamped)                // [0, 10000] nits → [0, 1] LUT coord
-/// out    = texture(u_lut, coord).rgb         // trilinear sample; nits
+/// clamped = clamp(in_nits, 0, 10000)         // PQ-domain overflow guard
+/// coord   = pq_oetf(clamped)                  // [0, 10000] nits → [0, 1] LUT coord
+/// out    = texture(u_lut, coord).rgb          // trilinear sample; nits
 /// ```
 ///
 /// `pq_oetf` (SMPTE ST 2084 inverse-EOTF) is the same function the
@@ -347,6 +347,15 @@ pub fn emit_per_channel_response_gain_gamma(
 /// interpolation between the 8 nearest grid points. `CLAMP_TO_EDGE` address
 /// mode means inputs above the highest grid point clip to the LUT's
 /// boundary value rather than wrapping or reading garbage.
+///
+/// **Gamut handling**: previous versions clamped per-channel via a
+/// push-constant `lut_input_max_nits`. That box was the wrong shape for
+/// the panel's reachable parallelepiped and pre-clipped colors the LUT's
+/// own cross-channel compensation could handle. The bake now projects
+/// out-of-gamut and below-floor requests onto the measured reachable
+/// surface at calibration time, so the table degrades gracefully and no
+/// shader-side per-channel pre-clamp is needed — only the loose PQ-domain
+/// `[0, 10000]` overflow guard below.
 pub fn emit_lut3d(ctx: &mut ShaderCtx, in_nits: spirv::Word) -> spirv::Word {
     let vec3_t = ctx.types.vec3;
     let vec4_t = ctx.types.vec4;
@@ -360,12 +369,13 @@ pub fn emit_lut3d(ctx: &mut ShaderCtx, in_nits: spirv::Word) -> spirv::Word {
         .expect("EncodeFragment::Lut3d requires builder to declare u_lut");
 
     // Shaper: PQ-encode the linear-nits input into [0, 1] coord space.
-    // max(., 0) protects against negative IR values (gamut-clipping from
-    // upstream CTMs that contain negatives, accumulation noise, etc.) —
-    // pow on negative bases is undefined and we'd get NaN coords.
+    // Loose [0, 10000] clamp keeps the PQ shaper's pow() out of trouble
+    // on adversarial or accumulated-overflow inputs; the bake handles
+    // gamut/range mapping inside the LUT, so we don't need a per-channel
+    // box from push constants here.
     let zero_vec = ctx.vec3_splat(f_zero);
-    let max_vec4 = load_push_vec4(ctx, MEMBER_LUT_INPUT_MAX_NITS);
-    let max_vec = vec4_xyz(ctx, max_vec4);
+    let pq_peak = ctx.const_f32(10_000.0);
+    let max_vec = ctx.vec3_splat(pq_peak);
     let in_clamped = ctx.glsl_call_vec3(GLSL_FCLAMP, [in_nits, zero_vec, max_vec]);
 
     let inv_10k = ctx.const_f32(1.0 / 10000.0);

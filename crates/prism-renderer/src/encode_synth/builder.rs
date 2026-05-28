@@ -164,11 +164,10 @@ impl ShaderCtx {
             mat4,  // 0: cal_matrix
             vec4,  // 1: response_gain (rgb + reserved)
             vec4,  // 2: response_gamma (rgb + reserved)
-            vec4,  // 3: lut_input_max_nits
-            f32_t, // 4: sdr_white_nits
-            f32_t, // 5: target_peak_nits
-            f32_t, // 6: dither_strength
-            f32_t, // 7: _pad
+            f32_t, // 3: sdr_white_nits
+            f32_t, // 4: target_peak_nits
+            f32_t, // 5: dither_strength
+            f32_t, // 6: _pad
         ]);
         // Block decoration so SPIR-V treats it as a push-constant block.
         b.decorate(push_struct, spirv::Decoration::Block, []);
@@ -194,7 +193,6 @@ impl ShaderCtx {
         for (member, offset) in [
             (MEMBER_RESPONSE_GAIN, OFFSET_RESPONSE_GAIN),
             (MEMBER_RESPONSE_GAMMA, OFFSET_RESPONSE_GAMMA),
-            (MEMBER_LUT_INPUT_MAX_NITS, OFFSET_LUT_INPUT_MAX_NITS),
             (MEMBER_SDR_WHITE_NITS, OFFSET_SDR_WHITE_NITS),
             (MEMBER_TARGET_PEAK_NITS, OFFSET_TARGET_PEAK_NITS),
             (MEMBER_DITHER_STRENGTH, OFFSET_DITHER_STRENGTH),
@@ -207,10 +205,11 @@ impl ShaderCtx {
             );
         }
         // Padding member (no offset decoration needed since it isn't read,
-        // but emitting one keeps the struct layout valid).
+        // but emitting one keeps the struct layout valid). Member index
+        // is one past the live members (i.e. 6 after dropping the cap).
         b.member_decorate(
             push_struct,
-            7,
+            6,
             spirv::Decoration::Offset,
             [rspirv::dr::Operand::LiteralBit32(OFFSET_PAD)],
         );
