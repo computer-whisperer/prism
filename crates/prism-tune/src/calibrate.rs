@@ -208,7 +208,7 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
     let setup = device.get_setup(&cal).context("download setup")?;
 
     // Patch surface. Mode picks the constructor.
-    let mut patch = open_patch_surface(&args.output, baseline.hdr_active)?;
+    let mut patch = open_patch_surface(&args.output, &baseline)?;
     patch
         .set_window_fraction(args.window)
         .context("set window fraction")?;

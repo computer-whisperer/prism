@@ -182,7 +182,7 @@ fn run_single_channel(args: SingleChannelArgs) -> Result<()> {
         .context("download cal matrix")?;
     let setup = device.get_setup(&cal).context("download setup")?;
 
-    let mut patch = open_patch_surface(&args.output, baseline.hdr_active)?;
+    let mut patch = open_patch_surface(&args.output, &baseline)?;
     patch
         .set_window_fraction(args.window)
         .context("set window fraction")?;
@@ -371,7 +371,7 @@ fn run_white_sweep(args: WhiteSweepArgs) -> Result<()> {
         .context("download cal matrix")?;
     let setup = device.get_setup(&cal).context("download setup")?;
 
-    let mut patch = open_patch_surface(&args.output, baseline.hdr_active)?;
+    let mut patch = open_patch_surface(&args.output, &baseline)?;
     patch
         .set_window_fraction(args.window)
         .context("set window fraction")?;

@@ -48,7 +48,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
-use tristim_driver::{measurement::raw_to_xyz, Colorimeter, Xyz};
+use tristim_driver::{measurement::raw_to_xyz, AdaptiveTier, Colorimeter, Xyz};
 
 use crate::common::{
     apply_border, apply_panel_peaks, open_patch_surface, query_output_baseline,
@@ -142,15 +142,17 @@ pub struct CalibrateLut3dArgs {
     /// setups.
     #[arg(long, default_value_t = 4)]
     pub gamut_repeats: usize,
-    /// Enable adaptive per-vertex integration on the gamut probe: each
-    /// vertex first burst-measures at this integration time and only
-    /// re-measures at the calibration default if the fast result fails
-    /// the confidence gate. Bright easy vertices stay short; dim or
-    /// saturated ones escalate. Typical Spyder default integration is
-    /// ~1000 ms, so a fast tier of 100–250 ms is a meaningful win.
-    /// Omit (the default) to keep the legacy single-tier behaviour.
-    #[arg(long)]
-    pub gamut_fast_integration_ms: Option<u16>,
+    /// Enable adaptive per-measurement integration across every probe
+    /// phase (black floor, per-channel saturation, gamut probe, 3D grid
+    /// sweep, and verify). Each measurement first probes at this
+    /// integration time and only re-measures at the calibration default
+    /// if the fast result fails the trust gate. Bright easy points
+    /// stay short; dim or saturated ones escalate. Typical Spyder
+    /// default integration is ~1000 ms, so a fast tier of 100–250 ms
+    /// is a meaningful win — Phase 2 (729 patches) gets the biggest
+    /// payoff. Omit to keep the legacy single-tier behaviour.
+    #[arg(long, alias = "gamut-fast-integration-ms")]
+    pub fast_integration_ms: Option<u16>,
 }
 
 /// One (requested, diagnosed-scanout, XYZ) measurement from a per-channel sweep.
@@ -426,6 +428,63 @@ fn sub_xyz_scaled(a: Xyz, b: Xyz, scale: f64) -> Xyz {
     }
 }
 
+/// Single-shot measurement with optional adaptive integration. Returns
+/// `(xyz, tier)` so callers can roll per-phase tier totals into their
+/// logging without bothering with `MeasurementConfidence` (the gamut
+/// probe is the only site that consumes confidence). `fast_ms = None`
+/// degrades to `SingleFull` (a plain default-integration measurement).
+fn measure_single_adaptive(
+    device: &mut Colorimeter,
+    setup: &Setup,
+    cal: &Calibration,
+    fast_ms: Option<u16>,
+) -> Result<(Xyz, AdaptiveTier)> {
+    let m = device
+        .measure_adaptive(setup, cal, 1, fast_ms)
+        .context("measure_adaptive")?;
+    let xyz = raw_to_xyz(&m.raws[0], &m.setup, &m.cal);
+    Ok((xyz, m.tier))
+}
+
+/// Compact tier suffix for per-measurement log lines. Empty string for
+/// `SingleFull` so non-adaptive runs keep the legacy log shape.
+fn tier_suffix(tier: AdaptiveTier) -> &'static str {
+    match tier {
+        AdaptiveTier::Fast => " [fast]",
+        AdaptiveTier::EscalatedFull => " [esc]",
+        AdaptiveTier::SingleFull => "",
+    }
+}
+
+/// Per-phase counters for the three adaptive outcomes. Printed at
+/// phase end so big phases (Phase 2 especially) surface their
+/// integration cost without spamming per-measurement.
+#[derive(Default, Clone, Copy)]
+struct TierTally {
+    fast: usize,
+    escalated: usize,
+    single: usize,
+}
+
+impl TierTally {
+    fn record(&mut self, tier: AdaptiveTier) {
+        match tier {
+            AdaptiveTier::Fast => self.fast += 1,
+            AdaptiveTier::EscalatedFull => self.escalated += 1,
+            AdaptiveTier::SingleFull => self.single += 1,
+        }
+    }
+
+    /// `Some("...")` when adaptive was on (any non-single tier seen);
+    /// `None` when every measurement was single-tier (legacy run).
+    fn summary(&self) -> Option<String> {
+        if self.fast == 0 && self.escalated == 0 {
+            return None;
+        }
+        Some(format!("{} fast, {} escalated", self.fast, self.escalated,))
+    }
+}
+
 pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     let baseline =
         query_output_baseline(&args.output).context("query baseline output state via prism IPC")?;
@@ -436,6 +495,12 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         baseline.initial_panel_peak_nits,
         baseline.sdr_reference_nits,
     );
+    if let Some(ms) = args.fast_integration_ms {
+        eprintln!(
+            "Adaptive integration enabled: fast tier {} ms, escalate to calibration default on low trust.",
+            ms,
+        );
+    }
 
     // Wipe any runtime overrides, then lift the IR clamp (HDR) so the
     // panel sees raw commanded values during the sweep. SDR clamp stays
@@ -465,7 +530,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         .context("download cal matrix")?;
     let setup = device.get_setup(&cal).context("download setup")?;
 
-    let mut patch = open_patch_surface(&args.output, baseline.hdr_active)?;
+    let mut patch = open_patch_surface(&args.output, &baseline)?;
     patch
         .set_window_fraction(args.window)
         .context("set window fraction")?;
@@ -514,11 +579,15 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     // Patch was already driven off by the prep-countdown setup above —
     // just give the panel the extra settle window before measuring.
     thread::sleep(settle_black);
-    let raw_black = device.measure_raw(&setup).context("measure black floor")?;
-    let black_xyz = raw_to_xyz(&raw_black, &setup, &cal);
+    let (black_xyz, black_tier) =
+        measure_single_adaptive(&mut device, &setup, &cal, args.fast_integration_ms)
+            .context("measure black floor")?;
     eprintln!(
-        "  black floor: X={:.4}  Y={:.4}  Z={:.4} cd/m²",
-        black_xyz.x, black_xyz.y, black_xyz.z,
+        "  black floor: X={:.4}  Y={:.4}  Z={:.4} cd/m²{}",
+        black_xyz.x,
+        black_xyz.y,
+        black_xyz.z,
+        tier_suffix(black_tier),
     );
     if let Some((_, w)) = log.as_mut() {
         // Header line first so any reader scanning for "# black_floor"
@@ -555,6 +624,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     };
     let targets = log_spaced_targets(args.min_cmd, effective_max_cmd, args.samples_per_channel);
     let mut responses: [Option<ChannelResponse>; 3] = [None, None, None];
+    let mut phase1_tally = TierTally::default();
 
     for channel in Channel::ALL {
         eprintln!("\n--- {} channel sweep ---", channel.label());
@@ -569,8 +639,10 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             let scanout_rgb = diagnose_scanout_cmd(&args.output, &baseline, requested_rgb)?;
             let scanout_cmd = scanout_rgb[channel.idx()];
             thread::sleep(settle);
-            let raw = device.measure_raw(&setup).context("measure")?;
-            let raw_xyz = raw_to_xyz(&raw, &setup, &cal);
+            let (raw_xyz, tier) =
+                measure_single_adaptive(&mut device, &setup, &cal, args.fast_integration_ms)
+                    .context("phase 1 measure")?;
+            phase1_tally.record(tier);
             // True emission above the black floor. Clamp to zero so the
             // toe can't go negative from measurement noise — the inverter
             // assumes non-negative XYZ for its line search.
@@ -580,7 +652,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
                 z: (raw_xyz.z - black_xyz.z).max(0.0),
             };
             eprintln!(
-                "  {} cmd {:>8.2} scanout {:>8.2} → X={:>8.3}  Y={:>8.3}  Z={:>8.3}  (raw Y={:.3}, less black {:.3})",
+                "  {} cmd {:>8.2} scanout {:>8.2} → X={:>8.3}  Y={:>8.3}  Z={:>8.3}  (raw Y={:.3}, less black {:.3}){}",
                 channel.label(),
                 cmd,
                 scanout_cmd,
@@ -589,6 +661,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
                 xyz.z,
                 raw_xyz.y,
                 black_xyz.y,
+                tier_suffix(tier),
             );
             if let Some((_, w)) = log.as_mut() {
                 // Log the BLACK-SUBTRACTED values — that's the model
@@ -687,6 +760,9 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             peak_y,
         });
     }
+    if let Some(s) = phase1_tally.summary() {
+        eprintln!("  phase 1 adaptive: {s}");
+    }
     let responses = [
         responses[0].take().unwrap(),
         responses[1].take().unwrap(),
@@ -725,14 +801,8 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         repeats: args.gamut_repeats,
         settle,
         settle_black,
-        fast_integration_ms: args.gamut_fast_integration_ms,
+        fast_integration_ms: args.fast_integration_ms,
     };
-    if let Some(ms) = args.gamut_fast_integration_ms {
-        eprintln!(
-            "  adaptive integration: fast tier {} ms, escalate to calibration default on low trust",
-            ms,
-        );
-    }
     let probe_params = crate::gamut::RefineParams::default();
     let gamut_mesh = crate::gamut::probe_gamut_refined(
         &probe_config,
@@ -825,6 +895,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         &baseline,
         &setup,
         &cal,
+        args.fast_integration_ms,
         log.as_mut(),
     )?;
 
@@ -1096,6 +1167,7 @@ fn sweep_3d_grid(
     baseline: &OutputBaseline,
     setup: &Setup,
     cal: &Calibration,
+    fast_ms: Option<u16>,
     mut log: Option<&mut (PathBuf, BufWriter<File>)>,
 ) -> Result<ResponseGrid> {
     if cube_edge < 2 {
@@ -1137,6 +1209,7 @@ fn sweep_3d_grid(
     let mut axis_scanout_max: [Vec<f64>; 3] =
         std::array::from_fn(|_| vec![f64::NEG_INFINITY; cube_edge]);
     let mut patches_done = 0usize;
+    let mut tally = TierTally::default();
     // Progress heartbeat at 10% increments — the 729-patch sweep takes
     // long enough that a silent stretch reads as a hang.
     let progress_step = (total / 10).max(1);
@@ -1157,8 +1230,9 @@ fn sweep_3d_grid(
                     axis_scanout_max[axis][idx] = axis_scanout_max[axis][idx].max(v);
                 }
                 thread::sleep(settle);
-                let raw = device.measure_raw(setup).context("3D-sweep measure")?;
-                let raw_xyz = raw_to_xyz(&raw, setup, cal);
+                let (raw_xyz, tier) = measure_single_adaptive(device, setup, cal, fast_ms)
+                    .context("3D-sweep measure")?;
+                tally.record(tier);
                 // Absolute emission — the reformed bake works in
                 // absolute XYZ and projects sub-floor requests onto
                 // the gamut mesh's measured bleed surface (cmd=0 ≡
@@ -1184,22 +1258,32 @@ fn sweep_3d_grid(
                     let elapsed = start.elapsed().as_secs_f64();
                     let rate = patches_done as f64 / elapsed;
                     let eta_secs = (total - patches_done) as f64 / rate.max(1e-6);
+                    let tier_str = match tally.summary() {
+                        Some(s) => format!(" ({s})"),
+                        None => String::new(),
+                    };
                     eprintln!(
-                        "  3D sweep: {}/{} patches ({:.0}%) — {:.1} patches/s, ETA {:.0}s",
+                        "  3D sweep: {}/{} patches ({:.0}%) — {:.1} patches/s, ETA {:.0}s{}",
                         patches_done,
                         total,
                         (patches_done as f64 / total as f64) * 100.0,
                         rate,
                         eta_secs,
+                        tier_str,
                     );
                 }
             }
         }
     }
+    let tier_str = match tally.summary() {
+        Some(s) => format!(" ({s})"),
+        None => String::new(),
+    };
     eprintln!(
-        "  3D sweep complete: {} patches in {:.1}s",
+        "  3D sweep complete: {} patches in {:.1}s{}",
         total,
         start.elapsed().as_secs_f64(),
+        tier_str,
     );
     let axis_cmds = diagnosed_axes_from_stats(
         axis_scanout_sum,
@@ -1357,8 +1441,8 @@ fn verify_white_point(
     for (patch_idx, &t) in targets.iter().enumerate() {
         set_white_patch(patch, baseline, t)?;
         thread::sleep(settle);
-        let raw = device.measure_raw(setup).context("measure (verify)")?;
-        let xyz = raw_to_xyz(&raw, setup, cal);
+        let (xyz, _tier) = measure_single_adaptive(device, setup, cal, args.fast_integration_ms)
+            .context("verify measure")?;
         let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
         let (up, vp) = xy_to_uv_prime((cx, cy));
         let duv = ((up - d65_up).powi(2) + (vp - d65_vp).powi(2)).sqrt();

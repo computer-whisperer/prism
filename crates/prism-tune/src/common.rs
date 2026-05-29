@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use prism_ipc::socket::Socket;
 use prism_ipc::{ColorState, OutputAction, Request, Response};
 use std::collections::HashMap;
-use tristim_display::{BufferFormat, DescriptionRequest, Mastering, PatchSurface};
+use tristim_display::{BufferFormat, DescriptionRequest, Luminances, Mastering, PatchSurface};
 
 // ─── Channel ──────────────────────────────────────────────────────────────────
 
@@ -145,13 +145,24 @@ pub fn query_output_baseline(name: &str) -> Result<OutputBaseline> {
 // ─── Patch surface lifecycle ──────────────────────────────────────────────────
 
 /// Open an HDR or SDR patch surface on the chosen output, mode-aware.
-/// HDR uses an fp16 buffer with a PQ + BT.2020 description and a generous
+///
+/// **HDR**: fp16 buffer with a PQ + BT.2020 description and a generous
 /// mastering envelope (10000 nits) so the patch nits aren't pre-clipped
-/// by the descriptor before reaching the panel. SDR is an unmanaged
-/// 8-bit xRGB surface — the compositor's default sRGB interpretation
-/// matches what our `srgb_oetf` helper produces.
-pub fn open_patch_surface(output: &str, hdr_active: bool) -> Result<PatchSurface> {
-    if hdr_active {
+/// by the descriptor before reaching the panel.
+///
+/// **SDR**: 8-bit xRGB buffer that *also* declares BT.2020 primaries
+/// (with sRGB transfer + reference luminance = `sdr_reference_nits`).
+/// Why not unmanaged sRGB: an unmanaged SDR buffer is interpreted as
+/// sRGB-primary, so `cv = (1, 0, 0)` routes through the decode pass's
+/// sRGB→BT.2020 chromaticity remap and hits the panel as a mix
+/// (~0.63 R + 0.07 G + 0.02 B in BT.2020), which the panel renders at
+/// well under its native red saturation. Declaring BT.2020 primaries
+/// makes the decode CTM identity, so `cv = (1, 0, 0)` drives the
+/// panel's native R purely — same shape as the HDR probe. The probe
+/// then measures the panel's actual reach, not the sRGB cube's image
+/// under prism's pipeline.
+pub fn open_patch_surface(output: &str, baseline: &OutputBaseline) -> Result<PatchSurface> {
+    if baseline.hdr_active {
         let probe_peak = 10_000.0;
         let desc = DescriptionRequest {
             transfer_function: "st2084_pq".into(),
@@ -167,7 +178,19 @@ pub fn open_patch_surface(output: &str, hdr_active: bool) -> Result<PatchSurface
         PatchSurface::open(output, BufferFormat::Xbgr16161616f, Some(desc))
             .with_context(|| format!("open HDR patch on {output}"))
     } else {
-        PatchSurface::open_sdr(output).with_context(|| format!("open SDR patch on {output}"))
+        let ref_nits = baseline.sdr_reference_nits;
+        let desc = DescriptionRequest {
+            transfer_function: "srgb".into(),
+            primaries: "bt2020".into(),
+            luminances: Some(Luminances {
+                min_nits: 0.0,
+                max_nits: ref_nits,
+                reference_nits: ref_nits,
+            }),
+            mastering: None,
+        };
+        PatchSurface::open(output, BufferFormat::Xrgb8888, Some(desc))
+            .with_context(|| format!("open SDR patch (BT.2020-described) on {output}"))
     }
 }
 
