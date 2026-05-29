@@ -62,7 +62,13 @@ use crate::surface_tex::SurfacePlacementSlot;
 /// Anything outside these sets gets rejected with the relevant
 /// protocol error at parse time (so the client sees a clear failure
 /// instead of a confusing `unsupported` later).
-const SUPPORTED_INTENTS: &[RenderIntent] = &[RenderIntent::Perceptual];
+// Perceptual is mandatory. Absolute (ICC-absolute colorimetric) is fully
+// honored: the input stage skips white-point adaptation (carrying the source
+// white verbatim) and reproduces the declared reference luminance literally —
+// the panel LUT's measured graceful degradation clips out-of-gamut faithfully.
+// Relative-colorimetric and the BPC/no-adaptation variants wait on the
+// reference-white anchoring work (see docs/color-negotiation.md, increment B).
+const SUPPORTED_INTENTS: &[RenderIntent] = &[RenderIntent::Perceptual, RenderIntent::Absolute];
 
 /// Features we advertise via `supported_feature`. Notable absences:
 /// `IccV2V4` (ICC creator deferred), `SetTfPower` (no use case yet).
@@ -191,8 +197,9 @@ pub struct SurfaceColorState {
     /// `None` as "assume sRGB" — see module doc.
     pub description: Option<Arc<ImageDescription>>,
     /// The rendering intent the client requested alongside the
-    /// description. Today only `Perceptual` is advertised; stored
-    /// for completeness when more intents land.
+    /// description. Drives white-point adaptation in
+    /// [`description_to_params`] (absolute ⇒ no adaptation). See
+    /// `SUPPORTED_INTENTS` for what's currently honored.
     pub intent: Option<RenderIntent>,
     /// Pending (not yet committed) description from a
     /// `set_image_description` request. Applied on `wl_surface.commit`.
@@ -259,7 +266,10 @@ impl SurfaceColorFeedbackSlot {
 /// total over every TF we advertise in `SUPPORTED_TFS`; unsupported
 /// TFs can never reach a committed description (the params creator
 /// rejects them with `invalid_tf`).
-pub fn description_to_params(desc: &ImageDescription) -> prism_renderer::SurfaceColorParams {
+pub fn description_to_params(
+    desc: &ImageDescription,
+    intent: Option<RenderIntent>,
+) -> prism_renderer::SurfaceColorParams {
     let transfer = match desc.tf {
         // Linear path — pixels already in linear-light. Caller
         // anchors via sdr_white_nits.
@@ -287,10 +297,24 @@ pub fn description_to_params(desc: &ImageDescription) -> prism_renderer::Surface
         .unwrap_or(80.0);
     // Convert the surface's primaries into the BT.2020 working space. Named
     // sets resolve to their standard chromaticities; explicit sets are used
-    // verbatim. `primaries_to_bt2020` Bradford-adapts any non-D65 white.
+    // verbatim.
     let chroma = match desc.primaries {
         PrimaryVolume::Named(p) => frame_chromaticities(chromaticities_for_named(p)),
         PrimaryVolume::Explicit(c) => frame_chromaticities(c),
+    };
+    // White-point handling is the defining difference between the colorimetric
+    // intents: absolute reproduces the source white verbatim (no chromatic
+    // adaptation), everything else (perceptual / relative, and the unmanaged
+    // default) Bradford-adapts the source white onto the display white. For D65
+    // sources the two matrices are identical.
+    let adapt_white = !matches!(
+        intent,
+        Some(RenderIntent::Absolute | RenderIntent::AbsoluteNoAdaptation)
+    );
+    let primaries_to_bt2020 = if adapt_white {
+        prism_frame::primaries_to_bt2020(&chroma)
+    } else {
+        prism_frame::primaries_to_bt2020_unadapted(&chroma)
     };
     // YUV→RGB coefficients for YUV-sampled surfaces follow the primaries:
     // BT.2020 → the BT.2020 NCL matrix; everything else (sRGB/BT.709, the
@@ -302,7 +326,7 @@ pub fn description_to_params(desc: &ImageDescription) -> prism_renderer::Surface
     prism_renderer::SurfaceColorParams {
         transfer,
         sdr_white_nits,
-        primaries_to_bt2020: prism_frame::primaries_to_bt2020(&chroma),
+        primaries_to_bt2020,
         yuv_matrix,
     }
 }
@@ -320,13 +344,15 @@ fn frame_chromaticities(c: PrimaryChromaticities) -> prism_frame::Chromaticities
 }
 
 impl SurfaceColorSlot {
-    /// Fetch the committed image description for a surface, if any.
-    /// Render path entry point.
-    pub fn current(states: &SurfaceData) -> Option<Arc<ImageDescription>> {
-        states
-            .data_map
-            .get::<SurfaceColorSlot>()
-            .and_then(|slot| slot.0.lock().unwrap().description.clone())
+    /// Fetch the committed image description and render intent for a surface,
+    /// if a description is set. Render path entry point; the intent steers
+    /// white-point adaptation (and, later, luminance anchoring) in
+    /// [`description_to_params`].
+    pub fn current(states: &SurfaceData) -> Option<(Arc<ImageDescription>, Option<RenderIntent>)> {
+        states.data_map.get::<SurfaceColorSlot>().and_then(|slot| {
+            let st = slot.0.lock().unwrap();
+            st.description.clone().map(|desc| (desc, st.intent))
+        })
     }
 
     /// Apply any pending description change. Called from the

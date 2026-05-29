@@ -2136,9 +2136,11 @@ fn render_output_now(
     // still uses, now scaled per the output's KDL config.
     let color_lookup = |states: &smithay::wayland::compositor::SurfaceData|
         -> Option<prism_renderer::SurfaceColorParams> {
-        prism_protocols::color_management::SurfaceColorSlot::current(states)
-            .as_deref()
-            .map(prism_protocols::color_management::description_to_params)
+        prism_protocols::color_management::SurfaceColorSlot::current(states).map(
+            |(desc, intent)| {
+                prism_protocols::color_management::description_to_params(&desc, intent)
+            },
+        )
     };
     // Render-demand safety net: surfaces the walk finds without a texture
     // on this output's GPU get collected here and materialized after the

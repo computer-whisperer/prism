@@ -284,17 +284,42 @@ fn bradford_adapt(src_white: [f32; 3], dst_white: [f32; 3]) -> Mat3 {
     mat3_mul(mat3_inverse(BRADFORD), mat3_mul(scale, BRADFORD))
 }
 
+fn primaries_to_bt2020_impl(src: &Chromaticities, adapt: bool) -> Mat3 {
+    let m_src = rgb_to_xyz(src);
+    let m_dst = rgb_to_xyz(&Chromaticities::BT2020);
+    let core = if adapt {
+        let cat = bradford_adapt(
+            xy_to_xyz(src.white),
+            xy_to_xyz(Chromaticities::BT2020.white),
+        );
+        mat3_mul(cat, m_src)
+    } else {
+        m_src
+    };
+    mat3_mul(mat3_inverse(m_dst), core)
+}
+
 /// Linear-light matrix converting `src`-primaries RGB into BT.2020 RGB,
 /// Bradford-adapted to BT.2020's D65 white. Row-major; apply as `m * rgb`.
 /// White is preserved exactly when `src.white == BT2020.white`.
+///
+/// This is the *media-relative* conversion: a non-D65 source white is mapped
+/// onto BT.2020's D65 white, so the content's white appears neutral on the
+/// display. It backs the perceptual / relative-colorimetric render intents and
+/// the unmanaged-client default (see [`primaries_to_bt2020_unadapted`] for the
+/// absolute counterpart).
 pub fn primaries_to_bt2020(src: &Chromaticities) -> Mat3 {
-    let m_src = rgb_to_xyz(src);
-    let m_dst = rgb_to_xyz(&Chromaticities::BT2020);
-    let cat = bradford_adapt(
-        xy_to_xyz(src.white),
-        xy_to_xyz(Chromaticities::BT2020.white),
-    );
-    mat3_mul(mat3_inverse(m_dst), mat3_mul(cat, m_src))
+    primaries_to_bt2020_impl(src, true)
+}
+
+/// Like [`primaries_to_bt2020`] but with **no chromatic adaptation**: the
+/// source white point is carried into BT.2020 verbatim (its chromaticity is
+/// preserved as absolute XYZ, not remapped onto D65). This is the conversion for
+/// the `absolute` / `absolute_no_adaptation` render intents, where the client
+/// asks for its declared colorimetry reproduced faithfully rather than adapted
+/// to the display white. Identical to [`primaries_to_bt2020`] for D65 sources.
+pub fn primaries_to_bt2020_unadapted(src: &Chromaticities) -> Mat3 {
+    primaries_to_bt2020_impl(src, false)
 }
 
 /// The sRGB/BT.709 → BT.2020 matrix — the conversion for legacy clients that
@@ -372,5 +397,45 @@ mod primaries_tests {
         approx(w[0], 1.0, 2e-3);
         approx(w[1], 1.0, 2e-3);
         approx(w[2], 1.0, 2e-3);
+    }
+
+    #[test]
+    fn unadapted_matches_adapted_for_d65() {
+        // The absolute (no-adaptation) variant only differs from the relative
+        // one when the source white ≠ D65. For the named D65 sets they are the
+        // same matrix.
+        for c in [
+            Chromaticities::BT709,
+            Chromaticities::DISPLAY_P3,
+            Chromaticities::ADOBE_RGB,
+            Chromaticities::BT2020,
+        ] {
+            approx_mat(
+                primaries_to_bt2020_unadapted(&c),
+                primaries_to_bt2020(&c),
+                1e-5,
+            );
+        }
+    }
+
+    #[test]
+    fn unadapted_carries_non_d65_white_verbatim() {
+        // Absolute intent: a D50-white source is *not* neutralized — its white
+        // lands tinted (warm, x>y bias) in BT.2020 rather than at (1,1,1),
+        // exactly the faithful reproduction absolute promises.
+        let d50 = Chromaticities {
+            white: (0.34567, 0.35850),
+            ..Chromaticities::BT709
+        };
+        let w = mat3_vec(primaries_to_bt2020_unadapted(&d50), [1.0, 1.0, 1.0]);
+        // Not neutral: D50 is warmer than D65, so the red channel exceeds blue.
+        assert!(
+            w[0] > w[2] + 0.02,
+            "D50 white should stay warm: {w:?} (r should exceed b)"
+        );
+        assert!(
+            (w[0] - 1.0).abs() > 2e-3 || (w[2] - 1.0).abs() > 2e-3,
+            "unadapted white must not be neutralized to (1,1,1): {w:?}"
+        );
     }
 }
