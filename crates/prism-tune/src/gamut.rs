@@ -28,7 +28,9 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 use tristim_display::PatchSurface;
-use tristim_driver::{Calibration, Colorimeter, MeasurementConfidence, Setup, TrustFlag, Xyz};
+use tristim_driver::{
+    AdaptiveTier, Calibration, Colorimeter, MeasurementConfidence, Setup, TrustFlag, Xyz,
+};
 
 /// The 14 coarse cube-surface probe points: 8 corners (black, three
 /// primaries, three secondaries, white) + 6 face centres. Each entry
@@ -409,12 +411,20 @@ impl RefineCtx<'_> {
 /// Configuration for the hardware gamut probe. `cmd_axis_max_nits` is
 /// the per-channel saturation peak discovered in the per-channel
 /// pre-probe; `cv = 1` on each axis maps to that nits value.
+///
+/// `fast_integration_ms` enables adaptive per-point integration: each
+/// vertex first burst-measures at the override integration time, and
+/// re-measures at the calibration default only if the fast result
+/// fails the confidence gate. Bright easy points stay fast; dim or
+/// saturated points pay the full integration. `None` keeps the
+/// legacy single-tier behaviour. See `Colorimeter::measure_adaptive`.
 #[derive(Debug, Clone)]
 pub struct ProbeConfig {
     pub cmd_axis_max_nits: [f64; 3],
     pub repeats: usize,
     pub settle: Duration,
     pub settle_black: Duration,
+    pub fast_integration_ms: Option<u16>,
 }
 
 /// Drive the colorimeter + patch surface through an adaptive cube-
@@ -453,10 +463,15 @@ pub fn probe_gamut_refined(
         } else {
             config.settle
         });
-        let raws = device
-            .measure_raw_repeated(setup, config.repeats, false)
-            .context("gamut probe measure_raw_repeated")?;
-        let confidence = MeasurementConfidence::from_repeats(&raws, setup, cal);
+        // Adaptive integration: bright vertices clear trust at the short
+        // tier and skip the long integration entirely. Dim/saturated
+        // vertices auto-escalate to the calibration default. `setup`/`cal`
+        // come back paired with the actual raws (the fast tier uses a
+        // scaled cal matrix), so they go straight into `from_repeats`.
+        let m = device
+            .measure_adaptive(setup, cal, config.repeats, config.fast_integration_ms)
+            .context("gamut probe measure_adaptive")?;
+        let confidence = MeasurementConfidence::from_repeats(&m.raws, &m.setup, &m.cal);
         let sample = ProbeSample {
             measured: confidence.mean,
             trustworthy: confidence.is_trustworthy(),
@@ -468,6 +483,7 @@ pub fn probe_gamut_refined(
             cmd_nits,
             measured: sample.measured,
             flags: flags.clone(),
+            tier: m.tier,
         });
         vertex_cmd_nits.insert(cv_key(cv), cmd_nits);
         index += 1;
@@ -497,6 +513,12 @@ pub enum GamutProbeEvent {
         cmd_nits: [f64; 3],
         measured: Xyz,
         flags: Vec<TrustFlag>,
+        /// Which integration tier produced this measurement — `Fast`
+        /// (short integration cleared trust), `EscalatedFull` (short
+        /// failed trust, re-measured at default), or `SingleFull`
+        /// (adaptive disabled). Useful for surfacing where the probe
+        /// is actually spending its time.
+        tier: AdaptiveTier,
     },
 }
 

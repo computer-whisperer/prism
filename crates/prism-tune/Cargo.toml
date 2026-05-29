@@ -25,8 +25,8 @@ clap = { workspace = true, features = ["derive"] }
 prism-ipc = { workspace = true, features = ["clap"] }
 prism-renderer.workspace = true
 serde_json.workspace = true
-tristim-driver = { git = "https://github.com/computer-whisperer/tristim.git", rev = "bf5ef44" }
-tristim-display = { git = "https://github.com/computer-whisperer/tristim.git", rev = "bf5ef44" }
+tristim-driver = { git = "https://github.com/computer-whisperer/tristim.git", rev = "89ffdc1" }
+tristim-display = { git = "https://github.com/computer-whisperer/tristim.git", rev = "89ffdc1" }
 
 # prism-tune is numerical calibration code. Matrix and 3D-LUT-cube loops
 # read clearer with explicit indices, and the calibration entry points

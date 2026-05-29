@@ -136,12 +136,21 @@ pub struct CalibrateLut3dArgs {
     /// catch math regressions or panel-state surprises.
     #[arg(long)]
     pub no_verify: bool,
-    /// Repeats per gamut-probe vertex. The probe burst-measures each
-    /// cube-surface boundary point and builds `MeasurementConfidence`
-    /// from the burst — repeats reduce temporal noise and feed the
-    /// `LowTrust → stop refining` rule. 8 mirrors tristim's default.
-    #[arg(long, default_value_t = 8)]
+    /// Repeats per gamut-probe vertex burst. Confidence + adaptive
+    /// integration cover most of the noise slack, so 4 is the sweet
+    /// spot — matches tristim's updated default. Bump for noisier
+    /// setups.
+    #[arg(long, default_value_t = 4)]
     pub gamut_repeats: usize,
+    /// Enable adaptive per-vertex integration on the gamut probe: each
+    /// vertex first burst-measures at this integration time and only
+    /// re-measures at the calibration default if the fast result fails
+    /// the confidence gate. Bright easy vertices stay short; dim or
+    /// saturated ones escalate. Typical Spyder default integration is
+    /// ~1000 ms, so a fast tier of 100–250 ms is a meaningful win.
+    /// Omit (the default) to keep the legacy single-tier behaviour.
+    #[arg(long)]
+    pub gamut_fast_integration_ms: Option<u16>,
 }
 
 /// One (requested, diagnosed-scanout, XYZ) measurement from a per-channel sweep.
@@ -716,7 +725,14 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         repeats: args.gamut_repeats,
         settle,
         settle_black,
+        fast_integration_ms: args.gamut_fast_integration_ms,
     };
+    if let Some(ms) = args.gamut_fast_integration_ms {
+        eprintln!(
+            "  adaptive integration: fast tier {} ms, escalate to calibration default on low trust",
+            ms,
+        );
+    }
     let probe_params = crate::gamut::RefineParams::default();
     let gamut_mesh = crate::gamut::probe_gamut_refined(
         &probe_config,
@@ -733,6 +749,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
                 cmd_nits,
                 measured,
                 flags,
+                tier,
             } = evt;
             let flag_str = if flags.is_empty() {
                 "ok".to_string()
@@ -747,9 +764,16 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join(",")
             };
+            // Tier annotation only when adaptive is on, so non-adaptive
+            // runs keep the legacy log shape (no surprise [single]).
+            let tier_str = match tier {
+                tristim_driver::AdaptiveTier::Fast => " [fast]",
+                tristim_driver::AdaptiveTier::EscalatedFull => " [esc]",
+                tristim_driver::AdaptiveTier::SingleFull => "",
+            };
             eprintln!(
                 "  vertex {index:>3} cv=({:.2},{:.2},{:.2}) cmd=({:>6.1},{:>6.1},{:>6.1}) → \
-                 XYZ=({:>7.3},{:>7.3},{:>7.3}) {flag_str}",
+                 XYZ=({:>7.3},{:>7.3},{:>7.3}) {flag_str}{tier_str}",
                 code_value[0],
                 code_value[1],
                 code_value[2],

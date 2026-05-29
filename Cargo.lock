@@ -2208,7 +2208,7 @@ dependencies = [
 [[package]]
 name = "tristim-display"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/tristim.git?rev=bf5ef44#bf5ef44d9e4535d15305a4f9a4dafd8daecb02ed"
+source = "git+https://github.com/computer-whisperer/tristim.git?rev=89ffdc1#89ffdc14d52b9d5a5600b9e6cb7c75aabfd3d9d2"
 dependencies = [
  "half",
  "libc",
@@ -2221,7 +2221,7 @@ dependencies = [
 [[package]]
 name = "tristim-driver"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/tristim.git?rev=bf5ef44#bf5ef44d9e4535d15305a4f9a4dafd8daecb02ed"
+source = "git+https://github.com/computer-whisperer/tristim.git?rev=89ffdc1#89ffdc14d52b9d5a5600b9e6cb7c75aabfd3d9d2"
 dependencies = [
  "rand 0.8.6",
  "rusb",
