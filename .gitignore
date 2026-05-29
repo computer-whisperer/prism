@@ -35,6 +35,7 @@ prism-layer-win.log
 /prism-tune-*.csv
 /prism-calibrate-*.csv
 /prism-calibrate-*.lut
+/prism-calibrate-*.gamut.json
 
 # Scratch screen captures
 /mpv-shot*.jpg
