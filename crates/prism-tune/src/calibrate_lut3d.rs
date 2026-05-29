@@ -1604,7 +1604,7 @@ fn build_inverse_lut(
                 let r_in = pq_eotf(i as f32 / denom) as f64;
                 let target_xyz = bt2020_to_xyz(r_in, g_in, bz_in);
                 let (cmd, residual) =
-                    project_and_invert(grid, seed_gain, target_xyz, floor, white_uv);
+                    project_and_invert(grid, seed_gain, target_xyz, floor, white[1], white_uv);
                 total_residual += residual;
                 if residual > worst_residual {
                     worst_residual = residual;
@@ -1636,24 +1636,40 @@ const PROJECT_SATURATION_FRAC: f64 = 0.995;
 const PROJECT_BISECTION_STEPS: usize = 16;
 
 /// Project an absolute-XYZ target into the panel's reachable volume and
-/// invert. Three cases:
+/// invert. Four cases, applied in order:
 ///
 /// 1. **Below floor** (`target_y ≤ floor_y`): hard-map to cmd=0 — the
 ///    panel can't go darker than its bleed point. The achieved emission
 ///    is `floor`; residual is the XYZ distance to it. Preserves bleed
 ///    chromaticity rather than crushing to neutral zero.
 ///
-/// 2. **In-gamut on first try**: take it.
+/// 2. **Above peak luminance** (`target_y > white_y`): roll the target
+///    down to the panel's peak-luminance surface by scaling all three
+///    XYZ components by `white_y / target_y` (preserves chromaticity,
+///    clamps Y). Without this, the fixed-Y chroma bisection below has
+///    no reachable scale at the requested Y and would fall back to a
+///    cmd parked at max with a huge residual.
 ///
-/// 3. **Out-of-gamut**: bisect a chroma scale `s ∈ [0, 1]` where
-///    `chromaticity(s) = lerp(white_uv, target_uv, s)` at fixed luminance.
-///    Keep the largest `s` whose inversion lands in-gamut. `s = 0` is
-///    neutral (always reachable); `s = 1` is the full requested chroma.
+/// 3. **In-gamut on first try**: take it.
+///
+/// 4. **Out-of-gamut by chromaticity**: bisect a chroma scale `s ∈ [0, 1]`
+///    where `chromaticity(s) = lerp(white_uv, target_uv, s)` at the
+///    (clamped) luminance. Keep the largest `s` whose inversion lands
+///    in-gamut. `s = 0` is neutral (always reachable at `Y ≤ white_y`);
+///    `s = 1` is the full requested chroma.
+///
+/// The returned residual is the XYZ distance from `target_abs` to what
+/// the panel actually emits at the returned cmd — so it quantifies the
+/// full projection magnitude (Y-clamp + chroma compression), not just
+/// Newton's local convergence against the projected target. That makes
+/// the build-time residual percentiles a uniform "how much did the bake
+/// have to project away from the request?" diagnostic.
 fn project_and_invert(
     grid: &ResponseGrid,
     seed_gain: [f64; 3],
     target_abs: [f64; 3],
     floor: [f64; 3],
+    white_y: f64,
     white_uv: Option<(f64, f64)>,
 ) -> ([f64; 3], f64) {
     // Below-floor: emit panel black with its measured chromaticity.
@@ -1665,41 +1681,59 @@ fn project_and_invert(
         return ([0.0, 0.0, 0.0], residual);
     }
 
-    let max_cmd = grid.max_cmd();
-    let in_gamut = |cmd: &[f64; 3], residual: f64| -> bool {
-        residual < PROJECT_TOL_NITS
-            && !(0..3).any(|c| cmd[c] >= max_cmd[c] * PROJECT_SATURATION_FRAC)
+    // Above-peak luminance: scale all of XYZ by `white_y / target_y` to
+    // land on the peak-luminance surface at the same chromaticity. The
+    // residual against the *original* target captures the roll-off cost.
+    let working_target = if target_abs[1] > white_y && target_abs[1] > 0.0 {
+        let s = white_y / target_abs[1];
+        [target_abs[0] * s, white_y, target_abs[2] * s]
+    } else {
+        target_abs
     };
 
-    let (cmd0, residual0) = invert_one(grid, seed_gain, target_abs);
-    if in_gamut(&cmd0, residual0) {
-        return (cmd0, residual0);
+    let max_cmd = grid.max_cmd();
+    let in_gamut = |cmd: &[f64; 3], residual_to_working: f64| -> bool {
+        residual_to_working < PROJECT_TOL_NITS
+            && !(0..3).any(|c| cmd[c] >= max_cmd[c] * PROJECT_SATURATION_FRAC)
+    };
+    // Residual against the *original* target — what the LUT cell will be
+    // judged on. Forward-evaluates the grid at the final cmd and L2's
+    // against target_abs.
+    let residual_to_target = |cmd: &[f64; 3]| -> f64 {
+        let emitted = grid.forward(*cmd);
+        ((emitted.x - target_abs[0]).powi(2)
+            + (emitted.y - target_abs[1]).powi(2)
+            + (emitted.z - target_abs[2]).powi(2))
+        .sqrt()
+    };
+
+    let (cmd0, residual0_to_working) = invert_one(grid, seed_gain, working_target);
+    if in_gamut(&cmd0, residual0_to_working) {
+        return (cmd0, residual_to_target(&cmd0));
     }
 
-    // Bisect chroma toward neutral at fixed luminance.
-    let target_uv = uv_prime(target_abs);
+    // Bisect chroma toward neutral at fixed (clamped) luminance.
+    let target_uv = uv_prime(working_target);
     let (Some((u_t, v_t)), Some((u_w, v_w))) = (target_uv, white_uv) else {
-        return (cmd0, residual0);
+        return (cmd0, residual_to_target(&cmd0));
     };
     let mut lo = 0.0_f64;
     let mut hi = 1.0_f64;
     let mut best_cmd = cmd0;
-    let mut best_residual = residual0;
     for _ in 0..PROJECT_BISECTION_STEPS {
         let scale = 0.5 * (lo + hi);
         let u = u_w + scale * (u_t - u_w);
         let v = v_w + scale * (v_t - v_w);
-        let compressed = xyz_from_uv_y(u, v, target_abs[1]);
-        let (cmd, residual) = invert_one(grid, seed_gain, compressed);
-        if in_gamut(&cmd, residual) {
+        let compressed = xyz_from_uv_y(u, v, working_target[1]);
+        let (cmd, residual_to_compressed) = invert_one(grid, seed_gain, compressed);
+        if in_gamut(&cmd, residual_to_compressed) {
             best_cmd = cmd;
-            best_residual = residual;
             lo = scale;
         } else {
             hi = scale;
         }
     }
-    (best_cmd, best_residual)
+    (best_cmd, residual_to_target(&best_cmd))
 }
 
 /// CIE 1976 `u'v'` chromaticity coordinates from absolute XYZ. Returns
@@ -2065,6 +2099,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A target whose luminance exceeds the panel's peak white must be
+    /// rolled down onto the peak-luminance surface (Y-clamp at fixed
+    /// chromaticity) before chroma bisection runs. Without the Y-clamp
+    /// the fixed-Y bisection has no reachable scale and returns the
+    /// initial Newton attempt with a huge residual; with it, the
+    /// residual is bounded by the projection cost — basically
+    /// ‖original − peak_white_at_same_chromaticity‖.
+    #[test]
+    fn project_clamps_above_peak_luminance_to_white_surface() {
+        // BT.2020-primary synthetic panel — well-conditioned for the
+        // Newton seed (all three channels contribute to Y, matching the
+        // shape of any real panel). Full-cube peak white emits
+        // bt2020_to_xyz(100, 100, 100) ≈ (95.0, 100.0, 109.0).
+        let r_pri = [0.6370, 0.2627, 0.0000];
+        let g_pri = [0.1446, 0.6780, 0.0281];
+        let b_pri = [0.1689, 0.0593, 1.0610];
+        let grid = synth_grid(9, r_pri, g_pri, b_pri, 100.0);
+        let seed_gain = [r_pri[1], g_pri[1], b_pri[1]];
+        let white_xyz = grid.forward([100.0, 100.0, 100.0]);
+        let white_y = white_xyz.y;
+        let white_uv = super::uv_prime([white_xyz.x, white_xyz.y, white_xyz.z]);
+        let floor = [0.0, 0.0, 0.0];
+
+        // Ask for 4× peak luminance at the panel's own white chromaticity.
+        // Y-clamp pulls us back to the peak-white corner; residual is the
+        // L2 gap between original and white_xyz — known and bounded.
+        let target = [white_xyz.x * 4.0, white_xyz.y * 4.0, white_xyz.z * 4.0];
+        let expected_gap = ((target[0] - white_xyz.x).powi(2)
+            + (target[1] - white_xyz.y).powi(2)
+            + (target[2] - white_xyz.z).powi(2))
+        .sqrt();
+        let (cmd, residual) =
+            super::project_and_invert(&grid, seed_gain, target, floor, white_y, white_uv);
+        // cmd should land at (or very near) the corner.
+        for c in 0..3 {
+            assert!(
+                (cmd[c] - 100.0).abs() < 2.0,
+                "above-peak target should park cmd[{c}] near corner, got {}",
+                cmd[c]
+            );
+        }
+        // Residual should be ≈ the projection-cost gap, NOT the thousands-
+        // of-cd/m² value the pre-fix bake produced for this kind of input.
+        // Tolerance accounts for Newton's small slack at the corner.
+        assert!(
+            (residual - expected_gap).abs() < 5.0,
+            "residual {residual} should be ≈ {expected_gap} (projection cost)",
+        );
     }
 
     /// Pure-channel target (red only) should produce cmd with most of
