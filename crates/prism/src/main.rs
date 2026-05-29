@@ -1090,6 +1090,12 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                         output_config.depth = prism_drm::ScanoutDepth::Fp16;
                         output_config.vk_format = vk_format_for_depth(output_config.depth);
                         output_config.encode_config = prism_renderer::EncodeConfig::default_pq();
+                        // HDR panels anchor diffuse white higher than the 80-nit
+                        // SDR default: BT.2408 reference white (203 nits) keeps
+                        // PQ content ~pass-through (its 203-nit reference white
+                        // maps to itself) while SDR content is boosted to match.
+                        // An explicit `sdr-reference-nits` below still wins.
+                        output_config.sdr_reference_nits = 203.0;
                         tracing::info!(
                             connector = %name,
                             "HDR config present: fp16 scanout + PQ encode + KMS signaling"
@@ -2138,7 +2144,11 @@ fn render_output_now(
         -> Option<prism_renderer::SurfaceColorParams> {
         prism_protocols::color_management::SurfaceColorSlot::current(states).map(
             |(desc, intent)| {
-                prism_protocols::color_management::description_to_params(&desc, intent)
+                prism_protocols::color_management::description_to_params(
+                    &desc,
+                    intent,
+                    output_sdr_reference_nits,
+                )
             },
         )
     };

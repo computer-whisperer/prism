@@ -62,13 +62,20 @@ use crate::surface_tex::SurfacePlacementSlot;
 /// Anything outside these sets gets rejected with the relevant
 /// protocol error at parse time (so the client sees a clear failure
 /// instead of a confusing `unsupported` later).
-// Perceptual is mandatory. Absolute (ICC-absolute colorimetric) is fully
-// honored: the input stage skips white-point adaptation (carrying the source
-// white verbatim) and reproduces the declared reference luminance literally —
-// the panel LUT's measured graceful degradation clips out-of-gamut faithfully.
-// Relative-colorimetric and the BPC/no-adaptation variants wait on the
-// reference-white anchoring work (see docs/color-negotiation.md, increment B).
-const SUPPORTED_INTENTS: &[RenderIntent] = &[RenderIntent::Perceptual, RenderIntent::Absolute];
+// Perceptual is mandatory. Relative (media-relative colorimetric) and absolute
+// (ICC-absolute colorimetric) are honored via the two input-stage knobs:
+// white-point adaptation and reference-white anchoring (see
+// `description_to_params` / `decode_luminance_scale`). Relative and perceptual
+// both adapt + anchor; absolute does neither (source white verbatim, declared
+// luminance literal). The panel LUT's measured graceful degradation supplies
+// the shared out-of-gamut operator for all of them. Not yet advertised:
+// `relative_bpc` (needs black-point compensation against the measured floor),
+// `saturation`, and `absolute_no_adaptation` — see docs/color-negotiation.md.
+const SUPPORTED_INTENTS: &[RenderIntent] = &[
+    RenderIntent::Perceptual,
+    RenderIntent::Relative,
+    RenderIntent::Absolute,
+];
 
 /// Features we advertise via `supported_feature`. Notable absences:
 /// `IccV2V4` (ICC creator deferred), `SetTfPower` (no use case yet).
@@ -255,11 +262,50 @@ impl SurfaceColorFeedbackSlot {
     }
 }
 
+/// The post-EOTF luminance multiplier the decode shader applies to land
+/// post-EOTF values in the anchored absolute-nits working space (the decode
+/// push's `sdr_white_nits`). It folds the per-transfer EOTF convention and the
+/// intent's luminance behavior into one scalar. `transfer` is the decode shader
+/// code (see [`description_to_params`]); `anchored` is true for the
+/// perceptual / relative intents (map the content's reference white onto the
+/// output reference-white level `output_ref_nits`, the spec's anchoring
+/// requirement) and false for absolute (reproduce declared luminance literally).
+///
+/// Three EOTF conventions:
+/// - **PQ** (code 2): the EOTF already yields absolute nits, with the content's
+///   reference white at `reference_lum`. Absolute → `1.0` (pass-through);
+///   anchored → `output_ref_nits / reference_lum`.
+/// - **ext-linear** (code 0, e.g. Windows-scRGB): `reference_lum` is the fixed
+///   value→nits *encoding scale* (scRGB pins 1.0 = 80 cd/m²), not a recoverable
+///   reference white. Always literal (`reference_lum`); anchoring would corrupt
+///   the encoding, so it is deliberately not applied here.
+/// - **normalized** (sRGB / gamma22 / BT.1886): the EOTF yields `[0,1]` with
+///   `1.0` at the reference white. Absolute → `reference_lum`; anchored →
+///   `output_ref_nits`.
+fn decode_luminance_scale(
+    transfer: i32,
+    anchored: bool,
+    reference_lum: f32,
+    output_ref_nits: f32,
+) -> f32 {
+    match transfer {
+        // ext-linear: keep the literal value→nits encoding scale.
+        0 => reference_lum,
+        // PQ: EOTF already absolute nits. `max(1.0)` guards a degenerate
+        // zero/sub-nit declared reference white.
+        2 if anchored => output_ref_nits / reference_lum.max(1.0),
+        2 => 1.0,
+        // sRGB / gamma22 / BT.1886: 1.0 = reference white.
+        _ if anchored => output_ref_nits,
+        _ => reference_lum,
+    }
+}
+
 /// Map a committed image description to the renderer's
 /// `SurfaceColorParams`. This is the bridge between the protocol-side
 /// description (semantic: "PQ encoded BT.2020 mastered to 400 nits")
 /// and the shader-side decode parameters (mechanical: "shader code 2,
-/// 80-nit reference white").
+/// anchored to the output reference white").
 ///
 /// `None` description ⇒ `None` (caller falls back to
 /// `SurfaceColorParams::default()`). The mapping is deliberately
@@ -269,6 +315,7 @@ impl SurfaceColorFeedbackSlot {
 pub fn description_to_params(
     desc: &ImageDescription,
     intent: Option<RenderIntent>,
+    output_ref_nits: f32,
 ) -> prism_renderer::SurfaceColorParams {
     let transfer = match desc.tf {
         // Linear path — pixels already in linear-light. Caller
@@ -290,11 +337,16 @@ pub fn description_to_params(
         // silently rendering wrong.
         _ => 1,
     };
-    let sdr_white_nits = desc
+    // The content's declared reference-white luminance (diffuse white), in
+    // cd/m². When the client set no luminances, fall back to the TF's
+    // spec-implied default — the *same* default the info events report
+    // (`default_luminances_for_tf`). Critically this is 203 for PQ, not 80:
+    // defaulting PQ to 80 would make anchored PQ rescale by 203/80 and brighten
+    // HDR video that declared no explicit reference white.
+    let reference_lum = desc
         .luminances
-        .map(|l| l.reference_lum as f32)
-        // sRGB default reference white per the protocol spec.
-        .unwrap_or(80.0);
+        .unwrap_or_else(|| default_luminances_for_tf(desc.tf))
+        .reference_lum as f32;
     // Convert the surface's primaries into the BT.2020 working space. Named
     // sets resolve to their standard chromaticities; explicit sets are used
     // verbatim.
@@ -302,20 +354,27 @@ pub fn description_to_params(
         PrimaryVolume::Named(p) => frame_chromaticities(chromaticities_for_named(p)),
         PrimaryVolume::Explicit(c) => frame_chromaticities(c),
     };
-    // White-point handling is the defining difference between the colorimetric
-    // intents: absolute reproduces the source white verbatim (no chromatic
-    // adaptation), everything else (perceptual / relative, and the unmanaged
-    // default) Bradford-adapts the source white onto the display white. For D65
-    // sources the two matrices are identical.
-    let adapt_white = !matches!(
+    // `absolute` (ICC-absolute colorimetric, with or without adaptation) drives
+    // both intent knobs:
+    //   (A) white point — absolute carries the source white verbatim (no
+    //       chromatic adaptation); every other intent, and the unmanaged
+    //       default, Bradford-adapts it onto the display white. Identical for
+    //       D65 sources.
+    //   (B) luminance — absolute reproduces the declared reference luminance
+    //       literally; every other intent anchors the reference white onto the
+    //       output's reference-white level so all content's diffuse white reads
+    //       at one brightness (the spec's anchoring requirement).
+    let absolute = matches!(
         intent,
         Some(RenderIntent::Absolute | RenderIntent::AbsoluteNoAdaptation)
     );
-    let primaries_to_bt2020 = if adapt_white {
-        prism_frame::primaries_to_bt2020(&chroma)
-    } else {
+    let primaries_to_bt2020 = if absolute {
         prism_frame::primaries_to_bt2020_unadapted(&chroma)
+    } else {
+        prism_frame::primaries_to_bt2020(&chroma)
     };
+    let sdr_white_nits =
+        decode_luminance_scale(transfer, !absolute, reference_lum, output_ref_nits);
     // YUV→RGB coefficients for YUV-sampled surfaces follow the primaries:
     // BT.2020 → the BT.2020 NCL matrix; everything else (sRGB/BT.709, the
     // SDR-video default) → BT.709. Ignored unless the surface is YUV.
@@ -1503,4 +1562,84 @@ fn into_tf(
 
 fn into_primaries(v: smithay::reexports::wayland_server::WEnum<Primaries>) -> Option<Primaries> {
     v.into_result().ok()
+}
+
+#[cfg(test)]
+mod luminance_tests {
+    use super::decode_luminance_scale;
+
+    // Decode transfer codes (see description_to_params).
+    const EXT_LINEAR: i32 = 0;
+    const SRGB: i32 = 1;
+    const PQ: i32 = 2;
+
+    fn approx(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+    }
+
+    // Output reference-white levels: SDR panel anchors at 80, HDR panel at 203.
+    const SDR_REF: f32 = 80.0;
+    const HDR_REF: f32 = 203.0;
+
+    #[test]
+    fn normalized_absolute_reproduces_declared_luminance() {
+        // Absolute: 1.0 → the content's own declared reference luminance,
+        // regardless of the output level. (The historical behavior.)
+        approx(decode_luminance_scale(SRGB, false, 100.0, HDR_REF), 100.0);
+        approx(decode_luminance_scale(SRGB, false, 80.0, SDR_REF), 80.0);
+    }
+
+    #[test]
+    fn normalized_anchored_maps_white_to_output_level() {
+        // Perceptual / relative: 1.0 → the output reference-white level,
+        // independent of what the client declared.
+        approx(decode_luminance_scale(SRGB, true, 100.0, HDR_REF), HDR_REF);
+        approx(decode_luminance_scale(SRGB, true, 250.0, SDR_REF), SDR_REF);
+    }
+
+    #[test]
+    fn pq_absolute_is_passthrough() {
+        // PQ EOTF already yields absolute nits; absolute keeps them.
+        approx(decode_luminance_scale(PQ, false, 203.0, HDR_REF), 1.0);
+        approx(decode_luminance_scale(PQ, false, 1000.0, SDR_REF), 1.0);
+    }
+
+    #[test]
+    fn pq_anchored_rescales_reference_white_to_output() {
+        // BT.2408 reference-white content (203) on a 203-nit HDR panel is a
+        // no-op — the property that keeps HDR video pass-through.
+        approx(decode_luminance_scale(PQ, true, 203.0, HDR_REF), 1.0);
+        // Content authored to a different reference white is rescaled so its
+        // diffuse white lands on the output level.
+        approx(
+            decode_luminance_scale(PQ, true, 100.0, HDR_REF),
+            HDR_REF / 100.0,
+        );
+    }
+
+    #[test]
+    fn pq_anchored_guards_degenerate_reference() {
+        // A zero / sub-nit declared reference must not divide by ~0.
+        let s = decode_luminance_scale(PQ, true, 0.0, HDR_REF);
+        assert!(s.is_finite() && s > 0.0, "got {s}");
+    }
+
+    #[test]
+    fn ext_linear_keeps_encoding_scale_regardless_of_intent() {
+        // scRGB pins value 1.0 = 80 cd/m² as an encoding scale; anchoring must
+        // NOT remap it (that would corrupt the DXVK/vkd3d HDR-games path). Both
+        // intents yield the literal encoding scale on any output.
+        approx(
+            decode_luminance_scale(EXT_LINEAR, false, 80.0, HDR_REF),
+            80.0,
+        );
+        approx(
+            decode_luminance_scale(EXT_LINEAR, true, 80.0, HDR_REF),
+            80.0,
+        );
+        approx(
+            decode_luminance_scale(EXT_LINEAR, true, 80.0, SDR_REF),
+            80.0,
+        );
+    }
 }

@@ -13,8 +13,12 @@
 //       precise BT.1886 has Lb/Lw black-lift terms but most content
 //       authors expect the pure-pow degenerate case)
 //
-// All transfers other than PQ scale the linear result by sdr_white_nits
-// to get into absolute-nits domain.
+// Every transfer scales the linear result by sdr_white_nits to reach the
+// anchored absolute-nits working space. The CPU folds the per-transfer EOTF
+// convention and the render intent into that one scalar (see
+// description_to_params / decode_luminance_scale): for non-PQ it is the nits the
+// source's 1.0 maps to; for PQ (already absolute after its EOTF) it is the
+// anchoring ratio output-ref-white / content-ref-white (1.0 for absolute).
 
 #version 450
 
@@ -178,12 +182,13 @@ void main() {
         linear = sampled.rgb;
     }
 
-    // Scale into absolute-nits domain. For PQ the EOTF already produced
-    // absolute nits; everything else interprets the source's 1.0 as
-    // `sdr_white_nits`.
-    if (push.transfer != 2) {
-        linear *= push.sdr_white_nits;
-    }
+    // Scale into the anchored absolute-nits working space. `sdr_white_nits` is
+    // the post-EOTF multiplier the CPU computed from the surface's transfer and
+    // render intent (decode_luminance_scale): non-PQ → the nits the source's 1.0
+    // maps to; PQ → the anchoring ratio (1.0 for the absolute intent, i.e. the
+    // former pass-through). Uniform across transfers so the intent policy lives
+    // entirely on the CPU.
+    linear *= push.sdr_white_nits;
 
     // Primaries → BT.2020. mat4 storage; the 3×3 lives in the upper-left.
     mat3 m = mat3(push.decode_matrix);

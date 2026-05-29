@@ -1,5 +1,20 @@
 # Color negotiation, render intents, and brightness
 
+> **Status.** Increments A + B landed: render intent is threaded to the input
+> stage; `perceptual`, `relative`, and `absolute` are advertised and honored via
+> the two input-stage knobs — white-point adaptation (absolute carries source
+> white verbatim) and reference-white anchoring (perceptual/relative anchor the
+> content's reference white to the per-output reference-white level;
+> `decode_luminance_scale`). The per-output level is config-based, defaulting to
+> 80 nits (SDR) / 203 nits (HDR, BT.2408) so HDR/PQ content stays ~pass-through
+> while SDR-on-HDR brightens to match. ext-linear/scRGB keeps its literal
+> encoding scale (not anchored). The out-of-gamut/over-peak operator stays the
+> panel LUT's measured degradation. **Runtime-unverified on the panels** — the
+> anchoring math is unit-tested, but on-panel brightness (SDR-on-HDR boost, HDR
+> pass-through) still needs a rig check. Pending: `relative_bpc`, `saturation`,
+> `absolute_no_adaptation`; EDID/ambient-derived brightness; per-intent LUT
+> variants.
+
 How prism turns the `wp_color_management_v1` negotiation into deterministic
 on-screen behavior. [color-management.md](color-management.md) is the *why* of the
 pipeline (decode-per-element / encode-per-output, the BT.2020 absolute-nits

@@ -176,17 +176,21 @@ fn cull_occluded(elements: &[RenderEl]) -> Vec<bool> {
 ///
 /// - 0 = Linear (already-linear pixels, e.g. ext_linear)
 /// - 1 = sRGB piecewise EOTF (default for unmanaged surfaces)
-/// - 2 = PQ (SMPTE ST 2084) — `sdr_white_nits` ignored, pixels
-///   already in absolute nits after decode
+/// - 2 = PQ (SMPTE ST 2084) — EOTF yields absolute nits; `sdr_white_nits`
+///   is then the anchoring ratio (1.0 = pass-through, i.e. absolute intent)
 /// - 4 = Gamma 2.2 (modern SDR default per wp_color_management v2)
 /// - 5 = BT.1886 (with default Lw/Lb → pure pow 2.4)
 #[derive(Clone, Copy, Debug)]
 pub struct SurfaceColorParams {
     pub transfer: i32,
-    /// Nits value the client's 1.0 white maps to. Ignored when
-    /// `transfer == 2` (PQ); else multiplied into the linear result
-    /// to anchor into the same absolute-nits coordinate system the
-    /// intermediate buffer uses.
+    /// Post-EOTF luminance multiplier into the intermediate's anchored
+    /// absolute-nits space. For non-PQ transfers it is the nits the source's
+    /// 1.0 maps to (the output reference-white level for the anchored intents,
+    /// or the content's declared reference luminance for absolute). For PQ —
+    /// whose EOTF already yields absolute nits — it is the anchoring ratio
+    /// (output-ref-white / content-ref-white, or 1.0 for absolute). Computed by
+    /// `description_to_params`; applied uniformly across transfers in
+    /// `decode.frag`.
     pub sdr_white_nits: f32,
     /// Linear-light matrix converting the client's primaries into the
     /// BT.2020 working space, row-major (`out[i] = Σ_k m[i][k]·in[k]`).
