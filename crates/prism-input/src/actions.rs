@@ -13,6 +13,8 @@
 //! IPC, animations) are stubbed.
 
 use std::process::Command;
+use std::sync::RwLock;
+use std::thread;
 
 use prism_config::Action;
 use prism_layout::layout::ActivateWindow;
@@ -27,7 +29,7 @@ pub fn handle_action(state: &mut PrismState, action: Action) {
             state.should_stop = true;
         }
         A::Spawn(args) => spawn(args),
-        A::SpawnSh(cmd) => spawn(vec!["sh".to_string(), "-c".to_string(), cmd]),
+        A::SpawnSh(cmd) => spawn_sh(cmd),
         A::CloseWindow => {
             // Use the layout's view of the focused window rather than
             // `state.keyboard_focus`. `keyboard_focus` updates on click
@@ -203,45 +205,98 @@ pub fn handle_action(state: &mut PrismState, action: Action) {
     }
 }
 
-/// Fork+exec a child process, detached from prism. Mirrors niri's
-/// `spawn`: ignore the child's stdio so its lifetime is fully
-/// independent.
-fn spawn(args: Vec<String>) {
-    let Some(program) = args.first().cloned() else {
-        tracing::warn!("action: Spawn with empty args");
-        return;
-    };
-    let rest: Vec<String> = args.into_iter().skip(1).collect();
-    tracing::info!("action: Spawn {program} {rest:?}");
+/// Environment overrides applied to every spawned child — the config
+/// `environment {}` block. `(name, Some(value))` sets the var,
+/// `(name, None)` removes it. Populated once at startup via
+/// [`set_child_env`]; read under a shared lock per spawn. A process-wide
+/// static rather than a `PrismState` field because [`spawn`] runs on a
+/// detached thread with no access to compositor state.
+static CHILD_ENV: RwLock<Vec<(String, Option<String>)>> = RwLock::new(Vec::new());
 
-    // Fork via Command. stdin → /dev/null (no TTY for child).
-    // stdout/stderr inherit prism's so spawn failures land in our
-    // log — hiding them via /dev/null is what made the alacritty /
-    // fuzzel "spawn but never appear" silent. setsid detaches the
-    // child from our process group so it survives prism exit.
+/// Install the child-environment overrides from the config `environment {}`
+/// block. Call once at startup, before spawning anything.
+pub fn set_child_env(vars: Vec<(String, Option<String>)>) {
+    *CHILD_ENV.write().unwrap() = vars;
+}
+
+/// Spawn a child process fully detached from prism. Public so the
+/// startup-spawn path in `main` reuses the exact mechanism keybinds use.
+///
+/// Runs on a short-lived thread: the double-fork below means we must
+/// `wait()` for the intermediate child, which is cheap but doesn't belong
+/// on the compositor thread. See [`spawn_sync`] for the fork details.
+pub fn spawn(args: Vec<String>) {
+    if args.is_empty() {
+        tracing::warn!("spawn: empty args");
+        return;
+    }
+    if let Err(e) = thread::Builder::new()
+        .name("spawn".to_owned())
+        .spawn(move || spawn_sync(args))
+    {
+        tracing::warn!("spawn: could not start spawner thread: {e}");
+    }
+}
+
+/// Spawn a command through `sh -c`, for `spawn-sh-at-startup` and the
+/// `SpawnSh` bind. Hardcoded `sh -c`, consistent with sway/Hyprland/niri.
+pub fn spawn_sh(command: String) {
+    spawn(vec!["sh".to_string(), "-c".to_string(), command]);
+}
+
+/// Build and launch the child. Runs on the spawner thread.
+///
+/// stdin → /dev/null (no TTY for the child); stdout/stderr inherit prism's
+/// so spawn failures land in our log — hiding them behind /dev/null is what
+/// made the earlier alacritty / fuzzel "spawn but never appear" failures
+/// silent.
+fn spawn_sync(args: Vec<String>) {
+    let program = args[0].clone();
+    let rest = &args[1..];
+    tracing::info!("spawn: {program} {rest:?}");
+
     let mut cmd = Command::new(&program);
-    cmd.args(&rest);
+    cmd.args(rest);
     cmd.stdin(std::process::Stdio::null());
-    // SAFETY: setsid(2) is async-signal-safe and called between fork
-    // and exec where the child is single-threaded. Detaches the child
-    // from prism's process group so it survives compositor exit.
+
+    // Apply the configured child environment (`environment {}`).
+    {
+        let env = CHILD_ENV.read().unwrap();
+        for (name, value) in env.iter() {
+            match value {
+                Some(v) => cmd.env(name, v),
+                None => cmd.env_remove(name),
+            };
+        }
+    }
+
+    // SAFETY: the closure runs in the forked child, between fork and exec,
+    // where it is single-threaded; fork(2)/setsid(2)/_exit(2) are all
+    // async-signal-safe. Double-fork: the intermediate child exits
+    // immediately, so the grandchild (which execs the program) reparents to
+    // init and never lingers as a zombie of prism. The intermediate is
+    // reaped by `wait()` below. setsid detaches the grandchild from prism's
+    // session / controlling TTY so it survives compositor exit.
     unsafe {
         use std::os::unix::process::CommandExt as _;
         cmd.pre_exec(|| {
+            match libc::fork() {
+                -1 => return Err(std::io::Error::last_os_error()),
+                0 => {}
+                _ => libc::_exit(0),
+            }
             libc::setsid();
             Ok(())
         });
     }
+
     match cmd.spawn() {
-        Ok(child) => {
-            tracing::debug!("spawned {program} pid={}", child.id());
-            // We don't wait — the child is detached. The Child handle
-            // drops here and the OS reparents to init (or, with
-            // setsid, the child becomes its own session leader).
+        // Reap the intermediate child (it `_exit(0)`'d right after forking
+        // the grandchild). The grandchild lives on, owned by init.
+        Ok(mut child) => {
+            let _ = child.wait();
         }
-        Err(e) => {
-            tracing::warn!("spawn {program} failed: {e}");
-        }
+        Err(e) => tracing::warn!("spawn {program} failed: {e}"),
     }
 }
 

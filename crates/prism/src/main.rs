@@ -930,7 +930,9 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     // Both bringup (mode / off / depth selection) and PrismState::new need it;
     // load once and share. `load_config()` already falls back to defaults on
     // failure with a loud log line, so this is safe before anything else.
-    let config = load_config();
+    // `mut` so the startup-spawn lists + environment can be taken out before
+    // the rest moves into PrismState (see below).
+    let mut config = load_config();
 
     // ── Open every card we want to drive ───────────────────────────────────
     // CARDS env var overrides the hard-coded list (comma-separated paths,
@@ -1295,6 +1297,19 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     if let Some(id) = primary_gpu {
         tracing::info!("primary GPU for dmabuf-feedback: {}:{}", id.major, id.minor);
     }
+    // Pull the startup-spawn lists and `environment {}` overrides out of the
+    // config before it's moved into PrismState. The environment is installed
+    // now (it applies to every child, keybind- or startup-spawned); the spawn
+    // lists are launched below, once the wayland socket is up.
+    let spawn_at_startup = std::mem::take(&mut config.spawn_at_startup);
+    let spawn_sh_at_startup = std::mem::take(&mut config.spawn_sh_at_startup);
+    prism_input::set_child_env(
+        std::mem::take(&mut config.environment)
+            .0
+            .into_iter()
+            .map(|var| (var.name, var.value))
+            .collect(),
+    );
     let mut state =
         prism_protocols::PrismState::new(&display, config, Some(session), gpus, primary_gpu);
     for card in cards {
@@ -1580,6 +1595,16 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         state.output_redraw.len()
     ));
     redraw_queued_outputs(&mut state);
+
+    // Launch configured startup commands. The wayland socket is up by now
+    // (WAYLAND_DISPLAY exported above), so clients like waybar / swayidle can
+    // connect immediately. Argv form first, then shell form — matching niri.
+    for entry in spawn_at_startup {
+        prism_input::spawn(entry.command);
+    }
+    for entry in spawn_sh_at_startup {
+        prism_input::spawn_sh(entry.command);
+    }
 
     breadcrumb("entering dispatch loop");
     while running.load(Ordering::SeqCst) && !state.should_stop {
