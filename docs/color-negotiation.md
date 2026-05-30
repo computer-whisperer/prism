@@ -2,23 +2,22 @@
 
 > **Status.** Increments A + B landed: render intent is threaded to the input
 > stage; `perceptual`, `relative`, and `absolute` are advertised and honored via
-> two input-stage knobs — white-point adaptation (absolute carries source white
-> verbatim) and reference-white anchoring (`decode_luminance_scale`).
-> **Reference-white anchoring applies to non-PQ content only.** Perceptual /
-> relative anchor a non-PQ surface's reference white to the per-output level
-> (config-based; default 80 nits SDR / 203 HDR), which brightens SDR-on-HDR;
-> absolute reproduces declared luminance literally; ext-linear/scRGB keeps its
-> literal encoding scale. **PQ/HDR is always pass-through (absolute nits),
-> regardless of intent** — hardware (OLED DP-1, no LUT) showed that anchoring PQ
-> dimmed/dulled HDR video, because clients declare PQ reference luminance
-> inconsistently and tying HDR brightness to the SDR-comfort reference knob
-> crushes it. Mapping a too-bright HDR master onto a panel is a tone-mapping
-> problem (target volume / max_cll), deferred. The out-of-gamut/over-peak
-> operator stays the panel LUT's measured degradation. SDR-on-HDR brightening is
-> the runtime-verified win; PQ pass-through restores the previously-verified HDR
-> path. Pending: HDR→panel tone mapping (the real mastering negotiation);
-> `relative_bpc`, `saturation`, `absolute_no_adaptation`; EDID/ambient-derived
-> brightness; per-intent LUT variants.
+> the two input-stage knobs — white-point adaptation (absolute carries source
+> white verbatim) and reference-white anchoring (perceptual/relative anchor the
+> content's reference white to the per-output reference-white level;
+> `decode_luminance_scale`). The per-output level is config-based, defaulting to
+> 80 nits (SDR) / 203 nits (HDR, BT.2408) so HDR/PQ content stays ~pass-through
+> while SDR-on-HDR brightens to match. ext-linear/scRGB keeps its literal
+> encoding scale (not anchored). The out-of-gamut/over-peak operator stays the
+> panel LUT's measured degradation. **Hardware (2026-05-29):** SDR-on-HDR
+> brightening and MPV HDR both look correct on DP-1 (OLED). A Firefox-HDR
+> dim/dull report was traced to a *Firefox update* regressing its own HDR
+> compositing (rolling Firefox back fixed it; MPV HDR through the same anchored
+> path is fine) — not prism. A speculative PQ→pass-through revert was made and
+> then reverted back. The full anchoring (incl. PQ) stands until there's real
+> evidence it misbehaves. Pending: `relative_bpc`, `saturation`,
+> `absolute_no_adaptation`; EDID/ambient-derived brightness; per-intent LUT
+> variants; mastering/target-volume tone mapping.
 
 How prism turns the `wp_color_management_v1` negotiation into deterministic
 on-screen behavior. [color-management.md](color-management.md) is the *why* of the
