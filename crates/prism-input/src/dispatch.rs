@@ -191,11 +191,18 @@ fn on_keyboard<I: PrismInputBackend>(state: &mut PrismState, event: I::KeyboardK
             // bind lookup so a user bind on `F1` (rare) can't shadow
             // it. We never want a config to be able to disable VT
             // switch — it's the OS-level escape hatch.
+            //
+            // Detected from the *modified* sym, not `raw`: the VT keysyms
+            // live at the non-standard Ctrl+Alt shift level, and `raw`
+            // (`raw_latin_sym_or_raw_current_sym`) reads level 0 — so it
+            // reports plain `F1..F12` here and would never match. smithay
+            // documents this exact pitfall on that method.
             const VT_KEYSYM_BASE: u32 = 0x1008_FE01;
             const VT_KEYSYM_LAST: u32 = 0x1008_FE0C;
             let raw_u32 = raw.raw();
-            if (VT_KEYSYM_BASE..=VT_KEYSYM_LAST).contains(&raw_u32) {
-                let vt = (raw_u32 - VT_KEYSYM_BASE + 1) as i32;
+            let modified_u32 = keysym.modified_sym().raw();
+            if (VT_KEYSYM_BASE..=VT_KEYSYM_LAST).contains(&modified_u32) {
+                let vt = (modified_u32 - VT_KEYSYM_BASE + 1) as i32;
                 match this.session.as_ref() {
                     Some(session) => match session.change_vt(vt) {
                         Ok(()) => tracing::info!("VT switch to {vt} requested"),
