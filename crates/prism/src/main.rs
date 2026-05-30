@@ -2245,6 +2245,66 @@ fn render_output_now(
         None => return Ok(RenderOutcome::FlipPending),
     };
 
+    // Capture close-animation snapshots before building this frame's elements,
+    // so closing windows can replay their last frame the SAME frame the copy
+    // runs (the SnapshotTexture's view is valid before the copy fills it; the
+    // copy rides the top of render_frame, before the decode pass samples it).
+    // The handles are owned by the layout's `ClosingWindow`s; here we allocate
+    // them + collect the intermediate→snapshot copies. Done before the `ctx`
+    // closures borrow `state`, and the `create` closure captures only cloned
+    // handles (not `state`), so the `&mut state.layout` borrow is conflict-free.
+    let mut snapshot_copies: Vec<prism_renderer::SnapshotCopy> = Vec::new();
+    {
+        let (snap_device, snap_fmt, out_extent) = {
+            let output = state
+                .outputs
+                .get(output_id)
+                .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
+            (
+                output.renderer.device(),
+                output.renderer.intermediate_format(),
+                output.extent,
+            )
+        };
+        let sx = out_extent.width as f64 / view_size.w.max(1.0);
+        let sy = out_extent.height as f64 / view_size.h.max(1.0);
+        let mut create = |geo: smithay::utils::Rectangle<f64, smithay::utils::Logical>| -> Option<Arc<prism_renderer::SnapshotTexture>> {
+            // Output-logical rect → physical pixels, clamped to the output.
+            let x0 = (geo.loc.x * sx).floor().max(0.0) as i32;
+            let y0 = (geo.loc.y * sy).floor().max(0.0) as i32;
+            let x1 = ((geo.loc.x + geo.size.w) * sx).ceil().min(out_extent.width as f64) as i32;
+            let y1 = ((geo.loc.y + geo.size.h) * sy).ceil().min(out_extent.height as f64) as i32;
+            let w = (x1 - x0).max(0) as u32;
+            let h = (y1 - y0).max(0) as u32;
+            if w == 0 || h == 0 {
+                return None;
+            }
+            let extent = vk::Extent2D {
+                width: w,
+                height: h,
+            };
+            let tex = match prism_renderer::SnapshotTexture::new(snap_device.clone(), extent, snap_fmt)
+            {
+                Ok(t) => Arc::new(t),
+                Err(e) => {
+                    tracing::warn!("close-animation snapshot alloc failed: {e:?}");
+                    return None;
+                }
+            };
+            snapshot_copies.push(prism_renderer::SnapshotCopy {
+                dst: tex.clone(),
+                src: vk::Rect2D {
+                    offset: vk::Offset2D { x: x0, y: y0 },
+                    extent,
+                },
+            });
+            Some(tex)
+        };
+        state
+            .layout
+            .ensure_close_snapshots(&smithay_output, &mut create);
+    }
+
     let texture_lookup =
         |states: &smithay::wayland::compositor::SurfaceData| -> Option<vk::ImageView> {
             states
@@ -2537,7 +2597,13 @@ fn render_output_now(
             .outputs
             .get_mut(output_id)
             .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
-        output.present(&frame, view_size, &encode_push, &render_waits, &[])?
+        output.present(
+            &frame,
+            view_size,
+            &encode_push,
+            &render_waits,
+            &snapshot_copies,
+        )?
     };
     // The render submit has been queued with the waits in its dependency list
     // (or, on skip / flip-pending, never used them); either way the imported

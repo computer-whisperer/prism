@@ -7,12 +7,13 @@
 use std::cmp::min;
 use std::iter::zip;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use prism_animation::rubber_band::RubberBand;
 use prism_animation::{Animation, Clock};
 use prism_config::{CornerRadius, LayoutPart};
-use prism_renderer::RenderEl;
+use prism_renderer::{RenderEl, SnapshotTexture};
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
@@ -323,6 +324,17 @@ impl<W: LayoutElement> Monitor<W> {
             base_options,
             options,
             layout_config,
+        }
+    }
+
+    /// Fill any closing window on this monitor still missing its GPU capture.
+    /// See `ClosingWindow` / `Layout::ensure_close_snapshots`.
+    pub fn ensure_close_snapshots(
+        &mut self,
+        create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
+    ) {
+        for ws in &mut self.workspaces {
+            ws.ensure_close_snapshots(create);
         }
     }
 

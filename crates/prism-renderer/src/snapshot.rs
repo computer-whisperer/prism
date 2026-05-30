@@ -31,6 +31,14 @@ pub struct SnapshotTexture {
     extent: vk::Extent2D,
 }
 
+impl std::fmt::Debug for SnapshotTexture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotTexture")
+            .field("extent", &self.extent)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SnapshotTexture {
     /// Allocate a DEVICE_LOCAL `TRANSFER_DST | SAMPLED` image of `extent` in
     /// `format` (the renderer passes its intermediate format so the copy is

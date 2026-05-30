@@ -18,6 +18,7 @@
 use std::cmp::{max, min};
 use std::iter::{self, zip};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ordered_float::NotNan;
@@ -25,7 +26,7 @@ use prism_animation::{Animation, Clock};
 use prism_config::utils::MergeWith as _;
 use prism_config::{CenterFocusedColumn, PresetSize, Struts};
 use prism_ipc::{ColumnDisplay, SizeChange, WindowLayout};
-use prism_renderer::RenderEl;
+use prism_renderer::{RenderEl, SnapshotTexture};
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 use tracing::error;
 
@@ -1537,14 +1538,30 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             blocker
         };
 
-        // niri renders the snapshot into an offscreen texture here via
-        // a fallible `ClosingWindow::new(renderer, snapshot, ...)`.
-        // Our stubbed ClosingWindow doesn't need a renderer or texture
-        // — `snapshot` carries just the pre-close size today.
+        // The GPU snapshot is captured lazily on the first render after unmap
+        // (the integrator copies the tile's region out of the intermediate);
+        // here we only record where the window was. `snapshot` (the old
+        // geometry-only `TileRenderSnapshot`) is now unused.
         let geometry = Rectangle::new(tile_pos, tile_size);
         let _ = snapshot;
         let closing = ClosingWindow::new(geometry, blocker, anim);
         self.closing_windows.push(closing);
+    }
+
+    /// Fill any closing window still missing its capture, via the integrator's
+    /// `create` (which allocates a `SnapshotTexture` and records the copy out
+    /// of the intermediate). See `ClosingWindow`.
+    pub fn ensure_close_snapshots(
+        &mut self,
+        create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
+    ) {
+        for closing in &mut self.closing_windows {
+            if closing.needs_snapshot() {
+                if let Some(snapshot) = create(closing.geometry()) {
+                    closing.set_snapshot(snapshot);
+                }
+            }
+        }
     }
 
     pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
@@ -2921,10 +2938,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         let scale = Scale::from(self.scale);
 
         // niri renders closing windows first (so they paint behind
-        // the active tiles); our ClosingWindow::render is a stub, so
-        // these contribute nothing today.
+        // the active tiles).
         for closing in self.closing_windows.iter().rev() {
-            closing.render(closing.geometry().loc, scale, 1.0, out);
+            closing.render(closing.geometry().loc, scale, out);
         }
 
         if self.columns.is_empty() {

@@ -34,6 +34,7 @@
 use std::collections::HashMap;
 use std::mem;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use monitor::MonitorAddWindowTarget;
@@ -44,7 +45,7 @@ use prism_config::{
     Config, CornerRadius, LayoutPart, PresetSize, Workspace as WorkspaceConfig, WorkspaceReference,
 };
 use prism_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
-use prism_renderer::RenderEl;
+use prism_renderer::{RenderEl, SnapshotTexture};
 use scrolling::{Column, ColumnWidth};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -1614,6 +1615,23 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn monitor_for_output_mut(&mut self, output: &Output) -> Option<&mut Monitor<W>> {
         self.monitors_mut().find(|mon| &mon.output == output)
+    }
+
+    /// Fill any closing window on `output` still missing its GPU capture, just
+    /// before the output is rendered. `create` (supplied by the integrator)
+    /// allocates a `SnapshotTexture` for a closing window's output-logical rect
+    /// and records the copy out of the intermediate; the returned `Arc` is then
+    /// owned by the `ClosingWindow` for the rest of its animation. Returning
+    /// `None` (allocation failed) leaves the window without a replay — it just
+    /// vanishes. See `ClosingWindow`.
+    pub fn ensure_close_snapshots(
+        &mut self,
+        output: &Output,
+        create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
+    ) {
+        if let Some(mon) = self.monitor_for_output_mut(output) {
+            mon.ensure_close_snapshots(create);
+        }
     }
 
     pub fn monitor_for_workspace(&self, workspace_name: &str) -> Option<&Monitor<W>> {

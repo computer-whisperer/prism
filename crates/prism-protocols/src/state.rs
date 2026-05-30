@@ -2215,6 +2215,16 @@ impl XdgShellHandler for PrismState {
             .find_window_and_output(wl_surface)
             .map(|(mapped, out)| (mapped.window.clone(), out.cloned()));
         if let Some((window, output)) = lookup {
+            // Start the close (shrink + fade) animation before removing the
+            // window: record the tile's geometry, then spin up a ClosingWindow
+            // that replays the window's last frame (captured from the
+            // intermediate at the next render). Mirrors niri's unmap path.
+            // An already-completed blocker = no cross-window transaction gating.
+            self.layout.store_unmap_snapshot(&window);
+            self.layout.start_close_animation_for_window(
+                &window,
+                prism_layout::utils::transaction::TransactionBlocker::completed(),
+            );
             self.layout.remove_window(
                 &window,
                 prism_layout::utils::transaction::Transaction::new(),

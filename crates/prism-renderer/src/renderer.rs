@@ -268,6 +268,12 @@ impl Renderer {
         self.intermediate_format
     }
 
+    /// The renderer's device handle — lets the integrator allocate
+    /// `SnapshotTexture`s for the close animation without holding the renderer.
+    pub fn device(&self) -> Arc<Device> {
+        self.device.clone()
+    }
+
     /// Allocate a [`SnapshotTexture`] of `extent` in the intermediate's format,
     /// ready to receive a [`SnapshotCopy`] in the next `render_frame`. Used by
     /// the window-close animation to capture a tile's last composited frame.

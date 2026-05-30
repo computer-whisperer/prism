@@ -6,6 +6,7 @@
 
 use std::cmp::max;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use prism_animation::Clock;
@@ -13,7 +14,7 @@ use prism_config::utils::MergeWith as _;
 use prism_config::{CenterFocusedColumn, CornerRadius, PresetSize, Workspace as WorkspaceConfig};
 use prism_frame::ElementId;
 use prism_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
-use prism_renderer::RenderEl;
+use prism_renderer::{RenderEl, SnapshotTexture};
 use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -326,6 +327,16 @@ impl<W: LayoutElement> Workspace<W> {
     pub fn advance_animations(&mut self) {
         self.scrolling.advance_animations();
         self.floating.advance_animations();
+    }
+
+    /// Fill any closing window still missing its GPU capture. See
+    /// `ClosingWindow` / `Layout::ensure_close_snapshots`.
+    pub fn ensure_close_snapshots(
+        &mut self,
+        create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
+    ) {
+        self.scrolling.ensure_close_snapshots(create);
+        self.floating.ensure_close_snapshots(create);
     }
 
     pub fn are_animations_ongoing(&self) -> bool {

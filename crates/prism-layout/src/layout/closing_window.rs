@@ -1,25 +1,37 @@
-//! Window-close animation — stubbed for now.
+//! Window-close animation — a shrink-and-fade of the window's last frame.
 //!
-//! Niri snapshots the closing window's last rendered frame (offscreen
-//! GLES texture), then plays a custom shader-driven dismissal effect
-//! against it. Same blockers as `opening_window.rs`: we don't have
-//! offscreen render or custom shader pipelines on prism-renderer yet.
-//! Windows just disappear when closed.
+//! When a window unmaps, its last composited frame still lives in the
+//! persistent intermediate (BT.2020 absolute-nits, premultiplied). The
+//! integrator copies that region into a [`SnapshotTexture`] the frame the
+//! window is removed (before the decode pass repaints over it — see
+//! `prism_renderer::SnapshotCopy`), and stores the `Arc` here via
+//! [`ClosingWindow::set_snapshot`]. We then keep replaying the snapshot as a
+//! pass-through decode draw (no re-decode, full HDR fidelity), shrinking
+//! 1.0→0.8 about the tile centre and fading 1→0. niri's fallback effect.
 //!
-//! The transaction blocker plumbing is preserved so the layout port
-//! still routes close commits through the transaction system; the
-//! visual side is just a no-op.
+//! The snapshot `Arc` lives exactly as long as the `ClosingWindow`; when the
+//! animation finishes the layout drops us and the texture frees itself.
+
+use std::sync::Arc;
 
 use prism_animation::Animation;
-use prism_renderer::RenderEl;
+use prism_frame::ElementId;
+use prism_renderer::{AlphaMode, RenderEl, SnapshotTexture, SurfaceColorParams, SurfaceEl};
 use smithay::utils::{Logical, Point, Rectangle, Scale};
 
 use crate::utils::transaction::TransactionBlocker;
 
-/// Per-instance state — held in `tile.rs`'s `closing_animations` map.
+/// Per-instance state — held in the scrolling / floating space's
+/// `closing_windows` vector for the duration of the animation.
 #[derive(Debug)]
 pub struct ClosingWindow {
+    /// Stable element id, so the damage tracker tracks the replay across frames.
+    id: ElementId,
+    /// Output-space rect the window occupied (the snapshot's placement + size).
     geometry: Rectangle<f64, Logical>,
+    /// The captured last frame. `None` until the integrator fills it on the
+    /// first render after unmap (see [`Self::set_snapshot`]).
+    snapshot: Option<Arc<SnapshotTexture>>,
     state: AnimationState,
 }
 
@@ -36,16 +48,15 @@ impl AnimationState {
 }
 
 impl ClosingWindow {
-    /// Construct without snapshotting anything. Real impl will capture
-    /// the window's last frame; the stub records geometry only so the
-    /// layout still tracks where the window was.
     pub fn new(
         geometry: Rectangle<f64, Logical>,
         blocker: TransactionBlocker,
         anim: Animation,
     ) -> Self {
         Self {
+            id: ElementId::alloc(),
             geometry,
+            snapshot: None,
             state: AnimationState::new(blocker, anim),
         }
     }
@@ -54,25 +65,69 @@ impl ClosingWindow {
         self.geometry
     }
 
+    /// Whether the GPU snapshot still needs capturing — the integrator calls
+    /// [`Self::set_snapshot`] on the first render after unmap.
+    pub fn needs_snapshot(&self) -> bool {
+        self.snapshot.is_none()
+    }
+
+    pub fn set_snapshot(&mut self, snapshot: Arc<SnapshotTexture>) {
+        self.snapshot = Some(snapshot);
+    }
+
     pub fn advance_animations(&mut self) {
-        // The blocker keeps the transaction alive until the anim ticks
-        // forward; without a real animation effect the stub treats one
-        // tick as enough and lets the transaction proceed.
-        let _ = &self.state;
+        // The clock drives `anim.value()`; nothing to advance by hand. The
+        // blocker only gates the owning transaction, not the visual.
+        let _ = &self.state.blocker;
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        // Always false so the closing animation completes immediately —
-        // the caller will drop us on the next tick.
-        false
+        !self.state.anim.is_done()
     }
 
+    /// Emit the shrink+fade replay of the captured frame. `location` is the
+    /// snapshot's top-left in output-logical pixels (the space passes
+    /// `geometry().loc`); `_scale` is the output scale, unused here since the
+    /// transform is expressed in logical space.
     pub fn render(
         &self,
-        _location: Point<f64, Logical>,
+        location: Point<f64, Logical>,
         _scale: Scale<f64>,
-        _alpha: f32,
-        _out: &mut Vec<RenderEl>,
+        out: &mut Vec<RenderEl>,
     ) {
+        let Some(snapshot) = &self.snapshot else {
+            // No capture yet (first frame after unmap, before the integrator
+            // filled it) — draw nothing this one frame.
+            return;
+        };
+
+        // niri's fallback close effect: scale 1.0→0.8, alpha 1→0.
+        let progress = self.state.anim.clamped_value().clamp(0.0, 1.0);
+        let anim_alpha = (1.0 - progress) as f32;
+        let anim_scale = ((1.0 - progress) / 5.0 + 0.8).max(0.0);
+
+        // The snapshot is already in the intermediate's working space, so it
+        // replays through a pass-through decode (no EOTF, identity primaries,
+        // premultiplied) — bit-identical to the window it captured.
+        let geometry = Rectangle::new(location, self.geometry.size);
+        let mut el = RenderEl::Surface(SurfaceEl {
+            id: self.id,
+            texture_view: snapshot.view(),
+            chroma_view: None,
+            yuv: 0,
+            geometry,
+            content_commit: 0,
+            opaque: Vec::new(),
+            src_rect_uv: [0.0, 0.0, 1.0, 1.0],
+            color: SurfaceColorParams::passthrough(),
+            alpha_mode: AlphaMode::Premultiplied,
+            alpha: 1.0,
+        });
+
+        let center =
+            location + Point::from((self.geometry.size.w / 2.0, self.geometry.size.h / 2.0));
+        el.scale_about(center, anim_scale);
+        el.mul_alpha(anim_alpha);
+        out.push(el);
     }
 }

@@ -8,12 +8,13 @@
 use std::cmp::max;
 use std::iter::zip;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use prism_animation::{Animation, Clock};
 use prism_config::utils::MergeWith as _;
 use prism_config::{PresetSize, RelativeTo};
 use prism_ipc::{PositionChange, SizeChange, WindowLayout};
-use prism_renderer::RenderEl;
+use prism_renderer::{RenderEl, SnapshotTexture};
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::ClosingWindow;
@@ -609,14 +610,30 @@ impl<W: LayoutElement> FloatingSpace<W> {
             blocker
         };
 
-        // niri renders the snapshot into an offscreen texture inside
-        // `ClosingWindow::new(renderer, snapshot, ...)`; our stub
-        // captures only the geometry. See `scrolling.rs`'s matching
-        // method for the deficit context.
+        // The GPU snapshot is captured lazily on the first render after unmap
+        // (the integrator copies the tile's region out of the intermediate);
+        // here we only record where the window was. `snapshot` (the old
+        // geometry-only `TileRenderSnapshot`) is now unused.
         let geometry = Rectangle::new(tile_pos, tile_size);
         let _ = snapshot;
         let closing = ClosingWindow::new(geometry, blocker, anim);
         self.closing_windows.push(closing);
+    }
+
+    /// Fill any closing window still missing its capture, via the integrator's
+    /// `create` (which allocates a `SnapshotTexture` and records the copy out
+    /// of the intermediate). See `ClosingWindow`.
+    pub fn ensure_close_snapshots(
+        &mut self,
+        create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
+    ) {
+        for closing in &mut self.closing_windows {
+            if closing.needs_snapshot() {
+                if let Some(snapshot) = create(closing.geometry()) {
+                    closing.set_snapshot(snapshot);
+                }
+            }
+        }
     }
 
     pub fn toggle_window_width(&mut self, id: Option<&W::Id>, forwards: bool) {
@@ -1059,9 +1076,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
     ) {
         let scale = Scale::from(self.scale);
 
-        // Closing windows first — stubbed.
+        // Closing windows first (under live tiles).
         for closing in self.closing_windows.iter().rev() {
-            closing.render(closing.geometry().loc, scale, 1.0, out);
+            closing.render(closing.geometry().loc, scale, out);
         }
 
         let active = self.active_window_id.clone();
