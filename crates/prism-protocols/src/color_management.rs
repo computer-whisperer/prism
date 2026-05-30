@@ -67,8 +67,11 @@ use crate::surface_tex::SurfacePlacementSlot;
 // white-point adaptation and reference-white anchoring (see
 // `description_to_params` / `decode_luminance_scale`). Relative and perceptual
 // both adapt + anchor; absolute does neither (source white verbatim, declared
-// luminance literal). The panel LUT's measured graceful degradation supplies
-// the shared out-of-gamut operator for all of them. Not yet advertised:
+// luminance literal). Reference-white anchoring applies to non-PQ content only:
+// PQ/HDR passes through at its absolute luminance (anchoring it crushed HDR
+// video on hardware — proper HDR→panel tone mapping is the future path). The
+// panel LUT's measured graceful degradation supplies the shared out-of-gamut
+// operator for all of them. Not yet advertised:
 // `relative_bpc` (needs black-point compensation against the measured floor),
 // `saturation`, and `absolute_no_adaptation` — see docs/color-negotiation.md.
 const SUPPORTED_INTENTS: &[RenderIntent] = &[
@@ -272,16 +275,21 @@ impl SurfaceColorFeedbackSlot {
 /// requirement) and false for absolute (reproduce declared luminance literally).
 ///
 /// Three EOTF conventions:
-/// - **PQ** (code 2): the EOTF already yields absolute nits, with the content's
-///   reference white at `reference_lum`. Absolute → `1.0` (pass-through);
-///   anchored → `output_ref_nits / reference_lum`.
+/// - **PQ** (code 2): the EOTF already yields absolute nits. Always pass-through
+///   (`1.0`), regardless of intent. Anchoring PQ — dividing by the client's
+///   declared reference white to map it onto the output level — crushed HDR
+///   video on hardware: clients (e.g. Firefox) declare PQ reference luminance
+///   inconsistently, and tying HDR brightness to the SDR-comfort reference knob
+///   dims it. HDR-on-HDR wants the content's absolute luminance; mapping a
+///   too-bright master onto the panel is a *tone-mapping* problem (target
+///   volume / max_cll), not this linear rescale. See docs/color-negotiation.md.
 /// - **ext-linear** (code 0, e.g. Windows-scRGB): `reference_lum` is the fixed
 ///   value→nits *encoding scale* (scRGB pins 1.0 = 80 cd/m²), not a recoverable
 ///   reference white. Always literal (`reference_lum`); anchoring would corrupt
 ///   the encoding, so it is deliberately not applied here.
 /// - **normalized** (sRGB / gamma22 / BT.1886): the EOTF yields `[0,1]` with
 ///   `1.0` at the reference white. Absolute → `reference_lum`; anchored →
-///   `output_ref_nits`.
+///   `output_ref_nits`. This is where reference-white anchoring lives.
 fn decode_luminance_scale(
     transfer: i32,
     anchored: bool,
@@ -291,9 +299,7 @@ fn decode_luminance_scale(
     match transfer {
         // ext-linear: keep the literal value→nits encoding scale.
         0 => reference_lum,
-        // PQ: EOTF already absolute nits. `max(1.0)` guards a degenerate
-        // zero/sub-nit declared reference white.
-        2 if anchored => output_ref_nits / reference_lum.max(1.0),
+        // PQ: pass through the EOTF's absolute nits (see doc above).
         2 => 1.0,
         // sRGB / gamma22 / BT.1886: 1.0 = reference white.
         _ if anchored => output_ref_nits,
@@ -1598,30 +1604,21 @@ mod luminance_tests {
     }
 
     #[test]
-    fn pq_absolute_is_passthrough() {
-        // PQ EOTF already yields absolute nits; absolute keeps them.
-        approx(decode_luminance_scale(PQ, false, 203.0, HDR_REF), 1.0);
-        approx(decode_luminance_scale(PQ, false, 1000.0, SDR_REF), 1.0);
-    }
-
-    #[test]
-    fn pq_anchored_rescales_reference_white_to_output() {
-        // BT.2408 reference-white content (203) on a 203-nit HDR panel is a
-        // no-op — the property that keeps HDR video pass-through.
-        approx(decode_luminance_scale(PQ, true, 203.0, HDR_REF), 1.0);
-        // Content authored to a different reference white is rescaled so its
-        // diffuse white lands on the output level.
-        approx(
-            decode_luminance_scale(PQ, true, 100.0, HDR_REF),
-            HDR_REF / 100.0,
-        );
-    }
-
-    #[test]
-    fn pq_anchored_guards_degenerate_reference() {
-        // A zero / sub-nit declared reference must not divide by ~0.
-        let s = decode_luminance_scale(PQ, true, 0.0, HDR_REF);
-        assert!(s.is_finite() && s > 0.0, "got {s}");
+    fn pq_is_passthrough_regardless_of_intent_or_declared_luminance() {
+        // PQ always passes its absolute nits through (scale 1.0) — it is NOT
+        // anchored. This is what keeps HDR video at the content's intended
+        // luminance; anchoring it crushed HDR on hardware. The result must not
+        // depend on intent, the declared reference white, or the output level.
+        for anchored in [false, true] {
+            for &reference_lum in &[100.0, 203.0, 1000.0, 0.0] {
+                for &out in &[SDR_REF, HDR_REF] {
+                    approx(
+                        decode_luminance_scale(PQ, anchored, reference_lum, out),
+                        1.0,
+                    );
+                }
+            }
+        }
     }
 
     #[test]
