@@ -1,0 +1,103 @@
+//! A standalone copy of a tile-sized region of the intermediate, captured for
+//! the window-close animation.
+//!
+//! When a window unmaps, its last composited frame still lives in the
+//! persistent intermediate (BT.2020 absolute-nits, premultiplied). The close
+//! animation needs to keep drawing that after the real surface is gone, so
+//! `render_frame` copies the tile's region out of the intermediate into one of
+//! these the frame the window is removed (before the decode pass repaints over
+//! it). The copy stays in intermediate space, so replaying it is just a
+//! pass-through decode draw (Linear transfer, identity primaries,
+//! `sdr_white = 1.0`) — no re-decode, full HDR fidelity.
+//!
+//! Lifetime: held (via `Arc`) by the layout's `ClosingWindow` for the duration
+//! of the animation (~250 ms). Like [`crate::upload::ShmTexture`], `Drop` does a
+//! `device_wait_idle` before freeing — heavy, but window close is rare and it
+//! sidesteps tracking which frames-in-flight still sample the image.
+
+use std::sync::Arc;
+
+use ash::vk;
+
+use crate::device::Device;
+use crate::error::{Result, VkResultExt};
+use crate::intermediate::{create_view, pick_device_local_memory};
+
+pub struct SnapshotTexture {
+    device: Arc<Device>,
+    image: vk::Image,
+    view: vk::ImageView,
+    memory: vk::DeviceMemory,
+    extent: vk::Extent2D,
+}
+
+impl SnapshotTexture {
+    /// Allocate a DEVICE_LOCAL `TRANSFER_DST | SAMPLED` image of `extent` in
+    /// `format` (the renderer passes its intermediate format so the copy is
+    /// format-compatible and the replay samples the same working space).
+    pub fn new(device: Arc<Device>, extent: vk::Extent2D, format: vk::Format) -> Result<Self> {
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: extent.width.max(1),
+                height: extent.height.max(1),
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.raw.create_image(&image_info, None) }
+            .vk_ctx("create_image (snapshot)")?;
+
+        let req = unsafe { device.raw.get_image_memory_requirements(image) };
+        let mem_type = pick_device_local_memory(&device, req.memory_type_bits)?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(mem_type);
+        let memory = unsafe { device.raw.allocate_memory(&alloc, None) }
+            .vk_ctx("allocate_memory (snapshot)")?;
+        unsafe { device.raw.bind_image_memory(image, memory, 0) }
+            .vk_ctx("bind_image_memory (snapshot)")?;
+
+        let view = create_view(&device, image, format)?;
+
+        Ok(Self {
+            device,
+            image,
+            view,
+            memory,
+            extent,
+        })
+    }
+
+    pub fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    pub fn view(&self) -> vk::ImageView {
+        self.view
+    }
+
+    pub fn extent(&self) -> vk::Extent2D {
+        self.extent
+    }
+}
+
+impl Drop for SnapshotTexture {
+    fn drop(&mut self) {
+        unsafe {
+            // Same conservative approach as `ShmTexture`: stall until the GPU is
+            // idle so no in-flight frame is still sampling this image. Window
+            // close is rare, so the cost is irrelevant.
+            let _ = self.device.raw.device_wait_idle();
+            self.device.raw.destroy_image_view(self.view, None);
+            self.device.raw.destroy_image(self.image, None);
+            self.device.raw.free_memory(self.memory, None);
+        }
+    }
+}

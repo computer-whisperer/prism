@@ -18,6 +18,7 @@ pub mod lut3d;
 pub mod oneshot;
 pub mod pipeline;
 pub mod renderer;
+pub mod snapshot;
 pub mod upload;
 
 pub use cross_gpu::{ExportableImage, MirrorCopier, MirrorCopyOp};
@@ -41,7 +42,8 @@ pub use lut3d::{
 pub use oneshot::OneshotPool;
 pub use pipeline::decode::{DecodePipeline, DecodePush};
 pub use pipeline::encode::{EncodePipeline, EncodePush};
-pub use renderer::{ElementDraw, Renderer};
+pub use renderer::{ElementDraw, Renderer, SnapshotCopy};
+pub use snapshot::SnapshotTexture;
 pub use upload::ShmTexture;
 
 // Re-export ash::vk so binary / glue crates don't need a direct ash dep.

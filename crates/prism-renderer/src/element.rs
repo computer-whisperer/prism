@@ -207,6 +207,23 @@ pub struct SurfaceColorParams {
     pub yuv_matrix: i32,
 }
 
+impl SurfaceColorParams {
+    /// Pass-through params for a texture already in the intermediate's working
+    /// space (BT.2020 absolute nits, linear) — i.e. a `SnapshotTexture` for the
+    /// close animation. Linear transfer (no EOTF), `sdr_white = 1.0` (no
+    /// rescale), identity primaries (already BT.2020). The decode shader then
+    /// just samples and re-emits, so the snapshot composites bit-identical to
+    /// the window it captured (modulo the per-element fade in `tint.a`).
+    pub fn passthrough() -> Self {
+        Self {
+            transfer: 0,
+            sdr_white_nits: 1.0,
+            primaries_to_bt2020: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            yuv_matrix: 0,
+        }
+    }
+}
+
 impl Default for SurfaceColorParams {
     fn default() -> Self {
         // Pre-color-management default: sRGB EOTF + 80-nit white, and the

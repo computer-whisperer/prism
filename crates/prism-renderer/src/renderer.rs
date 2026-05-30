@@ -26,6 +26,7 @@ use crate::intermediate::Intermediate;
 use crate::lut3d::{identity_lut, Lut3dTexture, LUT_CUBE_EDGE};
 use crate::pipeline::decode::{DecodePipeline, DecodePush};
 use crate::pipeline::encode::{EncodePipeline, EncodePush};
+use crate::snapshot::SnapshotTexture;
 use crate::upload::ShmTexture;
 use prism_frame::{Physical, Rectangle};
 
@@ -51,6 +52,18 @@ pub struct ElementDraw {
     /// shader references it statically but ignores it when `yuv == 0`).
     pub chroma_view: Option<vk::ImageView>,
     pub push: DecodePush,
+}
+
+/// A request to capture a region of the intermediate into a [`SnapshotTexture`]
+/// at the start of the frame, before the decode pass repaints over it — used by
+/// the window-close animation (approach B: the copy rides the frame's command
+/// buffer, so it's naturally ordered before the decode without a second submit).
+pub struct SnapshotCopy {
+    /// Destination, sized to `src.extent`. The renderer records a copy into it.
+    pub dst: Arc<SnapshotTexture>,
+    /// Region of the intermediate (physical pixels) to capture. Caller clamps
+    /// it to the output extent.
+    pub src: vk::Rect2D,
 }
 
 /// Per-frame-in-flight resources. Owned by the renderer.
@@ -255,6 +268,13 @@ impl Renderer {
         self.intermediate_format
     }
 
+    /// Allocate a [`SnapshotTexture`] of `extent` in the intermediate's format,
+    /// ready to receive a [`SnapshotCopy`] in the next `render_frame`. Used by
+    /// the window-close animation to capture a tile's last composited frame.
+    pub fn create_snapshot(&self, extent: vk::Extent2D) -> Result<SnapshotTexture> {
+        SnapshotTexture::new(self.device.clone(), extent, self.intermediate_format)
+    }
+
     /// Ensure the persistent intermediate matches `extent`/format. Returns
     /// `true` if it was (re)allocated this call — meaning its contents are
     /// undefined and the caller must paint the full frame (no preservation).
@@ -305,6 +325,10 @@ impl Renderer {
         // common case (native textures, no mirror). Consumed by the wait;
         // the caller destroys them after this returns.
         wait_semaphores: &[vk::Semaphore],
+        // Window-close snapshots to capture from the intermediate this frame,
+        // recorded before the decode pass (which would otherwise repaint over
+        // the region). Empty in the common case.
+        snapshots: &[SnapshotCopy],
     ) -> Result<OwnedFd> {
         let extent = scanout.extent();
         // `force_full`: the intermediate was just (re)allocated, so its contents
@@ -349,6 +373,170 @@ impl Renderer {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { self.device.raw.begin_command_buffer(cb, &begin_info) }
             .vk_ctx("begin_command_buffer (renderer)")?;
+
+        // ── Snapshot capture (window close) ─────────────────────────────────
+        // Copy each requested region out of the intermediate *before* the decode
+        // pass repaints over it. The intermediate holds last frame's composite
+        // here (it's persistent and still in SHADER_READ_ONLY from last frame's
+        // encode) — except on the first frame / realloc (`force_full`), where it
+        // is undefined and there's nothing to capture; then we clear the
+        // snapshots to transparent so the close replay simply draws nothing.
+        if !snapshots.is_empty() {
+            let subresource = vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1);
+
+            if force_full {
+                // Bring each snapshot to TRANSFER_DST, clear, then to SHADER_READ.
+                let to_dst: Vec<_> = snapshots
+                    .iter()
+                    .map(|s| {
+                        barrier_image(
+                            s.dst.image(),
+                            vk::ImageLayout::UNDEFINED,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::PipelineStageFlags2::TOP_OF_PIPE,
+                            vk::AccessFlags2::empty(),
+                            vk::PipelineStageFlags2::ALL_TRANSFER,
+                            vk::AccessFlags2::TRANSFER_WRITE,
+                        )
+                    })
+                    .collect();
+                unsafe {
+                    self.device.raw.cmd_pipeline_barrier2(
+                        cb,
+                        &vk::DependencyInfo::default().image_memory_barriers(&to_dst),
+                    );
+                    let clear = vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 0.0],
+                    };
+                    let range = vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    };
+                    for s in snapshots {
+                        self.device.raw.cmd_clear_color_image(
+                            cb,
+                            s.dst.image(),
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &clear,
+                            &[range],
+                        );
+                    }
+                }
+            } else {
+                // Pre-copy: intermediate SHADER_READ → TRANSFER_SRC, each
+                // snapshot UNDEFINED → TRANSFER_DST.
+                let mut pre = vec![barrier_image(
+                    intermediate.image,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    vk::PipelineStageFlags2::ALL_TRANSFER,
+                    vk::AccessFlags2::TRANSFER_READ,
+                )];
+                for s in snapshots {
+                    pre.push(barrier_image(
+                        s.dst.image(),
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::PipelineStageFlags2::TOP_OF_PIPE,
+                        vk::AccessFlags2::empty(),
+                        vk::PipelineStageFlags2::ALL_TRANSFER,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                    ));
+                }
+                unsafe {
+                    self.device.raw.cmd_pipeline_barrier2(
+                        cb,
+                        &vk::DependencyInfo::default().image_memory_barriers(&pre),
+                    );
+                    for s in snapshots {
+                        let region = vk::ImageCopy::default()
+                            .src_subresource(subresource)
+                            .src_offset(vk::Offset3D {
+                                x: s.src.offset.x,
+                                y: s.src.offset.y,
+                                z: 0,
+                            })
+                            .dst_subresource(subresource)
+                            .dst_offset(vk::Offset3D::default())
+                            .extent(vk::Extent3D {
+                                width: s.src.extent.width,
+                                height: s.src.extent.height,
+                                depth: 1,
+                            });
+                        self.device.raw.cmd_copy_image(
+                            cb,
+                            intermediate.image,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            s.dst.image(),
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            &[region],
+                        );
+                    }
+                }
+                // Post-copy: restore intermediate to SHADER_READ (the decode
+                // pass barrier below assumes that), each snapshot → SHADER_READ.
+                let mut post = vec![barrier_image(
+                    intermediate.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::ALL_TRANSFER,
+                    vk::AccessFlags2::TRANSFER_READ,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                )];
+                for s in snapshots {
+                    post.push(barrier_image(
+                        s.dst.image(),
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::ALL_TRANSFER,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                        vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    ));
+                }
+                unsafe {
+                    self.device.raw.cmd_pipeline_barrier2(
+                        cb,
+                        &vk::DependencyInfo::default().image_memory_barriers(&post),
+                    );
+                }
+            }
+
+            // The force_full branch left snapshots in TRANSFER_DST; finish the
+            // transition to SHADER_READ so the decode pass can sample them.
+            if force_full {
+                let to_read: Vec<_> = snapshots
+                    .iter()
+                    .map(|s| {
+                        barrier_image(
+                            s.dst.image(),
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::PipelineStageFlags2::ALL_TRANSFER,
+                            vk::AccessFlags2::TRANSFER_WRITE,
+                            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                            vk::AccessFlags2::SHADER_SAMPLED_READ,
+                        )
+                    })
+                    .collect();
+                unsafe {
+                    self.device.raw.cmd_pipeline_barrier2(
+                        cb,
+                        &vk::DependencyInfo::default().image_memory_barriers(&to_read),
+                    );
+                }
+            }
+        }
 
         // ── Decode pass (scissored to damage) ───────────────────────────────
         // Repaint only `decode_area` of the persistent intermediate, preserving

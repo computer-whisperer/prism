@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use drm_fourcc::DrmModifier;
 use prism_renderer::{
     synthesize_lut_from_matrix_curve, vk, DamageTracker, Device, DrmDevId, EncodePush,
-    ImportedImage, LoweredFrame, Renderer,
+    ImportedImage, LoweredFrame, Renderer, SnapshotCopy,
 };
 use smithay::backend::drm::{DrmDevice, DrmSurface, PlaneConfig, PlaneState};
 use smithay::reexports::drm::control::{connector, crtc, framebuffer, Mode};
@@ -768,6 +768,10 @@ impl OutputContext {
         // Cross-GPU mirror copy-done semaphores the render must wait on
         // before sampling. Empty for outputs with no mirrored surfaces.
         wait_semaphores: &[vk::Semaphore],
+        // Window-close snapshots to capture from the intermediate this frame
+        // (before the decode pass repaints over the region). Empty in the
+        // common case.
+        snapshots: &[SnapshotCopy],
     ) -> Result<PresentOutcome> {
         if self.frame_pending {
             return Ok(PresentOutcome::FlipPending);
@@ -804,7 +808,9 @@ impl OutputContext {
         // against what's actually displayed. The caller arms an estimated vblank.
         // `force_present` overrides the skip when the encode output changed
         // without any element moving (recolor / recalibration).
-        if damage.is_empty() && self.mode_set_done && !self.force_present {
+        // A pending snapshot must render even with no element damage — the copy
+        // out of the intermediate rides this frame's command buffer.
+        if damage.is_empty() && self.mode_set_done && !self.force_present && snapshots.is_empty() {
             tracing::debug!(target: "damage", output = %self.connector_name, "skip: no damage");
             return Ok(PresentOutcome::SkippedNoDamage);
         }
@@ -825,6 +831,7 @@ impl OutputContext {
             &damage,
             encode_push,
             wait_semaphores,
+            snapshots,
         )?;
 
         let src =

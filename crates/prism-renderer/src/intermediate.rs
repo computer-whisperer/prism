@@ -46,7 +46,13 @@ impl Intermediate {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            // TRANSFER_SRC so the window-close path can copy a tile-sized region
+            // out into a `SnapshotTexture` for the close animation.
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe { device.raw.create_image(&image_info, None) }
@@ -101,7 +107,7 @@ pub fn create_view(device: &Device, image: vk::Image, format: vk::Format) -> Res
     unsafe { device.raw.create_image_view(&info, None) }.vk_ctx("create_image_view")
 }
 
-fn pick_device_local_memory(device: &Device, type_bits: u32) -> Result<u32> {
+pub(crate) fn pick_device_local_memory(device: &Device, type_bits: u32) -> Result<u32> {
     let props = unsafe {
         device
             .instance_raw()
