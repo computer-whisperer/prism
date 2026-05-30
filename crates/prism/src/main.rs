@@ -1417,45 +1417,25 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
             .map_err(|e| anyhow!("insert drm notifier: {e}"))?;
     }
 
-    // Drain libseat session events. CRITICAL: without this, logind can't
-    // request a VT switch (we never ack the "pause" message), which blocks
-    // Ctrl+Alt+Fn AND blocks SIGINT delivery to us via the desktop session.
-    // The callback can be a near-no-op — libseat acks the pause inside its
-    // own dispatch path; we just need process_events to run.
-    event_loop
-        .handle()
-        .insert_source(session_notifier, |event, _, _state| {
-            use smithay::backend::session::Event as SessionEvent;
-            match event {
-                SessionEvent::PauseSession => {
-                    breadcrumb("session PAUSE");
-                    tracing::info!("libseat session paused (likely VT switch away)");
-                    // TODO: properly suspend rendering / release DRM resources;
-                    // for now we just let subsequent DRM ops fail and log.
-                }
-                SessionEvent::ActivateSession => {
-                    breadcrumb("session ACTIVATE");
-                    tracing::info!("libseat session activated");
-                    // TODO: re-acquire DRM resources after a previous pause.
-                }
-            }
-        })
-        .map_err(|e| anyhow!("insert session notifier: {e}"))?;
-
     // libinput → LibinputInputBackend → calloop source.
     //
     // The PrismState carries a Weak<LibSeatSession>, but Libinput
     // wants a Session impl by value. The owning LibSeatSession lives
-    // in the notifier inserted above; we clone the underlying
-    // (Arc-backed) handle here for the libinput interface.
+    // in the session notifier; we clone the underlying (Arc-backed)
+    // handle here for the libinput interface.
     //
     // udev_assign_seat enumerates every libinput-eligible device
     // (keyboards, mice, touchpads, tablets, touch) on the named seat
     // and emits a DeviceAdded for each — those drive the wl_seat
     // capability flips in prism_input::dispatch::on_device_added.
-    {
-        use input::Libinput;
-        use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+    //
+    // Built before the session notifier (below) so a clone can be moved
+    // into that callback: on VT switch logind revokes the evdev fds, and
+    // only `Libinput::resume()` re-opens them — without it, input stays
+    // dead after switching back.
+    use input::Libinput;
+    let libinput = {
+        use smithay::backend::libinput::LibinputSessionInterface;
         use smithay::backend::session::Session as _;
 
         let seat_session = state
@@ -1468,6 +1448,94 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         libinput
             .udev_assign_seat(&seat_name)
             .map_err(|()| anyhow!("libinput.udev_assign_seat({seat_name}) failed"))?;
+        tracing::info!("libinput backend running on seat {seat_name}");
+        libinput
+    };
+
+    // Drain libseat session events. CRITICAL on two counts:
+    //
+    //  1. Liveness: without process_events running, logind can't request a
+    //     VT switch (we never ack the "pause" message), which blocks
+    //     Ctrl+Alt+Fn AND blocks SIGINT delivery via the desktop session.
+    //
+    //  2. Suspend/resume: on VT switch away (PauseSession) logind revokes
+    //     our DRM master and input fds; on switch back (ActivateSession) we
+    //     must re-acquire master, reset each card's CRTC/plane state, resume
+    //     libinput, and force a full re-modeset of every output. Skipping
+    //     this leaves the displays frozen and input dead — recoverable only
+    //     by ssh + pkill.
+    {
+        let mut libinput = libinput.clone();
+        event_loop
+            .handle()
+            .insert_source(session_notifier, move |event, _, state| {
+                use smithay::backend::session::Event as SessionEvent;
+                match event {
+                    SessionEvent::PauseSession => {
+                        breadcrumb("session PAUSE");
+                        tracing::info!("libseat session paused (VT switch away)");
+                        state.session_active = false;
+                        libinput.suspend();
+                        // Release DRM master on every card so we stop trying
+                        // to commit page-flips (which would EACCES) and the
+                        // incoming VT can take over cleanly.
+                        for card in state.cards.values_mut() {
+                            card.drm.pause();
+                        }
+                    }
+                    SessionEvent::ActivateSession => {
+                        breadcrumb("session ACTIVATE");
+                        tracing::info!("libseat session activated (VT switch back)");
+                        if libinput.resume().is_err() {
+                            tracing::error!("libinput.resume() failed after VT switch");
+                        }
+                        // Re-acquire master and reset CRTC/plane/surface state
+                        // on each card. `true` => reset_state on the inactive→
+                        // active edge, so the next commit is a clean modeset.
+                        for card in state.cards.values_mut() {
+                            if let Err(e) = card.drm.activate(true) {
+                                tracing::error!("drm.activate after VT switch failed: {e}");
+                                breadcrumb(&format!("session ACTIVATE drm.activate ERROR: {e}"));
+                            }
+                        }
+                        state.session_active = true;
+                        // Per-output resume fixups. `activate(true)` reset both
+                        // the surface's kernel state and the connector's
+                        // properties, so for each output we:
+                        //  - re-install HDR/Colorspace/max-bpc signaling, else
+                        //    the panel returns in SDR (connector props don't
+                        //    ride the surface commit);
+                        //  - reset `mode_set_done`/`frame_pending`, stale
+                        //    bookkeeping from the pre-pause flip, so the next
+                        //    present re-modesets via commit (not a now-invalid
+                        //    page-flip) and isn't wedged by a lost-vblank guard.
+                        // `output.gpu_id` keys the card it scans out on (bringup
+                        // builds each output on its own card's GPU).
+                        let cards = &state.cards;
+                        for output in state.outputs.values_mut() {
+                            if let Some(card) = cards.get(&output.gpu_id) {
+                                output.reapply_color_signaling(&card.drm);
+                            }
+                            output.mark_for_resume();
+                        }
+                        // Force a full redraw of every output: the reset above
+                        // dropped scanout state, so each output must re-modeset.
+                        // This also restarts the vblank cadence (the resumed
+                        // flip's completion drives the next on_vblank).
+                        let ids: Vec<_> = state.outputs.keys().cloned().collect();
+                        for id in ids {
+                            state.output_redraw.entry(id).or_default().queue_redraw();
+                        }
+                        prism_protocols::state::update_output_cursors(state);
+                        redraw_queued_outputs(state);
+                    }
+                }
+            })
+            .map_err(|e| anyhow!("insert session notifier: {e}"))?;
+    }
+
+    {
+        use smithay::backend::libinput::LibinputInputBackend;
         let input_backend = LibinputInputBackend::new(libinput);
         event_loop
             .handle()
@@ -1475,7 +1543,6 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
                 prism_input::process_input_event(state, event);
             })
             .map_err(|e| anyhow!("insert libinput source: {e}"))?;
-        tracing::info!("libinput backend running on seat {seat_name}");
     }
 
     // SIGINT / SIGTERM → clean shutdown.
@@ -1834,6 +1901,14 @@ fn on_vblank(
 /// timestamp. Called once per main-loop iteration, after `dispatch`.
 fn redraw_queued_outputs(state: &mut prism_protocols::PrismState) {
     use prism_protocols::redraw::RedrawState;
+
+    // While the session is paused (we've VT-switched away) we hold no DRM
+    // master, so any page-flip commit fails with EACCES. Suppress rendering
+    // entirely; the queued state is preserved and drained when the
+    // ActivateSession handler re-queues every output on resume.
+    if !state.session_active {
+        return;
+    }
 
     let to_render: Vec<_> = state
         .output_redraw

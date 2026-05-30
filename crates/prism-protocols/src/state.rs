@@ -398,6 +398,13 @@ pub struct PrismState {
     /// while DRM devices and surfaces are torn down. `None` for headless
     /// usage (`prism wayland`).
     pub session: Option<prism_drm::SeatSession>,
+    /// Whether the libseat session currently holds the seat (i.e. we're on
+    /// the foreground VT). Flipped false on `PauseSession` and true on
+    /// `ActivateSession` by the session-notifier callback in `main`. While
+    /// false we hold no DRM master, so rendering is suppressed — committing a
+    /// page-flip would fail with `EACCES`. Always true in headless /
+    /// wayland-only modes, which never receive session events.
+    pub session_active: bool,
 
     // ── Input state ────────────────────────────────────────────────────────
     /// The *effective* keyboard focus — the surface smithay's keyboard is
@@ -754,6 +761,7 @@ impl PrismState {
             satellite: None,
             layer_shell_state,
             session,
+            session_active: true,
             cards: HashMap::new(),
             mirror_copiers: build_mirror_copiers(&gpus),
             gpus,

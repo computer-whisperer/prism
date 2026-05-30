@@ -29,7 +29,7 @@ use prism_renderer::{
     synthesize_lut_from_matrix_curve, vk, DamageTracker, Device, DrmDevId, EncodePush,
     ImportedImage, LoweredFrame, Renderer,
 };
-use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneState};
+use smithay::backend::drm::{DrmDevice, DrmSurface, PlaneConfig, PlaneState};
 use smithay::reexports::drm::control::{connector, crtc, framebuffer, Mode};
 
 use crate::frame_clock::FrameClock;
@@ -242,37 +242,16 @@ impl OutputContext {
         // Either install or explicitly clear at bringup — clearing
         // is what prevents stickiness from the prior session
         // (phase-1 "DP-4 stuck on PQ" bug). Both branches no-op
-        // gracefully if hdr_props is None.
-        if let Some(props) = hdr_props.as_mut() {
-            match &config.hdr {
-                Some(signaling) => {
-                    if let Err(e) = props.set_hdr(&card.drm, signaling) {
-                        tracing::warn!(
-                            connector = %pick.connector_name,
-                            "set HDR signaling failed: {e:#}"
-                        );
-                    } else {
-                        tracing::info!(
-                            connector = %pick.connector_name,
-                            ?signaling,
-                            "HDR signaling installed"
-                        );
-                    }
-                }
-                None => {
-                    // Best-effort clear; failure logs only.
-                    let _ = props.clear(&card.drm);
-                }
-            }
-        }
-
-        match set_connector_max_bpc(&card.drm, pick.connector, config.depth.max_bpc()) {
-            Ok(true) => tracing::info!("connector max bpc set to {}", config.depth.max_bpc()),
-            Ok(false) => {
-                tracing::warn!("connector doesn't expose 'max bpc'; link depth driver-controlled")
-            }
-            Err(e) => tracing::warn!("set max bpc failed: {e:#}"),
-        }
+        // gracefully if hdr_props is None. The same routine runs on
+        // session resume (see `reapply_color_signaling`), since
+        // `DrmDevice::activate` resets these connector properties.
+        apply_color_signaling(
+            &card.drm,
+            &pick.connector_name,
+            pick.connector,
+            &mut hdr_props,
+            config,
+        );
 
         tracing::info!(connector = %pick.connector_name, "OutputContext::new step: create_surface");
         let surface = card
@@ -735,6 +714,36 @@ impl OutputContext {
         self.force_present = true;
     }
 
+    /// Prepare this output for a session resume (VT switch back). On pause the
+    /// DRM device released master; on re-activate, `DrmDevice::activate(true)`
+    /// ran `reset_state` over every surface, clearing the kernel-side CRTC and
+    /// plane config. Mirror that in our own view: reset `mode_set_done` so the
+    /// next present re-establishes the mode via `commit` rather than a
+    /// now-invalid page-flip, and drop any in-flight-flip guard whose
+    /// completion vblank was lost when master went away (same reasoning as
+    /// [`Self::power_off`]). A powered-off output stays off — its queued
+    /// redraw is dropped by the `powered_off` guard before present.
+    pub fn mark_for_resume(&mut self) {
+        self.mode_set_done = false;
+        self.frame_pending = false;
+    }
+
+    /// Re-apply this connector's HDR / Colorspace / max-bpc signaling after a
+    /// session resume. These are written as plain connector properties (not
+    /// through the surface commit), so `DrmDevice::activate(true)`'s state
+    /// reset drops them back to defaults — without this the panel returns from
+    /// a VT switch in SDR instead of the HDR mode it had before. Shares the
+    /// exact bringup routine. Pairs with [`Self::mark_for_resume`].
+    pub fn reapply_color_signaling(&mut self, drm: &DrmDevice) {
+        apply_color_signaling(
+            drm,
+            &self.connector_name,
+            self.connector,
+            &mut self.hdr_props,
+            &self.config,
+        );
+    }
+
     /// Render the supplied frame (with the supplied encode parameters) into the
     /// *back* scanout image and submit it for display. Returns a
     /// [`PresentOutcome`]:
@@ -895,6 +904,50 @@ impl OutputContext {
         // to retry it until the next independent damage.
         self.force_present = false;
         Ok(PresentOutcome::Presented(present_sync))
+    }
+}
+
+/// Apply a connector's color-signaling state from its [`OutputConfig`]:
+/// install HDR_OUTPUT_METADATA + BT.2020 Colorspace when HDR is configured,
+/// explicitly clear to SDR otherwise, and set max-bpc for the link depth.
+///
+/// These are direct connector-property writes, independent of the surface's
+/// atomic commit — so they must be (re-)applied both at bringup and after a
+/// session resume, where `DrmDevice::activate` has reset connector state.
+/// All failures are best-effort (logged, not fatal): a connector with no HDR
+/// props no-ops, and a missing max-bpc prop just leaves link depth to the
+/// driver.
+fn apply_color_signaling(
+    drm: &DrmDevice,
+    connector_name: &str,
+    connector: connector::Handle,
+    hdr_props: &mut Option<crate::HdrProps>,
+    config: &OutputConfig,
+) {
+    if let Some(props) = hdr_props.as_mut() {
+        match &config.hdr {
+            Some(signaling) => {
+                if let Err(e) = props.set_hdr(drm, signaling) {
+                    tracing::warn!(connector = %connector_name, "set HDR signaling failed: {e:#}");
+                } else {
+                    tracing::info!(connector = %connector_name, ?signaling, "HDR signaling installed");
+                }
+            }
+            // Best-effort clear; failure logs only.
+            None => {
+                let _ = props.clear(drm);
+            }
+        }
+    }
+
+    match set_connector_max_bpc(drm, connector, config.depth.max_bpc()) {
+        Ok(true) => {
+            tracing::info!(connector = %connector_name, "connector max bpc set to {}", config.depth.max_bpc())
+        }
+        Ok(false) => {
+            tracing::warn!(connector = %connector_name, "connector doesn't expose 'max bpc'; link depth driver-controlled")
+        }
+        Err(e) => tracing::warn!(connector = %connector_name, "set max bpc failed: {e:#}"),
     }
 }
 
