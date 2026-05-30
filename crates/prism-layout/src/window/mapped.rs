@@ -615,7 +615,7 @@ impl LayoutElement for Mapped {
         &self,
         location: Point<f64, Logical>,
         _scale: Scale<f64>,
-        _alpha: f32,
+        alpha: f32,
         ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
@@ -634,6 +634,7 @@ impl LayoutElement for Mapped {
         crate::layout::element::push_surface_tree_elements(
             self.toplevel().wl_surface(),
             buf_origin,
+            alpha,
             ctx,
             out,
         );
@@ -643,7 +644,7 @@ impl LayoutElement for Mapped {
         &self,
         location: Point<f64, Logical>,
         _scale: Scale<f64>,
-        _alpha: f32,
+        alpha: f32,
         ctx: &crate::layout::RenderCtx<'_>,
         out: &mut Vec<RenderEl>,
     ) {
@@ -684,6 +685,7 @@ impl LayoutElement for Mapped {
             crate::layout::element::push_surface_tree_elements(
                 popup.wl_surface(),
                 popup_buf_origin,
+                alpha,
                 ctx,
                 out,
             );

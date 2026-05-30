@@ -192,6 +192,9 @@ fn surface_element_id(states: &SurfaceData) -> ElementId {
 pub fn push_surface_tree_elements(
     surface: &WlSurface,
     buf_origin: Point<f64, Logical>,
+    // Per-element opacity in `[0, 1]` applied to every surface in the tree
+    // (window fade animations, the `opacity` window rule). `1.0` is a no-op.
+    alpha: f32,
     ctx: &RenderCtx<'_>,
     out: &mut Vec<RenderEl>,
 ) {
@@ -273,6 +276,11 @@ pub fn push_surface_tree_elements(
                 let pos = surf_loc + view.offset.to_f64();
                 let dst = Rectangle::new(pos, view.dst.to_f64());
                 let nits = ctx.color_for(states).sdr_white_nits;
+                // NOTE: `alpha` (per-element fade) is not yet applied to the
+                // single-pixel-buffer solid path — `SolidColorEl` has no
+                // opacity field until the open/close work adds one. A toplevel
+                // whose content is a single-pixel buffer won't fade; rare
+                // (single-pixel buffers are almost always opaque backgrounds).
                 surf_els.push(RenderEl::SolidColor(SolidColorEl {
                     id: surface_element_id(states),
                     geometry: dst,
@@ -316,10 +324,18 @@ pub fn push_surface_tree_elements(
 
             // Opaque regions are surface-view-relative (origin = `pos`); offset
             // them into absolute output-space logical for occlusion culling.
-            let opaque: Vec<Rectangle<f64, Logical>> = opaque_rel
-                .iter()
-                .map(|r| Rectangle::new(pos + r.loc.to_f64(), r.size.to_f64()))
-                .collect();
+            // A faded surface (`alpha < 1.0`) is no longer fully opaque
+            // anywhere, so report no opaque regions — otherwise culling would
+            // drop content drawn behind the translucent tile (see the field
+            // note on `SurfaceEl::opaque`).
+            let opaque: Vec<Rectangle<f64, Logical>> = if alpha < 1.0 {
+                Vec::new()
+            } else {
+                opaque_rel
+                    .iter()
+                    .map(|r| Rectangle::new(pos + r.loc.to_f64(), r.size.to_f64()))
+                    .collect()
+            };
 
             let (chroma_view, yuv) = ctx.yuv_for(states);
             surf_els.push(RenderEl::Surface(SurfaceEl {
@@ -333,6 +349,7 @@ pub fn push_surface_tree_elements(
                 src_rect_uv: crate::utils::src_rect_uv_from_view(&view, buffer_size),
                 color: ctx.color_for(states),
                 alpha_mode: ctx.alpha_mode_for(states),
+                alpha,
             }));
         },
         |_, _, _| true,

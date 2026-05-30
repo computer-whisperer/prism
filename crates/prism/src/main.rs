@@ -2390,6 +2390,7 @@ fn render_output_now(
                 prism_layout::layout::element::push_surface_tree_elements(
                     ls.wl_surface(),
                     geo.loc.to_f64(),
+                    1.0, // layer-shell chrome (bars, wallpapers) never fades
                     &ctx,
                     out,
                 );

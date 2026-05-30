@@ -282,11 +282,11 @@ pub struct SurfaceEl {
     /// be skipped. Empty when the buffer has (or may have) alpha and the client
     /// declared no opaque region — the conservative case that never culls.
     ///
-    /// NOTE: this reflects only the *buffer's* opacity. The per-element fade
-    /// `alpha` animation multiplier is not yet plumbed into the decode path
-    /// (mapped.rs drops it); once it is, a surface with effective `alpha < 1.0`
-    /// must report no opaque regions, or culling will hide content behind a
-    /// translucent fading tile.
+    /// NOTE: this reflects only the *buffer's* opacity. A surface with an
+    /// effective per-element fade (`alpha < 1.0`) must report **no** opaque
+    /// regions, or occlusion culling will hide content drawn behind the
+    /// translucent fading tile. The layout walk clears this when it sets
+    /// `alpha < 1.0` (see `push_surface_tree_elements`).
     pub opaque: Vec<Rectangle<f64, Logical>>,
     pub src_rect_uv: [f32; 4],
     pub color: SurfaceColorParams,
@@ -294,6 +294,13 @@ pub struct SurfaceEl {
     /// premultiplied). Set from the buffer's DRM/wl_shm fourcc at frame-build
     /// time, since `vk::Format` alone can't distinguish `Xrgb` from `Argb`.
     pub alpha_mode: AlphaMode,
+    /// Per-element opacity multiplier in `[0, 1]`, `1.0` = fully opaque.
+    /// Drives window fade animations (open/close, interactive-move dimming,
+    /// the `opacity` window rule). Lowered into the decode push's `tint.a`,
+    /// which the shader folds into the premultiplied output — scaling a
+    /// premultiplied pixel by `alpha` is the correct fade regardless of the
+    /// buffer's own (premultiplied) alpha. `1.0` is a no-op.
+    pub alpha: f32,
 }
 
 impl SurfaceEl {
@@ -311,6 +318,12 @@ impl SurfaceEl {
         push.alpha_mode = self.alpha_mode.code();
         let [r, g, b] = output_peak_nits_rgb;
         push.output_peak_nits_rgba = [r, g, b, 0.0];
+        // Per-element opacity rides `tint.a`. The shader computes
+        // `alpha = sampled.a * tint.a` then outputs `vec4(bt2020 * alpha, alpha)`
+        // (premultiplied), so multiplying `tint.a` by the fade scales the whole
+        // premultiplied pixel — the correct fade for both opaque and
+        // already-premultiplied buffers. `identity_srgb` left `tint = [1; 4]`.
+        push.tint[3] = self.alpha;
         ElementDraw {
             texture_view: self.texture_view,
             chroma_view: self.chroma_view,
@@ -612,6 +625,7 @@ mod tests {
             src_rect_uv: [0.0, 0.0, 1.0, 1.0],
             color: SurfaceColorParams::default(),
             alpha_mode: AlphaMode::Opaque,
+            alpha: 1.0,
         })
     }
 
