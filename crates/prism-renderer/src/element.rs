@@ -514,6 +514,60 @@ impl RenderEl {
         }
     }
 
+    /// Multiply this element's opacity by `factor`, in place — the window
+    /// open/close fade. Surfaces carry opacity in their dedicated `alpha`;
+    /// solids and borders carry it in the alpha channel of their (straight)
+    /// BT.2020 colour. Both lower into the decode push's `tint.a`, so scaling
+    /// either is the same premultiplied fade, and a now-translucent solid
+    /// correctly stops being an occluder (see [`Self::push_opaque_regions`]).
+    pub fn mul_alpha(&mut self, factor: f32) {
+        match self {
+            Self::Surface(s) => {
+                s.alpha *= factor;
+                // A now-translucent surface no longer fully occludes anything.
+                if s.alpha < 1.0 {
+                    s.opaque.clear();
+                }
+            }
+            Self::SolidColor(s) => s.color_bt2020_nits[3] *= factor,
+            Self::Border(b) => b.color_bt2020_nits[3] *= factor,
+        }
+    }
+
+    /// Scale this element's geometry about `center` by `factor`, in place — the
+    /// window open/close zoom. Purely visual: the layout geometry is unchanged,
+    /// only the emitted destination rect moves, so input hit-testing and tiling
+    /// stay at full size. Border stripe thicknesses scale too so the ring stays
+    /// proportional to the shrunk window.
+    pub fn scale_about(&mut self, center: Point<f64, Logical>, factor: f64) {
+        fn scaled(
+            g: Rectangle<f64, Logical>,
+            center: Point<f64, Logical>,
+            factor: f64,
+        ) -> Rectangle<f64, Logical> {
+            let loc = Point::from((
+                center.x + (g.loc.x - center.x) * factor,
+                center.y + (g.loc.y - center.y) * factor,
+            ));
+            let size = Size::from((g.size.w * factor, g.size.h * factor));
+            Rectangle::new(loc, size)
+        }
+        match self {
+            Self::Surface(s) => {
+                s.geometry = scaled(s.geometry, center, factor);
+                // The opaque rects were computed against the un-scaled
+                // geometry; once moved they no longer describe where the
+                // surface is solid, so drop them rather than mis-cull.
+                s.opaque.clear();
+            }
+            Self::SolidColor(s) => s.geometry = scaled(s.geometry, center, factor),
+            Self::Border(b) => {
+                b.geometry = scaled(b.geometry, center, factor);
+                b.thickness = b.thickness.map(|t| t * factor);
+            }
+        }
+    }
+
     /// Append this element's fully-opaque rects (absolute output-space logical)
     /// to `out`, for occlusion culling. An element drawn behind the union of
     /// these rects contributes nothing visible and can be skipped.

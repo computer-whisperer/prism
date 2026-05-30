@@ -1081,14 +1081,19 @@ impl<W: LayoutElement> Tile<W> {
         // behind. Build back-to-front: shadow, focus ring, fullscreen
         // backdrop, border, window content (popups emit on top from
         // inside `LayoutElement::render`).
+        //
+        // Collect into a local vec rather than straight into `out`: an active
+        // open animation transforms the whole tile (zoom + fade about its
+        // centre) as a post-pass over these elements before they're appended.
+        let mut els: Vec<RenderEl> = Vec::new();
 
         if expanded_progress < 1. {
-            self.shadow.render(location, out);
+            self.shadow.render(location, &mut els);
         }
 
         // Hide focus ring when maximized/fullscreened — niri's logic.
         if focus_ring_visible && expanded_progress < 1. {
-            self.focus_ring.render(location, out);
+            self.focus_ring.render(location, &mut els);
         }
 
         // Fullscreen black backdrop. Niri caches a `SolidColorBuffer`;
@@ -1099,7 +1104,7 @@ impl<W: LayoutElement> Tile<W> {
             let alpha = fullscreen_progress as f32 * tile_alpha;
             let color_bt2020_nits =
                 prism_renderer::srgb_to_bt2020_nits(0., 0., 0., alpha, BACKDROP_SDR_WHITE_NITS);
-            out.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
+            els.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
                 id: self.backdrop_id,
                 geometry: backdrop,
                 color_bt2020_nits,
@@ -1108,14 +1113,24 @@ impl<W: LayoutElement> Tile<W> {
 
         // Border ring around the window itself.
         if self.visual_border_width().is_some() {
-            self.border.render(window_render_loc, out);
+            self.border.render(window_render_loc, &mut els);
         }
 
         // Window content. Delegates to `LayoutElement::render` (popups
         // emit on top of normal content; we leave that ordering to the
         // trait impl).
         self.window
-            .render(window_render_loc, scale, win_alpha, ctx, out);
+            .render(window_render_loc, scale, win_alpha, ctx, &mut els);
+
+        // Open animation: zoom + fade the assembled tile about its centre. The
+        // animated tile size matches what shadow/backdrop/border were laid out
+        // against this frame, so the centre is the tile rect's midpoint.
+        if let Some(open) = &self.open_animation {
+            let size = self.animated_tile_size();
+            let center = location + Point::from((size.w / 2., size.h / 2.));
+            open.transform(center, &mut els);
+        }
+        out.extend(els);
     }
 
     /// Snapshot bookkeeping for the close animation. Niri renders the

@@ -1801,6 +1801,12 @@ impl CompositorHandler for PrismState {
                             (m, w)
                         };
                         let id = mapped.id();
+                        // The layout keys windows by their smithay `Window`
+                        // (its `LayoutElement::Id`), distinct from the
+                        // `MappedId` above. Clone the handle before `mapped` is
+                        // moved into `add_window` so we can start the open
+                        // animation afterwards.
+                        let window = mapped.window.clone();
                         // Place the new window on the output that
                         // currently hosts the pointer (rather than
                         // always falling back to the layout's active
@@ -1848,6 +1854,10 @@ impl CompositorHandler for PrismState {
                         if let Some(out) = output_for_focus {
                             self.layout.focus_output(&out);
                         }
+                        // Kick off the open (zoom + fade-in) animation now that
+                        // the window is in the layout — niri does the same right
+                        // after adding (handlers/compositor.rs).
+                        self.layout.start_open_animation_for_window(&window);
                         tracing::info!(
                             ?id,
                             output = ?output_name,
