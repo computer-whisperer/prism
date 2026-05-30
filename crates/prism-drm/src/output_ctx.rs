@@ -980,10 +980,11 @@ impl Drop for OutputContext {
         // or EACCES if libseat released master before us — but the latter
         // is a Drop-order bug; complain loudly so it gets fixed.
         //
-        // Breadcrumb wrapping (vs just tracing) because a hang here gets
-        // SIGKILLed by the watchdog and tracing's stdio buffer is lost.
-        // The breadcrumbs are fsync'd per line so we can attribute the
-        // hang to clear() vs to the subsequent implicit field drops.
+        // Breadcrumb wrapping (vs just tracing) because a hang here may
+        // need an external SIGKILL (or a hard kernel wedge), and tracing's
+        // stdio buffer is lost on an ungraceful kill. The breadcrumbs are
+        // fsync'd per line so we can attribute the hang to clear() vs to
+        // the subsequent implicit field drops.
         breadcrumb(&format!(
             "OutputContext::Drop entry: {} (crtc {:?})",
             self.connector_name, self.crtc

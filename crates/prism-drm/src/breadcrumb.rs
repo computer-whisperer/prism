@@ -1,7 +1,7 @@
 //! Crash-resilient breadcrumb logging.
 //!
 //! Mirror of `prism::main::breadcrumb` so DRM-side code can leave a trail
-//! that survives `SIGKILL` (the watchdog) or a hard kernel wedge. Tracing
+//! that survives an external `SIGKILL` or a hard kernel wedge. Tracing
 //! via stdio is buffered and disappears when the process is killed
 //! ungracefully; this writes + `fsync`s per line.
 //!

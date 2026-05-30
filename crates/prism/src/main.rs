@@ -888,8 +888,6 @@ fn breadcrumb(msg: &str) {
 ///   PRISM_MAX_FRAMES=N      exit after N frames presented (default: unlimited).
 ///                            Use small values (e.g. 5) when testing on a TTY
 ///                            so the process self-terminates if rendering hangs.
-///   PRISM_WATCHDOG_SECS=N   spawn a sleeper thread that SIGKILLs our PID
-///                            after N seconds (default 10, 0 to disable).
 ///
 /// Breadcrumbs are appended to ./prism.crumbs (override with $PRISM_CRUMBS)
 /// with fsync per line, so they survive a system lockup.
@@ -910,28 +908,9 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
     let max_runtime_secs: Option<u64> = std::env::var("PRISM_MAX_RUNTIME_SECS")
         .ok()
         .and_then(|s| s.parse().ok());
-    // Hard self-kill watchdog. Spawns a sleeper thread that SIGKILLs our
-    // own PID after N seconds — uncatchable, runs in a separate thread so
-    // it fires even if our main thread is stuck on queue_wait_idle waiting
-    // for a hung GPU. Default 10s so a misbehaving TTY test still recovers
-    // before the kernel locks up. Set to 0 to disable.
-    let watchdog_secs: u64 = std::env::var("PRISM_WATCHDOG_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
     breadcrumb(&format!(
-        "startup: vblank-driven, max_frames={max_frames:?}, max_runtime={max_runtime_secs:?}s, watchdog={watchdog_secs}s"
+        "startup: vblank-driven, max_frames={max_frames:?}, max_runtime={max_runtime_secs:?}s"
     ));
-    if watchdog_secs > 0 {
-        let secs = watchdog_secs;
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(secs));
-            breadcrumb(&format!("WATCHDOG: {secs}s elapsed, SIGKILL self"));
-            unsafe {
-                libc::kill(libc::getpid(), libc::SIGKILL);
-            }
-        });
-    }
 
     tracing::info!("prism — integrated mode (wayland + scanout)");
 
