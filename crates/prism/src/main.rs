@@ -1406,6 +1406,18 @@ fn run_integrated(
     // startup is required for the $DISPLAY env mutation — see its docs.
     prism_protocols::xwayland::satellite::setup(&mut state);
     tracing::info!("WAYLAND_DISPLAY={socket}");
+    // Also emit the socket name with a direct, flushed write to stdout. An
+    // external harness (scripts/tty-test.sh) polls the log for this line to
+    // learn the socket and aborts (killing prism) if it doesn't appear within a
+    // few seconds. The `tracing` line above is subject to the active RUST_LOG
+    // filter — a custom filter for some debug target silently drops it — and to
+    // stdout buffering. This bypasses both so the line always lands promptly.
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "WAYLAND_DISPLAY={socket}");
+        let _ = out.flush();
+    }
     // IPC socket for runtime control (prism-tune, future prism-msg, etc.).
     // Best-effort: a bringup failure here would lock us out of calibration
     // tooling but shouldn't take the compositor down.
