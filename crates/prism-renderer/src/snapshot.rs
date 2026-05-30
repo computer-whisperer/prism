@@ -23,6 +23,15 @@ use crate::device::Device;
 use crate::error::{Result, VkResultExt};
 use crate::intermediate::{create_view, pick_device_local_memory};
 
+/// Snapshot storage format. Deliberately fp16, NOT the intermediate's fp32:
+/// the replay samples the snapshot **scaled** (real linear interpolation), and
+/// `R32G32B32A32_SFLOAT` lacks `SAMPLED_IMAGE_FILTER_LINEAR` on common GPUs
+/// (radv/AMD) — filtering it is undefined behaviour (garbage + GPU faults).
+/// `R16G16B16A16_SFLOAT` supports linear filtering everywhere and holds the
+/// intermediate's absolute-nits range with ample precision for a transient
+/// animation. The capture is a format-converting blit (fp32 → fp16), not a copy.
+pub const SNAPSHOT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
 pub struct SnapshotTexture {
     device: Arc<Device>,
     image: vk::Image,
@@ -40,10 +49,11 @@ impl std::fmt::Debug for SnapshotTexture {
 }
 
 impl SnapshotTexture {
-    /// Allocate a DEVICE_LOCAL `TRANSFER_DST | SAMPLED` image of `extent` in
-    /// `format` (the renderer passes its intermediate format so the copy is
-    /// format-compatible and the replay samples the same working space).
-    pub fn new(device: Arc<Device>, extent: vk::Extent2D, format: vk::Format) -> Result<Self> {
+    /// Allocate a DEVICE_LOCAL `TRANSFER_DST | SAMPLED` [`SNAPSHOT_FORMAT`]
+    /// (fp16) image of `extent`, ready to receive a format-converting blit from
+    /// the fp32 intermediate.
+    pub fn new(device: Arc<Device>, extent: vk::Extent2D) -> Result<Self> {
+        let format = SNAPSHOT_FORMAT;
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)

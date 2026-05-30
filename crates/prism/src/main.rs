@@ -2255,16 +2255,12 @@ fn render_output_now(
     // handles (not `state`), so the `&mut state.layout` borrow is conflict-free.
     let mut snapshot_copies: Vec<prism_renderer::SnapshotCopy> = Vec::new();
     {
-        let (snap_device, snap_fmt, out_extent) = {
+        let (snap_device, out_extent) = {
             let output = state
                 .outputs
                 .get(output_id)
                 .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
-            (
-                output.renderer.device(),
-                output.renderer.intermediate_format(),
-                output.extent,
-            )
+            (output.renderer.device(), output.extent)
         };
         let sx = out_extent.width as f64 / view_size.w.max(1.0);
         let sy = out_extent.height as f64 / view_size.h.max(1.0);
@@ -2283,8 +2279,7 @@ fn render_output_now(
                 width: w,
                 height: h,
             };
-            let tex = match prism_renderer::SnapshotTexture::new(snap_device.clone(), extent, snap_fmt)
-            {
+            let tex = match prism_renderer::SnapshotTexture::new(snap_device.clone(), extent) {
                 Ok(t) => Arc::new(t),
                 Err(e) => {
                     tracing::warn!("close-animation snapshot alloc failed: {e:?}");

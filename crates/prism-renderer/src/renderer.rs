@@ -274,11 +274,12 @@ impl Renderer {
         self.device.clone()
     }
 
-    /// Allocate a [`SnapshotTexture`] of `extent` in the intermediate's format,
-    /// ready to receive a [`SnapshotCopy`] in the next `render_frame`. Used by
-    /// the window-close animation to capture a tile's last composited frame.
+    /// Allocate a [`SnapshotTexture`] of `extent`, ready to receive a
+    /// [`SnapshotCopy`] (a format-converting blit) in the next `render_frame`.
+    /// Used by the window-close animation to capture a tile's last composited
+    /// frame.
     pub fn create_snapshot(&self, extent: vk::Extent2D) -> Result<SnapshotTexture> {
-        SnapshotTexture::new(self.device.clone(), extent, self.intermediate_format)
+        SnapshotTexture::new(self.device.clone(), extent)
     }
 
     /// Ensure the persistent intermediate matches `extent`/format. Returns
@@ -464,27 +465,42 @@ impl Renderer {
                         &vk::DependencyInfo::default().image_memory_barriers(&pre),
                     );
                     for s in snapshots {
-                        let region = vk::ImageCopy::default()
+                        // Blit, not copy: the snapshot is fp16 while the
+                        // intermediate is fp32, so the capture must format-
+                        // convert (a same-size 1:1 blit, NEAREST filter — no
+                        // scaling here; the *replay* scales later, sampling the
+                        // fp16 snapshot, which supports linear filtering).
+                        let region = vk::ImageBlit::default()
                             .src_subresource(subresource)
-                            .src_offset(vk::Offset3D {
-                                x: s.src.offset.x,
-                                y: s.src.offset.y,
-                                z: 0,
-                            })
+                            .src_offsets([
+                                vk::Offset3D {
+                                    x: s.src.offset.x,
+                                    y: s.src.offset.y,
+                                    z: 0,
+                                },
+                                vk::Offset3D {
+                                    x: s.src.offset.x + s.src.extent.width as i32,
+                                    y: s.src.offset.y + s.src.extent.height as i32,
+                                    z: 1,
+                                },
+                            ])
                             .dst_subresource(subresource)
-                            .dst_offset(vk::Offset3D::default())
-                            .extent(vk::Extent3D {
-                                width: s.src.extent.width,
-                                height: s.src.extent.height,
-                                depth: 1,
-                            });
-                        self.device.raw.cmd_copy_image(
+                            .dst_offsets([
+                                vk::Offset3D { x: 0, y: 0, z: 0 },
+                                vk::Offset3D {
+                                    x: s.src.extent.width as i32,
+                                    y: s.src.extent.height as i32,
+                                    z: 1,
+                                },
+                            ]);
+                        self.device.raw.cmd_blit_image(
                             cb,
                             intermediate.image,
                             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                             s.dst.image(),
                             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                             &[region],
+                            vk::Filter::NEAREST,
                         );
                     }
                 }
