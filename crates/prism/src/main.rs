@@ -560,7 +560,8 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     // doesn't use the page-flip path the fd is meant for.)
     // Damage `&[]`: a freshly built Renderer forces a full first-frame paint
     // regardless, so the empty damage list is moot here.
-    let _present_sync = renderer.render_frame(&scanout, &[element], &[], &encode_push, &[], &[])?;
+    let _present_sync =
+        renderer.render_frame(&scanout, &[element], &[], &encode_push, &[], &[], false)?;
     unsafe {
         let _ = device.raw.device_wait_idle();
     }
@@ -2254,7 +2255,9 @@ fn render_output_now(
     // closures borrow `state`, and the `create` closure captures only cloned
     // handles (not `state`), so the `&mut state.layout` borrow is conflict-free.
     let mut snapshot_copies: Vec<prism_renderer::SnapshotCopy> = Vec::new();
-    {
+    // True while a closing window is animating on this output — forces a
+    // full-frame decode (see `Layout::ensure_close_snapshots` for why).
+    let close_in_flight = {
         let (snap_device, out_extent) = {
             let output = state
                 .outputs
@@ -2297,8 +2300,8 @@ fn render_output_now(
         };
         state
             .layout
-            .ensure_close_snapshots(&smithay_output, &mut create);
-    }
+            .ensure_close_snapshots(&smithay_output, &mut create)
+    };
 
     let texture_lookup =
         |states: &smithay::wayland::compositor::SurfaceData| -> Option<vk::ImageView> {
@@ -2598,6 +2601,7 @@ fn render_output_now(
             &encode_push,
             &render_waits,
             &snapshot_copies,
+            close_in_flight,
         )?
     };
     // The render submit has been queued with the waits in its dependency list
@@ -2950,8 +2954,15 @@ fn run_gradient_scanout(output_name: Option<&str>, depth: prism_drm::ScanoutDept
     // returned SYNC_FD is dropped (we don't use the IN_FENCE_FD path
     // here, the synchronous wait is simpler for a one-shot test).
     // Damage `&[]`: fresh Renderer → forced full first-frame paint anyway.
-    let _present_sync =
-        renderer.render_frame(&scanout_image, &[element], &[], &encode_push, &[], &[])?;
+    let _present_sync = renderer.render_frame(
+        &scanout_image,
+        &[element],
+        &[],
+        &encode_push,
+        &[],
+        &[],
+        false,
+    )?;
     unsafe {
         let _ = device.raw.device_wait_idle();
     }

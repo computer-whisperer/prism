@@ -620,13 +620,15 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.closing_windows.push(closing);
     }
 
-    /// Fill any closing window still missing its capture, via the integrator's
-    /// `create` (which allocates a `SnapshotTexture` and records the copy out
-    /// of the intermediate). See `ClosingWindow`.
+    /// Fill any closing window still missing its capture via the integrator's
+    /// `create` (which allocates a `SnapshotTexture` and records the copy out of
+    /// the intermediate); return whether any closing window is present (so the
+    /// integrator can force a full-frame decode). See `ClosingWindow` /
+    /// `Layout::ensure_close_snapshots`.
     pub fn ensure_close_snapshots(
         &mut self,
         create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
-    ) {
+    ) -> bool {
         for closing in &mut self.closing_windows {
             if closing.needs_snapshot() {
                 if let Some(snapshot) = create(closing.geometry()) {
@@ -634,6 +636,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
                 }
             }
         }
+        !self.closing_windows.is_empty()
     }
 
     pub fn toggle_window_width(&mut self, id: Option<&W::Id>, forwards: bool) {

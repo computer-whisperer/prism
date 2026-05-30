@@ -327,15 +327,18 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
-    /// Fill any closing window on this monitor still missing its GPU capture.
-    /// See `ClosingWindow` / `Layout::ensure_close_snapshots`.
+    /// Fill any closing window on this monitor still missing its GPU capture;
+    /// return whether any closing window is present. See
+    /// `Layout::ensure_close_snapshots`.
     pub fn ensure_close_snapshots(
         &mut self,
         create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
-    ) {
+    ) -> bool {
+        let mut any = false;
         for ws in &mut self.workspaces {
-            ws.ensure_close_snapshots(create);
+            any |= ws.ensure_close_snapshots(create);
         }
+        any
     }
 
     pub fn into_workspaces(mut self) -> Vec<Workspace<W>> {

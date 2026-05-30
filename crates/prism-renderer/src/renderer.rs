@@ -314,6 +314,7 @@ impl Renderer {
     /// the kernel sequences the page-flip after the GPU finishes writing
     /// the scanout BO, without falling back to dmabuf implicit-sync
     /// (which makes `page_flip` itself block).
+    #[allow(clippy::too_many_arguments)] // cohesive low-level frame-submit entry point
     pub fn render_frame(
         &mut self,
         scanout: &ImportedImage,
@@ -336,6 +337,13 @@ impl Renderer {
         // recorded before the decode pass (which would otherwise repaint over
         // the region). Empty in the common case.
         snapshots: &[SnapshotCopy],
+        // Repaint the whole frame instead of just the damage bbox. Set while a
+        // closing window animates: it leaves a large clear-only damage ring
+        // (the area the shrinking snapshot vacates), and a *sub-region*
+        // `load_op = CLEAR` of the persistent intermediate doesn't reliably
+        // clear it on radv (partial fast-clear / DCC). A full-frame decode
+        // clears reliably; the cost is bounded (close animations are brief).
+        force_full_repaint: bool,
     ) -> Result<OwnedFd> {
         let extent = scanout.extent();
         // `force_full`: the intermediate was just (re)allocated, so its contents
@@ -346,8 +354,9 @@ impl Renderer {
             extent,
         };
         // The region the decode pass repaints this frame. `None` ⇒ skip decode
-        // (no damage and the intermediate is already valid).
-        let decode_area: Option<vk::Rect2D> = if force_full {
+        // (no damage and the intermediate is already valid). `force_full_repaint`
+        // (closing window animating) forces the whole frame — see the param doc.
+        let decode_area: Option<vk::Rect2D> = if force_full || force_full_repaint {
             Some(full_area)
         } else {
             damage_bbox(damage, extent)

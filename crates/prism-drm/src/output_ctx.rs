@@ -772,6 +772,10 @@ impl OutputContext {
         // (before the decode pass repaints over the region). Empty in the
         // common case.
         snapshots: &[SnapshotCopy],
+        // Force a full-frame decode this frame (bypass the damage optimization).
+        // Set while a closing window animates — see `render_frame` /
+        // `Layout::ensure_close_snapshots`.
+        force_full_repaint: bool,
     ) -> Result<PresentOutcome> {
         if self.frame_pending {
             return Ok(PresentOutcome::FlipPending);
@@ -832,6 +836,7 @@ impl OutputContext {
             encode_push,
             wait_semaphores,
             snapshots,
+            force_full_repaint,
         )?;
 
         let src =

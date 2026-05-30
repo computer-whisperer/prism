@@ -329,14 +329,16 @@ impl<W: LayoutElement> Workspace<W> {
         self.floating.advance_animations();
     }
 
-    /// Fill any closing window still missing its GPU capture. See
-    /// `ClosingWindow` / `Layout::ensure_close_snapshots`.
+    /// Fill any closing window still missing its GPU capture; return whether
+    /// any closing window is present. See `Layout::ensure_close_snapshots`.
     pub fn ensure_close_snapshots(
         &mut self,
         create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
-    ) {
-        self.scrolling.ensure_close_snapshots(create);
-        self.floating.ensure_close_snapshots(create);
+    ) -> bool {
+        // Run both (no short-circuit) so both spaces get their snapshots filled.
+        let scrolling = self.scrolling.ensure_close_snapshots(create);
+        let floating = self.floating.ensure_close_snapshots(create);
+        scrolling || floating
     }
 
     pub fn are_animations_ongoing(&self) -> bool {

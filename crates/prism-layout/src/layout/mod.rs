@@ -1618,20 +1618,29 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     /// Fill any closing window on `output` still missing its GPU capture, just
-    /// before the output is rendered. `create` (supplied by the integrator)
-    /// allocates a `SnapshotTexture` for a closing window's output-logical rect
-    /// and records the copy out of the intermediate; the returned `Arc` is then
-    /// owned by the `ClosingWindow` for the rest of its animation. Returning
-    /// `None` (allocation failed) leaves the window without a replay — it just
+    /// before the output is rendered, and return whether any closing window is
+    /// animating on it. `create` (supplied by the integrator) allocates a
+    /// `SnapshotTexture` for a closing window's output-logical rect and records
+    /// the copy out of the intermediate; the returned `Arc` is then owned by the
+    /// `ClosingWindow` for the rest of its animation. Returning `None`
+    /// (allocation failed) leaves the window without a replay — it just
     /// vanishes. See `ClosingWindow`.
+    ///
+    /// The returned bool drives a full-frame-decode override: a closing window
+    /// is the one case with a large clear-only damage region (the shrinking
+    /// ring the snapshot vacates), and a *sub-region* `load_op = CLEAR` of the
+    /// persistent intermediate doesn't reliably clear it on radv (a partial
+    /// fast-clear / DCC hazard). Repainting the full frame while a close is in
+    /// flight sidesteps it; the cost is bounded (close animations are brief).
     pub fn ensure_close_snapshots(
         &mut self,
         output: &Output,
         create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
-    ) {
+    ) -> bool {
         if let Some(mon) = self.monitor_for_output_mut(output) {
-            mon.ensure_close_snapshots(create);
+            return mon.ensure_close_snapshots(create);
         }
+        false
     }
 
     pub fn monitor_for_workspace(&self, workspace_name: &str) -> Option<&Monitor<W>> {
