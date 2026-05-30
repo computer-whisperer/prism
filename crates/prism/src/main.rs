@@ -34,17 +34,26 @@ fn main() -> Result<()> {
         default_panic(info);
     }));
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let output_name = args.get(1).map(String::as_str);
-    let depth_arg = args.get(2).map(String::as_str);
-    let result: Result<()> = match args.first().map(String::as_str) {
+    // Split `--flags` from positional args so flags can appear anywhere
+    // (e.g. `prism run --session DP-4 10`) without shifting the positional
+    // slots. Only `run` consumes a flag today (`--session`).
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let session = raw.iter().any(|a| a == "--session");
+    let positional: Vec<&str> = raw
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with("--"))
+        .collect();
+    let output_name = positional.get(1).copied();
+    let depth_arg = positional.get(2).copied();
+    let result: Result<()> = match positional.first().copied() {
         None => run_headless_smoke_tests(),
         Some("scanout") => run_scanout_smoke_test(output_name),
         Some("gradient") => run_gradient_scanout(output_name, parse_depth(depth_arg)?),
         Some("wayland") => run_wayland_server(),
-        Some("run") => run_integrated(output_name, parse_depth(depth_arg)?),
+        Some("run") => run_integrated(output_name, parse_depth(depth_arg)?, session),
         Some(other) => Err(anyhow!(
-            "unknown subcommand {other:?}; expected: (no args) | scanout [output] | gradient [output] [8|10] | wayland | run [output] [8|10]"
+            "unknown subcommand {other:?}; expected: (no args) | scanout [output] | gradient [output] [8|10] | wayland | run [output] [8|10] [--session]"
         )),
     };
     if let Err(e) = &result {
@@ -889,9 +898,53 @@ fn breadcrumb(msg: &str) {
 ///                            Use small values (e.g. 5) when testing on a TTY
 ///                            so the process self-terminates if rendering hangs.
 ///
+/// Publish the session environment into the systemd `--user` manager and the
+/// D-Bus activation environment, so services activated on demand (notably
+/// `xdg-desktop-portal` and its backend) inherit our `WAYLAND_DISPLAY` and
+/// render their windows on this session — without it, a file-chooser dialog
+/// opens on whichever compositor activated the portal first.
+///
+/// Mirrors niri's `import_environment`. Best-effort: `systemctl` /
+/// `dbus-update-activation-environment` may be absent (non-systemd, no D-Bus);
+/// failures are logged, not fatal. We `wait()` so the import completes before
+/// any service is spawned.
+fn import_environment() {
+    // `dbus-update-activation-environment` is guarded by `hash` so a missing
+    // binary is a clean skip rather than a shell error.
+    const VARS: &str = "WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE PRISM_SOCKET";
+    let script = format!(
+        "systemctl --user import-environment {VARS}; \
+         hash dbus-update-activation-environment 2>/dev/null && \
+         dbus-update-activation-environment {VARS}"
+    );
+    match std::process::Command::new("/bin/sh")
+        .args(["-c", &script])
+        .spawn()
+    {
+        Ok(mut child) => match child.wait() {
+            Ok(status) if status.success() => {
+                tracing::info!("imported session environment into systemd / D-Bus")
+            }
+            Ok(status) => tracing::warn!("import-environment shell exited with {status}"),
+            Err(e) => tracing::warn!("waiting for import-environment shell: {e}"),
+        },
+        Err(e) => tracing::warn!("spawning import-environment shell: {e}"),
+    }
+}
+
 /// Breadcrumbs are appended to ./prism.crumbs (override with $PRISM_CRUMBS)
 /// with fsync per line, so they survive a system lockup.
-fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> Result<()> {
+///
+/// `session_mode` (the `--session` flag): when true, prism is the login
+/// session, so it imports its environment into the systemd `--user` manager
+/// and the D-Bus activation environment (see [`import_environment`]). Gated
+/// because doing it unconditionally would clobber a *co-running* compositor's
+/// session env on the shared user bus.
+fn run_integrated(
+    output_name: Option<&str>,
+    depth: prism_drm::ScanoutDepth,
+    session_mode: bool,
+) -> Result<()> {
     use calloop::signals::{Signal, Signals};
     use calloop::EventLoop;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1595,6 +1648,21 @@ fn run_integrated(output_name: Option<&str>, depth: prism_drm::ScanoutDepth) -> 
         state.output_redraw.len()
     ));
     redraw_queued_outputs(&mut state);
+
+    // As the login session, publish our environment so on-demand services —
+    // notably xdg-desktop-portal and its backend — inherit prism's
+    // WAYLAND_DISPLAY and open their windows on *this* session. Must run
+    // after the socket is up (WAYLAND_DISPLAY is real) and before the spawns
+    // below, since a spawned service must see the updated environment.
+    if session_mode {
+        // Advertise the desktop so the portal can resolve a backend. Set
+        // (not just imported) if the launch wrapper didn't already pick one.
+        // SAFETY: still single-threaded here — the spawn threads start below.
+        if std::env::var_os("XDG_CURRENT_DESKTOP").is_none() {
+            unsafe { std::env::set_var("XDG_CURRENT_DESKTOP", "prism") };
+        }
+        import_environment();
+    }
 
     // Launch configured startup commands. The wayland socket is up by now
     // (WAYLAND_DISPLAY exported above), so clients like waybar / swayidle can
