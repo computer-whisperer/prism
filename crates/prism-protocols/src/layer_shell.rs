@@ -266,6 +266,13 @@ impl PrismState {
             }
         }
 
+        // A commit can change the surface's exclusive zone (a bar reserving
+        // space along an edge). `arrange()` above updated the `LayerMap`'s
+        // non-exclusive zone, but the layout's working area is derived from it
+        // and must be recomputed or tiled windows would overlap the bar.
+        // Mirrors niri's `output_resized` after arranging layers (niri.rs:2990).
+        self.layout.update_output_size(&output);
+
         if let Some(id) = self.layer_surface_output_id(surface) {
             self.output_redraw.entry(id).or_default().queue_redraw();
         }
@@ -287,6 +294,9 @@ impl PrismState {
         });
         if let Some((id, output, layer)) = found {
             layer_map_for_output(&output).unmap_layer(&layer);
+            // `unmap_layer` re-arranged the map; reclaim the bar's exclusive
+            // zone for the layout's working area so tiled windows expand back.
+            self.layout.update_output_size(&output);
             self.output_redraw.entry(id).or_default().queue_redraw();
         }
         // Drop a stale on-demand reference to the destroyed surface, then
