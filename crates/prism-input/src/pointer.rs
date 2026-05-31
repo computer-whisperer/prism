@@ -492,15 +492,15 @@ pub fn refresh_pointer_focus(state: &mut PrismState) {
         },
     );
     pointer.frame(state);
-    // The contents under a *stationary* pointer just changed — e.g. a window
-    // opened/closed/restacked beneath it. With focus-follows-mouse this must
-    // re-home keyboard focus, exactly as a real motion event would: otherwise a
-    // window mapped under the cursor stays unfocused until the user wiggles the
-    // mouse. `maybe_focus_follows_mouse` no-ops when ffm is disabled, and the
-    // early return above means this only runs when something actually changed —
-    // a window opening *elsewhere* leaves the contents here unchanged and never
-    // steals focus.
-    maybe_focus_follows_mouse(state);
+    // NOTE: focus-follows-mouse is deliberately *not* run here. niri drives
+    // ffm only from real pointer-motion events, never from a contents refresh
+    // (its `update_pointer_contents`). Re-homing focus when windows move under
+    // a *stationary* cursor means that during a column-scroll or
+    // workspace-switch animation, whatever tile slides under the cursor gets
+    // activated — which re-targets the scroll and cancels it. A window that
+    // opens under the cursor still gets focus: via its activation policy in
+    // `add_window`, reconciled by the per-frame `update_keyboard_focus` — not
+    // via ffm.
     // Contents settled on a (possibly new) surface — give any pointer constraint
     // there a chance to activate immediately, instead of waiting for the next
     // motion event's normal path (which would move the pointer first). Mirrors
@@ -519,8 +519,13 @@ pub fn refresh_pointer_focus(state: &mut PrismState) {
 ///   - skip when disabled
 ///   - skip when the pointer is in a grab (drag/resize)
 ///   - update active output when the pointer crosses output boundaries
-///   - activate the window under the pointer (without raising), and
-///     hand keyboard focus to its surface
+///   - activate the window under the pointer (without raising), gated by
+///     `should_trigger_focus_follows_mouse_on` so an in-progress workspace
+///     switch isn't cancelled; the per-frame `update_keyboard_focus` reconcile
+///     then hands it the keyboard
+///
+/// Called only from real pointer-motion handlers, never from the contents
+/// refresh — see the note in [`refresh_pointer_focus`].
 ///
 /// `max_scroll_amount` (ignore the focus update while the cursor is
 /// inside a scrolling viewport beyond N% of one screen) is not yet
@@ -561,9 +566,25 @@ fn maybe_focus_follows_mouse(state: &mut PrismState) {
         if state.surface_is_popup(&surface) {
             return;
         }
-        // Activate-without-raising under the cursor; the per-frame
-        // `update_keyboard_focus` reconcile hands it the keyboard.
-        focus_surface(state, &surface, false);
+        // A layer-shell surface under the cursor takes on-demand focus
+        // directly — no workspace concept applies.
+        if state.layer_surface_for(&surface).is_some() {
+            focus_surface(state, &surface, false);
+            return;
+        }
+        // A layout window: only activate it if focus-follows-mouse should
+        // trigger on its workspace. While a workspace switch animates, the
+        // window under a (moving) cursor may belong to the *outgoing*
+        // workspace; activating it would cancel the switch. niri guards the
+        // same way via `should_trigger_focus_follows_mouse_on`. The per-frame
+        // `update_keyboard_focus` reconcile then hands it the keyboard.
+        if let Some((mapped, _)) = state.layout.find_window_and_output(&surface) {
+            let window = mapped.window.clone();
+            if state.layout.should_trigger_focus_follows_mouse_on(&window) {
+                state.on_demand_layer_focus = None;
+                state.layout.activate_window_without_raising(&window);
+            }
+        }
     }
 }
 
