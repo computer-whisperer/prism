@@ -495,6 +495,15 @@ pub fn refresh_pointer_focus(state: &mut PrismState) {
         },
     );
     pointer.frame(state);
+    // The contents under a *stationary* pointer just changed — e.g. a window
+    // opened/closed/restacked beneath it. With focus-follows-mouse this must
+    // re-home keyboard focus, exactly as a real motion event would: otherwise a
+    // window mapped under the cursor stays unfocused until the user wiggles the
+    // mouse. `maybe_focus_follows_mouse` no-ops when ffm is disabled, and the
+    // early return above means this only runs when something actually changed —
+    // a window opening *elsewhere* leaves the contents here unchanged and never
+    // steals focus.
+    maybe_focus_follows_mouse(state);
     // Contents settled on a (possibly new) surface — give any pointer constraint
     // there a chance to activate immediately, instead of waiting for the next
     // motion event's normal path (which would move the pointer first). Mirrors
