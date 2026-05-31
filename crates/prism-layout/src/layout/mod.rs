@@ -1643,6 +1643,20 @@ impl<W: LayoutElement> Layout<W> {
         false
     }
 
+    /// Capture pre-resize frames for tiles mid-resize-animation on `output`,
+    /// and report whether any exist (→ force a full-frame decode). The
+    /// resize-animation analogue of [`Self::ensure_close_snapshots`].
+    pub fn ensure_resize_snapshots(
+        &mut self,
+        output: &Output,
+        create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
+    ) -> bool {
+        if let Some(mon) = self.monitor_for_output_mut(output) {
+            return mon.ensure_resize_snapshots(create);
+        }
+        false
+    }
+
     pub fn monitor_for_workspace(&self, workspace_name: &str) -> Option<&Monitor<W>> {
         self.monitors().find(|monitor| {
             monitor.workspaces.iter().any(|ws| {

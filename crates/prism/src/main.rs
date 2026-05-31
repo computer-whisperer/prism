@@ -2267,9 +2267,11 @@ fn render_output_now(
     // closures borrow `state`, and the `create` closure captures only cloned
     // handles (not `state`), so the `&mut state.layout` borrow is conflict-free.
     let mut snapshot_copies: Vec<prism_renderer::SnapshotCopy> = Vec::new();
-    // True while a closing window is animating on this output — forces a
-    // full-frame decode (see `Layout::ensure_close_snapshots` for why).
-    let close_in_flight = {
+    // True while a closing window OR a resizing tile is animating on this
+    // output — forces a full-frame decode (see `Layout::ensure_close_snapshots`
+    // for why; the resize shrink vacates a ring with the same radv sub-region
+    // clear hazard).
+    let force_full_decode = {
         let (snap_device, out_extent) = {
             let output = state
                 .outputs
@@ -2297,7 +2299,7 @@ fn render_output_now(
             let tex = match prism_renderer::SnapshotTexture::new(snap_device.clone(), extent) {
                 Ok(t) => Arc::new(t),
                 Err(e) => {
-                    tracing::warn!("close-animation snapshot alloc failed: {e:?}");
+                    tracing::warn!("animation snapshot alloc failed: {e:?}");
                     return None;
                 }
             };
@@ -2310,9 +2312,17 @@ fn render_output_now(
             });
             Some(tex)
         };
-        state
+        // Both reuse the same `create` (it only captures cloned GPU handles +
+        // the local copies vec). Run both unconditionally so a frame with both
+        // a closing window and a resizing tile captures each; the OR forces a
+        // full-frame decode while either animates.
+        let closing = state
             .layout
-            .ensure_close_snapshots(&smithay_output, &mut create)
+            .ensure_close_snapshots(&smithay_output, &mut create);
+        let resizing = state
+            .layout
+            .ensure_resize_snapshots(&smithay_output, &mut create);
+        closing || resizing
     };
 
     let texture_lookup =
@@ -2613,7 +2623,7 @@ fn render_output_now(
             &encode_push,
             &render_waits,
             &snapshot_copies,
-            close_in_flight,
+            force_full_decode,
         )?
     };
     // The render submit has been queued with the waits in its dependency list

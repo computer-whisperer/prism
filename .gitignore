@@ -12,6 +12,9 @@ Cargo.lock.bak
 # OS
 .DS_Store
 
+# Claude Code session/runtime files
+.claude/
+
 # Test-run artifacts from scripts/tty-test.sh
 prism.log
 prism.crumbs

@@ -639,6 +639,27 @@ impl<W: LayoutElement> FloatingSpace<W> {
         !self.closing_windows.is_empty()
     }
 
+    /// Resize-animation analogue of [`Self::ensure_close_snapshots`]; see the
+    /// scrolling-space version for the rationale. Returns whether any tile is
+    /// mid-resize.
+    pub fn ensure_resize_snapshots(
+        &mut self,
+        create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
+    ) -> bool {
+        let mut any = false;
+        for (tile, pos) in self.tiles_with_render_positions_mut(true) {
+            if tile.resize_animation().is_some() {
+                any = true;
+                if let Some(geo) = tile.resize_snapshot_geo(pos) {
+                    if let Some(snapshot) = create(geo) {
+                        tile.set_resize_snapshot(snapshot);
+                    }
+                }
+            }
+        }
+        any
+    }
+
     pub fn toggle_window_width(&mut self, id: Option<&W::Id>, forwards: bool) {
         let Some(id) = id.or(self.active_window_id.as_ref()).cloned() else {
             return;

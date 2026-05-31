@@ -1567,6 +1567,30 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         !self.closing_windows.is_empty()
     }
 
+    /// Capture the pre-resize frame for any tile whose resize animation still
+    /// needs one (the integrator's `create` copies the tile's region out of
+    /// the intermediate); return whether any tile is mid-resize (so the
+    /// integrator can force a full-frame decode — a shrink vacates a ring the
+    /// sub-region clear won't reliably wipe on radv, same hazard as close).
+    /// Mirrors [`Self::ensure_close_snapshots`].
+    pub fn ensure_resize_snapshots(
+        &mut self,
+        create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
+    ) -> bool {
+        let mut any = false;
+        for (tile, pos) in self.tiles_with_render_positions_mut(true) {
+            if tile.resize_animation().is_some() {
+                any = true;
+                if let Some(geo) = tile.resize_snapshot_geo(pos) {
+                    if let Some(snapshot) = create(geo) {
+                        tile.set_resize_snapshot(snapshot);
+                    }
+                }
+            }
+        }
+        any
+    }
+
     pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
         self.columns
             .iter_mut()

@@ -1772,17 +1772,49 @@ impl CompositorHandler for PrismState {
                         // "stacked tiles, 16-px-offset-per-window"
                         // visual.
                         window.on_commit();
-                        // Pre-commit hook is a no-op for now; niri
-                        // uses it for dmabuf-readiness blockers + the
-                        // post-commit transaction queue. We don't
-                        // have those subsystems yet but Mapped::new
-                        // requires a HookId so register a no-op hook
-                        // to get one. The hook does fire on every
-                        // commit, so keep it cheap.
-                        let hook = add_pre_commit_hook::<PrismState, _>(
-                            surface,
-                            |_state, _dh, _surface| {},
-                        );
+                        // Pre-commit hook: drives the resize animation's
+                        // snapshot capture. niri also uses it for
+                        // dmabuf-readiness blockers + the post-commit
+                        // transaction queue, which we don't have yet.
+                        //
+                        // It fires before `on_commit_buffer_handler`
+                        // applies the new buffer, so the window still
+                        // reports its OLD size here — exactly when the
+                        // resize animation needs to snapshot the
+                        // pre-resize size. If this commit acks a configure
+                        // we flagged to animate (`request_size(animate=true)`
+                        // → `animate_next_configure` → `animate_serials`),
+                        // `should_animate_commit` matches the acked serial
+                        // and we store the snapshot; `Tile::update_window`
+                        // later consumes it (`take_animation_snapshot`) to
+                        // seed `ResizeAnimation.size_from`. Mirrors niri's
+                        // `Mapped::pre_commit`.
+                        let hook =
+                            add_pre_commit_hook::<PrismState, _>(surface, |state, _dh, surface| {
+                                // The serial the client acked with this
+                                // commit (set by ack_configure, processed
+                                // before this hook). `None` before any ack.
+                                let acked = with_states(surface, |states| {
+                                    states
+                                        .data_map
+                                        .get::<XdgToplevelSurfaceData>()
+                                        .and_then(|d| {
+                                            d.lock().unwrap().last_acked.as_ref().map(|c| c.serial)
+                                        })
+                                });
+                                let Some(serial) = acked else {
+                                    return;
+                                };
+                                // None until the window is mapped into the
+                                // layout — initial pre-map commits no-op.
+                                if let Some((mapped, _)) =
+                                    state.layout.find_window_and_output_mut(surface)
+                                {
+                                    if mapped.should_animate_commit(serial) {
+                                        mapped.store_animation_snapshot();
+                                    }
+                                }
+                            });
                         let (mapped, default_column_width) = {
                             let config = self.config.borrow();
                             let m =
@@ -1885,11 +1917,21 @@ impl CompositorHandler for PrismState {
                 // Mirrors niri/src/handlers/compositor.rs:346:
                 //   self.niri.layout.update_window(&window, serial);
                 //
-                // We don't yet thread the ack_configure serial through
-                // (would let the layout match commits to specific
-                // configures for animation purposes); `None` is the
-                // "just resync from the current window geometry" path.
-                self.layout.update_window(&window, None);
+                // The acked configure serial is threaded through so the
+                // layout can match this commit to the configure it
+                // responded to. `Mapped::on_commit(serial)` retires
+                // acked maximized / windowed-fullscreen / interactive-
+                // resize state, and (via the pre-commit snapshot stored
+                // above) lets `Tile::update_window` start the resize
+                // animation. `None` would be the bare "resync geometry"
+                // path with no animation.
+                let acked = with_states(surface, |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .and_then(|d| d.lock().unwrap().last_acked.as_ref().map(|c| c.serial))
+                });
+                self.layout.update_window(&window, acked);
             }
         }
 

@@ -341,6 +341,16 @@ impl<W: LayoutElement> Workspace<W> {
         scrolling || floating
     }
 
+    pub fn ensure_resize_snapshots(
+        &mut self,
+        create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
+    ) -> bool {
+        // Run both (no short-circuit) so both spaces get their snapshots filled.
+        let scrolling = self.scrolling.ensure_resize_snapshots(create);
+        let floating = self.floating.ensure_resize_snapshots(create);
+        scrolling || floating
+    }
+
     pub fn are_animations_ongoing(&self) -> bool {
         self.scrolling.are_animations_ongoing() || self.floating.are_animations_ongoing()
     }

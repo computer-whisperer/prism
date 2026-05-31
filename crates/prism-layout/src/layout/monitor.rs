@@ -341,6 +341,17 @@ impl<W: LayoutElement> Monitor<W> {
         any
     }
 
+    pub fn ensure_resize_snapshots(
+        &mut self,
+        create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
+    ) -> bool {
+        let mut any = false;
+        for ws in &mut self.workspaces {
+            any |= ws.ensure_resize_snapshots(create);
+        }
+        any
+    }
+
     pub fn into_workspaces(mut self) -> Vec<Workspace<W>> {
         self.workspaces.retain(|ws| ws.has_windows_or_name());
 

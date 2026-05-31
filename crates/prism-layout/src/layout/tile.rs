@@ -15,12 +15,13 @@
 
 use core::f64;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use prism_animation::{Animation, Clock};
 use prism_config::utils::MergeWith as _;
 use prism_frame::ElementId;
 use prism_ipc::WindowLayout;
-use prism_renderer::RenderEl;
+use prism_renderer::{AlphaMode, RenderEl, SurfaceColorParams, SurfaceEl};
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use super::focus_ring::FocusRing;
@@ -28,7 +29,7 @@ use super::opening_window::OpenAnimation;
 use super::shadow::Shadow;
 use super::SizingMode;
 use super::{
-    HitType, LayoutElement, LayoutElementRenderSnapshot, Options, SizeFrac,
+    HitType, LayoutElement, LayoutElementRenderSnapshot, Options, SizeFrac, SnapshotTexture,
     RESIZE_ANIMATION_THRESHOLD,
 };
 use crate::utils::transaction::Transaction;
@@ -152,15 +153,22 @@ pub type TileRenderSnapshot = LayoutElementRenderSnapshot;
 struct ResizeAnimation {
     anim: Animation,
     size_from: Size<f64, Logical>,
-    /// Snapshot of the pre-resize render, used by niri to crossfade
-    /// inside an offscreen buffer. We keep the `Option<()>` so the
-    /// resize-trigger code path stays intact, but the visual crossfade
-    /// is currently a no-op (the tile just snaps to its animated
-    /// geometry; see [`super::LayoutElementRenderSnapshot`]).
+    /// Geometry-only snapshot stub (carries just the pre-resize window
+    /// size). The actual crossfade pixels live in `gpu_snapshot`, captured
+    /// from the persistent intermediate by the integrator on the first
+    /// render after the resize commit (see [`Tile::resize_snapshot_geo`]).
     #[allow(dead_code)]
     snapshot: LayoutElementRenderSnapshot,
-    // niri keeps an `OffscreenBuffer` here to render both the
-    // before/after into and crossfade; we don't have that path yet.
+    /// The captured pre-resize tile frame, replayed at the *animated* tile
+    /// rect and fading 1→0 on top of the live (already size-animated) content.
+    /// `None` until the integrator fills it; the live content alone renders
+    /// for that first frame. niri instead renders both states into an
+    /// `OffscreenBuffer` and crossfades; prism replays the snapshot through
+    /// the decode pass (same mechanism as the close animation).
+    gpu_snapshot: Option<Arc<SnapshotTexture>>,
+    /// Stable element id for the replay, so the damage tracker follows the
+    /// crossfade across frames.
+    snapshot_id: ElementId,
     tile_size_from: Size<f64, Logical>,
     // If the resize involved the fullscreen state at some point, this is the progress toward the
     // fullscreen state. Used for things like fullscreen backdrop alpha.
@@ -381,6 +389,8 @@ impl<W: LayoutElement> Tile<W> {
                     anim,
                     size_from,
                     snapshot: animate_from,
+                    gpu_snapshot: None,
+                    snapshot_id: ElementId::alloc(),
                     tile_size_from,
                     fullscreen_progress,
                     expanded_progress,
@@ -578,6 +588,32 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn resize_animation(&self) -> Option<&Animation> {
         self.resize_animation.as_ref().map(|resize| &resize.anim)
+    }
+
+    /// The output-logical rect to capture for the resize crossfade: the tile's
+    /// pre-resize size (`tile_size_from`) placed at its current render
+    /// `location`. Returns `None` when there's no resize animation or its
+    /// snapshot is already captured — so the integrator both gates on and sizes
+    /// the capture from this one call. Mirrors `ClosingWindow::needs_snapshot` +
+    /// `geometry`.
+    pub fn resize_snapshot_geo(
+        &self,
+        location: Point<f64, Logical>,
+    ) -> Option<Rectangle<f64, Logical>> {
+        let r = self.resize_animation.as_ref()?;
+        if r.gpu_snapshot.is_some() {
+            return None;
+        }
+        Some(Rectangle::new(location, r.tile_size_from))
+    }
+
+    /// Store the captured pre-resize frame. The replay is placed at the
+    /// animated tile rect each frame (see `render`), so the captured geometry
+    /// itself isn't retained.
+    pub fn set_resize_snapshot(&mut self, snapshot: Arc<SnapshotTexture>) {
+        if let Some(r) = &mut self.resize_animation {
+            r.gpu_snapshot = Some(snapshot);
+        }
     }
 
     pub fn animate_move_from(&mut self, from: Point<f64, Logical>) {
@@ -1121,6 +1157,44 @@ impl<W: LayoutElement> Tile<W> {
         // trait impl).
         self.window
             .render(window_render_loc, scale, win_alpha, ctx, &mut els);
+
+        // Resize crossfade. The live content above is already drawn at the
+        // animated size (inc1: `animated_tile_size`/`animated_window_size`
+        // interpolate, and border/ring/window_loc follow). Here we replay the
+        // captured pre-resize frame on TOP, stretched to the same animated
+        // tile rect, fading 1→0. Because the live content underneath is
+        // opaque, src-over of `snapshot·(1-v)` gives a true crossfade
+        // (`snap·(1-v) + live·v`) with no background bleed — so we fade only
+        // the snapshot, not both layers. niri renders both states into an
+        // offscreen buffer and crossfades; prism replays the snapshot through
+        // the decode pass, the same mechanism as the close animation. The
+        // snapshot is in the intermediate's working space, so it replays as a
+        // pass-through draw (no EOTF, identity primaries, premultiplied).
+        if let Some(resize) = &self.resize_animation {
+            if let Some(snapshot) = &resize.gpu_snapshot {
+                let progress = resize.anim.clamped_value().clamp(0.0, 1.0);
+                let fade = (1.0 - progress) as f32;
+                if fade > 0.0 {
+                    // Draw the old frame at the current animated tile rect, so
+                    // it tracks the live content's size as the animation runs.
+                    let target = Rectangle::new(location, self.animated_tile_size());
+                    // `opaque` empty: a fading snapshot never occludes.
+                    els.push(RenderEl::Surface(SurfaceEl {
+                        id: resize.snapshot_id,
+                        texture_view: snapshot.view(),
+                        chroma_view: None,
+                        yuv: 0,
+                        geometry: target,
+                        content_commit: 0,
+                        opaque: Vec::new(),
+                        src_rect_uv: [0.0, 0.0, 1.0, 1.0],
+                        color: SurfaceColorParams::passthrough(),
+                        alpha_mode: AlphaMode::Premultiplied,
+                        alpha: fade,
+                    }));
+                }
+            }
+        }
 
         // Open animation: zoom + fade the assembled tile about its centre. The
         // animated tile size matches what shadow/backdrop/border were laid out
