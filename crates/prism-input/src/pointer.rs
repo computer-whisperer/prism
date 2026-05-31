@@ -495,6 +495,14 @@ pub fn refresh_pointer_focus(state: &mut PrismState) {
         },
     );
     pointer.frame(state);
+    // Contents settled on a (possibly new) surface — give any pointer constraint
+    // there a chance to activate immediately, instead of waiting for the next
+    // motion event's normal path (which would move the pointer first). Mirrors
+    // niri calling `maybe_activate_pointer_constraint` after every contents
+    // update (niri.rs:877, :1095); prism previously only did so in the live
+    // motion handlers, so a lock that dropped couldn't re-engage until the
+    // pointer moved — by which time it may have left the surface.
+    state.maybe_activate_pointer_constraint();
     prism_protocols::state::update_output_cursors(state);
 }
 

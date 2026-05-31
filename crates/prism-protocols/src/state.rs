@@ -1567,7 +1567,29 @@ impl PointerConstraintsHandler for PrismState {
         // `location` is surface-local; `origin` is the surface origin in global
         // logical space. prism tracks the pointer position itself, so move it
         // directly — the next motion event syncs smithay's internal location.
-        self.pointer_pos = origin + location;
+        let mut target = origin + location;
+        // Clamp into the surface's output, with the half-open correction:
+        // integer output sizes are exclusive on the right/bottom edge. A locked
+        // game (e.g. Proton/Wine) continuously hints the cursor toward the
+        // window border; an unclamped hint at the right/bottom edge lands one
+        // logical pixel *outside* the output, so the next focus refresh finds no
+        // surface there, sends `wl_surface.leave`, and smithay deactivates the
+        // lock — the cursor then escapes onto the neighbouring monitor. Pinning
+        // to `output_loc + size - 1` keeps the hotspot on the locked output (the
+        // cursor image may still overflow the edge), which is what niri does in
+        // its `cursor_position_hint` (handlers/mod.rs: "i32 sizes are exclusive,
+        // but f64 sizes are inclusive").
+        let pp = self.pointer_pos;
+        if let Some(out_id) = self.output_containing((pp.x as i32, pp.y as i32)) {
+            if let Some(out) = self.wl_outputs.get(&out_id) {
+                if let Some((w, h)) = output_logical_size(out) {
+                    let loc = out.current_location();
+                    target.x = target.x.clamp(loc.x as f64, (loc.x + w - 1) as f64);
+                    target.y = target.y.clamp(loc.y as f64, (loc.y + h - 1) as f64);
+                }
+            }
+        }
+        self.pointer_pos = target;
         update_output_cursors(self);
     }
 }
