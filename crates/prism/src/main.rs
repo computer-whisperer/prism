@@ -1726,6 +1726,14 @@ fn run_integrated(
         // since nothing generated a pointer-motion event.
         prism_input::pointer::refresh_pointer_focus(&mut state);
 
+        // Reconcile keyboard focus from layout state every frame. Keyboard
+        // focus is *derived* from the layout's active window (plus layer-shell
+        // overrides), so any path that moved it this cycle — keyboard nav,
+        // window close, click, focus-follows-mouse — takes effect here.
+        // Idempotent: no-ops when the effective surface is unchanged. Mirrors
+        // niri calling `update_keyboard_focus` from `refresh()`.
+        state.update_keyboard_focus();
+
         state
             .display_handle
             .flush_clients()

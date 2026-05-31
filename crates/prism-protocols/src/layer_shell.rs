@@ -136,17 +136,27 @@ impl PrismState {
     ///      (a launcher / lock-style surface grabs the keyboard on map).
     ///   2. A layer surface the user clicked while it was `OnDemand`, as
     ///      long as it is still mapped + still `OnDemand`.
-    ///   3. The layout's focused window ([`Self::layout_focus_surface`]).
+    ///   3. The layout's active window's toplevel surface, read live from
+    ///      [`Layout::focus`] — the single source of truth. Keyboard focus is
+    ///      thus *derived* from layout state, not stored separately: any path
+    ///      that moves the layout's active window (click, focus-follows-mouse,
+    ///      keyboard navigation, window close) is reflected the next time this
+    ///      runs. Mirrors niri's `update_keyboard_focus` (niri.rs:1167).
     ///
     /// `None`-interactivity surfaces (bars, wallpapers) are never candidates,
     /// so they never steal the keyboard — even when clicked. Idempotent:
     /// no-ops (no enter/leave round-trip) when the effective surface is
-    /// unchanged, so it is cheap to call on every focus-affecting event.
+    /// unchanged, so it is cheap to call every frame.
     pub fn update_keyboard_focus(&mut self) {
         let target = self
             .exclusive_layer_focus()
             .or_else(|| self.active_on_demand_layer_focus())
-            .or_else(|| self.layout_focus_surface.clone().filter(IsAlive::alive));
+            .or_else(|| {
+                self.layout
+                    .focus()
+                    .map(|win| win.toplevel().wl_surface().clone())
+                    .filter(IsAlive::alive)
+            });
 
         let same = match (self.keyboard_focus.surface(), &target) {
             (Some(a), Some(b)) => a.id() == b.id(),

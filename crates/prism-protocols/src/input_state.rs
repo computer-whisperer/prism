@@ -19,9 +19,9 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 /// is pointed at right now. It is computed by
 /// [`PrismState::update_keyboard_focus`](crate::state::PrismState::update_keyboard_focus),
 /// which arbitrates between layer-shell surfaces and the layout's focused
-/// window. The layout's *desired* focus is tracked separately in
-/// `PrismState::layout_focus_surface` so it can be restored when a layer
-/// surface releases the keyboard.
+/// window. The layout-window candidate is read live from the layout's active
+/// window (`Layout::focus`), so keyboard focus is derived from layout state
+/// rather than stored separately.
 #[derive(Debug, Clone)]
 pub enum KeyboardFocus {
     /// The layout owns focus. `surface` is the focused window's

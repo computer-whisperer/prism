@@ -148,6 +148,8 @@ pub fn run(channel: Channel<WlcsEvent>) {
             // Re-evaluate pointer focus: a surface may have moved, resized,
             // or restacked under a stationary pointer this cycle.
             prism_input::pointer::refresh_pointer_focus(&mut state);
+            // Reconcile keyboard focus from layout state (derived, per-frame).
+            state.update_keyboard_focus();
             let _ = state.display_handle.flush_clients();
             state.clock.clear();
         }

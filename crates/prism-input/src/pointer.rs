@@ -243,15 +243,12 @@ pub fn on_pointer_button<I: PrismInputBackend>(
             // delivered below; we just skip the focus switch. Popup keyboard
             // focus, when a client wants it, comes from a real popup grab.
             if !state.surface_is_popup(&surface) {
-                // Resolve the surface's output for focus_output.
-                let output_for_focus = state
-                    .layout
-                    .find_window_and_output(&surface)
-                    .and_then(|(_, out)| out.cloned());
-                set_keyboard_focus(state, Some(surface));
-                if let Some(out) = output_for_focus {
-                    state.layout.focus_output(&out);
-                }
+                // Activate (and raise) the clicked window; this also makes its
+                // output the layout's active monitor, so no separate
+                // `focus_output` is needed. `update_keyboard_focus` (run every
+                // frame) then hands it the keyboard. niri's click path is the
+                // same single `activate_window`.
+                focus_surface(state, &surface, true);
             }
         }
 
@@ -564,57 +561,54 @@ fn maybe_focus_follows_mouse(state: &mut PrismState) {
         if state.surface_is_popup(&surface) {
             return;
         }
-        let window = state
-            .layout
-            .find_window_and_output(&surface)
-            .map(|(mapped, _)| mapped.window.clone());
-        if let Some(w) = window {
-            state.layout.activate_window_without_raising(&w);
-        }
-        set_keyboard_focus(state, Some(surface));
+        // Activate-without-raising under the cursor; the per-frame
+        // `update_keyboard_focus` reconcile hands it the keyboard.
+        focus_surface(state, &surface, false);
     }
 }
 
-/// Route a click / focus-follows-mouse hit to the focus arbiter.
+/// Route a click / focus-follows-mouse hit (the surface under the pointer)
+/// to keyboard focus.
 ///
-/// `surface` is whatever lies under the pointer — a window, a layer-shell
-/// surface, or one of their subsurfaces/popups (or `None` for empty space).
-/// We don't set keyboard focus directly; we update the arbiter's inputs and
-/// let [`PrismState::update_keyboard_focus`] decide:
-///   - a layout window (or empty space) becomes the layout's focus and drops
-///     any transient on-demand layer focus;
-///   - an `OnDemand` layer surface is remembered as the on-demand focus;
-///   - an `Exclusive` layer surface already holds focus via the arbiter, and
-///     a `None`-interactivity surface (bar, wallpaper) is left alone — neither
-///     disturbs the layout's focused window.
+/// Keyboard focus for layout windows is *derived* from the layout's active
+/// window by [`PrismState::update_keyboard_focus`], reconciled every frame.
+/// So for a window we don't poke keyboard focus directly — we just make it
+/// the layout's active window and let that reconcile follow. `raise`
+/// distinguishes a click (raise the window above its column-mates) from
+/// focus-follows-mouse (activate without raising), mirroring niri.
 ///
-/// The arbiter handles the enter/leave round-trip (and skips it when the
-/// effective surface is unchanged).
-fn set_keyboard_focus(state: &mut PrismState, surface: Option<WlSurface>) {
+/// Layer-shell surfaces don't live in the layout, so they're handled here:
+///   - an `OnDemand` surface is remembered as the on-demand focus (the
+///     arbiter holds the keyboard there until it unmaps or focus moves on);
+///   - an `Exclusive` surface already holds focus via the arbiter, and a
+///     `None`-interactivity surface (bar, wallpaper) never takes the keyboard
+///     — both are left untouched.
+fn focus_surface(state: &mut PrismState, surface: &WlSurface, raise: bool) {
     use smithay::wayland::shell::wlr_layer::KeyboardInteractivity;
 
-    match surface {
-        Some(surf) => match state.layer_surface_for(&surf) {
-            Some(ls) => {
-                if ls.cached_state().keyboard_interactivity == KeyboardInteractivity::OnDemand {
-                    state.on_demand_layer_focus = Some(ls.wl_surface().clone());
-                }
-                // Exclusive surfaces already hold focus via the arbiter;
-                // None-interactivity surfaces never take the keyboard. Either
-                // way, leave the layout's focused window untouched.
-            }
-            None => {
-                // A layout window (or a child surface of one).
-                state.layout_focus_surface = Some(surf);
-                state.on_demand_layer_focus = None;
-            }
-        },
-        None => {
-            state.layout_focus_surface = None;
-            state.on_demand_layer_focus = None;
+    if let Some(ls) = state.layer_surface_for(surface) {
+        if ls.cached_state().keyboard_interactivity == KeyboardInteractivity::OnDemand {
+            state.on_demand_layer_focus = Some(ls.wl_surface().clone());
+        }
+        // Exclusive / None: the arbiter owns it; leave the layout alone.
+        return;
+    }
+
+    // A layout window (or a child surface of one) — make it the layout's
+    // active window; `update_keyboard_focus` hands it the keyboard on the
+    // next reconcile. Drop any transient on-demand layer focus first.
+    state.on_demand_layer_focus = None;
+    let window = state
+        .layout
+        .find_window_and_output(surface)
+        .map(|(mapped, _)| mapped.window.clone());
+    if let Some(w) = window {
+        if raise {
+            state.layout.activate_window(&w);
+        } else {
+            state.layout.activate_window_without_raising(&w);
         }
     }
-    state.update_keyboard_focus();
 }
 
 // ─── WLCS test-harness entry points ──────────────────────────────
@@ -681,14 +675,7 @@ pub fn wlcs_pointer_button(state: &mut PrismState, button: u32, pressed: bool, t
     };
     if pressed && !pointer.is_grabbed() {
         if let Some((surface, _)) = surface_under_pointer(state) {
-            let output_for_focus = state
-                .layout
-                .find_window_and_output(&surface)
-                .and_then(|(_, out)| out.cloned());
-            set_keyboard_focus(state, Some(surface));
-            if let Some(out) = output_for_focus {
-                state.layout.focus_output(&out);
-            }
+            focus_surface(state, &surface, true);
         }
     }
     pointer.button(
