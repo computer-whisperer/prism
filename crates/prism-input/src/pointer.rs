@@ -520,21 +520,22 @@ pub fn refresh_pointer_focus(state: &mut PrismState) {
 ///   - skip when the pointer is in a grab (drag/resize)
 ///   - update active output when the pointer crosses output boundaries
 ///   - activate the window under the pointer (without raising), gated by
-///     `should_trigger_focus_follows_mouse_on` so an in-progress workspace
-///     switch isn't cancelled; the per-frame `update_keyboard_focus` reconcile
-///     then hands it the keyboard
+///     `should_trigger_focus_follows_mouse_on` (don't cancel an in-progress
+///     workspace switch) and `max_scroll_amount` (don't yank the view to
+///     activate a barely-visible off-screen window); the per-frame
+///     `update_keyboard_focus` reconcile then hands it the keyboard
 ///
 /// Called only from real pointer-motion handlers, never from the contents
 /// refresh — see the note in [`refresh_pointer_focus`].
 ///
-/// `max_scroll_amount` (ignore the focus update while the cursor is
-/// inside a scrolling viewport beyond N% of one screen) is not yet
-/// honored — needs scroll-amount tracking that we don't have.
+/// niri's tab-indicator guard has no analogue here: prism's `contents_under`
+/// only resolves `HitType::Input` hits (pointer_focus.rs), so the tab
+/// indicator — an `Activate`-only hit — never surfaces a window to ffm in the
+/// first place.
 fn maybe_focus_follows_mouse(state: &mut PrismState) {
-    let ffm = state.config.borrow().input.focus_follows_mouse;
-    if ffm.is_none() {
+    let Some(ffm) = state.config.borrow().input.focus_follows_mouse else {
         return;
-    }
+    };
     if let Some(pointer) = state.seat.get_pointer() {
         if pointer.is_grabbed() {
             return;
@@ -580,10 +581,19 @@ fn maybe_focus_follows_mouse(state: &mut PrismState) {
         // `update_keyboard_focus` reconcile then hands it the keyboard.
         if let Some((mapped, _)) = state.layout.find_window_and_output(&surface) {
             let window = mapped.window.clone();
-            if state.layout.should_trigger_focus_follows_mouse_on(&window) {
-                state.on_demand_layer_focus = None;
-                state.layout.activate_window_without_raising(&window);
+            if !state.layout.should_trigger_focus_follows_mouse_on(&window) {
+                return;
             }
+            // Don't let a hover over a sliver of an off-screen window yank the
+            // view: if activating it would scroll the viewport by more than the
+            // configured fraction of a screen, leave focus alone. niri parity.
+            if let Some(threshold) = ffm.max_scroll_amount {
+                if state.layout.scroll_amount_to_activate(&window) > threshold.0 {
+                    return;
+                }
+            }
+            state.on_demand_layer_focus = None;
+            state.layout.activate_window_without_raising(&window);
         }
     }
 }
