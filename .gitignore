@@ -17,6 +17,7 @@ Cargo.lock.bak
 
 # Test-run artifacts from scripts/tty-test.sh
 prism.log
+prism.stderr
 prism.crumbs
 prism-client.log
 tty-test.log
