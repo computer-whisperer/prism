@@ -55,6 +55,7 @@ use smithay::delegate_single_pixel_buffer;
 use smithay::delegate_viewporter;
 use smithay::delegate_xdg_activation;
 use smithay::delegate_xdg_decoration;
+use smithay::delegate_xdg_dialog;
 use smithay::delegate_xdg_shell;
 use smithay::desktop::{
     find_popup_root_surface, get_popup_toplevel_coords, PopupKeyboardGrab, PopupKind, PopupManager,
@@ -99,6 +100,7 @@ use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::{set_data_device_focus, DataDeviceState};
 use smithay::wayland::selection::primary_selection::{set_primary_focus, PrimarySelectionState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
+use smithay::wayland::shell::xdg::dialog::{XdgDialogHandler, XdgDialogState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
@@ -297,6 +299,10 @@ pub struct PrismState {
     /// against the seat's last keyboard/pointer enter serial and
     /// calls [`Layout::activate_window`] on success.
     pub xdg_activation: XdgActivationState,
+    /// `xdg_wm_dialog_v1` (xdg-dialog) state. Carries the per-toplevel
+    /// dialog/modal hint, which we fold into the open-floating decision
+    /// (see [`ResolvedWindowRules::compute_open_floating`]).
+    pub xdg_dialog: XdgDialogState,
     /// `wp_linux_drm_syncobj_v1` state, or `None` when the kernel
     /// lacks `syncobj_eventfd` support (we can't generate
     /// eventfd-backed blockers without it, so we don't advertise
@@ -715,6 +721,7 @@ impl PrismState {
         let single_pixel_buffer = SinglePixelBufferState::new::<PrismState>(&dh);
         let content_type = ContentTypeState::new::<PrismState>(&dh);
         let xdg_activation = XdgActivationState::new::<PrismState>(&dh);
+        let xdg_dialog = XdgDialogState::new::<PrismState>(&dh);
 
         // zwp_relative_pointer_manager_v1 — lets clients (games, 3D/CAD apps,
         // and X11 apps via xwayland-satellite) read unaccelerated relative
@@ -762,6 +769,7 @@ impl PrismState {
             single_pixel_buffer,
             content_type,
             xdg_activation,
+            xdg_dialog,
             drm_syncobj_state: None,
             primary_gpu_id: primary_gpu,
             loop_handle: None,
@@ -2630,6 +2638,13 @@ impl XdgActivationHandler for PrismState {
     }
 }
 delegate_xdg_activation!(PrismState);
+
+// xdg-dialog: we only need the global advertised and the hint tracked (smithay
+// stores it on the toplevel role). The dialog/modal hint is consumed at window
+// open time in `compute_open_floating`, so the `dialog_hint_changed` default
+// no-op is all we need here.
+impl XdgDialogHandler for PrismState {}
+delegate_xdg_dialog!(PrismState);
 
 /// Build the per-output `DmabufFeedback` published to clients whose
 /// surfaces map onto this output.

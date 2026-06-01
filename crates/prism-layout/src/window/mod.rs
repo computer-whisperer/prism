@@ -10,6 +10,7 @@ use prism_ipc::ColumnDisplay;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::utils::{Logical, Size};
 use smithay::wayland::compositor::with_states;
+use smithay::wayland::shell::xdg::dialog::ToplevelDialogHint;
 use smithay::wayland::shell::xdg::{
     SurfaceCachedState, ToplevelSurface, XdgToplevelSurfaceRoleAttributes,
 };
@@ -366,6 +367,13 @@ impl ResolvedWindowRules {
 
         // Windows with a parent (usually dialogs) open as floating by default.
         if toplevel.parent().is_some() {
+            return true;
+        }
+
+        // Windows the client tagged as a dialog or modal via xdg-dialog-v1 open
+        // floating too, even when they don't set a parent.
+        let hint = with_toplevel_role(toplevel, |role| role.dialog_hint);
+        if matches!(hint, ToplevelDialogHint::Dialog | ToplevelDialogHint::Modal) {
             return true;
         }
 
