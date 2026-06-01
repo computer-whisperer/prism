@@ -10,9 +10,12 @@
 //!   output and region capture (region cropped on the CPU copy). Blocks briefly
 //!   on `queue_wait_idle`.
 //! - **dmabuf (asynchronous, zero-copy)** — on `copy` with a `linux_dmabuf`
-//!   buffer, import it as a `COLOR_ATTACHMENT` and render the capture straight
-//!   into it; `ready` fires from a calloop sync_fd source once the GPU finishes
-//!   (no stall). Whole-output only. This is the path recording clients want.
+//!   buffer, import it as a `COLOR_ATTACHMENT` and **queue** the capture; the
+//!   render loop renders into it right after the output's frame
+//!   (`submit_pending_screencopy`), then `ready` fires from a calloop sync_fd
+//!   source once the GPU finishes (no stall). `copy_with_damage` rides the next
+//!   damage-driven frame (so it's throttled to actual changes); immediate `copy`
+//!   forces a frame. Whole-output only. This is the path recording clients want.
 //!
 //! We advertise `Xrgb8888` for both, and use `B8G8R8A8_UNORM` (memory
 //! `B,G,R,A`) so the bytes match an `Xrgb8888` buffer with no swizzle. dmabuf is
@@ -278,6 +281,20 @@ impl Dispatch<ZwlrScreencopyFrameV1, ScreencopyFrameData> for PrismState {
             );
         }
     }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: smithay::reexports::wayland_server::backend::ClientId,
+        frame: &ZwlrScreencopyFrameV1,
+        _data: &ScreencopyFrameData,
+    ) {
+        // Drop any *queued* (not-yet-submitted) dmabuf capture for this frame so
+        // an abandoned `copy_with_damage` (e.g. recording stopped while waiting
+        // for damage) doesn't leak its imported buffer. In-flight captures are
+        // left alone — their GPU work is outstanding; they self-clean when the
+        // sync_fd fires (`ready` on a dead frame is a harmless no-op).
+        state.screencopy_pending.retain(|p| p.frame != *frame);
+    }
 }
 
 impl PrismState {
@@ -386,12 +403,16 @@ impl PrismState {
         frame.ready(sec_hi, sec_lo, nsec);
     }
 
-    /// Fulfill a screencopy `copy` into a client **dmabuf**: import it as a
-    /// render target, render the capture encode straight into it (zero-copy),
-    /// and fire `ready` asynchronously once the GPU's sync_fd signals — no
-    /// `queue_wait_idle` stall. Only whole-output captures reach here (region
-    /// captures don't advertise dmabuf). `region` is `(x, y, w, h)`; for a
-    /// whole-output capture `x==y==0` and `w×h` is the full output.
+    /// Accept a screencopy `copy` into a client **dmabuf**: validate + import it
+    /// as a render target now, but **queue** it rather than rendering here. The
+    /// render loop drains the queue right after the output's next `present()`
+    /// ([`Self::submit_pending_screencopy`]), so the capture's GPU submit is
+    /// sequenced after that frame's encode on the shared queue — the proper fix
+    /// for the dmabuf ordering caveat. Whole-output only. `region` is
+    /// `(x, y, w, h)` (for whole-output `x==y==0`).
+    ///
+    /// An immediate `copy` forces the output to render (even if idle);
+    /// `copy_with_damage` waits for the next damage-driven frame.
     fn service_screencopy_dmabuf(
         &mut self,
         frame: &ZwlrScreencopyFrameV1,
@@ -416,9 +437,10 @@ impl PrismState {
             return;
         }
 
-        // Import + render. The owned `ImportedImage` must outlive the GPU work
-        // (it's moved into the completion source below).
-        let (imported, sync_fd) = {
+        // Import the client dmabuf as a COLOR_ATTACHMENT render target (cheap;
+        // same call the scanout uses). The actual render is deferred to the
+        // render loop.
+        let imported = {
             let Some(ctx) = self.outputs.get_mut(output_id) else {
                 trace!("screencopy: output {output_id} gone before dmabuf copy");
                 frame.failed();
@@ -433,9 +455,7 @@ impl PrismState {
                     return;
                 }
             };
-            // Import with the capture format (B8G8R8A8 = Xrgb8888 memory order)
-            // as a COLOR_ATTACHMENT so we can render into it.
-            let imported = match ImportedImage::import(
+            match ImportedImage::import(
                 device,
                 &prism_dmabuf,
                 CAPTURE_VK_FORMAT,
@@ -447,56 +467,130 @@ impl PrismState {
                     frame.failed();
                     return;
                 }
-            };
-            let white = ctx.effective_sdr_reference_nits();
-            match ctx.renderer.capture_into_dmabuf(&imported, white) {
-                Ok(fd) => (imported, fd),
-                Err(e) => {
-                    trace!("screencopy: capture_into_dmabuf failed: {e}");
-                    frame.failed();
-                    return;
-                }
             }
         };
 
-        // Park the in-flight capture on PrismState (NOT in the calloop closure):
-        // the GPU is still writing `imported`, so it must outlive the wait, and
-        // keeping it in state (not the closure) means an `insert_source` failure
-        // can't drop it out from under the GPU. The completion callback gets
-        // `&mut PrismState` and finishes it by id.
-        let id = next_capture_id();
-        self.screencopy_inflight.push(ScreencopyInflight {
-            id,
+        self.screencopy_pending.push(PendingScreencopyDmabuf {
+            output_id: output_id.clone(),
             imported,
             frame: frame.clone(),
             with_damage,
             region_wh: (rw as u32, rh as u32),
         });
 
-        let Some(loop_handle) = self.loop_handle.clone() else {
-            // No event loop (unreachable post-init): block on the fd, then
-            // complete inline so we never free the import while the GPU writes.
-            block_on_sync_fd(&sync_fd);
-            self.complete_screencopy_dmabuf(id);
-            return;
-        };
+        // Ensure the capture gets serviced. An immediate `copy` forces a present
+        // even on an idle output; `copy_with_damage` rides the next frame that
+        // damage produces (so a static screen yields no new frames, as intended).
+        if !with_damage {
+            if let Some(ctx) = self.outputs.get_mut(output_id) {
+                ctx.force_next_present();
+            }
+            self.output_redraw
+                .entry(output_id.clone())
+                .or_default()
+                .queue_redraw();
+        }
+    }
 
-        let source = Generic::new(sync_fd, Interest::READ, Mode::OneShot);
-        let res = loop_handle.insert_source(source, move |_, _, state: &mut PrismState| {
-            state.complete_screencopy_dmabuf(id);
-            Ok(PostAction::Remove)
-        });
-        if res.is_err() {
-            // Practically unreachable (epoll registration failure). Pull the
-            // entry back and leak its import rather than free it while the GPU
-            // may still be writing — a one-off leak is safer than a UAF.
-            trace!("screencopy: failed to register dmabuf completion source");
-            if let Some(pos) = self.screencopy_inflight.iter().position(|c| c.id == id) {
-                let ScreencopyInflight {
-                    imported, frame, ..
-                } = self.screencopy_inflight.remove(pos);
-                std::mem::forget(imported);
-                frame.failed();
+    /// Fail and drop any *queued* dmabuf captures for `output_id` — for when the
+    /// output can't render them (e.g. it's powered off, so the render loop skips
+    /// it). The imports were never GPU-submitted, so dropping them is safe; the
+    /// client gets `failed` instead of hanging. In-flight captures are untouched
+    /// (their GPU work self-cleans via the sync_fd).
+    pub fn fail_pending_screencopy(&mut self, output_id: &str) {
+        if self.screencopy_pending.is_empty() {
+            return;
+        }
+        let (mine, rest): (Vec<_>, Vec<_>) = self
+            .screencopy_pending
+            .drain(..)
+            .partition(|p| p.output_id == output_id);
+        self.screencopy_pending = rest;
+        for p in mine {
+            p.frame.failed();
+        }
+    }
+
+    /// Render and submit any queued dmabuf screencopy captures for `output_id`.
+    /// Called from the render loop **immediately after** the output's frame is
+    /// presented, so each capture's GPU submit is ordered after that frame's
+    /// encode (and before the next frame's decode overwrites the intermediate)
+    /// on the shared graphics queue. Each then completes asynchronously when its
+    /// sync_fd signals — see [`Self::complete_screencopy_dmabuf`].
+    pub fn submit_pending_screencopy(&mut self, output_id: &str) {
+        if self.screencopy_pending.is_empty() {
+            return;
+        }
+        // Take this output's queued captures; leave the rest queued.
+        let (mine, rest): (Vec<_>, Vec<_>) = self
+            .screencopy_pending
+            .drain(..)
+            .partition(|p| p.output_id == output_id);
+        self.screencopy_pending = rest;
+
+        for p in mine {
+            let PendingScreencopyDmabuf {
+                imported,
+                frame,
+                with_damage,
+                region_wh,
+                ..
+            } = p;
+
+            let sync_fd = {
+                let Some(ctx) = self.outputs.get_mut(output_id) else {
+                    frame.failed();
+                    continue;
+                };
+                let white = ctx.effective_sdr_reference_nits();
+                match ctx.renderer.capture_into_dmabuf(&imported, white) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        trace!("screencopy: capture_into_dmabuf failed: {e}");
+                        frame.failed();
+                        continue;
+                    }
+                }
+            };
+
+            // Park the in-flight capture on PrismState (NOT the calloop closure):
+            // the GPU is still writing `imported`, so it must outlive the wait,
+            // and keeping it in state means an `insert_source` failure can't drop
+            // it out from under the GPU.
+            let id = next_capture_id();
+            self.screencopy_inflight.push(ScreencopyInflight {
+                id,
+                imported,
+                frame,
+                with_damage,
+                region_wh,
+            });
+
+            let Some(loop_handle) = self.loop_handle.clone() else {
+                // No event loop (unreachable post-init): block on the fd, then
+                // complete inline so we never free the import mid-write.
+                block_on_sync_fd(&sync_fd);
+                self.complete_screencopy_dmabuf(id);
+                continue;
+            };
+
+            let source = Generic::new(sync_fd, Interest::READ, Mode::OneShot);
+            let res = loop_handle.insert_source(source, move |_, _, state: &mut PrismState| {
+                state.complete_screencopy_dmabuf(id);
+                Ok(PostAction::Remove)
+            });
+            if res.is_err() {
+                // Practically unreachable (epoll registration failure). Pull the
+                // entry back and leak its import rather than free it while the GPU
+                // may still be writing — a one-off leak is safer than a UAF.
+                trace!("screencopy: failed to register dmabuf completion source");
+                if let Some(pos) = self.screencopy_inflight.iter().position(|c| c.id == id) {
+                    let ScreencopyInflight {
+                        imported, frame, ..
+                    } = self.screencopy_inflight.remove(pos);
+                    std::mem::forget(imported);
+                    frame.failed();
+                }
             }
         }
     }
@@ -519,6 +613,18 @@ impl PrismState {
         c.frame.ready(sec_hi, sec_lo, nsec);
         // c.imported drops here — the GPU finished (its sync_fd signalled).
     }
+}
+
+/// A queued dmabuf screencopy awaiting its output's next frame. The client
+/// buffer is already imported as a render target; the render loop renders into
+/// it (via [`PrismState::submit_pending_screencopy`]) right after the frame, so
+/// the capture is ordered correctly on the GPU queue.
+pub struct PendingScreencopyDmabuf {
+    output_id: OutputId,
+    imported: ImportedImage,
+    frame: ZwlrScreencopyFrameV1,
+    with_damage: bool,
+    region_wh: (u32, u32),
 }
 
 /// An in-flight dmabuf screencopy: the GPU is rendering into `imported`; once

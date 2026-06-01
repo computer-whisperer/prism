@@ -273,21 +273,20 @@ impl CaptureEncoder {
     /// Captures whole-output only (`dst` extent must equal the intermediate);
     /// region/scaled capture is the SHM path's job for now.
     ///
-    /// **Ordering caveat.** This submits a *separate* command buffer that samples
-    /// the persistent intermediate without an explicit execution dependency on
-    /// the per-frame render submits (which also write/read the intermediate on
-    /// the same graphics queue). Safety today rests on two unenforced invariants:
-    /// (1) capture and `render_frame` are submitted from the *same thread* (the
-    /// calloop loop), so no frame is recorded concurrently; and (2) the single
-    /// graphics queue executes submissions in order (true on radv), so this
-    /// capture finishes sampling before the *next* frame's decode overwrites the
-    /// intermediate. If either breaks (a second queue; a driver that overlaps
-    /// same-queue submits), the worst case is a torn captured frame — not a
-    /// crash, since the intermediate is never freed. The robust fix is to record
-    /// the capture inside the frame's own submission (render-loop integration);
-    /// until then this is the documented trade-off. The in-cb `MemoryBarrier2`
-    /// below only orders *within this submission* (it makes prior writes visible
-    /// to our sample); it is not a cross-submit barrier.
+    /// **Ordering requirement.** This submits a *separate* command buffer that
+    /// samples the persistent intermediate; the in-cb `MemoryBarrier2` below only
+    /// orders work *within this submission* (it makes prior writes visible to our
+    /// sample), not against the per-frame render submits that also touch the
+    /// intermediate. Correct ordering therefore depends on **the caller invoking
+    /// this right after the output's `present()`**, from the same (calloop)
+    /// thread: the capture submit then lands between frame N and frame N+1 in
+    /// submission order, and the single graphics queue's in-order execution (as
+    /// the renderer already relies on for the intermediate across frames) means
+    /// the capture samples the completed frame N and finishes before frame N+1's
+    /// decode overwrites it. The screencopy path does this via
+    /// `submit_pending_screencopy`. Called out of that sequence (e.g. mid-frame
+    /// from an arbitrary event), the worst case is a torn captured frame — not a
+    /// crash, since the intermediate is never freed.
     pub fn capture_into_dmabuf(
         &mut self,
         intermediate_view: vk::ImageView,

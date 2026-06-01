@@ -2067,6 +2067,9 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
             .entry(output_id.to_owned())
             .or_default()
             .redraw = RedrawState::Idle;
+        // A powered-off output never renders, so any queued dmabuf capture for it
+        // would hang the client — fail them now instead.
+        state.fail_pending_screencopy(output_id);
         return;
     }
     match render_output_now(state, output_id) {
@@ -2647,6 +2650,13 @@ fn render_output_now(
         // for a real one. No harvest (no scanout, so no presentation feedback).
         prism_drm::PresentOutcome::SkippedNoDamage => return Ok(RenderOutcome::SkippedNoDamage),
     };
+
+    // Service queued dmabuf screencopy captures for this output now — right
+    // after the frame's render submit, so each capture's GPU work is sequenced
+    // after this frame's encode (and before the next frame's decode rewrites the
+    // intermediate) on the shared queue. `copy_with_damage` captures naturally
+    // ride this damage-driven frame; immediate ones forced it.
+    state.submit_pending_screencopy(output_id);
 
     // Extract pending `wp_presentation_feedback` from every surface mapped to
     // this output so we can fire it at the next vblank with the kernel-reported

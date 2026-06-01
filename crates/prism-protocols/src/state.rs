@@ -348,6 +348,10 @@ pub struct PrismState {
         OutputId,
         smithay::reexports::wayland_protocols_wlr::output_power_management::v1::server::zwlr_output_power_v1::ZwlrOutputPowerV1,
     )>,
+    /// Queued dmabuf screencopy captures awaiting their output's next frame.
+    /// Drained by [`PrismState::submit_pending_screencopy`] from the render loop
+    /// right after `present()`. See [`crate::screencopy`].
+    pub screencopy_pending: Vec<crate::screencopy::PendingScreencopyDmabuf>,
     /// In-flight async (dmabuf) screencopy captures: the GPU is rendering into
     /// each entry's imported buffer; a calloop sync_fd source fires `ready` and
     /// drops the import once done. See [`crate::screencopy`].
@@ -778,6 +782,7 @@ impl PrismState {
             idle_inhibit_manager,
             idle_inhibitors: std::collections::HashSet::new(),
             output_power_objects: Vec::new(),
+            screencopy_pending: Vec::new(),
             screencopy_inflight: Vec::new(),
             pointer_visibility: PointerVisibility::default(),
             pointer_inactivity_timer: None,

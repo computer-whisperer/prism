@@ -1,17 +1,20 @@
 # Screen capture: screenshots and screen recording
 
-> **Status.** Phases 1–3a landed (`wlr-screencopy` works with `grim`,
-> HW-verified). Done: the sRGB capture primitive (renderer); `wlr-screencopy`
-> SHM (synchronous, whole-output + region) **and** dmabuf (async, zero-copy,
-> whole-output) paths. The dmabuf path is build-clean but **runtime-unverified**
-> (needs a dmabuf screencopy client, e.g. `wf-recorder` / the wlr portal). Next:
-> render-loop integration (the damage queue + the proper fix for the dmabuf
-> ordering caveat), then **in-process** PipeWire + `org.gnome.Mutter.ScreenCast`
-> D-Bus, then `ext-image-copy-capture-v1`. Target end-state (agreed): both
-> capture protocols, niri-style in-process recording, color-correct HDR capture
-> via the sRGB encode pass. niri is the reference for the protocol/PipeWire/D-Bus
-> glue; the renderer coupling is prism-specific (custom Vulkan pipeline, not
-> smithay's `GlesRenderer`).
+> **Status.** `wlr-screencopy` complete (`grim` HW-verified). Done: the sRGB
+> capture primitive (renderer); SHM (synchronous, whole-output + region) and
+> dmabuf (async, zero-copy, whole-output) paths; and **render-loop integration**
+> — dmabuf captures are queued and serviced from the render loop right after the
+> output's `present()`, which (a) fixes the dmabuf GPU-ordering caveat by
+> sequencing the capture submit between frames on the shared queue, and (b)
+> throttles `copy_with_damage` to actual damage. The dmabuf path is build-clean
+> but **runtime-unverified** (needs a dmabuf screencopy client, e.g.
+> `wf-recorder` / the wlr portal). Next: **in-process** PipeWire +
+> `org.gnome.Mutter.ScreenCast` D-Bus (reusing `capture_into_dmabuf`), then
+> `ext-image-copy-capture-v1`. Target end-state (agreed): both capture protocols,
+> niri-style in-process recording, color-correct HDR capture via the sRGB encode
+> pass. niri is the reference for the protocol/PipeWire/D-Bus glue; the renderer
+> coupling is prism-specific (custom Vulkan pipeline, not smithay's
+> `GlesRenderer`).
 
 How prism lets external clients capture output contents — `grim`-style
 screenshots and OBS/portal-style screen recording — and how that couples to
