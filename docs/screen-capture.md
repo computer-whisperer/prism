@@ -1,20 +1,22 @@
 # Screen capture: screenshots and screen recording
 
 > **Status.** `wlr-screencopy` complete (`grim` HW-verified). Done: the sRGB
-> capture primitive (renderer); SHM (synchronous, whole-output + region) and
-> dmabuf (async, zero-copy, whole-output) paths; and **render-loop integration**
-> — dmabuf captures are queued and serviced from the render loop right after the
-> output's `present()`, which (a) fixes the dmabuf GPU-ordering caveat by
-> sequencing the capture submit between frames on the shared queue, and (b)
-> throttles `copy_with_damage` to actual damage. The dmabuf path is build-clean
-> but **runtime-unverified** (needs a dmabuf screencopy client, e.g.
-> `wf-recorder` / the wlr portal). Next: **in-process** PipeWire +
-> `org.gnome.Mutter.ScreenCast` D-Bus (reusing `capture_into_dmabuf`), then
-> `ext-image-copy-capture-v1`. Target end-state (agreed): both capture protocols,
-> niri-style in-process recording, color-correct HDR capture via the sRGB encode
-> pass. niri is the reference for the protocol/PipeWire/D-Bus glue; the renderer
-> coupling is prism-specific (custom Vulkan pipeline, not smithay's
-> `GlesRenderer`).
+> capture primitive (renderer); **both** the dmabuf (zero-copy, whole-output) and
+> SHM (whole-output + region) paths, **both asynchronous and serviced from the
+> render loop** right after the output's `present()`. That (a) fixes the dmabuf
+> GPU-ordering caveat by sequencing the capture submit between frames on the
+> shared queue, (b) throttles `copy_with_damage` to actual damage, and (c) removes
+> the explicit main-thread `queue_wait_idle` the SHM path used to do per frame.
+> **Recording is still laggy, though** — that drain was not the dominant cost. The
+> remaining per-frame main-thread cost is diagnosed but **not yet fixed**; see
+> [Recording perf](#recording-perf-still-laggy--diagnosed-not-fixed) below. The
+> dmabuf path and the async-SHM rework are otherwise **runtime-unverified** since
+> the rework. Next: **in-process** PipeWire + `org.gnome.Mutter.ScreenCast` D-Bus
+> (reusing `capture_into_dmabuf`), then `ext-image-copy-capture-v1`. Target
+> end-state (agreed): both capture protocols, niri-style in-process recording,
+> color-correct HDR capture via the sRGB encode pass. niri is the reference for
+> the protocol/PipeWire/D-Bus glue; the renderer coupling is prism-specific
+> (custom Vulkan pipeline, not smithay's `GlesRenderer`).
 
 How prism lets external clients capture output contents — `grim`-style
 screenshots and OBS/portal-style screen recording — and how that couples to
@@ -139,6 +141,39 @@ crude SDR rendition of HDR content — highlights blow out rather than roll off.
 It is correct-*looking* (neutral, viewer-safe) and is the right phase-1 cut; a
 later refinement is a proper tone curve + hue-preserving gamut roll-off (the same
 problem the panel LUT solves downstream, applied here for the sRGB target).
+
+### Recording perf (still laggy) — diagnosed, not fixed
+
+**TODO (deferred).** Continuous recording (`wf-recorder`) still makes the system
+laggy even after both paths were made async. The async rework removed the
+explicit `queue_wait_idle`, but that was not the dominant cost. The residual
+per-frame work lands on the compositor's **main (calloop) thread**, which is also
+the input thread — hence system-wide lag. Diagnosed by code-reasoning (not
+measured; per the project's perf approach), three costs:
+
+1. **Per-frame `vkAllocateMemory`.** `HostReadback::new` allocates a fresh ~33 MB
+   (4K) host-coherent buffer every SHM capture, on the main thread
+   (`submit_one_capture`). Large per-frame host allocations stall on many drivers.
+   *Fix:* pool the readback buffers (reuse across captures; the `AsyncSlot` fence
+   already serializes them).
+2. **Single shared `AsyncSlot` → main-thread fence wait.** `slot.begin()` waits on
+   the *previous* capture's completion fence. With one slot, capture N+1's
+   recording blocks the main thread on capture N's GPU work. At 4K we now run
+   **two** full-res encode passes per frame (panel realization for scanout **+**
+   the sRGB capture pass) plus the readback; when that exceeds the frame budget
+   this wait stalls input, self-reinforcingly. *Fix:* round-robin N async slots so
+   `begin()` rarely waits.
+3. **Per-frame ~33 MB CPU `memcpy`** (`copy_readback_to_shm`, in
+   `complete_screencopy`, also main thread). SHM-only. *Fix:* import the client
+   `wl_shm` pool via `VK_EXT_external_memory_host` and have the GPU write it
+   directly (zero-copy), or offload the copy to a worker thread.
+
+The **dmabuf** path avoids #1 and #3 (zero-copy); only #2 applies to it, so the
+cheapest win — and the confirming experiment — is multiple async slots + a
+whole-output dmabuf recording test. Which path `wf-recorder` actually took
+(SHM vs dmabuf) was not determinable from its log; an instrumented run (capture
+path + per-frame main-thread timing) would pin the dominant cost before investing
+in the SHM-specific fixes (#1/#3).
 
 ### Destination-agnostic by design
 

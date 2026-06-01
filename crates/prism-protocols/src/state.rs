@@ -348,13 +348,13 @@ pub struct PrismState {
         OutputId,
         smithay::reexports::wayland_protocols_wlr::output_power_management::v1::server::zwlr_output_power_v1::ZwlrOutputPowerV1,
     )>,
-    /// Queued dmabuf screencopy captures awaiting their output's next frame.
-    /// Drained by [`PrismState::submit_pending_screencopy`] from the render loop
-    /// right after `present()`. See [`crate::screencopy`].
-    pub screencopy_pending: Vec<crate::screencopy::PendingScreencopyDmabuf>,
-    /// In-flight async (dmabuf) screencopy captures: the GPU is rendering into
-    /// each entry's imported buffer; a calloop sync_fd source fires `ready` and
-    /// drops the import once done. See [`crate::screencopy`].
+    /// Queued screencopy captures (dmabuf or SHM) awaiting their output's next
+    /// frame. Drained by [`PrismState::submit_pending_screencopy`] from the
+    /// render loop right after `present()`. See [`crate::screencopy`].
+    pub screencopy_pending: Vec<crate::screencopy::PendingScreencopy>,
+    /// In-flight async screencopy captures: the GPU is rendering into each
+    /// entry's target; a calloop sync_fd source fires `ready` (memcpying first
+    /// for SHM) and drops the target once done. See [`crate::screencopy`].
     pub screencopy_inflight: Vec<crate::screencopy::ScreencopyInflight>,
     /// Per-output smithay `Output`, keyed by the same `OutputId`
     /// (connector name) as `outputs`. Populated by [`advertise_output`];

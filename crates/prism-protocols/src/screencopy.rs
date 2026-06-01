@@ -2,24 +2,25 @@
 //! `xdg-desktop-portal-wlr`, etc.
 //!
 //! Hand-rolled (smithay ships no screencopy). See `docs/screen-capture.md`.
-//! Two buffer paths, both rendering the sRGB capture encode of the output's
-//! persistent intermediate (`Renderer`):
+//! Both buffer paths are **queued and serviced from the render loop**
+//! (`submit_pending_screencopy`, right after the output's `present()`), so the
+//! capture's GPU submit is correctly ordered after the frame, and **neither
+//! stalls the main thread** — the key to non-laggy recording. An immediate
+//! `copy` forces a frame even on an idle output; `copy_with_damage` rides the
+//! next damage-driven frame (throttled to actual changes). Both render the sRGB
+//! capture encode of the output's persistent intermediate (`Renderer`):
 //!
-//! - **SHM (synchronous)** — on `copy`, capture into an offscreen, read it back,
-//!   and memcpy into the client `wl_shm` buffer, then `ready`. Supports whole-
-//!   output and region capture (region cropped on the CPU copy). Blocks briefly
-//!   on `queue_wait_idle`.
-//! - **dmabuf (asynchronous, zero-copy)** — on `copy` with a `linux_dmabuf`
-//!   buffer, import it as a `COLOR_ATTACHMENT` and **queue** the capture; the
-//!   render loop renders into it right after the output's frame
-//!   (`submit_pending_screencopy`), then `ready` fires from a calloop sync_fd
-//!   source once the GPU finishes (no stall). `copy_with_damage` rides the next
-//!   damage-driven frame (so it's throttled to actual changes); immediate `copy`
-//!   forces a frame. Whole-output only. This is the path recording clients want.
+//! - **dmabuf (zero-copy)** — `copy` with a `linux_dmabuf` buffer: import it as a
+//!   `COLOR_ATTACHMENT` and render straight into it. Whole-output only. The path
+//!   recording clients prefer.
+//! - **SHM** — `copy` with a `wl_shm` buffer: render into an offscreen + an owned
+//!   host readback (async), and on completion memcpy into the client buffer.
+//!   Whole-output and region (region cropped on the copy).
 //!
-//! We advertise `Xrgb8888` for both, and use `B8G8R8A8_UNORM` (memory
-//! `B,G,R,A`) so the bytes match an `Xrgb8888` buffer with no swizzle. dmabuf is
-//! advertised only for whole-output captures (the encode renders a full frame).
+//! Either way, `ready` fires from a calloop sync_fd source once the GPU finishes
+//! (the SHM completion memcpys first). We advertise `Xrgb8888` for both and
+//! capture into `B8G8R8A8_UNORM` (memory `B,G,R,A`) so the bytes match with no
+//! swizzle; dmabuf is advertised only for whole-output captures.
 //!
 //! Style mirrors [`crate::output_power`]: `GlobalDispatch` / `Dispatch` are
 //! implemented directly on [`PrismState`], so there's no handler trait and no
@@ -31,7 +32,7 @@ use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use prism_renderer::{vk, ImportedImage};
+use prism_renderer::{vk, HostReadback, ImportedImage};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Fourcc};
 use smithay::output::Output;
@@ -47,7 +48,7 @@ use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
 use smithay::wayland::dmabuf::get_dmabuf;
-use smithay::wayland::shm::with_buffer_contents_mut;
+use smithay::wayland::shm::{with_buffer_contents, with_buffer_contents_mut};
 use tracing::trace;
 
 use crate::state::{OutputId, PrismState};
@@ -298,9 +299,12 @@ impl Dispatch<ZwlrScreencopyFrameV1, ScreencopyFrameData> for PrismState {
 }
 
 impl PrismState {
-    /// Synchronously fulfill a screencopy `copy` into a `wl_shm` buffer: capture
-    /// the output now, validate + fill the client buffer, send `ready` (or
-    /// `failed`). `region` is `(x, y, w, h)` in physical px within the output.
+    /// Accept a screencopy `copy` into a `wl_shm` buffer: validate it and
+    /// **queue** the capture (like the dmabuf path). The render loop captures it
+    /// asynchronously right after the output's frame and the completion memcpys
+    /// the result in — no main-thread `queue_wait_idle` stall (that stall, hit
+    /// per frame, is what made screen recording lag). `region` is `(x, y, w, h)`
+    /// in physical px; a region capture is a sub-rect cropped on the copy.
     fn service_screencopy_shm(
         &mut self,
         frame: &ZwlrScreencopyFrameV1,
@@ -309,98 +313,62 @@ impl PrismState {
         buffer: &WlBuffer,
         with_damage: bool,
     ) {
-        let (rx, ry, rw, rh) = region;
-
-        // Capture the full output (the renderer always captures the whole
-        // intermediate); we crop to the region during the copy below. The
-        // owned CaptureImage drops the `outputs` borrow before we touch the
-        // client buffer.
-        let capture = {
-            let Some(ctx) = self.outputs.get_mut(output_id) else {
-                trace!("screencopy: output {output_id} gone before copy");
-                frame.failed();
-                return;
-            };
-            let white = ctx.effective_sdr_reference_nits();
-            match ctx.renderer.capture(CAPTURE_VK_FORMAT, white) {
-                Ok(c) => c,
-                Err(e) => {
-                    trace!("screencopy: capture failed: {e}");
-                    frame.failed();
-                    return;
-                }
-            }
-        };
-
-        let cap_w = capture.width as i32;
-        let cap_h = capture.height as i32;
-        // The region must lie within the captured output (it was clamped at
-        // request time, but the mode could have changed since).
-        if rx < 0 || ry < 0 || rx + rw > cap_w || ry + rh > cap_h {
-            trace!("screencopy: region no longer fits output");
-            frame.failed();
+        let (_rx, _ry, rw, rh) = region;
+        // Validate the SHM buffer up front (read-only) so a bad one fails now,
+        // before we queue anything.
+        let valid = with_buffer_contents(buffer, |_ptr, len, bdata| {
+            bdata.format == wl_shm::Format::Xrgb8888
+                && bdata.width == rw
+                && bdata.height == rh
+                && bdata.stride >= rw * 4
+                && len >= (bdata.offset as usize) + (bdata.stride as usize) * (rh as usize)
+        })
+        .unwrap_or(false);
+        if !valid {
+            frame.post_error(
+                zwlr_screencopy_frame_v1::Error::InvalidBuffer,
+                "buffer does not match the advertised format/size",
+            );
             return;
         }
 
-        let src_stride = (capture.width * 4) as usize;
-        let row_bytes = (rw * 4) as usize;
-        let region_off = (ry as usize * src_stride) + rx as usize * 4;
+        self.enqueue_screencopy(
+            output_id,
+            frame,
+            with_damage,
+            PendingKind::Shm {
+                buffer: buffer.clone(),
+                region,
+            },
+        );
+    }
 
-        // Copy region rows into the client buffer. The closure returns
-        // `Err(())` on a buffer that doesn't match what we advertised.
-        let copy_result = with_buffer_contents_mut(buffer, |ptr, len, bdata| {
-            if bdata.format != wl_shm::Format::Xrgb8888
-                || bdata.width != rw
-                || bdata.height != rh
-                || bdata.stride < rw * 4
-            {
-                return Err(());
-            }
-            let dst_stride = bdata.stride as usize;
-            let dst_off = bdata.offset as usize;
-            for row in 0..rh as usize {
-                let src_start = region_off + row * src_stride;
-                let dst_start = dst_off + row * dst_stride;
-                if src_start + row_bytes > capture.pixels.len() || dst_start + row_bytes > len {
-                    return Err(());
-                }
-                // SAFETY: bounds checked just above; src and dst are distinct
-                // allocations (owned Vec vs. the mapped shm pool).
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        capture.pixels.as_ptr().add(src_start),
-                        ptr.add(dst_start),
-                        row_bytes,
-                    );
-                }
-            }
-            Ok(())
+    /// Queue a capture and ensure the output renders so the render loop services
+    /// it. An immediate `copy` forces a present even on an idle output;
+    /// `copy_with_damage` rides the next frame damage produces (so a static
+    /// screen yields no new frames, as intended).
+    fn enqueue_screencopy(
+        &mut self,
+        output_id: &OutputId,
+        frame: &ZwlrScreencopyFrameV1,
+        with_damage: bool,
+        kind: PendingKind,
+    ) {
+        self.screencopy_pending.push(PendingScreencopy {
+            output_id: output_id.clone(),
+            frame: frame.clone(),
+            with_damage,
+            kind,
         });
-
-        match copy_result {
-            Ok(Ok(())) => {}
-            Ok(Err(())) => {
-                frame.post_error(
-                    zwlr_screencopy_frame_v1::Error::InvalidBuffer,
-                    "buffer does not match the advertised format/size",
-                );
-                return;
+        if !with_damage {
+            if let Some(ctx) = self.outputs.get_mut(output_id) {
+                ctx.force_next_present();
             }
-            Err(e) => {
-                trace!("screencopy: shm access error: {e:?}");
-                frame.failed();
-                return;
-            }
+            self.output_redraw
+                .entry(output_id.clone())
+                .or_default()
+                .queue_redraw();
         }
-
-        // Our capture is top-down with the same orientation as scanout, so no
-        // Y-invert. For v3 with_damage clients, report the whole region damaged.
-        frame.flags(Flags::empty());
-        if with_damage && frame.version() >= 3 {
-            frame.damage(0, 0, rw as u32, rh as u32);
-        }
-        let (sec_hi, sec_lo, nsec) = monotonic_timestamp();
-        frame.ready(sec_hi, sec_lo, nsec);
     }
 
     /// Accept a screencopy `copy` into a client **dmabuf**: validate + import it
@@ -470,26 +438,15 @@ impl PrismState {
             }
         };
 
-        self.screencopy_pending.push(PendingScreencopyDmabuf {
-            output_id: output_id.clone(),
-            imported,
-            frame: frame.clone(),
+        self.enqueue_screencopy(
+            output_id,
+            frame,
             with_damage,
-            region_wh: (rw as u32, rh as u32),
-        });
-
-        // Ensure the capture gets serviced. An immediate `copy` forces a present
-        // even on an idle output; `copy_with_damage` rides the next frame that
-        // damage produces (so a static screen yields no new frames, as intended).
-        if !with_damage {
-            if let Some(ctx) = self.outputs.get_mut(output_id) {
-                ctx.force_next_present();
-            }
-            self.output_redraw
-                .entry(output_id.clone())
-                .or_default()
-                .queue_redraw();
-        }
+            PendingKind::Dmabuf {
+                imported,
+                region_wh: (rw as u32, rh as u32),
+            },
+        );
     }
 
     /// Fail and drop any *queued* dmabuf captures for `output_id` — for when the
@@ -511,12 +468,12 @@ impl PrismState {
         }
     }
 
-    /// Render and submit any queued dmabuf screencopy captures for `output_id`.
-    /// Called from the render loop **immediately after** the output's frame is
-    /// presented, so each capture's GPU submit is ordered after that frame's
-    /// encode (and before the next frame's decode overwrites the intermediate)
-    /// on the shared graphics queue. Each then completes asynchronously when its
-    /// sync_fd signals — see [`Self::complete_screencopy_dmabuf`].
+    /// Render and submit any queued screencopy captures (dmabuf or SHM) for
+    /// `output_id`. Called from the render loop **immediately after** the
+    /// output's frame is presented, so each capture's GPU submit is ordered after
+    /// that frame's encode (and before the next frame's decode overwrites the
+    /// intermediate) on the shared graphics queue. Each then completes
+    /// asynchronously when its sync_fd signals — see [`Self::complete_screencopy`].
     pub fn submit_pending_screencopy(&mut self, output_id: &str) {
         if self.screencopy_pending.is_empty() {
             return;
@@ -529,114 +486,253 @@ impl PrismState {
         self.screencopy_pending = rest;
 
         for p in mine {
-            let PendingScreencopyDmabuf {
-                imported,
+            let PendingScreencopy {
                 frame,
                 with_damage,
-                region_wh,
+                kind,
                 ..
             } = p;
 
-            let sync_fd = {
-                let Some(ctx) = self.outputs.get_mut(output_id) else {
+            let (sync_fd, inflight_kind) = match self.submit_one_capture(output_id, kind) {
+                Ok(v) => v,
+                Err(()) => {
                     frame.failed();
                     continue;
-                };
-                let white = ctx.effective_sdr_reference_nits();
-                match ctx.renderer.capture_into_dmabuf(&imported, white) {
-                    Ok(fd) => fd,
-                    Err(e) => {
-                        trace!("screencopy: capture_into_dmabuf failed: {e}");
-                        frame.failed();
-                        continue;
-                    }
                 }
             };
 
             // Park the in-flight capture on PrismState (NOT the calloop closure):
-            // the GPU is still writing `imported`, so it must outlive the wait,
-            // and keeping it in state means an `insert_source` failure can't drop
-            // it out from under the GPU.
+            // the GPU is still writing the target (imported dmabuf / readback
+            // buffer), so it must outlive the wait, and keeping it in state means
+            // an `insert_source` failure can't drop it out from under the GPU.
             let id = next_capture_id();
             self.screencopy_inflight.push(ScreencopyInflight {
                 id,
-                imported,
                 frame,
                 with_damage,
-                region_wh,
+                kind: inflight_kind,
             });
 
             let Some(loop_handle) = self.loop_handle.clone() else {
                 // No event loop (unreachable post-init): block on the fd, then
-                // complete inline so we never free the import mid-write.
+                // complete inline so we never free the target mid-write.
                 block_on_sync_fd(&sync_fd);
-                self.complete_screencopy_dmabuf(id);
+                self.complete_screencopy(id);
                 continue;
             };
 
             let source = Generic::new(sync_fd, Interest::READ, Mode::OneShot);
             let res = loop_handle.insert_source(source, move |_, _, state: &mut PrismState| {
-                state.complete_screencopy_dmabuf(id);
+                state.complete_screencopy(id);
                 Ok(PostAction::Remove)
             });
             if res.is_err() {
                 // Practically unreachable (epoll registration failure). Pull the
-                // entry back and leak its import rather than free it while the GPU
-                // may still be writing — a one-off leak is safer than a UAF.
-                trace!("screencopy: failed to register dmabuf completion source");
+                // entry back; the GPU may still be writing its target, so leak the
+                // GPU-referenced resource (forget the kind) rather than risk a UAF.
+                trace!("screencopy: failed to register completion source");
                 if let Some(pos) = self.screencopy_inflight.iter().position(|c| c.id == id) {
-                    let ScreencopyInflight {
-                        imported, frame, ..
-                    } = self.screencopy_inflight.remove(pos);
-                    std::mem::forget(imported);
+                    let ScreencopyInflight { frame, kind, .. } =
+                        self.screencopy_inflight.remove(pos);
+                    std::mem::forget(kind);
                     frame.failed();
                 }
             }
         }
     }
 
-    /// Finish an in-flight dmabuf screencopy whose GPU sync_fd has signalled:
-    /// send `ready` and drop the import (now safe — the GPU is done). Called
-    /// from the calloop completion source. No-op if the entry is gone.
-    pub fn complete_screencopy_dmabuf(&mut self, id: u64) {
+    /// Submit one queued capture: render it (dmabuf → into the client buffer; SHM
+    /// → into an offscreen + host readback) and return its sync_fd plus the
+    /// in-flight kind to park. `Err(())` if the output is gone or the GPU submit
+    /// failed (caller fails the frame).
+    fn submit_one_capture(
+        &mut self,
+        output_id: &str,
+        kind: PendingKind,
+    ) -> Result<(OwnedFd, InflightKind), ()> {
+        let Some(ctx) = self.outputs.get_mut(output_id) else {
+            return Err(());
+        };
+        let white = ctx.effective_sdr_reference_nits();
+        let src_width = ctx.extent.width;
+        match kind {
+            PendingKind::Dmabuf {
+                imported,
+                region_wh,
+            } => {
+                let fd = ctx
+                    .renderer
+                    .capture_into_dmabuf(&imported, white)
+                    .map_err(|e| trace!("screencopy: capture_into_dmabuf failed: {e}"))?;
+                Ok((
+                    fd,
+                    InflightKind::Dmabuf {
+                        imported,
+                        region_wh,
+                    },
+                ))
+            }
+            PendingKind::Shm { buffer, region } => {
+                let (fd, readback) = ctx
+                    .renderer
+                    .capture_to_host(CAPTURE_VK_FORMAT, white)
+                    .map_err(|e| trace!("screencopy: capture_to_host failed: {e}"))?;
+                Ok((
+                    fd,
+                    InflightKind::Shm {
+                        readback,
+                        buffer,
+                        region,
+                        src_width,
+                    },
+                ))
+            }
+        }
+    }
+
+    /// Finish an in-flight screencopy whose GPU sync_fd has signalled: for SHM,
+    /// memcpy the readback into the client buffer; then send `ready` and drop the
+    /// capture's GPU resource (now safe — the GPU is done). Called from the
+    /// calloop completion source. No-op if the entry is gone.
+    pub fn complete_screencopy(&mut self, id: u64) {
         let Some(pos) = self.screencopy_inflight.iter().position(|c| c.id == id) else {
             return;
         };
         let c = self.screencopy_inflight.remove(pos);
+
+        // Damage rect (whole captured region) for v3 with_damage clients.
+        let (region_w, region_h) = match &c.kind {
+            InflightKind::Dmabuf { region_wh, .. } => *region_wh,
+            InflightKind::Shm { region, .. } => (region.2 as u32, region.3 as u32),
+        };
+
+        // SHM: copy the readback into the client buffer before signalling ready.
+        if let InflightKind::Shm {
+            readback,
+            buffer,
+            region,
+            src_width,
+        } = &c.kind
+        {
+            if copy_readback_to_shm(readback, *src_width, *region, buffer).is_err() {
+                trace!("screencopy: shm readback copy failed");
+                c.frame.failed();
+                return;
+            }
+        }
+
         c.frame.flags(Flags::empty());
         if c.with_damage && c.frame.version() >= 3 {
-            c.frame.damage(0, 0, c.region_wh.0, c.region_wh.1);
+            c.frame.damage(0, 0, region_w, region_h);
         }
-        // Timestamp the completion *now* (the GPU just finished), not at request
-        // time — this is the frame's actual presentation/ready instant.
+        // Timestamp the completion *now* (the GPU just finished).
         let (sec_hi, sec_lo, nsec) = monotonic_timestamp();
         c.frame.ready(sec_hi, sec_lo, nsec);
-        // c.imported drops here — the GPU finished (its sync_fd signalled).
+        // c.kind drops here — GPU done (its sync_fd signalled).
     }
 }
 
-/// A queued dmabuf screencopy awaiting its output's next frame. The client
-/// buffer is already imported as a render target; the render loop renders into
-/// it (via [`PrismState::submit_pending_screencopy`]) right after the frame, so
-/// the capture is ordered correctly on the GPU queue.
-pub struct PendingScreencopyDmabuf {
-    output_id: OutputId,
-    imported: ImportedImage,
-    frame: ZwlrScreencopyFrameV1,
-    with_damage: bool,
-    region_wh: (u32, u32),
+/// Copy a captured frame's `region` sub-rect out of a host readback (which holds
+/// the whole output, `src_width` px wide, row-major Xrgb8888) into a client
+/// `wl_shm` buffer. `Err(())` if the buffer no longer matches / is inaccessible.
+fn copy_readback_to_shm(
+    readback: &HostReadback,
+    src_width: u32,
+    region: (i32, i32, i32, i32),
+    buffer: &WlBuffer,
+) -> Result<(), ()> {
+    let (rx, ry, rw, rh) = region;
+    let src = readback.as_slice();
+    let src_stride = (src_width * 4) as usize;
+    let row_bytes = (rw * 4) as usize;
+    let region_off = (ry as usize * src_stride) + rx as usize * 4;
+
+    let r = with_buffer_contents_mut(buffer, |ptr, len, bdata| {
+        if bdata.format != wl_shm::Format::Xrgb8888
+            || bdata.width != rw
+            || bdata.height != rh
+            || bdata.stride < rw * 4
+        {
+            return Err(());
+        }
+        let dst_stride = bdata.stride as usize;
+        let dst_off = bdata.offset as usize;
+        for row in 0..rh as usize {
+            let src_start = region_off + row * src_stride;
+            let dst_start = dst_off + row * dst_stride;
+            if src_start + row_bytes > src.len() || dst_start + row_bytes > len {
+                return Err(());
+            }
+            // SAFETY: bounds checked just above; src (readback) and dst (mapped
+            // shm pool) are distinct allocations.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(src_start),
+                    ptr.add(dst_start),
+                    row_bytes,
+                );
+            }
+        }
+        Ok(())
+    });
+    match r {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(()),
+    }
 }
 
-/// An in-flight dmabuf screencopy: the GPU is rendering into `imported`; once
-/// its sync_fd fires we send `ready` and drop the import. Held on
-/// [`PrismState`] so an `insert_source` failure can't free the import while the
-/// GPU still writes it.
-pub struct ScreencopyInflight {
-    id: u64,
-    imported: ImportedImage,
+/// A queued screencopy awaiting its output's next frame. The render loop
+/// captures it (via [`PrismState::submit_pending_screencopy`]) right after the
+/// frame, so the capture is ordered correctly on the GPU queue.
+pub struct PendingScreencopy {
+    output_id: OutputId,
     frame: ZwlrScreencopyFrameV1,
     with_damage: bool,
-    region_wh: (u32, u32),
+    kind: PendingKind,
+}
+
+enum PendingKind {
+    /// Client dmabuf, already imported as a `COLOR_ATTACHMENT` render target.
+    /// `region_wh` is the whole-output size (dmabuf is whole-output only).
+    Dmabuf {
+        imported: ImportedImage,
+        region_wh: (u32, u32),
+    },
+    /// Client `wl_shm` buffer + the `(x, y, w, h)` region to fill from the
+    /// whole-output capture.
+    Shm {
+        buffer: WlBuffer,
+        region: (i32, i32, i32, i32),
+    },
+}
+
+/// An in-flight screencopy: the GPU is rendering into the capture target; once
+/// its sync_fd fires we (for SHM) memcpy into the client buffer, send `ready`,
+/// and drop the target. Held on [`PrismState`] so an `insert_source` failure
+/// can't free the target while the GPU still writes it.
+pub struct ScreencopyInflight {
+    id: u64,
+    frame: ZwlrScreencopyFrameV1,
+    with_damage: bool,
+    kind: InflightKind,
+}
+
+enum InflightKind {
+    Dmabuf {
+        /// Held only to keep the GPU render target alive until the sync_fd
+        /// fires; dropped (freed) on completion. Not read by name (RAII).
+        #[allow(dead_code)]
+        imported: ImportedImage,
+        region_wh: (u32, u32),
+    },
+    Shm {
+        readback: HostReadback,
+        buffer: WlBuffer,
+        region: (i32, i32, i32, i32),
+        /// Width of the captured frame (whole output) — the readback's row
+        /// stride, for cropping `region` out of it.
+        src_width: u32,
+    },
 }
 
 /// Monotonic id for matching a completion callback to its in-flight entry.

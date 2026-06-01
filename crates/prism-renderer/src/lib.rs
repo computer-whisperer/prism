@@ -22,7 +22,7 @@ pub mod renderer;
 pub mod snapshot;
 pub mod upload;
 
-pub use capture::{CaptureEncoder, CaptureImage};
+pub use capture::{CaptureEncoder, HostReadback};
 pub use cross_gpu::{ExportableImage, MirrorCopier, MirrorCopyOp};
 pub use damage::DamageTracker;
 pub use device::{Device, DrmDevId, DrmFormatModifierInfo, PhysicalDeviceInfo};

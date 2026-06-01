@@ -15,13 +15,23 @@
 //! shader's `clamp` — a crude but viewer-safe first-cut tone/gamut map (the doc
 //! tracks the roll-off follow-up).
 //!
-//! Phase 1 uses the immediate (out-of-band) path: a single one-shot submit that
-//! samples the intermediate where it already sits (`SHADER_READ_ONLY_OPTIMAL`
-//! after the last frame's encode), renders into an owned offscreen, and copies
-//! that into a host-visible buffer. Must be called when no frame for this output
-//! is mid-flight (the live render path's own submit must have drained); the
-//! caller's `OneshotPool::record_and_submit` `queue_wait_idle` then orders this
-//! capture before the next frame's decode rewrites the intermediate.
+//! Both capture paths are **asynchronous** and non-blocking — they record a
+//! submit on a reusable [`AsyncSlot`] and return a Linux `SYNC_FD` that signals
+//! on GPU completion, so the compositor's main thread never `queue_wait_idle`s
+//! (continuous recording would otherwise stall it every frame):
+//!
+//! - [`CaptureEncoder::capture_into_dmabuf`] renders the encode straight into a
+//!   caller-supplied dmabuf (the client's screencopy buffer / a PipeWire pool
+//!   buffer) — zero-copy.
+//! - [`CaptureEncoder::capture_to_host_async`] renders into a shared offscreen
+//!   and copies that into an owned [`HostReadback`] for the SHM path; the caller
+//!   reads the bytes once the sync_fd fires.
+//!
+//! Both sample the intermediate where it already sits
+//! (`SHADER_READ_ONLY_OPTIMAL` after the last frame's encode) and require the
+//! caller to invoke them from the render loop right after the output's
+//! `present()`, so the submit is sequenced after that frame on the shared queue
+//! (see the per-method "ordering" docs).
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
@@ -33,7 +43,6 @@ use crate::device::Device;
 use crate::encode_synth::{EncodeConfig, EncodeFragment, EncodePushSynth as EncodePush};
 use crate::error::{RendererError, Result, VkResultExt};
 use crate::intermediate::{create_view, pick_device_local_memory};
-use crate::oneshot::OneshotPool;
 use crate::pipeline::encode::EncodePipeline;
 
 /// Whether `format` is a capture target this module can produce. Both are
@@ -50,52 +59,107 @@ fn is_supported_format(format: vk::Format) -> bool {
     )
 }
 
-/// A captured frame: tightly packed, row-major, 4 bytes/pixel in `format`'s
-/// channel order (sRGB-encoded), no row padding. `pixels.len() == width *
-/// height * 4`.
-pub struct CaptureImage {
-    pub width: u32,
-    pub height: u32,
-    /// The pixel byte order — `R8G8B8A8_UNORM` or `B8G8R8A8_UNORM`.
-    pub format: vk::Format,
-    pub pixels: Vec<u8>,
+/// An owned, host-visible, persistently-mapped readback buffer holding one
+/// captured frame: tightly packed, row-major, 4 bytes/pixel in the capture
+/// encoder's `format` byte order (sRGB-encoded), no row padding. Allocated per
+/// SHM capture and freed on drop; the caller reads [`Self::as_slice`] once the
+/// capture's sync_fd has signalled, then drops it.
+pub struct HostReadback {
+    device: Arc<Device>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
+    size: vk::DeviceSize,
 }
 
-impl CaptureImage {
-    /// Serialize as a binary PPM (`P6`, 8-bit RGB), dropping alpha. A
-    /// zero-dependency debug format for the phase-1 dump path; real frontends
-    /// hand `pixels` to a client buffer instead. Swizzles per `format` so the
-    /// PPM is always RGB regardless of capture byte order.
-    pub fn to_ppm(&self) -> Vec<u8> {
-        let bgr = self.format == vk::Format::B8G8R8A8_UNORM;
-        let header = format!("P6\n{} {}\n255\n", self.width, self.height);
-        let mut out = Vec::with_capacity(header.len() + (self.width * self.height * 3) as usize);
-        out.extend_from_slice(header.as_bytes());
-        for px in self.pixels.chunks_exact(4) {
-            if bgr {
-                out.extend_from_slice(&[px[2], px[1], px[0]]);
-            } else {
-                out.extend_from_slice(&px[..3]);
+// SAFETY: `ptr` is a persistently-mapped HOST_COHERENT pointer into this
+// buffer's own allocation; only read under `&self` after the owning capture's
+// sync_fd has signalled (no concurrent GPU write), single-threaded.
+unsafe impl Send for HostReadback {}
+unsafe impl Sync for HostReadback {}
+
+impl HostReadback {
+    fn new(device: &Arc<Device>, extent: vk::Extent2D) -> Result<Self> {
+        let size = (extent.width as vk::DeviceSize) * (extent.height as vk::DeviceSize) * 4;
+        let info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { device.raw.create_buffer(&info, None) }
+            .vk_ctx("create_buffer (capture readback)")?;
+        let req = unsafe { device.raw.get_buffer_memory_requirements(buffer) };
+        let mem_type = pick_host_visible_memory(device, req.memory_type_bits)?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(mem_type);
+        let memory = unsafe { device.raw.allocate_memory(&alloc, None) }.inspect_err(|_| unsafe {
+            device.raw.destroy_buffer(buffer, None);
+        });
+        let memory = memory.vk_ctx("allocate_memory (capture readback)")?;
+        if let Err(e) = unsafe { device.raw.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                device.raw.free_memory(memory, None);
+                device.raw.destroy_buffer(buffer, None);
             }
+            return Err(RendererError::Vk {
+                context: "bind_buffer_memory (capture readback)",
+                result: e,
+            });
         }
-        out
+        let ptr = match unsafe {
+            device
+                .raw
+                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+        } {
+            Ok(p) => p as *mut u8,
+            Err(e) => {
+                unsafe {
+                    device.raw.free_memory(memory, None);
+                    device.raw.destroy_buffer(buffer, None);
+                }
+                return Err(RendererError::Vk {
+                    context: "map_memory (capture readback)",
+                    result: e,
+                });
+            }
+        };
+        Ok(Self {
+            device: device.clone(),
+            buffer,
+            memory,
+            ptr,
+            size,
+        })
+    }
+
+    /// The captured bytes. Valid only after the owning capture's sync_fd has
+    /// signalled (GPU copy complete). HOST_COHERENT, so no invalidate needed.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: own mapped allocation of `size` bytes; read after GPU completion.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.size as usize) }
     }
 }
 
-/// Owned offscreen target + host-visible readback buffer, sized to one output.
-/// Reallocated when the output extent changes (mode change); owns the device
-/// handle so its `Drop` frees its own resources (the realloc in
-/// `ensure_target` relies on this).
+impl Drop for HostReadback {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.raw.unmap_memory(self.memory);
+            self.device.raw.destroy_buffer(self.buffer, None);
+            self.device.raw.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Shared offscreen render target for the SHM capture path, sized to one output
+/// and reused across captures (the [`AsyncSlot`] fence serializes them).
+/// Reallocated when the output extent changes; owns the device handle so its
+/// `Drop` frees its own resources.
 struct Target {
     device: Arc<Device>,
     extent: vk::Extent2D,
     image: vk::Image,
     view: vk::ImageView,
     memory: vk::DeviceMemory,
-    buffer: vk::Buffer,
-    buffer_memory: vk::DeviceMemory,
-    buffer_ptr: *mut u8,
-    buffer_size: vk::DeviceSize,
 }
 
 /// Renders the intermediate through the capture encode and reads it back.
@@ -104,22 +168,16 @@ struct Target {
 pub struct CaptureEncoder {
     device: Arc<Device>,
     encode: EncodePipeline,
-    oneshot: OneshotPool,
+    /// Shared offscreen for the SHM path (the dmabuf path renders into the
+    /// client buffer directly). Lazily allocated, sized to the output.
     target: Option<Target>,
-    /// Async-submit resources for the dmabuf path (renders into a client
-    /// dmabuf, returns a sync_fd). Lazily created on first dmabuf capture.
+    /// Async-submit resources (reusable cmd buffer + fence + exportable
+    /// semaphore) shared by both capture paths. Lazily created on first capture.
     async_slot: Option<AsyncSlot>,
     /// The target pixel format this encoder's pipeline was built for. The
     /// renderer rebuilds the encoder if a capture asks for a different one.
     format: vk::Format,
 }
-
-// SAFETY: `buffer_ptr` is a persistently-mapped HOST_COHERENT pointer, only
-// touched under `&mut self` while no GPU access is outstanding (each capture
-// waits on its one-shot submit before reading). Same rationale as
-// `EncodeDiagnoseProbe`.
-unsafe impl Send for CaptureEncoder {}
-unsafe impl Sync for CaptureEncoder {}
 
 impl CaptureEncoder {
     /// Build a capture encoder targeting `format` (`R8G8B8A8_UNORM` or
@@ -140,11 +198,9 @@ impl CaptureEncoder {
             ],
         };
         let encode = EncodePipeline::new(device.clone(), format, &config)?;
-        let oneshot = OneshotPool::new(device.clone())?;
         Ok(Self {
             device,
             encode,
-            oneshot,
             target: None,
             async_slot: None,
             format,
@@ -156,29 +212,41 @@ impl CaptureEncoder {
         self.format
     }
 
-    /// Capture `intermediate_view` (the live per-output intermediate, currently
-    /// in `SHADER_READ_ONLY_OPTIMAL`) of size `extent` as an sRGB RGBA8 image.
-    /// `sdr_white_nits` is the output's reference-white level (the value 1.0
-    /// after normalization) — pass `effective_sdr_reference_nits()`.
-    pub fn capture(
+    /// Capture `intermediate_view` (size `extent`) into host memory
+    /// **asynchronously** — the SHM screencopy path. Renders the sRGB encode into
+    /// the shared offscreen, copies it into a freshly-allocated, owned
+    /// [`HostReadback`], and submits without blocking, returning a Linux
+    /// `SYNC_FD` that signals on GPU completion plus the `HostReadback` to read
+    /// once it does. Avoids the main-thread `queue_wait_idle` that the old
+    /// synchronous path incurred on every recorded frame.
+    ///
+    /// Same ordering requirement as [`Self::capture_into_dmabuf`]: call from the
+    /// render loop right after the output's `present()` so the submit is
+    /// sequenced after the frame on the shared queue.
+    pub fn capture_to_host_async(
         &mut self,
         intermediate_view: vk::ImageView,
         extent: vk::Extent2D,
         sdr_white_nits: f32,
-    ) -> Result<CaptureImage> {
+    ) -> Result<(OwnedFd, HostReadback)> {
         self.ensure_target(extent)?;
+        if self.async_slot.is_none() {
+            self.async_slot = Some(AsyncSlot::new(&self.device)?);
+        }
+        let readback = HostReadback::new(&self.device, extent)?;
         let push = capture_push(sdr_white_nits);
-        let target = self.target.as_ref().unwrap();
-
         let encode = &self.encode;
+        let target = self.target.as_ref().unwrap();
         let image = target.image;
         let view = target.view;
-        let buffer = target.buffer;
-        self.oneshot.record_and_submit(|raw, cb| unsafe {
-            // Make the prior frame's writes to the intermediate visible to our
-            // sample (cross-submit: the live render path's encode left it in
-            // SHADER_READ_ONLY, but a fresh submit needs the visibility edge),
-            // and bring the offscreen UNDEFINED → COLOR_ATTACHMENT.
+        let slot = self.async_slot.as_ref().unwrap();
+        let cb = slot.begin(&self.device)?;
+        let raw = &self.device.raw;
+
+        unsafe {
+            // Make intermediate writes visible to our sample, and bring the
+            // offscreen UNDEFINED → COLOR_ATTACHMENT. (Within-submission edge;
+            // cross-frame ordering is the caller's responsibility — see the doc.)
             let to_attach = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
                 .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -203,8 +271,8 @@ impl CaptureEncoder {
 
             record_fullscreen_encode(raw, encode, cb, intermediate_view, view, extent, &push);
 
-            // COLOR_ATTACHMENT → TRANSFER_SRC, then copy the whole image into
-            // the tightly-packed host buffer (buffer_row_length 0 ⇒ packed).
+            // COLOR_ATTACHMENT → TRANSFER_SRC, then copy the whole image into the
+            // tightly-packed host buffer (buffer_row_length 0 ⇒ packed).
             let to_src = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                 .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -239,23 +307,16 @@ impl CaptureEncoder {
                 cb,
                 image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                buffer,
+                readback.buffer,
                 &region,
             );
-        })?;
 
-        let target = self.target.as_ref().unwrap();
-        // SAFETY: HOST_COHERENT mapping; the one-shot submit above has been
-        // waited on, so the copy is complete and no GPU access is outstanding.
-        let pixels = unsafe {
-            std::slice::from_raw_parts(target.buffer_ptr, target.buffer_size as usize).to_vec()
-        };
-        Ok(CaptureImage {
-            width: extent.width,
-            height: extent.height,
-            format: self.format,
-            pixels,
-        })
+            raw.end_command_buffer(cb)
+        }
+        .vk_ctx("end_command_buffer (capture to host)")?;
+
+        let sync_fd = slot.submit_and_export(&self.device)?;
+        Ok((sync_fd, readback))
     }
 
     /// Capture `intermediate_view` (size `extent`) directly into a caller-
@@ -301,20 +362,8 @@ impl CaptureEncoder {
         let push = capture_push(sdr_white_nits);
         let encode = &self.encode;
         let slot = self.async_slot.as_ref().unwrap();
-        let cb = slot.cmd_buffer;
+        let cb = slot.begin(&self.device)?;
         let raw = &self.device.raw;
-
-        // Gate reuse of this slot's cb/semaphore against the previous dmabuf
-        // capture still being in flight.
-        unsafe { raw.wait_for_fences(&[slot.fence], true, u64::MAX) }
-            .vk_ctx("wait_for_fences (capture async slot)")?;
-        unsafe { raw.reset_fences(&[slot.fence]) }.vk_ctx("reset_fences (capture async slot)")?;
-        unsafe { raw.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty()) }
-            .vk_ctx("reset_command_buffer (capture async slot)")?;
-
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { raw.begin_command_buffer(cb, &begin) }.vk_ctx("begin_command_buffer (capture)")?;
 
         unsafe {
             // Make writes to the intermediate visible to our sample, and bring
@@ -368,32 +417,7 @@ impl CaptureEncoder {
         }
         .vk_ctx("end_command_buffer (capture)")?;
 
-        // Submit, signalling both the fence (slot-reuse gate) and the exportable
-        // binary semaphore (we export it as the returned sync_fd).
-        let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
-        let signal = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(slot.semaphore)
-            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-        let submit = [vk::SubmitInfo2::default()
-            .command_buffer_infos(&cb_infos)
-            .signal_semaphore_infos(&signal)];
-        unsafe { raw.queue_submit2(self.device.graphics_queue, &submit, slot.fence) }
-            .vk_ctx("queue_submit2 (capture async)")?;
-
-        // Export the just-signalled semaphore as a sync_file fd (transfers the
-        // sync state to the fd and unsignals the semaphore for next reuse).
-        let get_info = vk::SemaphoreGetFdInfoKHR::default()
-            .semaphore(slot.semaphore)
-            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-        let raw_fd = unsafe { slot.fd_loader.get_semaphore_fd(&get_info) }
-            .vk_ctx("vkGetSemaphoreFdKHR (capture SYNC_FD)")?;
-        if raw_fd < 0 {
-            return Err(RendererError::MissingFeature(
-                "capture: vkGetSemaphoreFdKHR returned a negative fd",
-            ));
-        }
-        // SAFETY: a fresh, owned sync_file fd from a successful export.
-        Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+        slot.submit_and_export(&self.device)
     }
 
     /// (Re)allocate the offscreen + readback target if it doesn't match `extent`.
@@ -443,53 +467,22 @@ impl Target {
             .vk_ctx("bind_image_memory (capture offscreen)")?;
         let view = create_view(device, image, format)?;
 
-        // Host-visible readback buffer, tightly packed RGBA8.
-        let buffer_size = (extent.width as vk::DeviceSize) * (extent.height as vk::DeviceSize) * 4;
-        let buf_info = vk::BufferCreateInfo::default()
-            .size(buffer_size)
-            .usage(vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { device.raw.create_buffer(&buf_info, None) }
-            .vk_ctx("create_buffer (capture readback)")?;
-        let breq = unsafe { device.raw.get_buffer_memory_requirements(buffer) };
-        let bmem_type = pick_host_visible_memory(device, breq.memory_type_bits)?;
-        let balloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(breq.size)
-            .memory_type_index(bmem_type);
-        let buffer_memory = unsafe { device.raw.allocate_memory(&balloc, None) }
-            .vk_ctx("allocate_memory (capture readback)")?;
-        unsafe { device.raw.bind_buffer_memory(buffer, buffer_memory, 0) }
-            .vk_ctx("bind_buffer_memory (capture readback)")?;
-        let buffer_ptr = unsafe {
-            device
-                .raw
-                .map_memory(buffer_memory, 0, buffer_size, vk::MemoryMapFlags::empty())
-        }
-        .vk_ctx("map_memory (capture readback)")? as *mut u8;
-
         Ok(Self {
             device: device.clone(),
             extent,
             image,
             view,
             memory,
-            buffer,
-            buffer_memory,
-            buffer_ptr,
-            buffer_size,
         })
     }
 }
 
 impl Drop for Target {
     fn drop(&mut self) {
-        // No GPU work referencing this target is outstanding: each capture waits
-        // on its one-shot submit, and a realloc/teardown only happens between
-        // captures (and the encoder drains the device before dropping).
+        // No GPU work references the offscreen at teardown: a realloc/teardown
+        // only happens between captures, and the encoder drains the device
+        // before dropping.
         unsafe {
-            self.device.raw.unmap_memory(self.buffer_memory);
-            self.device.raw.destroy_buffer(self.buffer, None);
-            self.device.raw.free_memory(self.buffer_memory, None);
             self.device.raw.destroy_image_view(self.view, None);
             self.device.raw.destroy_image(self.image, None);
             self.device.raw.free_memory(self.memory, None);
@@ -557,6 +550,53 @@ impl AsyncSlot {
             semaphore,
             fd_loader,
         })
+    }
+
+    /// Gate reuse against the previous submit (wait + reset the fence), reset
+    /// the command buffer, and begin recording. Returns the command buffer.
+    fn begin(&self, device: &Device) -> Result<vk::CommandBuffer> {
+        let raw = &device.raw;
+        unsafe { raw.wait_for_fences(&[self.fence], true, u64::MAX) }
+            .vk_ctx("wait_for_fences (capture async slot)")?;
+        unsafe { raw.reset_fences(&[self.fence]) }.vk_ctx("reset_fences (capture async slot)")?;
+        unsafe { raw.reset_command_buffer(self.cmd_buffer, vk::CommandBufferResetFlags::empty()) }
+            .vk_ctx("reset_command_buffer (capture async slot)")?;
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { raw.begin_command_buffer(self.cmd_buffer, &begin) }
+            .vk_ctx("begin_command_buffer (capture)")?;
+        Ok(self.cmd_buffer)
+    }
+
+    /// Submit the (already-ended) command buffer, signalling both the fence
+    /// (slot-reuse gate) and the exportable binary semaphore, then export the
+    /// semaphore as a Linux sync_file fd (the export unsignals it for reuse).
+    fn submit_and_export(&self, device: &Device) -> Result<OwnedFd> {
+        let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(self.cmd_buffer)];
+        let signal = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(self.semaphore)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let submit = [vk::SubmitInfo2::default()
+            .command_buffer_infos(&cb_infos)
+            .signal_semaphore_infos(&signal)];
+        unsafe {
+            device
+                .raw
+                .queue_submit2(device.graphics_queue, &submit, self.fence)
+        }
+        .vk_ctx("queue_submit2 (capture async)")?;
+        let get_info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(self.semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let raw_fd = unsafe { self.fd_loader.get_semaphore_fd(&get_info) }
+            .vk_ctx("vkGetSemaphoreFdKHR (capture SYNC_FD)")?;
+        if raw_fd < 0 {
+            return Err(RendererError::MissingFeature(
+                "capture: vkGetSemaphoreFdKHR returned a negative fd",
+            ));
+        }
+        // SAFETY: a fresh, owned sync_file fd from a successful export.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
     }
 }
 
@@ -690,39 +730,6 @@ fn pick_host_visible_memory(device: &Device, type_bits: u32) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// PPM serialization: header + RGB triples, alpha dropped, packed.
-    #[test]
-    fn ppm_header_and_pixels() {
-        let img = CaptureImage {
-            width: 2,
-            height: 1,
-            format: vk::Format::R8G8B8A8_UNORM,
-            pixels: vec![10, 20, 30, 255, 40, 50, 60, 128],
-        };
-        let ppm = img.to_ppm();
-        let header = b"P6\n2 1\n255\n";
-        assert_eq!(&ppm[..header.len()], header);
-        assert_eq!(&ppm[header.len()..], &[10, 20, 30, 40, 50, 60]);
-    }
-
-    /// BGRA capture swizzles to RGB in the PPM (the screencopy path captures
-    /// `B8G8R8A8_UNORM` to fill `Xrgb8888` buffers).
-    #[test]
-    fn ppm_swizzles_bgra() {
-        let img = CaptureImage {
-            width: 1,
-            height: 1,
-            format: vk::Format::B8G8R8A8_UNORM,
-            // memory B,G,R,A = 30,20,10 → RGB 10,20,30
-            pixels: vec![30, 20, 10, 255],
-        };
-        let ppm = img.to_ppm();
-        let header = b"P6\n1 1\n255\n";
-        assert_eq!(&ppm[header.len()..], &[10, 20, 30]);
-    }
-
     /// The BT.2020 → sRGB capture matrix maps neutral grey to neutral grey
     /// (white point preserved): equal-energy BT.2020 RGB stays equal-energy.
     /// Catches a transposed/mis-scaled matrix that would tint captures.

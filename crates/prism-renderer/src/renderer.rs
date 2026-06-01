@@ -241,29 +241,28 @@ impl Renderer {
         probe.diagnose(&self.encode, encode_push, self.lut3d.as_ref(), input_nits)
     }
 
-    /// Capture this output's last composited frame as an sRGB image in
-    /// `format` (`R8G8B8A8_UNORM` or `B8G8R8A8_UNORM` — the latter fills
-    /// `Xrgb8888`/`Argb8888` client buffers without a CPU swizzle).
+    /// Capture this output's last composited frame as an sRGB image in `format`
+    /// (`R8G8B8A8_UNORM` or `B8G8R8A8_UNORM` — the latter fills `Xrgb8888`/
+    /// `Argb8888` client buffers without a CPU swizzle) into host memory,
+    /// **asynchronously** (the SHM screencopy path).
     ///
     /// Renders the persistent intermediate (the last frame's BT.2020 absolute-
     /// nits composite, still resident) through the capture encode chain — a
-    /// colorimetric sRGB target with no panel correction — and reads it back to
-    /// host memory. `sdr_white_nits` is the output's reference-white level
-    /// (`effective_sdr_reference_nits()`); it sets where diffuse white lands.
+    /// colorimetric sRGB target with no panel correction — into an owned
+    /// [`HostReadback`](crate::capture::HostReadback), and returns a Linux
+    /// `SYNC_FD` that signals on GPU completion plus that buffer. The caller
+    /// reads the bytes once the fd fires. `sdr_white_nits` is the output's
+    /// reference-white level (`effective_sdr_reference_nits()`).
     ///
-    /// Must be called when no `render_frame` for this output is mid-flight, so
-    /// the capture's own submit (which `queue_wait_idle`s) is ordered before the
-    /// next frame's decode rewrites the intermediate. Errors if no frame has
-    /// been rendered yet (no intermediate to capture).
-    ///
-    /// Lazy-allocates the capture encoder + its offscreen/readback target on
-    /// first call so non-capturing sessions don't pay for it; rebuilds the
-    /// encoder if a different `format` is requested than last time.
-    pub fn capture(
+    /// Must be called from the render loop right after the output's `present()`
+    /// (same ordering requirement as [`Self::capture_into_dmabuf`]). Errors if no
+    /// frame has been rendered yet (no intermediate to capture). Lazy-allocates
+    /// the capture encoder; rebuilds it if a different `format` is requested.
+    pub fn capture_to_host(
         &mut self,
         format: vk::Format,
         sdr_white_nits: f32,
-    ) -> Result<crate::capture::CaptureImage> {
+    ) -> Result<(OwnedFd, crate::capture::HostReadback)> {
         let (view, extent) = {
             let intermediate =
                 self.intermediate
@@ -283,7 +282,7 @@ impl Renderer {
         self.capture
             .as_mut()
             .unwrap()
-            .capture(view, extent, sdr_white_nits)
+            .capture_to_host_async(view, extent, sdr_white_nits)
     }
 
     /// Capture this output's last composited frame directly into `dst` — a
