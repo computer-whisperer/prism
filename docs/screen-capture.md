@@ -1,12 +1,15 @@
 # Screen capture: screenshots and screen recording
 
-> **Status.** Design + phase 1 in progress. No capture protocol is wired yet.
-> This doc sets the architecture; the renderer-side capture primitive (the
-> sRGB capture encode + offscreen readback) is the first increment. Target
-> end-state (agreed): `wlr-screencopy` *and* `ext-image-copy-capture-v1`
-> frontends, **in-process** PipeWire + `org.gnome.Mutter.ScreenCast` D-Bus for
-> recording (niri-style), and color-correct capture on HDR outputs via an
-> sRGB encode pass. niri is the reference port for the protocol/PipeWire/D-Bus
+> **Status.** Phases 1–3a landed (`wlr-screencopy` works with `grim`,
+> HW-verified). Done: the sRGB capture primitive (renderer); `wlr-screencopy`
+> SHM (synchronous, whole-output + region) **and** dmabuf (async, zero-copy,
+> whole-output) paths. The dmabuf path is build-clean but **runtime-unverified**
+> (needs a dmabuf screencopy client, e.g. `wf-recorder` / the wlr portal). Next:
+> render-loop integration (the damage queue + the proper fix for the dmabuf
+> ordering caveat), then **in-process** PipeWire + `org.gnome.Mutter.ScreenCast`
+> D-Bus, then `ext-image-copy-capture-v1`. Target end-state (agreed): both
+> capture protocols, niri-style in-process recording, color-correct HDR capture
+> via the sRGB encode pass. niri is the reference for the protocol/PipeWire/D-Bus
 > glue; the renderer coupling is prism-specific (custom Vulkan pipeline, not
 > smithay's `GlesRenderer`).
 
@@ -174,10 +177,17 @@ Phase 1 uses the immediate path only.
    `Renderer::capture_srgb()` producing RGBA8 from the live intermediate, plus a
    debug dump to verify HDR→sRGB end-to-end before any protocol churn. De-risks
    the only prism-specific part.
-2. **`wlr-screencopy`** — port niri's `zwlr_screencopy_manager_v1` dispatch
-   ([niri `src/protocols/screencopy.rs`]); SHM full-frame first (→ `grim`
-   works), then dmabuf + `copy_with_damage` + region. Buffer-fill calls the
-   phase-1 primitive.
+2. **`wlr-screencopy`** *(done; dmabuf path runtime-unverified)* — hand-rolled
+   `zwlr_screencopy_v1` (`crates/prism-protocols/src/screencopy.rs`), in the
+   `output_power.rs` style (impls on `PrismState`, no delegate macro). Two buffer
+   paths on the phase-1 primitive: **SHM** (synchronous readback; whole-output +
+   region, cropped on the CPU copy) and **dmabuf** (async, zero-copy:
+   `Renderer::capture_into_dmabuf` renders into the imported client buffer and
+   returns a sync_fd; `ready` fires from a calloop source; whole-output only).
+   `copy_with_damage` is serviced like `copy` (full-frame). The async dmabuf path
+   has an *ordering caveat* — it samples the intermediate from a separate submit,
+   relying on same-queue (radv) serialization; the robust fix is render-loop
+   integration (next phase). See the `capture_into_dmabuf` doc comment.
 3. **In-process PipeWire + `org.gnome.Mutter.ScreenCast`** — port niri's
    `screencasting/` (`pw_utils.rs`) and `dbus/mutter_screen_cast.rs`. Net-new
    deps: `pipewire`, `zbus`. The PipeWire mainloop folds into prism's existing

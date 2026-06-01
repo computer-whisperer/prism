@@ -286,6 +286,52 @@ impl Renderer {
             .capture(view, extent, sdr_white_nits)
     }
 
+    /// Capture this output's last composited frame directly into `dst` — a
+    /// dmabuf-backed image (e.g. a `wlr-screencopy` client buffer) imported with
+    /// `COLOR_ATTACHMENT` usage and a supported capture format — and return a
+    /// Linux `SYNC_FD` that signals when the GPU finishes.
+    ///
+    /// Non-blocking, zero-copy: unlike [`Self::capture`] there's no host
+    /// readback. The caller gates the protocol completion event on the returned
+    /// fd and must keep `dst` alive until it fires. `dst`'s extent must equal
+    /// this output's (whole-output capture only). Errors if no frame has been
+    /// rendered yet.
+    pub fn capture_into_dmabuf(
+        &mut self,
+        dst: &ImportedImage,
+        sdr_white_nits: f32,
+    ) -> Result<OwnedFd> {
+        let (view, extent) = {
+            let intermediate =
+                self.intermediate
+                    .as_ref()
+                    .ok_or(crate::error::RendererError::MissingFeature(
+                        "capture_into_dmabuf: no intermediate (no frame rendered yet)",
+                    ))?;
+            (intermediate.view, intermediate.extent)
+        };
+        if dst.extent().width != extent.width || dst.extent().height != extent.height {
+            return Err(crate::error::RendererError::MissingFeature(
+                "capture_into_dmabuf: dst extent != output extent (whole-output capture only)",
+            ));
+        }
+        let format = dst.format();
+        let need_rebuild = self.capture.as_ref().is_none_or(|c| c.format() != format);
+        if need_rebuild {
+            self.capture = Some(crate::capture::CaptureEncoder::new(
+                self.device.clone(),
+                format,
+            )?);
+        }
+        self.capture.as_mut().unwrap().capture_into_dmabuf(
+            view,
+            dst.image(),
+            dst.view(),
+            extent,
+            sdr_white_nits,
+        )
+    }
+
     /// Replace this output's 3D LUT content. No-op (and returns Ok) when
     /// the encode chain doesn't include `EncodeFragment::Lut3d`. `entries`
     /// must be `cube_edge³` RGB triples in linear nits, X-fastest

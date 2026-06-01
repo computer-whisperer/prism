@@ -348,6 +348,10 @@ pub struct PrismState {
         OutputId,
         smithay::reexports::wayland_protocols_wlr::output_power_management::v1::server::zwlr_output_power_v1::ZwlrOutputPowerV1,
     )>,
+    /// In-flight async (dmabuf) screencopy captures: the GPU is rendering into
+    /// each entry's imported buffer; a calloop sync_fd source fires `ready` and
+    /// drops the import once done. See [`crate::screencopy`].
+    pub screencopy_inflight: Vec<crate::screencopy::ScreencopyInflight>,
     /// Per-output smithay `Output`, keyed by the same `OutputId`
     /// (connector name) as `outputs`. Populated by [`advertise_output`];
     /// logical positions assigned by [`layout_outputs`]. Drops before
@@ -774,6 +778,7 @@ impl PrismState {
             idle_inhibit_manager,
             idle_inhibitors: std::collections::HashSet::new(),
             output_power_objects: Vec::new(),
+            screencopy_inflight: Vec::new(),
             pointer_visibility: PointerVisibility::default(),
             pointer_inactivity_timer: None,
             suppressed_keys: std::collections::HashSet::new(),

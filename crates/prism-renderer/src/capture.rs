@@ -23,8 +23,10 @@
 //! caller's `OneshotPool::record_and_submit` `queue_wait_idle` then orders this
 //! capture before the next frame's decode rewrites the intermediate.
 
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 
+use ash::khr::external_semaphore_fd;
 use ash::vk;
 
 use crate::device::Device;
@@ -104,6 +106,9 @@ pub struct CaptureEncoder {
     encode: EncodePipeline,
     oneshot: OneshotPool,
     target: Option<Target>,
+    /// Async-submit resources for the dmabuf path (renders into a client
+    /// dmabuf, returns a sync_fd). Lazily created on first dmabuf capture.
+    async_slot: Option<AsyncSlot>,
     /// The target pixel format this encoder's pipeline was built for. The
     /// renderer rebuilds the encoder if a capture asks for a different one.
     format: vk::Format,
@@ -141,6 +146,7 @@ impl CaptureEncoder {
             encode,
             oneshot,
             target: None,
+            async_slot: None,
             format,
         })
     }
@@ -161,15 +167,8 @@ impl CaptureEncoder {
         sdr_white_nits: f32,
     ) -> Result<CaptureImage> {
         self.ensure_target(extent)?;
+        let push = capture_push(sdr_white_nits);
         let target = self.target.as_ref().unwrap();
-
-        let mut push = EncodePush::sdr_identity();
-        push.sdr_white_nits = sdr_white_nits;
-        push.target_peak_nits = sdr_white_nits;
-        // CalibrationMatrix does `out = mat3(cal_matrix) * in`; set it to the
-        // BT.2020 → BT.709 primaries conversion so the sRGB OETF that follows
-        // receives sRGB-primary light.
-        push.set_ctm(prism_frame::bt2020_to_srgb_matrix());
 
         let encode = &self.encode;
         let image = target.image;
@@ -202,61 +201,7 @@ impl CaptureEncoder {
                     .image_memory_barriers(&to_attach),
             );
 
-            let color_attach = [vk::RenderingAttachmentInfo::default()
-                .image_view(view)
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::DONT_CARE)
-                .store_op(vk::AttachmentStoreOp::STORE)];
-            let rendering_info = vk::RenderingInfo::default()
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent,
-                })
-                .layer_count(1)
-                .color_attachments(&color_attach);
-            raw.cmd_begin_rendering(cb, &rendering_info);
-
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: extent.width as f32,
-                height: extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            raw.cmd_set_viewport(cb, 0, &[viewport]);
-            raw.cmd_set_scissor(
-                cb,
-                0,
-                &[vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent,
-                }],
-            );
-            raw.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, encode.pipeline);
-
-            // Binding 0 = intermediate. No LUT binding (capture chain omits it).
-            let intermediate_info = [vk::DescriptorImageInfo::default()
-                .sampler(encode.sampler)
-                .image_view(intermediate_view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let writes = [encode.write_intermediate_binding(&intermediate_info)];
-            encode.push_loader.cmd_push_descriptor_set(
-                cb,
-                vk::PipelineBindPoint::GRAPHICS,
-                encode.pipeline_layout,
-                0,
-                &writes,
-            );
-            raw.cmd_push_constants(
-                cb,
-                encode.pipeline_layout,
-                vk::ShaderStageFlags::FRAGMENT,
-                0,
-                bytemuck::bytes_of(&push),
-            );
-            raw.cmd_draw(cb, 3, 1, 0, 0);
-            raw.cmd_end_rendering(cb);
+            record_fullscreen_encode(raw, encode, cb, intermediate_view, view, extent, &push);
 
             // COLOR_ATTACHMENT → TRANSFER_SRC, then copy the whole image into
             // the tightly-packed host buffer (buffer_row_length 0 ⇒ packed).
@@ -311,6 +256,145 @@ impl CaptureEncoder {
             format: self.format,
             pixels,
         })
+    }
+
+    /// Capture `intermediate_view` (size `extent`) directly into a caller-
+    /// provided dmabuf-backed image (`dst_image`/`dst_view`, same `extent`,
+    /// imported with `COLOR_ATTACHMENT` usage and this encoder's `format`) — the
+    /// zero-copy path for `wlr-screencopy` dmabuf clients and (later) PipeWire.
+    ///
+    /// Unlike [`Self::capture`], this does **not** block: it submits the encode
+    /// and returns a Linux `SYNC_FD` `OwnedFd` that signals when the GPU is done.
+    /// The caller gates the protocol's completion event on that fd and must keep
+    /// the dmabuf import alive until it fires. The image is left in `GENERAL`
+    /// layout for external (cross-API / KMS-style) consumption, matching the
+    /// scanout handoff.
+    ///
+    /// Captures whole-output only (`dst` extent must equal the intermediate);
+    /// region/scaled capture is the SHM path's job for now.
+    ///
+    /// **Ordering caveat.** This submits a *separate* command buffer that samples
+    /// the persistent intermediate without an explicit execution dependency on
+    /// the per-frame render submits (which also write/read the intermediate on
+    /// the same graphics queue). Safety today rests on two unenforced invariants:
+    /// (1) capture and `render_frame` are submitted from the *same thread* (the
+    /// calloop loop), so no frame is recorded concurrently; and (2) the single
+    /// graphics queue executes submissions in order (true on radv), so this
+    /// capture finishes sampling before the *next* frame's decode overwrites the
+    /// intermediate. If either breaks (a second queue; a driver that overlaps
+    /// same-queue submits), the worst case is a torn captured frame — not a
+    /// crash, since the intermediate is never freed. The robust fix is to record
+    /// the capture inside the frame's own submission (render-loop integration);
+    /// until then this is the documented trade-off. The in-cb `MemoryBarrier2`
+    /// below only orders *within this submission* (it makes prior writes visible
+    /// to our sample); it is not a cross-submit barrier.
+    pub fn capture_into_dmabuf(
+        &mut self,
+        intermediate_view: vk::ImageView,
+        dst_image: vk::Image,
+        dst_view: vk::ImageView,
+        extent: vk::Extent2D,
+        sdr_white_nits: f32,
+    ) -> Result<OwnedFd> {
+        if self.async_slot.is_none() {
+            self.async_slot = Some(AsyncSlot::new(&self.device)?);
+        }
+        let push = capture_push(sdr_white_nits);
+        let encode = &self.encode;
+        let slot = self.async_slot.as_ref().unwrap();
+        let cb = slot.cmd_buffer;
+        let raw = &self.device.raw;
+
+        // Gate reuse of this slot's cb/semaphore against the previous dmabuf
+        // capture still being in flight.
+        unsafe { raw.wait_for_fences(&[slot.fence], true, u64::MAX) }
+            .vk_ctx("wait_for_fences (capture async slot)")?;
+        unsafe { raw.reset_fences(&[slot.fence]) }.vk_ctx("reset_fences (capture async slot)")?;
+        unsafe { raw.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty()) }
+            .vk_ctx("reset_command_buffer (capture async slot)")?;
+
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { raw.begin_command_buffer(cb, &begin) }.vk_ctx("begin_command_buffer (capture)")?;
+
+        unsafe {
+            // Make writes to the intermediate visible to our sample, and bring
+            // the dst dmabuf UNDEFINED → COLOR_ATTACHMENT. NB: this is a
+            // *within-submission* visibility edge only — execution ordering vs.
+            // the per-frame submits relies on same-queue ordering (see the
+            // method doc's "Ordering caveat").
+            let to_attach = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(dst_image)
+                .subresource_range(color_range())];
+            let intermediate_vis = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
+            raw.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default()
+                    .memory_barriers(&intermediate_vis)
+                    .image_memory_barriers(&to_attach),
+            );
+
+            record_fullscreen_encode(raw, encode, cb, intermediate_view, dst_view, extent, &push);
+
+            // COLOR_ATTACHMENT → GENERAL for external consumption (the client's
+            // reader / KMS), matching the scanout's final handoff transition.
+            let to_general = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
+                .dst_access_mask(vk::AccessFlags2::empty())
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(dst_image)
+                .subresource_range(color_range())];
+            raw.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_general),
+            );
+
+            raw.end_command_buffer(cb)
+        }
+        .vk_ctx("end_command_buffer (capture)")?;
+
+        // Submit, signalling both the fence (slot-reuse gate) and the exportable
+        // binary semaphore (we export it as the returned sync_fd).
+        let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+        let signal = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(slot.semaphore)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let submit = [vk::SubmitInfo2::default()
+            .command_buffer_infos(&cb_infos)
+            .signal_semaphore_infos(&signal)];
+        unsafe { raw.queue_submit2(self.device.graphics_queue, &submit, slot.fence) }
+            .vk_ctx("queue_submit2 (capture async)")?;
+
+        // Export the just-signalled semaphore as a sync_file fd (transfers the
+        // sync state to the fd and unsignals the semaphore for next reuse).
+        let get_info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(slot.semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let raw_fd = unsafe { slot.fd_loader.get_semaphore_fd(&get_info) }
+            .vk_ctx("vkGetSemaphoreFdKHR (capture SYNC_FD)")?;
+        if raw_fd < 0 {
+            return Err(RendererError::MissingFeature(
+                "capture: vkGetSemaphoreFdKHR returned a negative fd",
+            ));
+        }
+        // SAFETY: a fresh, owned sync_file fd from a successful export.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
     }
 
     /// (Re)allocate the offscreen + readback target if it doesn't match `extent`.
@@ -416,11 +500,165 @@ impl Drop for Target {
 
 impl Drop for CaptureEncoder {
     fn drop(&mut self) {
-        // Drain before the target (and its mapped memory) tears down.
+        // Drain before the fields (target's mapped memory, async slot's pool /
+        // fence / semaphore) tear down in their own Drop impls.
         unsafe {
             let _ = self.device.raw.device_wait_idle();
         }
     }
+}
+
+/// Async-submit resources for the dmabuf capture path: a reusable command
+/// buffer + a reuse-gate fence + an exportable binary semaphore we hand to the
+/// caller as a sync_fd. One in flight at a time (the fence serializes reuse).
+struct AsyncSlot {
+    device: Arc<Device>,
+    pool: vk::CommandPool,
+    cmd_buffer: vk::CommandBuffer,
+    /// Signalled by each submit; waited at the start of the next to gate reuse.
+    /// Created signalled so the first wait is a no-op.
+    fence: vk::Fence,
+    /// Exportable (SYNC_FD) binary semaphore, signalled by each submit and
+    /// exported as the returned sync_fd. The export unsignals it for reuse.
+    semaphore: vk::Semaphore,
+    fd_loader: external_semaphore_fd::Device,
+}
+
+impl AsyncSlot {
+    fn new(device: &Arc<Device>) -> Result<Self> {
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(device.physical.graphics_queue_family)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.raw.create_command_pool(&pool_info, None) }
+            .vk_ctx("create_command_pool (capture async)")?;
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd_buffer = unsafe { device.raw.allocate_command_buffers(&alloc) }
+            .vk_ctx("allocate_command_buffers (capture async)")?[0];
+        let fence = unsafe {
+            device.raw.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
+        }
+        .vk_ctx("create_fence (capture async)")?;
+        let mut export = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let sem_info = vk::SemaphoreCreateInfo::default().push_next(&mut export);
+        let semaphore = unsafe { device.raw.create_semaphore(&sem_info, None) }
+            .vk_ctx("create_semaphore (capture async, exportable SYNC_FD)")?;
+        let fd_loader = external_semaphore_fd::Device::new(device.instance_raw(), &device.raw);
+        Ok(Self {
+            device: device.clone(),
+            pool,
+            cmd_buffer,
+            fence,
+            semaphore,
+            fd_loader,
+        })
+    }
+}
+
+impl Drop for AsyncSlot {
+    fn drop(&mut self) {
+        // CaptureEncoder::drop drained the device before we get here.
+        unsafe {
+            self.device.raw.destroy_semaphore(self.semaphore, None);
+            self.device.raw.destroy_fence(self.fence, None);
+            self.device.raw.destroy_command_pool(self.pool, None);
+        }
+    }
+}
+
+/// Build the capture encode push constants for a given reference-white level:
+/// the BT.2020 → BT.709 primaries matrix plus `sdr_white_nits` for the sRGB
+/// OETF's normalization. Shared by the SHM and dmabuf paths.
+fn capture_push(sdr_white_nits: f32) -> EncodePush {
+    let mut push = EncodePush::sdr_identity();
+    push.sdr_white_nits = sdr_white_nits;
+    push.target_peak_nits = sdr_white_nits;
+    // CalibrationMatrix does `out = mat3(cal_matrix) * in`; set it to the
+    // BT.2020 → BT.709 primaries conversion so the sRGB OETF that follows
+    // receives sRGB-primary light.
+    push.set_ctm(prism_frame::bt2020_to_srgb_matrix());
+    push
+}
+
+/// Record the capture encode pass: a full-screen triangle sampling
+/// `intermediate_view` (`SHADER_READ_ONLY_OPTIMAL`) and writing the sRGB capture
+/// into `dst_view` (must already be `COLOR_ATTACHMENT_OPTIMAL`, `extent`-sized).
+/// Emits no barriers — the caller wraps this with the layout transitions and
+/// submit appropriate to its destination (owned offscreen vs. client dmabuf).
+///
+/// # Safety
+/// `cb` must be in the recording state; `dst_view`/`intermediate_view` must be
+/// live and in the layouts above for the duration of the submitted work.
+unsafe fn record_fullscreen_encode(
+    raw: &ash::Device,
+    encode: &EncodePipeline,
+    cb: vk::CommandBuffer,
+    intermediate_view: vk::ImageView,
+    dst_view: vk::ImageView,
+    extent: vk::Extent2D,
+    push: &EncodePush,
+) {
+    let color_attach = [vk::RenderingAttachmentInfo::default()
+        .image_view(dst_view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .store_op(vk::AttachmentStoreOp::STORE)];
+    let rendering_info = vk::RenderingInfo::default()
+        .render_area(vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        })
+        .layer_count(1)
+        .color_attachments(&color_attach);
+    raw.cmd_begin_rendering(cb, &rendering_info);
+
+    let viewport = vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: extent.width as f32,
+        height: extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+    raw.cmd_set_viewport(cb, 0, &[viewport]);
+    raw.cmd_set_scissor(
+        cb,
+        0,
+        &[vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        }],
+    );
+    raw.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, encode.pipeline);
+
+    // Binding 0 = intermediate. No LUT binding (capture chain omits it).
+    let intermediate_info = [vk::DescriptorImageInfo::default()
+        .sampler(encode.sampler)
+        .image_view(intermediate_view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let writes = [encode.write_intermediate_binding(&intermediate_info)];
+    encode.push_loader.cmd_push_descriptor_set(
+        cb,
+        vk::PipelineBindPoint::GRAPHICS,
+        encode.pipeline_layout,
+        0,
+        &writes,
+    );
+    raw.cmd_push_constants(
+        cb,
+        encode.pipeline_layout,
+        vk::ShaderStageFlags::FRAGMENT,
+        0,
+        bytemuck::bytes_of(push),
+    );
+    raw.cmd_draw(cb, 3, 1, 0, 0);
+    raw.cmd_end_rendering(cb);
 }
 
 fn color_range() -> vk::ImageSubresourceRange {
