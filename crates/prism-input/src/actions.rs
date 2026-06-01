@@ -271,8 +271,8 @@ fn spawn_sync(args: Vec<String>) {
     }
 
     // SAFETY: the closure runs in the forked child, between fork and exec,
-    // where it is single-threaded; fork(2)/setsid(2)/_exit(2) are all
-    // async-signal-safe. Double-fork: the intermediate child exits
+    // where it is single-threaded; fork(2)/setsid(2)/_exit(2) and the
+    // sigemptyset/sigprocmask below are all async-signal-safe. Double-fork: the intermediate child exits
     // immediately, so the grandchild (which execs the program) reparents to
     // init and never lingers as a zombie of prism. The intermediate is
     // reaped by `wait()` below. setsid detaches the grandchild from prism's
@@ -286,6 +286,20 @@ fn spawn_sync(args: Vec<String>) {
                 _ => libc::_exit(0),
             }
             libc::setsid();
+            // Reset the signal mask to empty. calloop's `Signals` source
+            // blocks SIGINT/SIGTERM on prism's main thread, and that blocked
+            // mask is inherited across fork+exec — including into a terminal's
+            // shell and the apps it runs. Without this, Ctrl-C can't cancel a
+            // foreground app: the tty echoes `^C` and raises SIGINT, but it
+            // stays blocked/pending and never fires. Mirrors the xwayland
+            // satellite's `unblock_all`.
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            if libc::sigemptyset(&mut set) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
