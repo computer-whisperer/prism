@@ -16,6 +16,7 @@ pub mod output_power;
 pub mod pointer_focus;
 pub mod redraw;
 pub mod rlimit;
+pub mod screencopy;
 pub mod selection;
 pub mod server;
 pub mod state;

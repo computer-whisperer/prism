@@ -679,6 +679,11 @@ impl PrismState {
         // is kept alive by the display; nothing else to store.
         crate::output_power::create_output_power_global(&dh);
 
+        // wlr-screencopy — screenshots / capture (grim, wf-recorder, portal).
+        // Hand-rolled; see crate::screencopy. Stateless (per-frame data lives in
+        // the frame resource), so nothing to store here.
+        crate::screencopy::create_screencopy_global(&dh);
+
         // wp_cursor_shape_v1 — clients request a named cursor shape (text,
         // pointer, grab, …) instead of providing a buffer. smithay routes
         // each request through `SeatHandler::cursor_image(Named(icon))`, so

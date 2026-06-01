@@ -4,6 +4,7 @@
 //! [`element`] (a back-to-front list of [`RenderEl`](element::RenderEl)s),
 //! produces scanout buffers for `prism_drm` to submit.
 
+pub mod capture;
 pub mod cross_gpu;
 pub mod damage;
 pub mod device;
@@ -21,6 +22,7 @@ pub mod renderer;
 pub mod snapshot;
 pub mod upload;
 
+pub use capture::{CaptureEncoder, CaptureImage};
 pub use cross_gpu::{ExportableImage, MirrorCopier, MirrorCopyOp};
 pub use damage::DamageTracker;
 pub use device::{Device, DrmDevId, DrmFormatModifierInfo, PhysicalDeviceInfo};

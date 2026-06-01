@@ -23,8 +23,9 @@ pub mod dmabuf;
 pub mod id;
 
 pub use color::{
-    primaries_to_bt2020, primaries_to_bt2020_unadapted, srgb_to_bt2020_matrix, Chromaticities,
-    ColorDescription, GammaExponent, MasteringInfo, Mat3, Primaries, TransferFunction,
+    bt2020_to_srgb_matrix, primaries_to_bt2020, primaries_to_bt2020_unadapted,
+    srgb_to_bt2020_matrix, Chromaticities, ColorDescription, GammaExponent, MasteringInfo, Mat3,
+    Primaries, TransferFunction,
 };
 pub use dmabuf::{Dmabuf, DmabufPlane};
 pub use id::ElementId;

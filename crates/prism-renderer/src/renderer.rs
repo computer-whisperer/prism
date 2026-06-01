@@ -106,6 +106,10 @@ pub struct Renderer {
     /// output. Allocated lazily on first diagnose call so non-
     /// calibration sessions don't pay for it.
     diagnose: Option<EncodeDiagnoseProbe>,
+    /// Screen-capture encoder (sRGB capture chain + offscreen readback).
+    /// Allocated lazily on first capture so non-capturing sessions don't
+    /// pay for the offscreen/readback target. See [`crate::capture`].
+    capture: Option<crate::capture::CaptureEncoder>,
     scanout_format: vk::Format,
     intermediate_format: vk::Format,
     command_pool: vk::CommandPool,
@@ -202,6 +206,7 @@ impl Renderer {
             white_tex,
             lut3d,
             diagnose: None,
+            capture: None,
             scanout_format,
             intermediate_format,
             command_pool,
@@ -234,6 +239,51 @@ impl Renderer {
         }
         let probe = self.diagnose.as_mut().unwrap();
         probe.diagnose(&self.encode, encode_push, self.lut3d.as_ref(), input_nits)
+    }
+
+    /// Capture this output's last composited frame as an sRGB image in
+    /// `format` (`R8G8B8A8_UNORM` or `B8G8R8A8_UNORM` — the latter fills
+    /// `Xrgb8888`/`Argb8888` client buffers without a CPU swizzle).
+    ///
+    /// Renders the persistent intermediate (the last frame's BT.2020 absolute-
+    /// nits composite, still resident) through the capture encode chain — a
+    /// colorimetric sRGB target with no panel correction — and reads it back to
+    /// host memory. `sdr_white_nits` is the output's reference-white level
+    /// (`effective_sdr_reference_nits()`); it sets where diffuse white lands.
+    ///
+    /// Must be called when no `render_frame` for this output is mid-flight, so
+    /// the capture's own submit (which `queue_wait_idle`s) is ordered before the
+    /// next frame's decode rewrites the intermediate. Errors if no frame has
+    /// been rendered yet (no intermediate to capture).
+    ///
+    /// Lazy-allocates the capture encoder + its offscreen/readback target on
+    /// first call so non-capturing sessions don't pay for it; rebuilds the
+    /// encoder if a different `format` is requested than last time.
+    pub fn capture(
+        &mut self,
+        format: vk::Format,
+        sdr_white_nits: f32,
+    ) -> Result<crate::capture::CaptureImage> {
+        let (view, extent) = {
+            let intermediate =
+                self.intermediate
+                    .as_ref()
+                    .ok_or(crate::error::RendererError::MissingFeature(
+                        "capture: no intermediate (no frame rendered yet)",
+                    ))?;
+            (intermediate.view, intermediate.extent)
+        };
+        let need_rebuild = self.capture.as_ref().is_none_or(|c| c.format() != format);
+        if need_rebuild {
+            self.capture = Some(crate::capture::CaptureEncoder::new(
+                self.device.clone(),
+                format,
+            )?);
+        }
+        self.capture
+            .as_mut()
+            .unwrap()
+            .capture(view, extent, sdr_white_nits)
     }
 
     /// Replace this output's 3D LUT content. No-op (and returns Ok) when

@@ -332,6 +332,19 @@ pub fn srgb_to_bt2020_matrix() -> Mat3 {
     *M
 }
 
+/// The BT.2020 → sRGB/BT.709 matrix — the exact inverse of
+/// [`srgb_to_bt2020_matrix`]. Converts the renderer's BT.2020 absolute-nits
+/// intermediate into sRGB/BT.709 primaries, the colorimetric conversion the
+/// screen-capture encode applies before the sRGB OETF (see
+/// `docs/screen-capture.md`). Row-major; apply as `m * rgb`. Cached. Saturated
+/// BT.2020 colors map outside `[0, 1]` here; the capture's `clamp` handles that
+/// (a hard gamut clip — see the doc for the tone/gamut-roll-off follow-up).
+pub fn bt2020_to_srgb_matrix() -> Mat3 {
+    use std::sync::LazyLock;
+    static M: LazyLock<Mat3> = LazyLock::new(|| mat3_inverse(srgb_to_bt2020_matrix()));
+    *M
+}
+
 #[cfg(test)]
 mod primaries_tests {
     use super::*;
