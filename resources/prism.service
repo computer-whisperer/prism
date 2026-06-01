@@ -1,0 +1,20 @@
+[Unit]
+Description=Prism, a Wayland compositor
+# Tie the lifetime of graphical-session.target to prism: it comes up with
+# prism and is torn down when prism exits.
+BindsTo=graphical-session.target
+Before=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+
+# Run XDG autostart entries (.desktop with X-GNOME-Autostart) as part of the
+# session, after prism is ready.
+Wants=xdg-desktop-autostart.target
+Before=xdg-desktop-autostart.target
+
+[Service]
+Slice=session.slice
+# prism sends READY=1 once the Wayland socket is listening and the session
+# environment has been published (see notify_systemd_ready in main.rs).
+Type=notify
+ExecStart=prism run --session

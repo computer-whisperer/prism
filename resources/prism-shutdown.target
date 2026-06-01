@@ -1,0 +1,9 @@
+[Unit]
+Description=Shutdown running prism session
+DefaultDependencies=no
+StopWhenUnneeded=true
+
+# Pulling in this target tears down the graphical session. prism-session
+# starts it (job-mode replace-irreversibly) right after prism exits.
+Conflicts=graphical-session.target graphical-session-pre.target
+After=graphical-session.target graphical-session-pre.target

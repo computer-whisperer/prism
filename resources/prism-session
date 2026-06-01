@@ -1,0 +1,64 @@
+#!/bin/sh
+# Launch prism as a systemd --user managed session, mirroring niri-session.
+#
+# Run this from a TTY after logging in. It hands the compositor to the
+# systemd user manager so it runs on your real session bus (the one that
+# already hosts gnome-keyring / the Secret Service, xdg-desktop-portal, etc.)
+# — NOT a private dbus-run-session bus, which cannot host the per-user
+# keyring singleton and would make every password-store request hang.
+
+# If invoked as the user service itself (ExecStart=prism-session), external
+# session management is in play — exec the compositor directly.
+if [ -n "${MANAGERPID:-}" ] && [ "${SYSTEMD_EXEC_PID:-}" = "$$" ]; then
+    case "$(ps -p "$MANAGERPID" -o cmd=)" in
+    *systemd*--user*)
+        exec prism run --session
+        ;;
+    esac
+fi
+
+# Re-exec under a login shell so the user's environment (PATH, etc.) is loaded
+# before we touch the systemd/D-Bus environment.
+if [ -n "$SHELL" ] &&
+   grep -q "$SHELL" /etc/shells &&
+   ! (echo "$SHELL" | grep -q "false") &&
+   ! (echo "$SHELL" | grep -q "nologin"); then
+  if [ "$1" != '-l' ]; then
+    exec bash -c "exec -l '$SHELL' -c '$0 -l $*'"
+  else
+    shift
+  fi
+fi
+
+if ! hash systemctl >/dev/null 2>&1; then
+    echo "prism-session: systemd not detected; run 'prism run --session' directly." >&2
+    exit 1
+fi
+
+# Refuse to start a second session.
+if systemctl --user -q is-active prism.service; then
+  echo 'A prism session is already running.' >&2
+  exit 1
+fi
+
+# Clear any prior failed state so a stale failure doesn't block startup.
+systemctl --user reset-failed
+
+# Publish the login environment into the systemd user manager so services
+# started as part of the session inherit it.
+systemctl --user import-environment
+
+# The D-Bus activation environment is independent of systemd; update it too,
+# so dbus-activated services (portals, etc.) see the same environment.
+if hash dbus-update-activation-environment 2>/dev/null; then
+    dbus-update-activation-environment --all
+fi
+
+# Start prism and block until it exits.
+systemctl --user --wait start prism.service
+
+# prism has exited — force the graphical session down.
+systemctl --user start --job-mode=replace-irreversibly prism-shutdown.target
+
+# Drop the variables prism published, so a later session starts clean.
+systemctl --user unset-environment WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP PRISM_SOCKET

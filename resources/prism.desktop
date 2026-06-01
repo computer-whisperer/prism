@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Prism
+Comment=A Wayland compositor
+Exec=prism-session
+Type=Application
+DesktopNames=prism

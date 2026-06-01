@@ -933,6 +933,43 @@ fn import_environment() {
     }
 }
 
+/// Notify systemd that prism is up and ready to serve clients (`READY=1`),
+/// for the `Type=notify` user service (see `resources/prism.service`). Once
+/// this fires, systemd lets `graphical-session.target` and the autostart
+/// units proceed — so it must run after the Wayland socket is listening and
+/// the environment is published.
+///
+/// No-op when `$NOTIFY_SOCKET` is unset (i.e. not launched as a notify
+/// service — e.g. a bare `prism run` from a shell). Best-effort: failures
+/// are logged, not fatal. Speaks the sd_notify wire protocol directly (one
+/// datagram to the `$NOTIFY_SOCKET` AF_UNIX socket) to avoid a libsystemd
+/// dependency.
+fn notify_systemd_ready() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
+        return; // not run under a Type=notify service; nothing to do
+    };
+    let result = (|| -> std::io::Result<()> {
+        let sock = std::os::unix::net::UnixDatagram::unbound()?;
+        const MSG: &[u8] = b"READY=1\n";
+        // systemd uses a path-based socket for user services, but an abstract
+        // socket (leading '@' → leading NUL) is also legal — handle both.
+        if socket.as_bytes().first() == Some(&b'@') {
+            use std::os::linux::net::SocketAddrExt;
+            let addr = std::os::unix::net::SocketAddr::from_abstract_name(&socket.as_bytes()[1..])?;
+            sock.connect_addr(&addr)?;
+            sock.send(MSG)?;
+        } else {
+            sock.send_to(MSG, std::path::Path::new(&socket))?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => tracing::info!("notified systemd: READY=1"),
+        Err(e) => tracing::warn!("sd_notify READY=1 failed: {e}"),
+    }
+}
+
 /// Breadcrumbs are appended to ./prism.crumbs (override with $PRISM_CRUMBS)
 /// with fsync per line, so they survive a system lockup.
 ///
@@ -1675,6 +1712,11 @@ fn run_integrated(
             unsafe { std::env::set_var("XDG_CURRENT_DESKTOP", "prism") };
         }
         import_environment();
+
+        // Tell systemd we're ready so graphical-session.target and the
+        // autostart units start only now (the socket is up, env published).
+        // No-op unless launched as a Type=notify service.
+        notify_systemd_ready();
     }
 
     // Launch configured startup commands. The wayland socket is up by now
