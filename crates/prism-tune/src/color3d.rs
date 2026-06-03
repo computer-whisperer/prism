@@ -21,6 +21,7 @@
 use std::collections::HashSet;
 
 use damascene_core::scene::glam::Vec3;
+use damascene_core::scene::{LabelPlacement, PointLabels};
 use damascene_core::scene::{LineData, LinesHandle};
 use damascene_core::scene::{LineSegment, PointData, PointsHandle, ScenePoint};
 
@@ -76,22 +77,63 @@ const P3_TO_XYZ: [[f64; 3]; 3] = [
     [0.000_000_0, 0.045_113_4, 1.043_944_4],
 ];
 
-/// A built gamut scene: the measured-color point cloud and the reference
-/// gamut-cage wireframes. Both are damascene geometry handles (Arc'd,
-/// versioned), built once per capture and cloned into a fresh `SceneSpec`
-/// each frame.
+/// A built gamut scene: the measured-color point cloud, the enabled
+/// reference gamut-cage wireframes, and one labelled anchor per cage (at
+/// its green primary). All are damascene geometry handles (Arc'd,
+/// versioned), built once per capture + reference set and cloned into a
+/// fresh `SceneSpec` each frame.
 pub struct GamutScene {
     pub points: PointsHandle,
     pub cages: LinesHandle,
+    /// One marker point per enabled cage, at its green primary — the
+    /// vertex that differs most between gamuts, so labels don't pile up at
+    /// the shared white.
+    pub cage_label_geo: PointsHandle,
+    /// Persistent in-plot name labels, aligned with `cage_label_geo`.
+    pub cage_labels: PointLabels,
     /// Distinct point count after voxel dedup (for the status line).
     pub point_count: usize,
 }
 
-/// Reference gamuts overlaid as cage wireframes.
-const REF_GAMUTS: [(&str, &[[f64; 3]; 3], [f32; 4]); 3] = [
-    ("sRGB", &SRGB_TO_XYZ, [0.42, 0.60, 1.0, 0.5]),
-    ("Display P3", &P3_TO_XYZ, [0.36, 0.85, 0.52, 0.5]),
-    ("Rec.2020", &BT2020_TO_XYZ, [1.0, 0.70, 0.30, 0.5]),
+/// A reference gamut the plot can outline as a cage overlay.
+pub struct RefGamut {
+    /// Toggle route suffix (`cage:<key>`) and stable identity.
+    pub key: &'static str,
+    /// Button / in-plot label text.
+    pub name: &'static str,
+    /// This gamut's linear-RGB → XYZ matrix.
+    matrix: &'static [[f64; 3]; 3],
+    /// Cage + label color (authoring sRGBA).
+    pub color: [f32; 4],
+}
+
+/// Number of reference-gamut overlays offered.
+pub const N_REF_GAMUTS: usize = 3;
+
+/// Which reference cages are enabled, parallel to [`REF_GAMUTS`].
+pub type RefSet = [bool; N_REF_GAMUTS];
+
+/// Reference gamuts overlaid as cage wireframes, in nesting order
+/// (sRGB ⊂ Display P3 ⊂ Rec.2020).
+pub const REF_GAMUTS: [RefGamut; N_REF_GAMUTS] = [
+    RefGamut {
+        key: "srgb",
+        name: "sRGB",
+        matrix: &SRGB_TO_XYZ,
+        color: [0.42, 0.60, 1.0, 0.5],
+    },
+    RefGamut {
+        key: "p3",
+        name: "Display P3",
+        matrix: &P3_TO_XYZ,
+        color: [0.36, 0.85, 0.52, 0.5],
+    },
+    RefGamut {
+        key: "bt2020",
+        name: "Rec.2020",
+        matrix: &BT2020_TO_XYZ,
+        color: [1.0, 0.70, 0.30, 0.5],
+    },
 ];
 
 fn mat_mul(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
@@ -140,7 +182,7 @@ fn point_color(bt2020: [f64; 3]) -> [f32; 4] {
 /// collapse to one mark instead of thousands. Point swatch colors are the
 /// same in both spaces (tonemapped relative to reference white so a mark
 /// looks like its pixel); only the *positions* differ.
-pub fn build_gamut_scene(samples: &[[f32; 3]], space: GamutSpace) -> GamutScene {
+pub fn build_gamut_scene(samples: &[[f32; 3]], space: GamutSpace, refs: RefSet) -> GamutScene {
     let inv_ref = 1.0 / REFERENCE_WHITE_NITS;
     let mut seen: HashSet<(i32, i32, i32)> = HashSet::new();
     let mut points: Vec<ScenePoint> = Vec::new();
@@ -188,19 +230,53 @@ pub fn build_gamut_scene(samples: &[[f32; 3]], space: GamutSpace) -> GamutScene 
         }
     }
 
+    // Only the enabled cages are drawn; each gets a labelled marker at its
+    // green primary so every outlined gamut is named where it's most
+    // distinctive (green diverges most between gamuts).
     let mut cages: Vec<LineSegment> = Vec::new();
-    for (_name, matrix, color) in REF_GAMUTS {
-        match space {
-            GamutSpace::Cielab => cages.extend(gamut_cage_lab(matrix, color)),
-            GamutSpace::Bt2020Rgb => cages.extend(gamut_cage_rgb(matrix, color)),
+    let mut anchor_pts: Vec<ScenePoint> = Vec::new();
+    let mut anchor_txt: Vec<String> = Vec::new();
+    for (on, g) in refs.iter().zip(REF_GAMUTS.iter()) {
+        if !*on {
+            continue;
         }
+        match space {
+            GamutSpace::Cielab => cages.extend(gamut_cage_lab(g.matrix, g.color)),
+            GamutSpace::Bt2020Rgb => cages.extend(gamut_cage_rgb(g.matrix, g.color)),
+        }
+        anchor_pts.push(ScenePoint {
+            position: cage_green_world(g.matrix, space),
+            color: g.color,
+        });
+        anchor_txt.push(g.name.to_string());
     }
 
     let point_count = points.len();
     GamutScene {
         points: PointsHandle::new(PointData { points }),
         cages: LinesHandle::new(LineData { segments: cages }),
+        cage_label_geo: PointsHandle::new(PointData { points: anchor_pts }),
+        cage_labels: PointLabels::new(anchor_txt)
+            .always()
+            .placement(LabelPlacement::Above),
         point_count,
+    }
+}
+
+/// World position of a gamut's green primary `[0, 1, 0]` in the given
+/// plot space — the anchor for its in-plot name label.
+fn cage_green_world(rgb_to_xyz: &[[f64; 3]; 3], space: GamutSpace) -> Vec3 {
+    const GREEN: [f64; 3] = [0.0, 1.0, 0.0];
+    match space {
+        GamutSpace::Cielab => lab_to_world(xyz_to_lab(mat_mul(rgb_to_xyz, GREEN), D65)),
+        GamutSpace::Bt2020Rgb => {
+            let bt = mat_mul(&XYZ_TO_BT2020, mat_mul(rgb_to_xyz, GREEN));
+            Vec3::new(
+                (bt[0] * REFERENCE_WHITE_NITS) as f32,
+                (bt[1] * REFERENCE_WHITE_NITS) as f32,
+                (bt[2] * REFERENCE_WHITE_NITS) as f32,
+            )
+        }
     }
 }
 
@@ -315,7 +391,7 @@ mod tests {
         // A BT.2020 sample at exactly REFERENCE_WHITE_NITS is L*≈100,
         // independent of any per-output white.
         let w = REFERENCE_WHITE_NITS as f32;
-        let scene = build_gamut_scene(&[[w, w, w]], GamutSpace::Cielab);
+        let scene = build_gamut_scene(&[[w, w, w]], GamutSpace::Cielab, [true; N_REF_GAMUTS]);
         let (data, _rev) = scene.points.snapshot();
         assert_eq!(scene.point_count, 1);
         assert!(approx(data.points[0].position.y as f64, 100.0, 0.1));
@@ -325,7 +401,7 @@ mod tests {
     fn cloud_dedups_identical_samples() {
         let samples = vec![[100.0f32, 50.0, 25.0]; 1000];
         for space in [GamutSpace::Cielab, GamutSpace::Bt2020Rgb] {
-            let scene = build_gamut_scene(&samples, space);
+            let scene = build_gamut_scene(&samples, space, [true; N_REF_GAMUTS]);
             assert_eq!(
                 scene.point_count, 1,
                 "identical samples collapse, {space:?}"
@@ -336,11 +412,38 @@ mod tests {
     #[test]
     fn raw_rgb_position_is_absolute_nits() {
         // BT.2020 RGB mode plots the buffer values directly, no scaling.
-        let scene = build_gamut_scene(&[[120.0, 250.0, 60.0]], GamutSpace::Bt2020Rgb);
+        let scene = build_gamut_scene(
+            &[[120.0, 250.0, 60.0]],
+            GamutSpace::Bt2020Rgb,
+            [true; N_REF_GAMUTS],
+        );
         let (data, _rev) = scene.points.snapshot();
         let p = data.points[0].position;
         assert!(approx(p.x as f64, 120.0, 1e-3));
         assert!(approx(p.y as f64, 250.0, 1e-3));
         assert!(approx(p.z as f64, 60.0, 1e-3));
+    }
+
+    #[test]
+    fn enabled_set_selects_cages_and_labels() {
+        let sample = [[100.0f32, 50.0, 25.0]];
+        // All three on: three labelled anchors, named in REF_GAMUTS order.
+        let all = build_gamut_scene(&sample, GamutSpace::Cielab, [true; N_REF_GAMUTS]);
+        assert_eq!(all.cage_label_geo.snapshot().0.points.len(), 3);
+        assert_eq!(all.cage_labels.get(0), Some("sRGB"));
+        assert_eq!(all.cage_labels.get(1), Some("Display P3"));
+        assert_eq!(all.cage_labels.get(2), Some("Rec.2020"));
+        let all_segs = all.cages.snapshot().0.segments.len();
+
+        // Only Rec.2020 on: one anchor labelled "Rec.2020", a third of the cages.
+        let one = build_gamut_scene(&sample, GamutSpace::Cielab, [false, false, true]);
+        assert_eq!(one.cage_label_geo.snapshot().0.points.len(), 1);
+        assert_eq!(one.cage_labels.get(0), Some("Rec.2020"));
+        assert_eq!(one.cages.snapshot().0.segments.len(), all_segs / 3);
+
+        // None on: no cages, no labels (the cloud still stands on its own).
+        let none = build_gamut_scene(&sample, GamutSpace::Cielab, [false; N_REF_GAMUTS]);
+        assert_eq!(none.cage_label_geo.snapshot().0.points.len(), 0);
+        assert_eq!(none.cages.snapshot().0.segments.len(), 0);
     }
 }

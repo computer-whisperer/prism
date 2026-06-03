@@ -26,7 +26,7 @@ use prism_ipc::{
     ColorState, FrameFormat, FrameMeta, Output, OutputAction, Request, Response, ResponseCurveState,
 };
 
-use crate::color3d::{self, GamutScene, GamutSpace};
+use crate::color3d::{self, GamutScene, GamutSpace, RefSet, REF_GAMUTS};
 use crate::common::{send_action, srgb_oetf};
 
 /// Cloud-sample decimation cap (per axis). The cloud is deduped in Lab
@@ -118,6 +118,9 @@ struct TuneGui {
     gamut: Option<GamutScene>,
     /// Which coordinate space the gamut view plots in.
     gamut_space: GamutSpace,
+    /// Which reference gamut cages are drawn, parallel to
+    /// [`REF_GAMUTS`](crate::color3d::REF_GAMUTS).
+    enabled_gamuts: RefSet,
     selection: Selection,
 }
 
@@ -132,6 +135,7 @@ impl TuneGui {
             frame_samples: None,
             gamut: None,
             gamut_space: GamutSpace::Cielab,
+            enabled_gamuts: [true; REF_GAMUTS.len()],
             selection: Selection::default(),
         };
         gui.reload(None);
@@ -174,6 +178,7 @@ impl TuneGui {
             frame_samples: None,
             gamut: None,
             gamut_space: GamutSpace::Cielab,
+            enabled_gamuts: [true; REF_GAMUTS.len()],
             selection: Selection::default(),
         };
         gui.sync_fields();
@@ -271,7 +276,7 @@ impl TuneGui {
         self.gamut = self
             .frame_samples
             .as_ref()
-            .map(|s| color3d::build_gamut_scene(s, self.gamut_space));
+            .map(|s| color3d::build_gamut_scene(s, self.gamut_space, self.enabled_gamuts));
     }
 
     fn apply_sdr(&mut self) {
@@ -526,18 +531,34 @@ impl App for TuneGui {
                 );
 
                 let space_toggle = row([
-                    space_button(
+                    toggle_button(
                         "CIELAB",
                         "space:lab",
                         self.gamut_space == GamutSpace::Cielab,
                     ),
-                    space_button(
+                    toggle_button(
                         "BT.2020 RGB (nits)",
                         "space:rgb",
                         self.gamut_space == GamutSpace::Bt2020Rgb,
                     ),
                 ])
                 .gap(tokens::SPACE_2);
+
+                // Per-gamut cage on/off, in REF_GAMUTS order. Each cage is
+                // named in-plot at its green primary (see GamutScene).
+                let mut cage_btns: Vec<El> = Vec::with_capacity(REF_GAMUTS.len());
+                for (i, g) in REF_GAMUTS.iter().enumerate() {
+                    cage_btns.push(toggle_button(
+                        g.name,
+                        &format!("cage:{}", g.key),
+                        self.enabled_gamuts[i],
+                    ));
+                }
+                let cage_toggle = column([
+                    text("Reference gamuts").small().muted(),
+                    row(cage_btns).gap(tokens::SPACE_2),
+                ])
+                .gap(tokens::SPACE_1);
 
                 let gamut_body: El = match &self.gamut {
                     Some(g) => {
@@ -558,6 +579,17 @@ impl App for TuneGui {
                                 },
                             )
                             .lines(g.cages.clone())
+                            // A small square marker + persistent name at each
+                            // enabled cage's green primary.
+                            .points_labeled(
+                                g.cage_label_geo.clone(),
+                                PointStyle {
+                                    size: 5.0,
+                                    shape: PointShape::Square,
+                                    size_mode: SizeMode::ScreenSpace,
+                                },
+                                g.cage_labels.clone(),
+                            )
                             .axis_titles(tx, ty, tz);
                         chart3d(scene)
                             .width(Size::Fill(1.0))
@@ -569,7 +601,7 @@ impl App for TuneGui {
                 };
                 let gamut_card = titled_card(
                     "Gamut cloud — drag to orbit, wheel to zoom",
-                    [space_toggle, gamut_body],
+                    [space_toggle, cage_toggle, gamut_body],
                 );
 
                 column([
@@ -653,6 +685,13 @@ impl App for TuneGui {
                         }
                         return;
                     }
+                    if let Some(key) = r.strip_prefix("cage:") {
+                        if let Some(i) = REF_GAMUTS.iter().position(|g| g.key == key) {
+                            self.enabled_gamuts[i] = !self.enabled_gamuts[i];
+                            self.rebuild_gamut();
+                        }
+                        return;
+                    }
                 }
             }
         }
@@ -664,8 +703,9 @@ impl App for TuneGui {
     }
 }
 
-/// A gamut-space selector button — primary when active, ghost otherwise.
-fn space_button(label: &str, key: &str, active: bool) -> El {
+/// A toggle button — primary when active, ghost otherwise. Used for both
+/// the coordinate-space selector and the per-gamut cage toggles.
+fn toggle_button(label: &str, key: &str, active: bool) -> El {
     let btn = button(label.to_string()).key(key.to_string());
     if active {
         btn.primary()
