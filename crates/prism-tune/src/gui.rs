@@ -4,7 +4,8 @@
 //! First cut: the IPC surface only. It lists the connected outputs,
 //! shows each one's live [`ColorState`], and lets you apply the runtime
 //! color overrides (`SdrReferenceNits` / `ResponseCurve` /
-//! `PanelPeakNits` / `ResetColor`) and see the result reflected back.
+//! `PanelPeakNits` / `AdvertisedPeakNits` / `ResetColor`) and see the
+//! result reflected back.
 //!
 //! prism IPC is a fast one-shot socket round-trip, so every query and
 //! every apply runs synchronously inside `on_event` — no worker thread.
@@ -100,6 +101,9 @@ struct Fields {
     gain: [String; 3],
     gamma: [String; 3],
     peak: [String; 3],
+    /// Color-management advertised mastering peak (cd/m²). Empty for
+    /// SDR outputs (no mastering metadata is advertised).
+    advertised_peak: String,
 }
 
 impl Fields {
@@ -113,6 +117,10 @@ impl Fields {
             gain: gain.map(|v| format!("{v:.4}")),
             gamma: gamma.map(|v| format!("{v:.4}")),
             peak: color.panel_peak_nits.map(|v| format!("{v:.1}")),
+            advertised_peak: color
+                .advertised_peak_nits
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_default(),
         }
     }
 }
@@ -194,6 +202,7 @@ impl TuneGui {
                     gamma: [1.08, 1.07, 1.10],
                 }),
                 ctm: None,
+                advertised_peak_nits: Some(1000.0),
             },
         };
         let mut gui = TuneGui {
@@ -378,6 +387,16 @@ impl TuneGui {
         }
     }
 
+    fn apply_advertised(&mut self) {
+        match parse_field(&self.fields.advertised_peak, "advertised peak") {
+            Ok(nits) => self.apply(
+                OutputAction::AdvertisedPeakNits { nits },
+                "advertised peak nits",
+            ),
+            Err(e) => self.status = format!("{e:#}"),
+        }
+    }
+
     fn apply_peak(&mut self) {
         let parsed = (|| {
             Ok::<_, anyhow::Error>([
@@ -408,6 +427,13 @@ impl TuneGui {
             &mut self.fields.sdr_nits,
             &mut self.selection,
             "sdr",
+            &nits,
+            event,
+        );
+        numeric_input::apply_event(
+            &mut self.fields.advertised_peak,
+            &mut self.selection,
+            "advertised",
             &nits,
             event,
         );
@@ -475,6 +501,13 @@ fn color_state_card(color: &ColorState) -> El {
                 "SDR reference nits",
                 &format!("{:.1}", color.sdr_reference_nits),
             ),
+            info_row(
+                "Advertised peak nits",
+                &match color.advertised_peak_nits {
+                    Some(v) => format!("{v:.1}"),
+                    None => "—".to_string(),
+                },
+            ),
             info_row("Response curve", response),
             info_row("Gamut matrix (CTM)", ctm),
         ],
@@ -534,6 +567,35 @@ impl App for TuneGui {
                     ])
                     .gap(tokens::SPACE_2)
                     .align(Align::Center)],
+                );
+
+                // Color-management advertised mastering peak. HDR-only —
+                // it sets the mastering_luminance max in the preferred
+                // image description, independent of the panel-facing
+                // max-luminance (infoframe + encode clamp).
+                let advertised_card = titled_card(
+                    "Advertised peak · color management",
+                    [
+                        row([
+                            text("Nits").muted(),
+                            numeric_input(
+                                &self.fields.advertised_peak,
+                                &self.selection,
+                                "advertised",
+                                nits_opts(),
+                            )
+                            .width(Size::Fill(1.0)),
+                            button("Apply").key("apply:advertised").primary(),
+                        ])
+                        .gap(tokens::SPACE_2)
+                        .align(Align::Center),
+                        text(
+                            "What color-managed clients tone-map against; \
+                              separate from the panel's max-luminance.",
+                        )
+                        .muted()
+                        .small(),
+                    ],
                 );
 
                 let response_card = titled_card(
@@ -704,17 +766,22 @@ impl App for TuneGui {
                     [space_toggle, cage_toggle, shell_controls, gamut_body],
                 );
 
-                column([
+                let mut cards = vec![
                     header,
                     preview_card,
                     gamut_card,
                     color_state_card(&output.color),
                     sdr_card,
-                    response_card,
-                    peak_card,
-                    reset,
-                ])
-                .gap(tokens::SPACE_4)
+                ];
+                // The advertised mastering peak only applies to HDR
+                // outputs — skip the card entirely on SDR.
+                if output.color.hdr_active {
+                    cards.push(advertised_card);
+                }
+                cards.push(response_card);
+                cards.push(peak_card);
+                cards.push(reset);
+                column(cards).gap(tokens::SPACE_4)
             }
             None => column([text("No output selected.").muted()]).padding(tokens::SPACE_4),
         };
@@ -771,6 +838,10 @@ impl App for TuneGui {
                 }
                 "apply:sdr" => {
                     self.apply_sdr();
+                    return;
+                }
+                "apply:advertised" => {
+                    self.apply_advertised();
                     return;
                 }
                 "apply:response" => {

@@ -261,6 +261,7 @@ fn collect_outputs(state: &PrismState) -> HashMap<String, Output> {
             sdr_reference_nits: ctx.effective_sdr_reference_nits() as f64,
             response_curve: curve,
             ctm,
+            advertised_peak_nits: ctx.effective_advertised_peak_nits().map(|v| v as f64),
         };
         let info = Output {
             name: ctx.connector_name.clone(),
@@ -306,6 +307,11 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
     // PanelPeakNits affect the encode pipeline elsewhere (target_peak +
     // decode clamp) but not LUT *contents*, so they skip the re-synthesis.
     let mut lut_dirty = false;
+    // Set when a mutation changes what color-management clients are told
+    // (the advertised mastering peak) without touching the LUT or encode
+    // push — triggers a rebuild + re-advertise of the output's preferred
+    // image description after the match.
+    let mut readvertise = false;
     match action {
         OutputAction::SdrReferenceNits { nits } => {
             let v = (nits.clamp(1.0, 10_000.0)) as f32;
@@ -359,6 +365,18 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                     "panel-peak-nits applied but HDR infoframe rebuild failed: {e:#}"
                 );
             }
+        }
+        OutputAction::AdvertisedPeakNits { nits } => {
+            let v = (nits.round().clamp(1.0, 10_000.0)) as u32;
+            output_ctx.color_override.advertised_peak_nits = Some(v);
+            tracing::info!(
+                connector = %name,
+                advertised_peak_nits = v,
+                "ipc: set advertised-peak-nits override"
+            );
+            // Client-facing only — no LUT/encode change, no infoframe
+            // change. Just re-advertise the preferred description.
+            readvertise = true;
         }
         OutputAction::Ctm {
             rr,
@@ -497,6 +515,9 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                 );
             }
             lut_dirty = true;
+            // Clearing the override reverts the advertised peak to the
+            // KDL value — re-advertise so clients pick that back up.
+            readvertise = true;
         }
         other => {
             return Err(format!(
@@ -518,6 +539,14 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
         }
     }
 
+    // Rebuild + re-advertise the output's preferred image description
+    // when the advertised mastering peak changed (or was reset). This is
+    // independent of the render path — it only touches what
+    // color-management clients are told.
+    if readvertise {
+        readvertise_output_preferred(state, &output_id);
+    }
+
     // The recolor changes the encode output without moving any element, so the
     // damage tracker sees nothing — force the next present past the zero-damage
     // skip, or the change wouldn't reach the screen until something moved.
@@ -534,6 +563,58 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
         .queue_redraw();
 
     Ok(Response::OutputConfigChanged(OutputConfigChanged::Applied))
+}
+
+/// Rebuild an output's preferred `wp_color_management_v1` image
+/// description from its current (post-override) color state and push it
+/// to clients. Called after a tunable that only changes the advertised
+/// metadata (the mastering peak) — the render path is untouched.
+///
+/// The rebuild allocates a fresh image-description identity; we cache it
+/// as the output's preferred and send `preferred_changed2` to every
+/// color-managed toplevel currently mapped to the output so it re-queries
+/// the new value. Surfaces without a feedback object pick the new
+/// description up on their next `get_preferred`.
+fn readvertise_output_preferred(state: &mut PrismState, output_id: &str) {
+    let Some(output_ctx) = state.outputs.get(output_id) else {
+        return;
+    };
+    let preferred = prism_protocols::color_management::build_output_preferred(
+        output_ctx,
+        &state.color_management,
+    );
+    let identity = preferred.identity;
+    state
+        .color_management
+        .set_output_preferred(output_id.to_owned(), preferred);
+    tracing::info!(
+        connector = %output_id,
+        identity,
+        "color-mgmt: output preferred re-advertised after ipc tune"
+    );
+
+    // Notify color-managed toplevels on this output. windows_for_output
+    // panics on an output the layout doesn't track, so guard on the
+    // monitor existing first (wl_outputs and the layout are added
+    // together at bringup, but be defensive in the IPC path).
+    let Some(wl_output) = state.wl_outputs.get(output_id).cloned() else {
+        return;
+    };
+    if state.layout.monitor_for_output(&wl_output).is_none() {
+        return;
+    }
+    let surfaces: Vec<_> = state
+        .layout
+        .windows_for_output(&wl_output)
+        .map(|w| w.toplevel().wl_surface().clone())
+        .collect();
+    for surface in surfaces {
+        smithay::wayland::compositor::with_states(&surface, |states| {
+            prism_protocols::color_management::SurfaceColorFeedbackSlot::notify_preferred_changed(
+                states, identity,
+            );
+        });
+    }
 }
 
 /// Best-effort socket cleanup on shutdown. Doesn't panic on failure —

@@ -1423,10 +1423,25 @@ pub enum OutputAction {
         #[cfg_attr(feature = "clap", arg(long))]
         b: f64,
     },
+    /// Set the absolute peak luminance (cd/m²) this output advertises to
+    /// color-management clients as its mastering-display ceiling — the
+    /// `mastering_luminance` max in the preferred `wp_color_management_v1`
+    /// image description, i.e. the value a well-behaved client tone-maps
+    /// against. Independent of the panel-facing `max-luminance` (which
+    /// drives the HDR_OUTPUT_METADATA infoframe and the encode clamp):
+    /// tuning this changes only what color-managed clients are told.
+    /// Clients with a live surface-feedback object get a
+    /// `preferred_changed2` so they re-query. No effect on SDR outputs.
+    /// Sticky until `reset-color` or restart.
+    AdvertisedPeakNits {
+        /// Advertised peak luminance, cd/m². Clamped to [1, 10_000].
+        #[cfg_attr(feature = "clap", arg(long))]
+        nits: f64,
+    },
     /// Clear all runtime color overrides for this output (sdr
-    /// reference, response curve, panel peak nits, ctm, lut3d).
-    /// Subsequent rendering reverts to whatever's in the persisted
-    /// KDL config.
+    /// reference, response curve, panel peak nits, ctm, lut3d,
+    /// advertised peak nits). Subsequent rendering reverts to whatever's
+    /// in the persisted KDL config.
     ResetColor,
 }
 
@@ -1569,8 +1584,9 @@ pub struct Output {
 
 /// Snapshot of the effective per-output color pipeline state. Reflects
 /// runtime overrides (from `OutputAction::SdrReferenceNits` /
-/// `ResponseCurve` / `PanelPeakNits`) and persisted KDL config,
-/// resolved into the values the render path actually uses.
+/// `ResponseCurve` / `PanelPeakNits` / `AdvertisedPeakNits`) and
+/// persisted KDL config, resolved into the values the render path
+/// (and color-management advertisement) actually uses.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ColorState {
@@ -1591,6 +1607,10 @@ pub struct ColorState {
     /// identity (no matrix applied; BT.2020 IR drives panel primaries
     /// directly without gamut correction).
     pub ctm: Option<[[f64; 3]; 3]>,
+    /// Effective peak luminance (cd/m²) advertised to color-management
+    /// clients as the mastering-display ceiling. `None` for SDR outputs
+    /// (no mastering metadata advertised).
+    pub advertised_peak_nits: Option<f64>,
 }
 
 /// Per-channel response correction snapshot. See [`ColorState::response_curve`].

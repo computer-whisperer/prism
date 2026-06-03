@@ -283,6 +283,18 @@ pub struct HdrConfig {
     /// `max_luminance`.
     #[knuffel(property)]
     pub max_fall: Option<u32>,
+    /// Absolute peak luminance (cd/m²) advertised to color-management
+    /// clients as the display's mastering ceiling — the
+    /// `mastering_luminance` max in the preferred `wp_color_management_v1`
+    /// image description, i.e. the value a well-behaved client tone-maps
+    /// its content against. This is purely client-facing: unlike
+    /// `max_luminance` it does NOT drive the HDR_OUTPUT_METADATA
+    /// infoframe sent to the panel, nor the encode-side clamp. Split out
+    /// so a calibration pass can tune what clients are told the display
+    /// reaches independently of the panel signaling. Defaults to
+    /// `max_luminance` when unset.
+    #[knuffel(property)]
+    pub advertised_peak_nits: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

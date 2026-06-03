@@ -126,6 +126,14 @@ pub struct OutputConfig {
     /// connector-side advertisement (HDR_OUTPUT_METADATA blob +
     /// Colorspace).
     pub hdr: Option<crate::HdrSignaling>,
+    /// Absolute peak luminance (cd/m²) advertised to color-management
+    /// clients as the display's mastering ceiling (the
+    /// `mastering_luminance` max in the preferred `wp_color_management_v1`
+    /// image description). Purely a client-facing advertisement — unlike
+    /// `hdr.max_luminance` it does not feed the HDR_OUTPUT_METADATA
+    /// infoframe or the encode clamp. `None` = advertise
+    /// `hdr.max_luminance`. Only meaningful when `hdr` is `Some`.
+    pub advertised_peak_nits: Option<u32>,
     /// What absolute luminance "SDR white" (= 1.0 from a color-unaware
     /// client) maps to on this output, in cd/m². Plumbed through to
     /// the per-surface decode push as the `sdr_white_nits` parameter

@@ -123,6 +123,7 @@ pub fn query_output_baseline(name: &str) -> Result<OutputBaseline> {
         sdr_reference_nits,
         response_curve,
         ctm: _,
+        advertised_peak_nits: _,
     } = output.color;
     let initial_response_curve = response_curve.map(|c| (c.gain, c.gamma));
     // "Unknown" is prism IPC's sentinel for "EDID didn't carry this

@@ -535,7 +535,14 @@ pub fn build_output_preferred(
         // primary color volume) when the panel doesn't advertise
         // narrower ones via EDID — matches what build_hdr_metadata_blob
         // ships in the HDR_OUTPUT_METADATA infoframe.
-        let max_lum = hdr.max_luminance as u32;
+        // Mastering-display peak we advertise to clients. Defaults to
+        // the panel's KDL max-luminance but can be tuned independently
+        // via config `advertised-peak-nits` / the IPC override, so the
+        // value clients tone-map against isn't locked to the
+        // HDR_OUTPUT_METADATA signaling.
+        let advertised_peak = ctx
+            .effective_advertised_peak_nits()
+            .unwrap_or(hdr.max_luminance as u32);
         // Prefer the measured panel floor (calibrate-lut3d writes it
         // to the .lut header, OutputContext exposes it via
         // effective_black_point_xyz) over the KDL-configured min
@@ -561,7 +568,7 @@ pub fn build_output_preferred(
             mastering_primaries: None,
             mastering_luminance: Some(MasteringLuminance {
                 min_lum_ticks,
-                max_lum,
+                max_lum: advertised_peak,
             }),
             max_cll: Some(hdr.max_cll as u32),
             max_fall: Some(hdr.max_fall as u32),

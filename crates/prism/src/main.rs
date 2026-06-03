@@ -1098,6 +1098,9 @@ fn run_integrated(
         encode_config: prism_renderer::EncodeConfig::default_srgb(),
         vrr: false,
         hdr: None,
+        // Client-facing mastering-peak advertisement; None ⇒ advertise
+        // hdr.max_luminance. Set per-output below from the KDL color block.
+        advertised_peak_nits: None,
         // IEC sRGB default: 1.0 client-side = 80 cd/m². Per-output
         // overrides applied below when a connector's KDL color block
         // sets `sdr-reference-nits`.
@@ -1168,6 +1171,10 @@ fn run_integrated(
                         // maps to itself) while SDR content is boosted to match.
                         // An explicit `sdr-reference-nits` below still wins.
                         output_config.sdr_reference_nits = 203.0;
+                        // Client-facing mastering peak — independent of the
+                        // infoframe's max-luminance. None here ⇒ advertise
+                        // max-luminance (resolved in effective_advertised_peak_nits).
+                        output_config.advertised_peak_nits = hdr_cfg.advertised_peak_nits;
                         tracing::info!(
                             connector = %name,
                             "HDR config present: fp16 scanout + PQ encode + KMS signaling"

@@ -544,6 +544,30 @@ impl OutputContext {
         self.config.panel_peak_nits_rgb
     }
 
+    /// Resolve the peak luminance (cd/m²) to advertise to
+    /// color-management clients as the display's mastering ceiling.
+    /// Resolution order:
+    ///   1. Runtime IPC override (`ColorOverride::advertised_peak_nits`)
+    ///   2. KDL config `advertised-peak-nits`
+    ///   3. KDL `hdr { max-luminance … }`
+    ///
+    /// Returns `None` for SDR outputs (no `hdr` block ⇒ no mastering
+    /// metadata is advertised).
+    ///
+    /// Distinct from [`Self::effective_panel_peak_nits_rgb`] and the
+    /// panel-facing `max-luminance`: this only changes what we *tell*
+    /// clients the display reaches, not the HDR_OUTPUT_METADATA
+    /// infoframe or the encode clamp.
+    pub fn effective_advertised_peak_nits(&self) -> Option<u32> {
+        let hdr = self.config.hdr?;
+        Some(
+            self.color_override
+                .advertised_peak_nits
+                .or(self.config.advertised_peak_nits)
+                .unwrap_or(hdr.max_luminance as u32),
+        )
+    }
+
     /// Per-channel BT.2020-domain clamp the decoder applies to the fp16
     /// intermediate. The job here is only to prevent fp32 garbage from
     /// reaching the encode stage on adversarial content — gamut / range
@@ -612,6 +636,13 @@ pub struct ColorOverride {
     /// calibration tools after the per-channel saturation discovery
     /// phase produces measured per-subpixel maxima.
     pub panel_peak_nits_rgb: Option<[f32; 3]>,
+    /// Override for the color-management advertised peak luminance
+    /// (cd/m²) — the `mastering_luminance` max in the output's preferred
+    /// image description. Set by calibration tooling to tune what
+    /// color-managed clients are told the display reaches, without
+    /// touching the HDR_OUTPUT_METADATA infoframe or the encode path.
+    /// Shadows `OutputConfig::advertised_peak_nits`.
+    pub advertised_peak_nits: Option<u32>,
     /// Per-output 3×3 gamut-correction matrix override. Set by
     /// calibration tools after measured primaries are known; the
     /// encode shader applies `panel_rgb = M * bt2020_rgb` to map IR
