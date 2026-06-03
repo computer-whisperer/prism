@@ -3,17 +3,20 @@
 //! pulling `tristim-color`, which would force a bump of the pinned
 //! tristim git rev) — the needed subset is small and standard.
 //!
-//! The cloud and cages live in the same Lab frame: world X = a*, Y = L*
-//! (up), Z = b*, all referenced to D65 (BT.2020's white).
+//! Two plot spaces ([`GamutSpace`]):
 //!
-//! Measurements are **absolute**: the intermediate is absolute-nits
-//! BT.2020 linear, so the cloud is anchored to a fixed reference white
-//! ([`REFERENCE_WHITE_NITS`] → L* = 100) rather than the output's
-//! per-display `sdr_reference_nits`. That keeps two outputs — or SDR vs.
-//! HDR content — directly comparable, and lets content brighter than
-//! reference white extend above L* = 100 (so the L* axis isn't clipped).
-//! The cube-corner white of each cage sits at the same L* = 100, so a
-//! reference-white-luminance sample lands exactly on the cage white.
+//! - **CIELAB** — perceptual; world X = a*, Y = L* (up), Z = b*, D65.
+//!   Lab is *relative by construction* (L* = 100 is "white"), so this
+//!   mode anchors to a fixed [`REFERENCE_WHITE_NITS`] (not the output's
+//!   `sdr_reference_nits`); content brighter than reference white extends
+//!   above L* = 100. Each cage's white corner sits at L* = 100, so a
+//!   reference-white-luminance sample lands on the cage white.
+//!
+//! - **BT.2020 RGB** — the raw intermediate buffer values in **absolute
+//!   nits** (X=R, Y=G, Z=B), no normalization. This is the truly-absolute
+//!   view; reference gamuts (sRGB, P3) appear as nested cubes (scaled to
+//!   reference white) showing containment, with the BT.2020 cage as the
+//!   axis-aligned outer box.
 
 use std::collections::HashSet;
 
@@ -39,12 +42,32 @@ const BT2020_TO_XYZ: [[f64; 3]; 3] = [
     [0.000_000_0, 0.028_072_7, 1.060_985_1],
 ];
 
+/// XYZ → BT.2020 linear RGB (D65) — inverse of [`BT2020_TO_XYZ`]. Used
+/// to express other gamuts' primaries in the buffer's BT.2020 RGB space.
+const XYZ_TO_BT2020: [[f64; 3]; 3] = [
+    [1.716_651_2, -0.355_670_8, -0.253_366_3],
+    [-0.666_684_4, 1.616_481_2, 0.015_768_5],
+    [0.017_639_9, -0.042_770_6, 0.942_103_1],
+];
+
 /// sRGB / BT.709 linear RGB → XYZ (D65).
 const SRGB_TO_XYZ: [[f64; 3]; 3] = [
     [0.412_456_4, 0.357_576_1, 0.180_437_5],
     [0.212_672_9, 0.715_152_2, 0.072_175_0],
     [0.019_333_9, 0.119_192_0, 0.950_304_1],
 ];
+
+/// Coordinate space for the gamut plot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GamutSpace {
+    /// Perceptual CIELAB, anchored to [`REFERENCE_WHITE_NITS`] (white →
+    /// L* = 100). Relative by construction — Lab needs a white reference.
+    Cielab,
+    /// Raw BT.2020 RGB in **absolute nits**, straight from the
+    /// intermediate buffer (X=R, Y=G, Z=B). No normalization; reference
+    /// gamuts appear as nested cubes scaled to [`REFERENCE_WHITE_NITS`].
+    Bt2020Rgb,
+}
 
 /// Display-P3 linear RGB → XYZ (D65).
 const P3_TO_XYZ: [[f64; 3]; 3] = [
@@ -60,7 +83,7 @@ const P3_TO_XYZ: [[f64; 3]; 3] = [
 pub struct GamutScene {
     pub points: PointsHandle,
     pub cages: LinesHandle,
-    /// Distinct point count after Lab dedup (for the status line).
+    /// Distinct point count after voxel dedup (for the status line).
     pub point_count: usize,
 }
 
@@ -111,45 +134,66 @@ fn point_color(bt2020: [f64; 3]) -> [f32; 4] {
     [enc(sr), enc(sg), enc(sb), 1.0]
 }
 
-/// Build the point cloud + cages from BT.2020 absolute-nits samples,
-/// anchored to the fixed [`REFERENCE_WHITE_NITS`] (absolute, not relative
-/// to any per-output white). Points are deduplicated on a Lab voxel grid
-/// so large flat regions collapse to one mark instead of thousands.
-pub fn build_gamut_scene(samples: &[[f32; 3]]) -> GamutScene {
-    let scale = 1.0 / REFERENCE_WHITE_NITS;
-
-    // Lab voxel dedup: quantize to `CELL`-sized cells, keep one per cell.
-    const CELL: f64 = 2.0;
+/// Build the point cloud + reference cages from BT.2020 absolute-nits
+/// samples, in the requested [`GamutSpace`]. Points are deduplicated on a
+/// voxel grid (in the plot's own coordinates) so large flat regions
+/// collapse to one mark instead of thousands. Point swatch colors are the
+/// same in both spaces (tonemapped relative to reference white so a mark
+/// looks like its pixel); only the *positions* differ.
+pub fn build_gamut_scene(samples: &[[f32; 3]], space: GamutSpace) -> GamutScene {
+    let inv_ref = 1.0 / REFERENCE_WHITE_NITS;
     let mut seen: HashSet<(i32, i32, i32)> = HashSet::new();
     let mut points: Vec<ScenePoint> = Vec::new();
+
     for s in samples {
-        let bt2020 = [
-            s[0] as f64 * scale,
-            s[1] as f64 * scale,
-            s[2] as f64 * scale,
-        ];
-        // Clamp tiny negatives from sensor/encode noise before Lab.
-        let xyz = mat_mul(
-            &BT2020_TO_XYZ,
-            [bt2020[0].max(0.0), bt2020[1].max(0.0), bt2020[2].max(0.0)],
-        );
-        let lab = xyz_to_lab(xyz, D65);
-        let cell = (
-            (lab[1] / CELL).round() as i32,
-            (lab[0] / CELL).round() as i32,
-            (lab[2] / CELL).round() as i32,
-        );
+        let nits = [s[0] as f64, s[1] as f64, s[2] as f64];
+        // White-relative copy, only for the swatch color.
+        let rel = [nits[0] * inv_ref, nits[1] * inv_ref, nits[2] * inv_ref];
+
+        let (position, cell) = match space {
+            GamutSpace::Cielab => {
+                // Clamp tiny negatives from encode noise before Lab.
+                let xyz = mat_mul(
+                    &BT2020_TO_XYZ,
+                    [rel[0].max(0.0), rel[1].max(0.0), rel[2].max(0.0)],
+                );
+                let lab = xyz_to_lab(xyz, D65);
+                const CELL: f64 = 2.0; // Lab units
+                let cell = (
+                    (lab[1] / CELL).round() as i32,
+                    (lab[0] / CELL).round() as i32,
+                    (lab[2] / CELL).round() as i32,
+                );
+                (lab_to_world(lab), cell)
+            }
+            GamutSpace::Bt2020Rgb => {
+                const CELL: f64 = 4.0; // nits
+                let cell = (
+                    (nits[0] / CELL).round() as i32,
+                    (nits[1] / CELL).round() as i32,
+                    (nits[2] / CELL).round() as i32,
+                );
+                (
+                    Vec3::new(nits[0] as f32, nits[1] as f32, nits[2] as f32),
+                    cell,
+                )
+            }
+        };
+
         if seen.insert(cell) {
             points.push(ScenePoint {
-                position: lab_to_world(lab),
-                color: point_color(bt2020),
+                position,
+                color: point_color(rel),
             });
         }
     }
 
     let mut cages: Vec<LineSegment> = Vec::new();
     for (_name, matrix, color) in REF_GAMUTS {
-        cages.extend(gamut_cage(matrix, color));
+        match space {
+            GamutSpace::Cielab => cages.extend(gamut_cage_lab(matrix, color)),
+            GamutSpace::Bt2020Rgb => cages.extend(gamut_cage_rgb(matrix, color)),
+        }
     }
 
     let point_count = points.len();
@@ -163,8 +207,60 @@ pub fn build_gamut_scene(samples: &[[f32; 3]]) -> GamutScene {
 /// Wireframe of an RGB cube's 12 edges mapped into Lab — the edges curve
 /// because Lab is nonlinear in the source RGB. White corner `[1,1,1]`
 /// lands at L* = 100 (D65), matching the normalized point cloud.
-fn gamut_cage(rgb_to_xyz: &[[f64; 3]; 3], color: [f32; 4]) -> Vec<LineSegment> {
+fn gamut_cage_lab(rgb_to_xyz: &[[f64; 3]; 3], color: [f32; 4]) -> Vec<LineSegment> {
     const STEPS: usize = 16;
+    let world_of = |rgb: [f64; 3]| lab_to_world(xyz_to_lab(mat_mul(rgb_to_xyz, rgb), D65));
+
+    let mut segs = Vec::new();
+    for_each_cube_edge(|ca, cb| {
+        let mut prev = world_of(ca);
+        for i in 1..=STEPS {
+            let t = i as f64 / STEPS as f64;
+            let rgb = [
+                ca[0] + (cb[0] - ca[0]) * t,
+                ca[1] + (cb[1] - ca[1]) * t,
+                ca[2] + (cb[2] - ca[2]) * t,
+            ];
+            let cur = world_of(rgb);
+            segs.push(LineSegment {
+                start: prev,
+                end: cur,
+                color,
+            });
+            prev = cur;
+        }
+    });
+    segs
+}
+
+/// The gamut's RGB unit cube expressed in the buffer's BT.2020 RGB space,
+/// scaled to [`REFERENCE_WHITE_NITS`]. The transform RGB→XYZ→BT.2020-RGB
+/// is linear, so edges stay straight (no subdivision). For BT.2020 itself
+/// this collapses to the axis-aligned `[0, ref]³` cube; narrower gamuts
+/// (sRGB, P3) become skewed boxes nested inside it.
+fn gamut_cage_rgb(rgb_to_xyz: &[[f64; 3]; 3], color: [f32; 4]) -> Vec<LineSegment> {
+    let world_of = |rgb: [f64; 3]| {
+        let bt = mat_mul(&XYZ_TO_BT2020, mat_mul(rgb_to_xyz, rgb));
+        Vec3::new(
+            (bt[0] * REFERENCE_WHITE_NITS) as f32,
+            (bt[1] * REFERENCE_WHITE_NITS) as f32,
+            (bt[2] * REFERENCE_WHITE_NITS) as f32,
+        )
+    };
+    let mut segs = Vec::new();
+    for_each_cube_edge(|ca, cb| {
+        segs.push(LineSegment {
+            start: world_of(ca),
+            end: world_of(cb),
+            color,
+        });
+    });
+    segs
+}
+
+/// Call `f(corner_a, corner_b)` for each of the unit cube's 12 edges
+/// (corner pairs differing in exactly one channel).
+fn for_each_cube_edge(mut f: impl FnMut([f64; 3], [f64; 3])) {
     let corner = |bits: usize| {
         [
             (bits & 1) as f64,
@@ -172,35 +268,13 @@ fn gamut_cage(rgb_to_xyz: &[[f64; 3]; 3], color: [f32; 4]) -> Vec<LineSegment> {
             ((bits >> 2) & 1) as f64,
         ]
     };
-    let world_of = |rgb: [f64; 3]| lab_to_world(xyz_to_lab(mat_mul(rgb_to_xyz, rgb), D65));
-
-    let mut segs = Vec::new();
     for a in 0..8usize {
         for b in (a + 1)..8usize {
-            // Cube edge = corners differing in exactly one bit.
-            if (a ^ b).count_ones() != 1 {
-                continue;
-            }
-            let (ca, cb) = (corner(a), corner(b));
-            let mut prev = world_of(ca);
-            for i in 1..=STEPS {
-                let t = i as f64 / STEPS as f64;
-                let rgb = [
-                    ca[0] + (cb[0] - ca[0]) * t,
-                    ca[1] + (cb[1] - ca[1]) * t,
-                    ca[2] + (cb[2] - ca[2]) * t,
-                ];
-                let cur = world_of(rgb);
-                segs.push(LineSegment {
-                    start: prev,
-                    end: cur,
-                    color,
-                });
-                prev = cur;
+            if (a ^ b).count_ones() == 1 {
+                f(corner(a), corner(b));
             }
         }
     }
-    segs
 }
 
 #[cfg(test)]
@@ -241,7 +315,7 @@ mod tests {
         // A BT.2020 sample at exactly REFERENCE_WHITE_NITS is L*≈100,
         // independent of any per-output white.
         let w = REFERENCE_WHITE_NITS as f32;
-        let scene = build_gamut_scene(&[[w, w, w]]);
+        let scene = build_gamut_scene(&[[w, w, w]], GamutSpace::Cielab);
         let (data, _rev) = scene.points.snapshot();
         assert_eq!(scene.point_count, 1);
         assert!(approx(data.points[0].position.y as f64, 100.0, 0.1));
@@ -250,10 +324,23 @@ mod tests {
     #[test]
     fn cloud_dedups_identical_samples() {
         let samples = vec![[100.0f32, 50.0, 25.0]; 1000];
-        let scene = build_gamut_scene(&samples);
-        assert_eq!(
-            scene.point_count, 1,
-            "identical samples collapse to one Lab cell"
-        );
+        for space in [GamutSpace::Cielab, GamutSpace::Bt2020Rgb] {
+            let scene = build_gamut_scene(&samples, space);
+            assert_eq!(
+                scene.point_count, 1,
+                "identical samples collapse, {space:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_rgb_position_is_absolute_nits() {
+        // BT.2020 RGB mode plots the buffer values directly, no scaling.
+        let scene = build_gamut_scene(&[[120.0, 250.0, 60.0]], GamutSpace::Bt2020Rgb);
+        let (data, _rev) = scene.points.snapshot();
+        let p = data.points[0].position;
+        assert!(approx(p.x as f64, 120.0, 1e-3));
+        assert!(approx(p.y as f64, 250.0, 1e-3));
+        assert!(approx(p.z as f64, 60.0, 1e-3));
     }
 }

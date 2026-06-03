@@ -26,7 +26,7 @@ use prism_ipc::{
     ColorState, FrameFormat, FrameMeta, Output, OutputAction, Request, Response, ResponseCurveState,
 };
 
-use crate::color3d::{self, GamutScene};
+use crate::color3d::{self, GamutScene, GamutSpace};
 use crate::common::{send_action, srgb_oetf};
 
 /// Cloud-sample decimation cap (per axis). The cloud is deduped in Lab
@@ -109,8 +109,15 @@ struct TuneGui {
     /// Tonemapped preview of the most recently fetched intermediate
     /// frame (decimated, BT.2020→sRGB). `None` until the first fetch.
     preview: Option<Image>,
-    /// 3D gamut point cloud + reference cages built from the same fetch.
+    /// Raw BT.2020 absolute-nits samples from the last fetch, retained so
+    /// the gamut view can be rebuilt when the coordinate space toggles
+    /// without re-capturing.
+    frame_samples: Option<Vec<[f32; 3]>>,
+    /// 3D gamut point cloud + reference cages, built from `frame_samples`
+    /// in the current `gamut_space`.
     gamut: Option<GamutScene>,
+    /// Which coordinate space the gamut view plots in.
+    gamut_space: GamutSpace,
     selection: Selection,
 }
 
@@ -122,7 +129,9 @@ impl TuneGui {
             fields: Fields::default(),
             status: String::new(),
             preview: None,
+            frame_samples: None,
             gamut: None,
+            gamut_space: GamutSpace::Cielab,
             selection: Selection::default(),
         };
         gui.reload(None);
@@ -162,7 +171,9 @@ impl TuneGui {
             fields: Fields::default(),
             status: "Mock state — no prism connection.".to_string(),
             preview: None,
+            frame_samples: None,
             gamut: None,
+            gamut_space: GamutSpace::Cielab,
             selection: Selection::default(),
         };
         gui.sync_fields();
@@ -242,16 +253,25 @@ impl TuneGui {
             .unwrap_or(203.0);
         match capture_frame(&output, white) {
             Ok((image, samples, w, h)) => {
-                let gamut = color3d::build_gamut_scene(&samples);
-                self.status = format!(
-                    "Fetched {w}×{h} frame from {output} · {} distinct colors.",
-                    gamut.point_count
-                );
                 self.preview = Some(image);
-                self.gamut = Some(gamut);
+                self.frame_samples = Some(samples);
+                self.rebuild_gamut();
+                let colors = self.gamut.as_ref().map_or(0, |g| g.point_count);
+                self.status =
+                    format!("Fetched {w}×{h} frame from {output} · {colors} distinct colors.");
             }
             Err(e) => self.status = format!("Fetch failed: {e:#}"),
         }
+    }
+
+    /// Rebuild the gamut scene from the retained samples in the current
+    /// coordinate space. Cheap (dedup over a decimated grid), so it runs
+    /// on every space toggle without re-fetching.
+    fn rebuild_gamut(&mut self) {
+        self.gamut = self
+            .frame_samples
+            .as_ref()
+            .map(|s| color3d::build_gamut_scene(s, self.gamut_space));
     }
 
     fn apply_sdr(&mut self) {
@@ -505,11 +525,29 @@ impl App for TuneGui {
                     ],
                 );
 
-                let gamut_card = match &self.gamut {
+                let space_toggle = row([
+                    space_button(
+                        "CIELAB",
+                        "space:lab",
+                        self.gamut_space == GamutSpace::Cielab,
+                    ),
+                    space_button(
+                        "BT.2020 RGB (nits)",
+                        "space:rgb",
+                        self.gamut_space == GamutSpace::Bt2020Rgb,
+                    ),
+                ])
+                .gap(tokens::SPACE_2);
+
+                let gamut_body: El = match &self.gamut {
                     Some(g) => {
-                        // No L* clip: the cloud is absolute (anchored to
-                        // REFERENCE_WHITE_NITS), so content brighter than
-                        // reference white legitimately sits above L* = 100.
+                        // Axes are unclipped: both spaces are absolute, so
+                        // content brighter than reference white sits above
+                        // the cage whites instead of being clamped.
+                        let (tx, ty, tz) = match self.gamut_space {
+                            GamutSpace::Cielab => ("a*", "L*", "b*"),
+                            GamutSpace::Bt2020Rgb => ("R (nits)", "G (nits)", "B (nits)"),
+                        };
                         let scene = SceneSpec::new()
                             .points_styled(
                                 g.points.clone(),
@@ -520,25 +558,19 @@ impl App for TuneGui {
                                 },
                             )
                             .lines(g.cages.clone())
-                            .axis_titles("a*", "L*", "b*");
-                        titled_card(
-                            "Gamut cloud · absolute CIELAB (203-nit white) — drag to orbit",
-                            [chart3d(scene)
-                                .width(Size::Fill(1.0))
-                                .height(Size::Fixed(480.0))],
-                        )
+                            .axis_titles(tx, ty, tz);
+                        chart3d(scene)
+                            .width(Size::Fill(1.0))
+                            .height(Size::Fixed(480.0))
                     }
-                    None => titled_card(
-                        "Gamut cloud · CIELAB",
-                        [
-                            column([text("Fetch a frame to plot its colors in Lab space.")
-                                .muted()
-                                .small()])
-                            .height(Size::Fixed(48.0))
-                            .justify(Justify::Center),
-                        ],
-                    ),
+                    None => column([text("Fetch a frame to plot its colors.").muted().small()])
+                        .height(Size::Fixed(48.0))
+                        .justify(Justify::Center),
                 };
+                let gamut_card = titled_card(
+                    "Gamut cloud — drag to orbit, wheel to zoom",
+                    [space_toggle, gamut_body],
+                );
 
                 column([
                     header,
@@ -586,6 +618,16 @@ impl App for TuneGui {
                     self.fetch_frame();
                     return;
                 }
+                "space:lab" => {
+                    self.gamut_space = GamutSpace::Cielab;
+                    self.rebuild_gamut();
+                    return;
+                }
+                "space:rgb" => {
+                    self.gamut_space = GamutSpace::Bt2020Rgb;
+                    self.rebuild_gamut();
+                    return;
+                }
                 "apply:sdr" => {
                     self.apply_sdr();
                     return;
@@ -619,6 +661,16 @@ impl App for TuneGui {
 
     fn selection(&self) -> Selection {
         self.selection.clone()
+    }
+}
+
+/// A gamut-space selector button — primary when active, ghost otherwise.
+fn space_button(label: &str, key: &str, active: bool) -> El {
+    let btn = button(label.to_string()).key(key.to_string());
+    if active {
+        btn.primary()
+    } else {
+        btn.ghost()
     }
 }
 
