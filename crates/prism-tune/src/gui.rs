@@ -23,7 +23,8 @@ use damascene_core::prelude::*;
 use damascene_core::scene::{PointShape, PointStyle, SceneSpec, SizeMode};
 use prism_ipc::socket::Socket;
 use prism_ipc::{
-    ColorState, FrameFormat, FrameMeta, Output, OutputAction, Request, Response, ResponseCurveState,
+    ColorState, FrameFormat, FrameMeta, GamutMesh, Output, OutputAction, Request, Response,
+    ResponseCurveState,
 };
 
 use crate::color3d::{self, GamutScene, GamutSpace, RefSet, REF_GAMUTS};
@@ -51,6 +52,23 @@ fn query_outputs() -> Result<Vec<Output>> {
             Ok(outputs)
         }
         Ok(other) => bail!("unexpected reply to Outputs: {other:?}"),
+        Err(e) => bail!("prism returned an error: {e}"),
+    }
+}
+
+/// Fetch the measured gamut-surface mesh the compositor has configured
+/// for `output` (KDL `color.gamut`). `Ok(None)` ⇒ none configured.
+fn query_gamut_mesh(output: &str) -> Result<Option<GamutMesh>> {
+    let mut socket = Socket::connect()
+        .context("connect to PRISM_SOCKET (is prism running, and are you in its env?)")?;
+    match socket
+        .send(Request::GamutMesh {
+            output: output.to_string(),
+        })
+        .context("send GamutMesh request")?
+    {
+        Ok(Response::GamutMesh(mesh)) => Ok(mesh),
+        Ok(other) => bail!("unexpected reply to GamutMesh: {other:?}"),
         Err(e) => bail!("prism returned an error: {e}"),
     }
 }
@@ -121,6 +139,13 @@ struct TuneGui {
     /// Which reference gamut cages are drawn, parallel to
     /// [`REF_GAMUTS`](crate::color3d::REF_GAMUTS).
     enabled_gamuts: RefSet,
+    /// The measured gamut-surface mesh pulled from the compositor for the
+    /// selected output (`color.gamut` config), retained so the shell can
+    /// be rebuilt on a space toggle without re-fetching. `None` until
+    /// fetched / when the output has none configured.
+    gamut_mesh: Option<GamutMesh>,
+    /// Whether the measured-gamut lattice shell is drawn.
+    show_shell: bool,
     selection: Selection,
 }
 
@@ -136,6 +161,8 @@ impl TuneGui {
             gamut: None,
             gamut_space: GamutSpace::Cielab,
             enabled_gamuts: [true; REF_GAMUTS.len()],
+            gamut_mesh: None,
+            show_shell: false,
             selection: Selection::default(),
         };
         gui.reload(None);
@@ -179,6 +206,8 @@ impl TuneGui {
             gamut: None,
             gamut_space: GamutSpace::Cielab,
             enabled_gamuts: [true; REF_GAMUTS.len()],
+            gamut_mesh: None,
+            show_shell: false,
             selection: Selection::default(),
         };
         gui.sync_fields();
@@ -269,14 +298,50 @@ impl TuneGui {
         }
     }
 
-    /// Rebuild the gamut scene from the retained samples in the current
-    /// coordinate space. Cheap (dedup over a decimated grid), so it runs
-    /// on every space toggle without re-fetching.
+    /// Rebuild the gamut scene from the retained frame samples and/or the
+    /// measured-gamut shell in the current coordinate space. Cheap (dedup
+    /// over a decimated grid), so it runs on every space / cage / shell
+    /// toggle without re-fetching. Builds a scene whenever there's either a
+    /// cloud or a visible shell to show.
     fn rebuild_gamut(&mut self) {
-        self.gamut = self
-            .frame_samples
-            .as_ref()
-            .map(|s| color3d::build_gamut_scene(s, self.gamut_space, self.enabled_gamuts));
+        let shell = self
+            .show_shell
+            .then_some(self.gamut_mesh.as_ref())
+            .flatten();
+        let have_cloud = self.frame_samples.is_some();
+        self.gamut = (have_cloud || shell.is_some()).then(|| {
+            let empty: Vec<[f32; 3]> = Vec::new();
+            let samples = self.frame_samples.as_deref().unwrap_or(&empty);
+            color3d::build_gamut_scene(samples, self.gamut_space, self.enabled_gamuts, shell)
+        });
+    }
+
+    /// Pull the selected output's measured gamut-surface mesh from the
+    /// compositor (`color.gamut` config) and show it as a lattice shell.
+    /// One IPC round-trip; the mesh is retained so space toggles rebuild
+    /// without re-fetching.
+    fn fetch_gamut_mesh(&mut self) {
+        let Some(output) = self.current().map(|o| o.name.clone()) else {
+            self.status = "No output selected.".into();
+            return;
+        };
+        match query_gamut_mesh(&output) {
+            Ok(Some(mesh)) => {
+                let (v, p) = (mesh.vertices.len(), mesh.patches.len());
+                self.gamut_mesh = Some(mesh);
+                self.show_shell = true;
+                self.rebuild_gamut();
+                self.status =
+                    format!("Loaded measured gamut for {output} · {v} vertices, {p} patches.");
+            }
+            Ok(None) => {
+                self.gamut_mesh = None;
+                self.show_shell = false;
+                self.rebuild_gamut();
+                self.status = format!("No measured gamut (color.gamut) configured for {output}.");
+            }
+            Err(e) => self.status = format!("Gamut fetch failed: {e:#}"),
+        }
     }
 
     fn apply_sdr(&mut self) {
@@ -560,6 +625,19 @@ impl App for TuneGui {
                 ])
                 .gap(tokens::SPACE_1);
 
+                // Measured-gamut shell: a button to pull the mesh from the
+                // compositor, and (once loaded) a show/hide toggle.
+                let mut shell_row: Vec<El> =
+                    vec![button("Load measured gamut").key("fetch:gamut").secondary()];
+                if self.gamut_mesh.is_some() {
+                    shell_row.push(toggle_button("Show shell", "shell", self.show_shell));
+                }
+                let shell_controls = column([
+                    text("Measured gamut").small().muted(),
+                    row(shell_row).gap(tokens::SPACE_2),
+                ])
+                .gap(tokens::SPACE_1);
+
                 let gamut_body: El = match &self.gamut {
                     Some(g) => {
                         // Axes are unclipped: both spaces are absolute, so
@@ -579,6 +657,7 @@ impl App for TuneGui {
                                 },
                             )
                             .lines(g.cages.clone())
+                            .lines(g.shell.clone())
                             // A small square marker + persistent name at each
                             // enabled cage's green primary.
                             .points_labeled(
@@ -595,13 +674,15 @@ impl App for TuneGui {
                             .width(Size::Fill(1.0))
                             .height(Size::Fixed(480.0))
                     }
-                    None => column([text("Fetch a frame to plot its colors.").muted().small()])
-                        .height(Size::Fixed(48.0))
-                        .justify(Justify::Center),
+                    None => column([text("Fetch a frame or load the measured gamut to plot.")
+                        .muted()
+                        .small()])
+                    .height(Size::Fixed(48.0))
+                    .justify(Justify::Center),
                 };
                 let gamut_card = titled_card(
                     "Gamut cloud — drag to orbit, wheel to zoom",
-                    [space_toggle, cage_toggle, gamut_body],
+                    [space_toggle, cage_toggle, shell_controls, gamut_body],
                 );
 
                 column([
@@ -650,6 +731,15 @@ impl App for TuneGui {
                     self.fetch_frame();
                     return;
                 }
+                "fetch:gamut" => {
+                    self.fetch_gamut_mesh();
+                    return;
+                }
+                "shell" => {
+                    self.show_shell = !self.show_shell;
+                    self.rebuild_gamut();
+                    return;
+                }
                 "space:lab" => {
                     self.gamut_space = GamutSpace::Cielab;
                     self.rebuild_gamut();
@@ -682,6 +772,11 @@ impl App for TuneGui {
                             self.selected = Some(i);
                             self.sync_fields();
                             self.status.clear();
+                            // The measured gamut is per-output; drop it so a
+                            // stale shell doesn't carry over to the new one.
+                            self.gamut_mesh = None;
+                            self.show_shell = false;
+                            self.rebuild_gamut();
                         }
                         return;
                     }

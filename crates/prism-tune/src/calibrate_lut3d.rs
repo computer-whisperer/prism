@@ -2107,6 +2107,14 @@ fn print_kdl_block(
         );
     }
     println!("        lut3d \"{}\"", lut_path.display());
+    // The measured gamut-surface sidecar written alongside the LUT. The
+    // compositor doesn't use it in the pipeline; it serves it over IPC so
+    // the prism-tune gamut-cloud inspector can overlay the panel's actual
+    // reachable boundary as a lattice shell.
+    println!(
+        "        gamut \"{}\"",
+        lut_path.with_extension("gamut.json").display()
+    );
     println!("    }}");
     println!("}}");
 }

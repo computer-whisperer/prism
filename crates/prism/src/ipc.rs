@@ -147,6 +147,7 @@ fn dispatch(state: &mut PrismState, req: Request) -> (Reply, Option<OwnedFd>) {
         }
         Request::Output { output, action } => (handle_output_action(state, &output, action), None),
         Request::CaptureFrame { output } => handle_capture_frame(state, &output),
+        Request::GamutMesh { output } => (handle_gamut_mesh(state, &output), None),
         other => (
             Err(format!(
                 "request {other:?} is not implemented in this build"
@@ -185,6 +186,27 @@ fn handle_capture_frame(state: &mut PrismState, name: &str) -> (Reply, Option<Ow
             (Ok(Response::FrameCaptured(meta)), Some(frame.fd))
         }
         Err(e) => (Err(format!("capture-frame: {e:#}")), None),
+    }
+}
+
+/// Load + return the measured gamut-surface mesh configured for `name`
+/// (KDL `color.gamut`), or `Response::GamutMesh(None)` when none is set.
+/// Parses the `.gamut.json` sidecar on demand — it's inspector-only data,
+/// not worth holding in memory per output.
+fn handle_gamut_mesh(state: &PrismState, name: &str) -> Reply {
+    let Some(ctx) = state
+        .outputs
+        .values()
+        .find(|ctx| ctx.connector_name == name)
+    else {
+        return Err(format!("gamut-mesh: output {name:?} not found"));
+    };
+    let Some(path) = ctx.kdl_gamut_path.as_ref() else {
+        return Ok(Response::GamutMesh(None));
+    };
+    match prism_ipc::GamutMesh::load_json(path) {
+        Ok(mesh) => Ok(Response::GamutMesh(Some(mesh))),
+        Err(e) => Err(format!("gamut-mesh: load {} failed: {e}", path.display())),
     }
 }
 

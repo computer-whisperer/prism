@@ -134,6 +134,17 @@ pub enum Request {
         /// Output connector name (e.g. `DisplayPort-4`).
         output: String,
     },
+    /// Fetch the measured gamut-surface mesh configured for this output
+    /// (KDL `color.gamut "file"` — the `.gamut.json` sidecar written by
+    /// `prism-tune calibrate-lut3d`). The compositor reads and parses the
+    /// file on demand and replies with `Response::GamutMesh(Some(..))`, or
+    /// `Response::GamutMesh(None)` when no gamut file is configured. The
+    /// mesh is the panel's actual reachable color boundary; intended for
+    /// the gamut-cloud inspector to overlay as a lattice shell.
+    GamutMesh {
+        /// Output connector name (e.g. `DisplayPort-4`).
+        output: String,
+    },
 }
 
 /// Reply from niri to client.
@@ -191,6 +202,10 @@ pub enum Response {
     /// itself travels out-of-band as a memfd file descriptor (see
     /// [`socket::Socket::send_recv_fd`]); this describes how to read it.
     FrameCaptured(FrameMeta),
+    /// The measured gamut-surface mesh for a `Request::GamutMesh`, or
+    /// `None` when the output has no `color.gamut` file configured (or it
+    /// failed to load). Small enough to travel inline as JSON.
+    GamutMesh(Option<GamutMesh>),
 }
 
 /// Describes the memfd payload of a `Response::FrameCaptured`. The fd's
@@ -219,6 +234,115 @@ pub enum FrameFormat {
     /// Four little-endian `f32` channels per texel: R, G, B, A (16
     /// bytes). RGB are BT.2020 absolute-nits linear; A is unused.
     Rgba32Float,
+}
+
+/// Schema tag the `.gamut.json` sidecar is written with (and the only
+/// version [`GamutMesh::load_json`] accepts).
+pub const GAMUT_MESH_SCHEMA: &str = "prism-gamut-mesh.v1";
+
+/// A measured gamut-surface mesh: the panel's actual reachable color
+/// boundary, probed by `prism-tune calibrate-lut3d` and stored as the
+/// `.gamut.json` sidecar of a `.lut` file. The boundary is the surface of
+/// the command-space RGB cube, adaptively subdivided into quad
+/// [`patches`](GamutMesh::patches) over shared [`vertices`](GamutMesh::vertices).
+///
+/// This is the wire/file form: a deserialized-friendly subset of
+/// prism-tune's in-memory `gamut::GamutMesh` (drops mesh-internal book-
+/// keeping). All XYZ are absolute (cd/m²), pre-black-subtraction.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct GamutMesh {
+    /// Measured white corner (code value `(1,1,1)`), absolute XYZ (cd/m²).
+    pub white_xyz: [f64; 3],
+    /// Per-channel command-axis saturation peaks (cd/m²).
+    pub cmd_axis_max_nits: [f64; 3],
+    /// Shared boundary vertices; patches index into this list.
+    pub vertices: Vec<GamutVertex>,
+    /// Quad patches tiling the cube surface (corners index `vertices`).
+    pub patches: Vec<GamutPatch>,
+}
+
+/// One measured boundary vertex of a [`GamutMesh`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct GamutVertex {
+    /// Requested RGB code value, each in `[0, 1]`.
+    pub code_value: [f64; 3],
+    /// Actual per-channel commanded luminance (cd/m²).
+    pub cmd_nits: [f64; 3],
+    /// Measured colorimeter reading, absolute XYZ (cd/m²).
+    pub xyz: [f64; 3],
+    /// CIELAB relative to the mesh's own measured white (informational —
+    /// consumers re-anchoring to a different white recompute from `xyz`).
+    pub lab: [f64; 3],
+    /// Confidence flag from the measurement burst.
+    pub trustworthy: bool,
+}
+
+/// One quad face of a [`GamutMesh`] boundary.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct GamutPatch {
+    /// The cube face's fixed axis (0 = R, 1 = G, 2 = B).
+    pub axis: usize,
+    /// The fixed axis's value (0.0 or 1.0).
+    pub value: f64,
+    /// Four corner indices into [`GamutMesh::vertices`], in CCW order.
+    pub corners: [u32; 4],
+    /// Why subdivision of this patch stopped.
+    pub status: GamutPatchStatus,
+}
+
+/// Why a [`GamutPatch`] was not subdivided further.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GamutPatchStatus {
+    /// Planar enough (centre within tolerance of the bilinear average).
+    Flat,
+    /// Corners collapsed in measured space — pipeline clamping detected.
+    Folded,
+    /// Hit the subdivision depth cap while still curved.
+    MaxDepth,
+    /// A corner was untrustworthy; stopped rather than chase noise.
+    LowTrust,
+}
+
+impl GamutMesh {
+    /// Load a `.gamut.json` sidecar (schema [`GAMUT_MESH_SCHEMA`]).
+    /// Ignores the file's redundant per-patch `face` label and the
+    /// document `schema` tag beyond validating it.
+    pub fn load_json(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        Self::from_json_reader(std::io::BufReader::new(file))
+    }
+
+    /// Parse a `.gamut.json` document from any reader (the testable core
+    /// of [`load_json`]). Validates the schema tag.
+    pub fn from_json_reader(reader: impl std::io::Read) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind};
+
+        /// The on-disk document wrapper — the mesh plus its schema tag.
+        #[derive(Deserialize)]
+        struct Doc {
+            schema: String,
+            #[serde(flatten)]
+            mesh: GamutMesh,
+        }
+
+        let doc: Doc =
+            serde_json::from_reader(reader).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+        if doc.schema != GAMUT_MESH_SCHEMA {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "gamut mesh schema {:?}, expected {:?}",
+                    doc.schema, GAMUT_MESH_SCHEMA
+                ),
+            ));
+        }
+        Ok(doc.mesh)
+    }
 }
 
 /// Per-channel decoded scanout nits returned by `OutputAction::EncodeDiagnose`.
@@ -2354,5 +2478,47 @@ mod tests {
         );
         assert!("-".parse::<PositionChange>().is_err());
         assert!("10% ".parse::<PositionChange>().is_err());
+    }
+
+    /// A `prism-gamut-mesh.v1` document — exactly the shape
+    /// `prism-tune calibrate-lut3d` writes, including the redundant
+    /// per-patch `face` label — round-trips through `from_json_reader`:
+    /// schema accepted, `face`/`schema` ignored, snake_case status mapped.
+    #[test]
+    fn gamut_mesh_parses_v1_sidecar() {
+        let json = r#"{
+            "schema": "prism-gamut-mesh.v1",
+            "white_xyz": [193.0, 203.0, 221.0],
+            "cmd_axis_max_nits": [38.9, 113.9, 15.7],
+            "vertices": [
+                {"code_value": [0.0, 0.0, 0.0], "cmd_nits": [0.1, 0.1, 0.1],
+                 "xyz": [0.2, 0.18, 0.34], "lab": [1.6, 0.0, 0.0], "trustworthy": true},
+                {"code_value": [1.0, 0.0, 0.0], "cmd_nits": [38.9, 0.0, 0.0],
+                 "xyz": [40.0, 20.0, 2.0], "lab": [51.0, 60.0, 40.0], "trustworthy": false}
+            ],
+            "patches": [
+                {"face": "R=1", "axis": 0, "value": 1.0, "corners": [0, 1, 1, 0], "status": "folded"},
+                {"face": "B=0", "axis": 2, "value": 0.0, "corners": [0, 1, 0, 1], "status": "max_depth"}
+            ]
+        }"#;
+        let mesh = GamutMesh::from_json_reader(json.as_bytes()).expect("parse v1 sidecar");
+        assert_eq!(mesh.white_xyz, [193.0, 203.0, 221.0]);
+        assert_eq!(mesh.vertices.len(), 2);
+        assert!(mesh.vertices[0].trustworthy && !mesh.vertices[1].trustworthy);
+        assert_eq!(mesh.vertices[1].xyz, [40.0, 20.0, 2.0]);
+        assert_eq!(mesh.patches.len(), 2);
+        assert_eq!(mesh.patches[0].status, GamutPatchStatus::Folded);
+        assert_eq!(mesh.patches[1].status, GamutPatchStatus::MaxDepth);
+        assert_eq!(mesh.patches[0].corners, [0, 1, 1, 0]);
+    }
+
+    /// A wrong / future schema tag is rejected rather than silently
+    /// misinterpreted.
+    #[test]
+    fn gamut_mesh_rejects_unknown_schema() {
+        let json = r#"{"schema": "prism-gamut-mesh.v2", "white_xyz": [0,0,0],
+            "cmd_axis_max_nits": [0,0,0], "vertices": [], "patches": []}"#;
+        let err = GamutMesh::from_json_reader(json.as_bytes()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

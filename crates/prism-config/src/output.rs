@@ -184,12 +184,30 @@ pub struct ColorConfig {
     /// file load fails.
     #[knuffel(child)]
     pub lut3d: Option<Lut3dFile>,
+    /// Path to a measured gamut-surface mesh (`.gamut.json`) produced by
+    /// `prism-tune calibrate-lut3d` as the sidecar of the `.lut` above.
+    /// The compositor does not use it in the render pipeline; it loads it
+    /// on demand for the `GamutMesh` IPC so the gamut-cloud inspector can
+    /// overlay the panel's actual reachable boundary as a lattice shell.
+    ///
+    /// Path is resolved as given: absolute, or relative to prism's CWD.
+    #[knuffel(child)]
+    pub gamut: Option<GamutFile>,
 }
 
 /// Per-output 3D LUT file reference. See [`ColorConfig::lut3d`].
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub struct Lut3dFile {
     /// Path to the `.lut` file. Absolute or relative to prism's CWD.
+    #[knuffel(argument)]
+    pub path: String,
+}
+
+/// Per-output measured gamut-surface sidecar reference. See
+/// [`ColorConfig::gamut`].
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct GamutFile {
+    /// Path to the `.gamut.json` file. Absolute or relative to prism's CWD.
     #[knuffel(argument)]
     pub path: String,
 }

@@ -1329,6 +1329,16 @@ fn run_integrated(
                             }
                         }
                     }
+                    // KDL `color.gamut "file"` — record the measured
+                    // gamut-surface sidecar path (not loaded now; the
+                    // GamutMesh IPC parses it on demand for the inspector).
+                    if let Some(gamut_cfg) =
+                        find_connector_config(&name, &output.edid, &config.outputs.0)
+                            .and_then(|c| c.color.as_ref())
+                            .and_then(|c| c.gamut.as_ref())
+                    {
+                        output.kdl_gamut_path = Some(std::path::PathBuf::from(&gamut_cfg.path));
+                    }
                     // Bake whichever color representation is current
                     // (loaded LUT or synthesis from CTM + curve) into the
                     // renderer's LUT texture. Failure here means the

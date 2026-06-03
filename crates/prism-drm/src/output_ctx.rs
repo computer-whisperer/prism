@@ -121,6 +121,11 @@ pub struct OutputContext {
     /// measurement). Read via [`Self::effective_black_point_xyz`],
     /// which prefers the IPC override.
     pub kdl_black_point_xyz: Option<[f32; 3]>,
+    /// Path to the measured gamut-surface sidecar from KDL `color.gamut
+    /// "file"`, if configured. Not used by the render pipeline — held so
+    /// the `GamutMesh` IPC can load + serve it on demand for the
+    /// gamut-cloud inspector. `None` ⇒ no gamut file configured.
+    pub kdl_gamut_path: Option<std::path::PathBuf>,
     /// Set on first present to switch from `commit` (mode-set) to `page_flip`
     /// (just-swap-fb) for subsequent frames.
     mode_set_done: bool,
@@ -374,6 +379,7 @@ impl OutputContext {
             color_override: ColorOverride::default(),
             kdl_lut3d_entries: None,
             kdl_black_point_xyz: None,
+            kdl_gamut_path: None,
             mode_set_done: false,
             force_present: false,
             frame_pending: false,

@@ -85,6 +85,9 @@ const P3_TO_XYZ: [[f64; 3]; 3] = [
 pub struct GamutScene {
     pub points: PointsHandle,
     pub cages: LinesHandle,
+    /// The measured gamut-surface lattice shell (patch quad-edges), empty
+    /// when no mesh is supplied. Folded patches drawn hot.
+    pub shell: LinesHandle,
     /// One marker point per enabled cage, at its green primary — the
     /// vertex that differs most between gamuts, so labels don't pile up at
     /// the shared white.
@@ -94,6 +97,13 @@ pub struct GamutScene {
     /// Distinct point count after voxel dedup (for the status line).
     pub point_count: usize,
 }
+
+/// The measured gamut shell's normal patch-edge color (a distinct magenta,
+/// reading against both the neutral cloud and the colored reference cages).
+const SHELL_COLOR: [f32; 4] = [0.93, 0.45, 0.85, 0.7];
+/// Folded (clamped) patches of the shell — where pushing the code value
+/// stopped moving the measurement; drawn hotter to flag the boundary hit.
+const SHELL_FOLD_COLOR: [f32; 4] = [1.0, 0.40, 0.25, 0.9];
 
 /// A reference gamut the plot can outline as a cage overlay.
 pub struct RefGamut {
@@ -182,7 +192,12 @@ fn point_color(bt2020: [f64; 3]) -> [f32; 4] {
 /// collapse to one mark instead of thousands. Point swatch colors are the
 /// same in both spaces (tonemapped relative to reference white so a mark
 /// looks like its pixel); only the *positions* differ.
-pub fn build_gamut_scene(samples: &[[f32; 3]], space: GamutSpace, refs: RefSet) -> GamutScene {
+pub fn build_gamut_scene(
+    samples: &[[f32; 3]],
+    space: GamutSpace,
+    refs: RefSet,
+    shell: Option<&prism_ipc::GamutMesh>,
+) -> GamutScene {
     let inv_ref = 1.0 / REFERENCE_WHITE_NITS;
     let mut seen: HashSet<(i32, i32, i32)> = HashSet::new();
     let mut points: Vec<ScenePoint> = Vec::new();
@@ -251,16 +266,72 @@ pub fn build_gamut_scene(samples: &[[f32; 3]], space: GamutSpace, refs: RefSet) 
         anchor_txt.push(g.name.to_string());
     }
 
+    let shell_segments = shell.map(|m| shell_segments(m, space)).unwrap_or_default();
+
     let point_count = points.len();
     GamutScene {
         points: PointsHandle::new(PointData { points }),
         cages: LinesHandle::new(LineData { segments: cages }),
+        shell: LinesHandle::new(LineData {
+            segments: shell_segments,
+        }),
         cage_label_geo: PointsHandle::new(PointData { points: anchor_pts }),
         cage_labels: PointLabels::new(anchor_txt)
             .always()
             .placement(LabelPlacement::Above),
         point_count,
     }
+}
+
+/// World position of a measured vertex's absolute XYZ (cd/m²) in the given
+/// plot space, anchored the same way as the point cloud so the shell sits
+/// in one frame with it: CIELAB normalizes by [`REFERENCE_WHITE_NITS`]
+/// (203-nit white → L* = 100); BT.2020 RGB is the absolute nits straight
+/// from the inverse matrix.
+fn mesh_vertex_world(xyz_abs: [f64; 3], space: GamutSpace) -> Vec3 {
+    match space {
+        GamutSpace::Cielab => {
+            let inv_ref = 1.0 / REFERENCE_WHITE_NITS;
+            let xyz_n = [
+                xyz_abs[0] * inv_ref,
+                xyz_abs[1] * inv_ref,
+                xyz_abs[2] * inv_ref,
+            ];
+            lab_to_world(xyz_to_lab(xyz_n, D65))
+        }
+        GamutSpace::Bt2020Rgb => {
+            let bt = mat_mul(&XYZ_TO_BT2020, xyz_abs);
+            Vec3::new(bt[0] as f32, bt[1] as f32, bt[2] as f32)
+        }
+    }
+}
+
+/// The measured gamut shell as patch quad-edge segments in `space`. Each
+/// patch contributes its 4 boundary edges (corners are stored CCW); folded
+/// patches are drawn in [`SHELL_FOLD_COLOR`] to flag the clamp.
+fn shell_segments(mesh: &prism_ipc::GamutMesh, space: GamutSpace) -> Vec<LineSegment> {
+    let world: Vec<Vec3> = mesh
+        .vertices
+        .iter()
+        .map(|v| mesh_vertex_world(v.xyz, space))
+        .collect();
+    let mut out = Vec::new();
+    for p in &mesh.patches {
+        let color = match p.status {
+            prism_ipc::GamutPatchStatus::Folded => SHELL_FOLD_COLOR,
+            _ => SHELL_COLOR,
+        };
+        for k in 0..4 {
+            let (Some(&start), Some(&end)) = (
+                world.get(p.corners[k] as usize),
+                world.get(p.corners[(k + 1) % 4] as usize),
+            ) else {
+                continue;
+            };
+            out.push(LineSegment { start, end, color });
+        }
+    }
+    out
 }
 
 /// World position of a gamut's green primary `[0, 1, 0]` in the given
@@ -391,7 +462,7 @@ mod tests {
         // A BT.2020 sample at exactly REFERENCE_WHITE_NITS is L*≈100,
         // independent of any per-output white.
         let w = REFERENCE_WHITE_NITS as f32;
-        let scene = build_gamut_scene(&[[w, w, w]], GamutSpace::Cielab, [true; N_REF_GAMUTS]);
+        let scene = build_gamut_scene(&[[w, w, w]], GamutSpace::Cielab, [true; N_REF_GAMUTS], None);
         let (data, _rev) = scene.points.snapshot();
         assert_eq!(scene.point_count, 1);
         assert!(approx(data.points[0].position.y as f64, 100.0, 0.1));
@@ -401,7 +472,7 @@ mod tests {
     fn cloud_dedups_identical_samples() {
         let samples = vec![[100.0f32, 50.0, 25.0]; 1000];
         for space in [GamutSpace::Cielab, GamutSpace::Bt2020Rgb] {
-            let scene = build_gamut_scene(&samples, space, [true; N_REF_GAMUTS]);
+            let scene = build_gamut_scene(&samples, space, [true; N_REF_GAMUTS], None);
             assert_eq!(
                 scene.point_count, 1,
                 "identical samples collapse, {space:?}"
@@ -416,6 +487,7 @@ mod tests {
             &[[120.0, 250.0, 60.0]],
             GamutSpace::Bt2020Rgb,
             [true; N_REF_GAMUTS],
+            None,
         );
         let (data, _rev) = scene.points.snapshot();
         let p = data.points[0].position;
@@ -428,7 +500,7 @@ mod tests {
     fn enabled_set_selects_cages_and_labels() {
         let sample = [[100.0f32, 50.0, 25.0]];
         // All three on: three labelled anchors, named in REF_GAMUTS order.
-        let all = build_gamut_scene(&sample, GamutSpace::Cielab, [true; N_REF_GAMUTS]);
+        let all = build_gamut_scene(&sample, GamutSpace::Cielab, [true; N_REF_GAMUTS], None);
         assert_eq!(all.cage_label_geo.snapshot().0.points.len(), 3);
         assert_eq!(all.cage_labels.get(0), Some("sRGB"));
         assert_eq!(all.cage_labels.get(1), Some("Display P3"));
@@ -436,14 +508,73 @@ mod tests {
         let all_segs = all.cages.snapshot().0.segments.len();
 
         // Only Rec.2020 on: one anchor labelled "Rec.2020", a third of the cages.
-        let one = build_gamut_scene(&sample, GamutSpace::Cielab, [false, false, true]);
+        let one = build_gamut_scene(&sample, GamutSpace::Cielab, [false, false, true], None);
         assert_eq!(one.cage_label_geo.snapshot().0.points.len(), 1);
         assert_eq!(one.cage_labels.get(0), Some("Rec.2020"));
         assert_eq!(one.cages.snapshot().0.segments.len(), all_segs / 3);
 
         // None on: no cages, no labels (the cloud still stands on its own).
-        let none = build_gamut_scene(&sample, GamutSpace::Cielab, [false; N_REF_GAMUTS]);
+        let none = build_gamut_scene(&sample, GamutSpace::Cielab, [false; N_REF_GAMUTS], None);
         assert_eq!(none.cage_label_geo.snapshot().0.points.len(), 0);
         assert_eq!(none.cages.snapshot().0.segments.len(), 0);
+    }
+
+    #[test]
+    fn shell_segments_render_per_patch_with_fold_flag() {
+        use prism_ipc::{GamutMesh, GamutPatch, GamutPatchStatus, GamutVertex};
+
+        let w = REFERENCE_WHITE_NITS;
+        let vert = |xyz: [f64; 3]| GamutVertex {
+            code_value: [0.0; 3],
+            cmd_nits: [0.0; 3],
+            xyz,
+            lab: [0.0; 3],
+            trustworthy: true,
+        };
+        // One flat quad + one folded quad → 8 edge segments, the folded
+        // four in the hot color.
+        let mesh = GamutMesh {
+            white_xyz: [w, w, w],
+            cmd_axis_max_nits: [w, w, w],
+            vertices: vec![
+                vert([10.0, 10.0, 10.0]),
+                vert([40.0, 10.0, 5.0]),
+                vert([35.0, 70.0, 12.0]),
+                vert([18.0, 7.0, 95.0]),
+            ],
+            patches: vec![
+                GamutPatch {
+                    axis: 0,
+                    value: 0.0,
+                    corners: [0, 1, 2, 3],
+                    status: GamutPatchStatus::Flat,
+                },
+                GamutPatch {
+                    axis: 0,
+                    value: 1.0,
+                    corners: [0, 1, 2, 3],
+                    status: GamutPatchStatus::Folded,
+                },
+            ],
+        };
+
+        for space in [GamutSpace::Cielab, GamutSpace::Bt2020Rgb] {
+            let scene = build_gamut_scene(&[], space, [false; N_REF_GAMUTS], Some(&mesh));
+            let (lines, _) = scene.shell.snapshot();
+            assert_eq!(lines.segments.len(), 8, "two quads → 8 edges, {space:?}");
+            let folded = lines
+                .segments
+                .iter()
+                .filter(|s| s.color == SHELL_FOLD_COLOR)
+                .count();
+            assert_eq!(folded, 4, "the folded patch's 4 edges are hot, {space:?}");
+            for s in &lines.segments {
+                assert!(s.start.is_finite() && s.end.is_finite());
+            }
+        }
+
+        // No mesh ⇒ empty shell.
+        let bare = build_gamut_scene(&[], GamutSpace::Cielab, [false; N_REF_GAMUTS], None);
+        assert_eq!(bare.shell.snapshot().0.segments.len(), 0);
     }
 }
