@@ -14,9 +14,10 @@
 //!
 //! - **BT.2020 RGB** — the raw intermediate buffer values in **absolute
 //!   nits** (X=R, Y=G, Z=B), no normalization. This is the truly-absolute
-//!   view; reference gamuts (sRGB, P3) appear as nested cubes (scaled to
-//!   reference white) showing containment, with the BT.2020 cage as the
-//!   axis-aligned outer box.
+//!   view; reference gamuts appear as nested cubes each scaled to its own
+//!   **spec reference-white luminance** (sRGB/P3 80, Rec.2020 203), so the
+//!   cubes top out at different absolute nits — the gamuts' absolute span
+//!   difference — while still nesting in chromaticity (sRGB ⊂ P3 ⊂ Rec.2020).
 
 use std::collections::HashSet;
 
@@ -66,7 +67,8 @@ pub enum GamutSpace {
     Cielab,
     /// Raw BT.2020 RGB in **absolute nits**, straight from the
     /// intermediate buffer (X=R, Y=G, Z=B). No normalization; reference
-    /// gamuts appear as nested cubes scaled to [`REFERENCE_WHITE_NITS`].
+    /// gamuts appear as nested cubes, each scaled to its own spec
+    /// reference-white luminance (see [`RefGamut`]).
     Bt2020Rgb,
 }
 
@@ -123,6 +125,11 @@ pub struct RefGamut {
     matrix: &'static [[f64; 3]; 3],
     /// Cage + label color (authoring sRGBA).
     pub color: [f32; 4],
+    /// The gamut's spec reference-white luminance (cd/m²) — the absolute
+    /// nits its `[1,1,1]` white corner sits at in the BT.2020 view. Per
+    /// standard, so brighter-spec gamuts draw taller cubes and the
+    /// absolute span difference is visible (not all pinned to one white).
+    white_nits: f64,
 }
 
 /// Number of reference-gamut overlays offered.
@@ -132,25 +139,32 @@ pub const N_REF_GAMUTS: usize = 3;
 pub type RefSet = [bool; N_REF_GAMUTS];
 
 /// Reference gamuts overlaid as cage wireframes, in nesting order
-/// (sRGB ⊂ Display P3 ⊂ Rec.2020).
+/// (sRGB ⊂ Display P3 ⊂ Rec.2020). Each carries its spec reference-white
+/// luminance so the BT.2020 view shows the absolute span difference.
 pub const REF_GAMUTS: [RefGamut; N_REF_GAMUTS] = [
     RefGamut {
         key: "srgb",
         name: "sRGB",
         matrix: &SRGB_TO_XYZ,
         color: [0.42, 0.60, 1.0, 0.5],
+        // IEC 61966-2-1 reference white.
+        white_nits: 80.0,
     },
     RefGamut {
         key: "p3",
         name: "Display P3",
         matrix: &P3_TO_XYZ,
         color: [0.36, 0.85, 0.52, 0.5],
+        // Display-P3 (D65, sRGB-style transfer) shares sRGB's SDR white.
+        white_nits: 80.0,
     },
     RefGamut {
         key: "bt2020",
         name: "Rec.2020",
         matrix: &BT2020_TO_XYZ,
         color: [1.0, 0.70, 0.30, 0.5],
+        // ITU-R BT.2408 / BT.2100 HDR reference white.
+        white_nits: 203.0,
     },
 ];
 
@@ -265,10 +279,10 @@ pub fn build_gamut_scene(
         }
         match space {
             GamutSpace::Cielab => cages.extend(gamut_cage_lab(g.matrix, g.color)),
-            GamutSpace::Bt2020Rgb => cages.extend(gamut_cage_rgb(g.matrix, g.color)),
+            GamutSpace::Bt2020Rgb => cages.extend(gamut_cage_rgb(g.matrix, g.color, g.white_nits)),
         }
         anchor_pts.push(ScenePoint {
-            position: cage_green_world(g.matrix, space),
+            position: cage_green_world(g.matrix, space, g.white_nits),
             color: g.color,
         });
         anchor_txt.push(g.name.to_string());
@@ -349,17 +363,19 @@ fn shell_segments(mesh: &prism_ipc::GamutMesh, space: GamutSpace) -> Vec<LineSeg
 }
 
 /// World position of a gamut's green primary `[0, 1, 0]` in the given
-/// plot space — the anchor for its in-plot name label.
-fn cage_green_world(rgb_to_xyz: &[[f64; 3]; 3], space: GamutSpace) -> Vec3 {
+/// plot space — the anchor for its in-plot name label. In the BT.2020
+/// view the corner is scaled to the gamut's spec `white_nits`, so the
+/// label rides the (rescaled) cage.
+fn cage_green_world(rgb_to_xyz: &[[f64; 3]; 3], space: GamutSpace, white_nits: f64) -> Vec3 {
     const GREEN: [f64; 3] = [0.0, 1.0, 0.0];
     match space {
         GamutSpace::Cielab => lab_to_world(xyz_to_lab(mat_mul(rgb_to_xyz, GREEN), D65)),
         GamutSpace::Bt2020Rgb => {
             let bt = mat_mul(&XYZ_TO_BT2020, mat_mul(rgb_to_xyz, GREEN));
             Vec3::new(
-                (bt[0] * REFERENCE_WHITE_NITS) as f32,
-                (bt[1] * REFERENCE_WHITE_NITS) as f32,
-                (bt[2] * REFERENCE_WHITE_NITS) as f32,
+                (bt[0] * white_nits) as f32,
+                (bt[1] * white_nits) as f32,
+                (bt[2] * white_nits) as f32,
             )
         }
     }
@@ -395,17 +411,23 @@ fn gamut_cage_lab(rgb_to_xyz: &[[f64; 3]; 3], color: [f32; 4]) -> Vec<LineSegmen
 }
 
 /// The gamut's RGB unit cube expressed in the buffer's BT.2020 RGB space,
-/// scaled to [`REFERENCE_WHITE_NITS`]. The transform RGB→XYZ→BT.2020-RGB
-/// is linear, so edges stay straight (no subdivision). For BT.2020 itself
-/// this collapses to the axis-aligned `[0, ref]³` cube; narrower gamuts
-/// (sRGB, P3) become skewed boxes nested inside it.
-fn gamut_cage_rgb(rgb_to_xyz: &[[f64; 3]; 3], color: [f32; 4]) -> Vec<LineSegment> {
+/// scaled to the gamut's spec `white_nits` (so its `[1,1,1]` white corner
+/// sits at `(white_nits, white_nits, white_nits)`). The transform
+/// RGB→XYZ→BT.2020-RGB is linear, so edges stay straight (no subdivision).
+/// Because each gamut uses its *own* spec white, the cubes top out at
+/// different absolute nits (sRGB 80, Rec.2020 203…) — the absolute span
+/// difference — while still nesting in chromaticity (sRGB ⊂ P3 ⊂ Rec.2020).
+fn gamut_cage_rgb(
+    rgb_to_xyz: &[[f64; 3]; 3],
+    color: [f32; 4],
+    white_nits: f64,
+) -> Vec<LineSegment> {
     let world_of = |rgb: [f64; 3]| {
         let bt = mat_mul(&XYZ_TO_BT2020, mat_mul(rgb_to_xyz, rgb));
         Vec3::new(
-            (bt[0] * REFERENCE_WHITE_NITS) as f32,
-            (bt[1] * REFERENCE_WHITE_NITS) as f32,
-            (bt[2] * REFERENCE_WHITE_NITS) as f32,
+            (bt[0] * white_nits) as f32,
+            (bt[1] * white_nits) as f32,
+            (bt[2] * white_nits) as f32,
         )
     };
     let mut segs = Vec::new();
@@ -531,6 +553,34 @@ mod tests {
         let none = build_gamut_scene(&sample, GamutSpace::Cielab, [false; N_REF_GAMUTS], None);
         assert_eq!(none.cage_label_geo.snapshot().0.points.len(), 0);
         assert_eq!(none.cages.snapshot().0.segments.len(), 0);
+    }
+
+    #[test]
+    fn bt2020_cages_scale_to_per_gamut_spec_white() {
+        // In the BT.2020 view each cage tops out at its own spec white, so
+        // the green primaries land at different absolute nits. Rec.2020's
+        // green is the on-axis (0, 203, 0); sRGB's is dimmer (80-white) and
+        // off-axis. The anchors are the green corners, in REF_GAMUTS order.
+        let scene = build_gamut_scene(&[], GamutSpace::Bt2020Rgb, [true; N_REF_GAMUTS], None);
+        let (data, _rev) = scene.cage_label_geo.snapshot();
+        let anchors = &data.points;
+        assert_eq!(anchors.len(), 3);
+
+        let srgb_green = anchors[0].position; // white_nits = 80
+        let bt2020_green = anchors[2].position; // white_nits = 203
+
+        // Rec.2020 green [0,1,0] → BT.2020 [0,1,0] × 203 (matrices invert).
+        assert!(approx(bt2020_green.x as f64, 0.0, 0.5));
+        assert!(approx(bt2020_green.y as f64, 203.0, 0.5));
+        assert!(approx(bt2020_green.z as f64, 0.0, 0.5));
+
+        // sRGB green sits well below Rec.2020's — the absolute span gap the
+        // per-gamut white produces (≈74 nits G vs 203).
+        assert!(
+            srgb_green.y > 50.0 && srgb_green.y < 100.0,
+            "{srgb_green:?}"
+        );
+        assert!(srgb_green.y < bt2020_green.y);
     }
 
     #[test]
