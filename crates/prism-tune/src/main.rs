@@ -29,6 +29,7 @@ mod calibrate_lut3d;
 mod characterize;
 mod common;
 mod gamut;
+mod gui;
 mod validate_lut3d;
 
 use anyhow::{Context, Result};
@@ -80,6 +81,21 @@ enum TopCommand {
     /// driven off-neutral (the "bright whites tint" class of bug) and,
     /// with `--lut`, whether the GPU matches the LUT file's own prediction.
     ValidateLut3d(validate_lut3d::ValidateLut3dArgs),
+    /// Launch the damascene GUI control panel. First cut: an
+    /// interactive front-end over the per-output color IPC — list
+    /// outputs, view live `ColorState`, and apply the runtime color
+    /// overrides (SDR reference / response curve / panel peaks / reset).
+    Gui,
+    /// Dev diagnostic: render the GUI panel (with mock state) through
+    /// damascene's bundle pipeline and dump the standard artifact set
+    /// (`.svg` / `.tree.txt` / `.draw_ops.txt` / `.shader_manifest.txt`
+    /// / `.lint.txt`), echoing the layout lint to stderr. Headless — no
+    /// running prism, no GPU required.
+    GuiBundle {
+        /// Directory to write artifacts into.
+        #[arg(long, default_value = "prism-tune-gui-bundle")]
+        out: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -111,6 +127,8 @@ fn main() -> Result<()> {
         TopCommand::CalibrateLut3d(args) => calibrate_lut3d::run(args),
         TopCommand::Characterize(args) => characterize::run(args),
         TopCommand::ValidateLut3d(args) => validate_lut3d::run(args),
+        TopCommand::Gui => gui::run(),
+        TopCommand::GuiBundle { out } => gui::dump_bundle(&out),
     }
 }
 

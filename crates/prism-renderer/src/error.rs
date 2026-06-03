@@ -20,6 +20,9 @@ pub enum RendererError {
 
     #[error("required Vulkan feature not supported on selected device: {0}")]
     MissingFeature(&'static str),
+
+    #[error("{0}")]
+    Io(String),
 }
 
 pub type Result<T> = std::result::Result<T, RendererError>;

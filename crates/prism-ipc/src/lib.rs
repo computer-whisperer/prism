@@ -119,6 +119,21 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Capture this output's most recent composited frame — the raw
+    /// BT.2020 absolute-nits *intermediate* (the linear light buffer the
+    /// encode pass reads, before LUT / response-curve / OETF panel
+    /// correction). The compositor reads the whole intermediate back
+    /// into a memfd and replies with `Response::FrameCaptured(meta)`
+    /// **plus the memfd passed as an out-of-band file descriptor**
+    /// (`SCM_RIGHTS`), which clients receive via
+    /// [`socket::Socket::send_recv_fd`]. The client `mmap`s the fd and
+    /// reads `meta.byte_len` bytes of pixel data laid out per `meta`.
+    /// On-demand and synchronous on the compositor side (a single
+    /// ~one-frame hitch); intended for a frame inspector, not streaming.
+    CaptureFrame {
+        /// Output connector name (e.g. `DisplayPort-4`).
+        output: String,
+    },
 }
 
 /// Reply from niri to client.
@@ -172,6 +187,38 @@ pub enum Response {
     /// `trilinear_sample_lut(entries, pq_oetf(input))`) to localize
     /// shader/LUT bugs vs. panel non-additivity.
     EncodeDiagnose(EncodeDiagnoseResult),
+    /// Geometry + layout for a `Request::CaptureFrame`. The pixel data
+    /// itself travels out-of-band as a memfd file descriptor (see
+    /// [`socket::Socket::send_recv_fd`]); this describes how to read it.
+    FrameCaptured(FrameMeta),
+}
+
+/// Describes the memfd payload of a `Response::FrameCaptured`. The fd's
+/// first `byte_len` bytes are `height` rows of `width` pixels, each row
+/// `stride_bytes` wide, in the pixel `format`, holding BT.2020
+/// absolute-nits *linear* light (the intermediate's domain).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct FrameMeta {
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+    /// Bytes per row (tightly packed: `width * texel_bytes(format)`).
+    pub stride_bytes: u32,
+    /// Total payload length in the memfd, in bytes.
+    pub byte_len: u64,
+    /// Pixel layout of each texel in the memfd.
+    pub format: FrameFormat,
+}
+
+/// Pixel layout of a captured frame's texels.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum FrameFormat {
+    /// Four little-endian `f32` channels per texel: R, G, B, A (16
+    /// bytes). RGB are BT.2020 absolute-nits linear; A is unused.
+    Rgba32Float,
 }
 
 /// Per-channel decoded scanout nits returned by `OutputAction::EncodeDiagnose`.

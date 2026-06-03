@@ -22,6 +22,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
+damascene-core.workspace = true
+damascene-winit-wgpu.workspace = true
 prism-ipc = { workspace = true, features = ["clap"] }
 prism-renderer.workspace = true
 serde_json.workspace = true

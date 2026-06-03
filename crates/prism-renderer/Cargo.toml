@@ -16,6 +16,7 @@ half.workspace = true
 libc.workspace = true
 prism-frame.workspace = true
 rspirv.workspace = true
+rustix = { workspace = true, features = ["fs"] }
 smithay.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

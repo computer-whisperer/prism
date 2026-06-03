@@ -1,10 +1,17 @@
 //! Helper for blocking communication over the prism socket.
 
 use std::env;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, IoSlice, IoSliceMut, Write};
+use std::mem::MaybeUninit;
 use std::net::Shutdown;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+
+use rustix::net::{
+    recvmsg, sendmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags,
+};
 
 use crate::{Event, Reply, Request};
 
@@ -60,6 +67,52 @@ impl Socket {
         Ok(reply)
     }
 
+    /// Sends a request and reads a reply that may carry an out-of-band
+    /// file descriptor (`SCM_RIGHTS`), e.g. [`Request::CaptureFrame`].
+    ///
+    /// Returns the parsed [`Reply`] plus the received fd, if the server
+    /// attached one. The reply line is read with `recvmsg` rather than
+    /// the buffered [`Self::send`] path, because ancillary fds are
+    /// silently dropped by an ordinary `read()` that swallows the bytes
+    /// they were queued against. Use this on a **fresh** connection
+    /// (one request per socket, as prism's clients already do) so no
+    /// buffered read-ahead can race the ancillary data.
+    ///
+    /// [`Request::CaptureFrame`]: crate::Request::CaptureFrame
+    pub fn send_recv_fd(&mut self, request: Request) -> io::Result<(Reply, Option<OwnedFd>)> {
+        let mut buf = serde_json::to_string(&request).unwrap();
+        buf.push('\n');
+        self.stream.get_mut().write_all(buf.as_bytes())?;
+
+        let stream = self.stream.get_mut();
+        let mut line: Vec<u8> = Vec::with_capacity(256);
+        let mut received_fd: Option<OwnedFd> = None;
+        let mut chunk = [0u8; 4096];
+        loop {
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+            let mut iov = [IoSliceMut::new(&mut chunk)];
+            let ret = recvmsg(&*stream, &mut iov, &mut ancillary, RecvFlags::empty())?;
+            for msg in ancillary.drain() {
+                if let RecvAncillaryMessage::ScmRights(fds) = msg {
+                    // Keep the last fd; the protocol attaches exactly one.
+                    received_fd = fds.into_iter().next_back().or(received_fd);
+                }
+            }
+            if ret.bytes == 0 {
+                break; // EOF before newline
+            }
+            line.extend_from_slice(&chunk[..ret.bytes]);
+            if line.contains(&b'\n') {
+                break;
+            }
+        }
+
+        let text = String::from_utf8_lossy(&line);
+        let reply: Reply = serde_json::from_str(text.trim_end())?;
+        Ok((reply, received_fd))
+    }
+
     /// Starts reading event stream [`Event`]s from the socket.
     ///
     /// The returned function will block until the next [`Event`] arrives, then return it.
@@ -98,4 +151,40 @@ impl Socket {
             Ok(event)
         }
     }
+}
+
+/// Write one JSON [`Reply`] line to `stream`, optionally attaching `fd`
+/// as out-of-band ancillary data (`SCM_RIGHTS`). The server side of
+/// [`Socket::send_recv_fd`]: when `fd` is `Some`, the reply is sent with
+/// `sendmsg` so the descriptor rides alongside the reply bytes;
+/// otherwise it's a plain write, identical to the normal reply path.
+pub fn write_reply_with_fd(
+    stream: &UnixStream,
+    reply: &Reply,
+    fd: Option<BorrowedFd<'_>>,
+) -> io::Result<()> {
+    let mut buf = serde_json::to_string(reply)?;
+    buf.push('\n');
+
+    let Some(fd) = fd else {
+        let mut writer: &UnixStream = stream;
+        return writer.write_all(buf.as_bytes());
+    };
+
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut space);
+    let fds = [fd];
+    let pushed = ancillary.push(SendAncillaryMessage::ScmRights(&fds));
+    debug_assert!(pushed, "ancillary buffer too small for one fd");
+
+    // The fd attaches to this first sendmsg; for our small replies it
+    // carries the whole line, but loop defensively on short sends and
+    // flush any remainder with plain writes (the fd's already delivered).
+    let iov = [IoSlice::new(buf.as_bytes())];
+    let mut sent = sendmsg(stream, &iov, &mut ancillary, SendFlags::empty())?;
+    let mut writer: &UnixStream = stream;
+    while sent < buf.len() {
+        sent += writer.write(&buf.as_bytes()[sent..])?;
+    }
+    Ok(())
 }

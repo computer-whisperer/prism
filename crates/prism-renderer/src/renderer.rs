@@ -331,6 +331,29 @@ impl Renderer {
         )
     }
 
+    /// Capture this output's last composited frame — the raw BT.2020
+    /// absolute-nits *intermediate* (before LUT / response-curve / OETF
+    /// panel correction) — into a memfd, returning the fd + geometry.
+    ///
+    /// On-demand and synchronous (a single ~one-frame hitch): meant for
+    /// the prism-tune frame inspector behind an explicit "fetch frame"
+    /// IPC, NOT for the render path. Errors if no frame has been
+    /// rendered yet. See [`crate::intermediate_capture`].
+    pub fn capture_intermediate(&self) -> Result<crate::intermediate_capture::CapturedFrame> {
+        let intermediate =
+            self.intermediate
+                .as_ref()
+                .ok_or(crate::error::RendererError::MissingFeature(
+                    "capture_intermediate: no intermediate (no frame rendered yet)",
+                ))?;
+        crate::intermediate_capture::capture_intermediate_to_memfd(
+            &self.device,
+            intermediate.image,
+            intermediate.extent,
+            intermediate.format,
+        )
+    }
+
     /// Replace this output's 3D LUT content. No-op (and returns Ok) when
     /// the encode chain doesn't include `EncodeFragment::Lut3d`. `entries`
     /// must be `cube_edge³` RGB triples in linear nits, X-fastest

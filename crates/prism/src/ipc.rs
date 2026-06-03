@@ -20,7 +20,8 @@
 //! `prism-tune` invocation) can find us.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -112,39 +113,78 @@ fn handle_connection(stream: UnixStream, state: &mut PrismState) -> Result<()> {
     let mut line = String::new();
     reader.read_line(&mut line).context("read request line")?;
 
-    let reply: Reply = match serde_json::from_str::<Request>(&line) {
+    let (reply, fd): (Reply, Option<OwnedFd>) = match serde_json::from_str::<Request>(&line) {
         Ok(req) => dispatch(state, req),
-        Err(e) => Err(format!("parse request: {e}")),
+        Err(e) => (Err(format!("parse request: {e}")), None),
     };
 
-    let mut buf = serde_json::to_string(&reply).context("serialize reply")?;
-    buf.push('\n');
-    reader
-        .get_mut()
-        .write_all(buf.as_bytes())
-        .context("write reply")?;
+    prism_ipc::socket::write_reply_with_fd(
+        reader.get_mut(),
+        &reply,
+        fd.as_ref().map(|f| f.as_fd()),
+    )
+    .context("write reply")?;
     Ok(())
 }
 
 /// Route a parsed Request to the matching handler. Unsupported variants
 /// return `Err("not implemented")` rather than panic — clients then know
 /// which surface area is still future work.
-fn dispatch(state: &mut PrismState, req: Request) -> Reply {
+fn dispatch(state: &mut PrismState, req: Request) -> (Reply, Option<OwnedFd>) {
     match req {
-        Request::Version => Ok(Response::Version(env!("CARGO_PKG_VERSION").to_string())),
-        Request::Outputs => Ok(Response::Outputs(collect_outputs(state))),
+        Request::Version => (
+            Ok(Response::Version(env!("CARGO_PKG_VERSION").to_string())),
+            None,
+        ),
+        Request::Outputs => (Ok(Response::Outputs(collect_outputs(state))), None),
         Request::FocusedOutput => {
             // True focus tracking lives in input dispatch (not yet
             // multi-output-aware); for now report the first connected
             // output so the IPC at least has a defined answer.
             let map = collect_outputs(state);
             let first = map.into_values().next();
-            Ok(Response::FocusedOutput(first))
+            (Ok(Response::FocusedOutput(first)), None)
         }
-        Request::Output { output, action } => handle_output_action(state, &output, action),
-        other => Err(format!(
-            "request {other:?} is not implemented in this build"
-        )),
+        Request::Output { output, action } => (handle_output_action(state, &output, action), None),
+        Request::CaptureFrame { output } => handle_capture_frame(state, &output),
+        other => (
+            Err(format!(
+                "request {other:?} is not implemented in this build"
+            )),
+            None,
+        ),
+    }
+}
+
+/// Capture an output's intermediate frame into a memfd and return the
+/// fd alongside a [`Response::FrameCaptured`] describing its layout.
+/// The fd is passed out-of-band (`SCM_RIGHTS`) by `handle_connection`.
+fn handle_capture_frame(state: &mut PrismState, name: &str) -> (Reply, Option<OwnedFd>) {
+    let Some(output_id) = state
+        .outputs
+        .iter()
+        .find(|(_id, ctx)| ctx.connector_name == name)
+        .map(|(id, _)| id.clone())
+    else {
+        return (
+            Err(format!("capture-frame: output {name:?} not found")),
+            None,
+        );
+    };
+
+    let output_ctx = state.outputs.get(&output_id).expect("just found above");
+    match output_ctx.renderer.capture_intermediate() {
+        Ok(frame) => {
+            let meta = prism_ipc::FrameMeta {
+                width: frame.width,
+                height: frame.height,
+                stride_bytes: frame.stride_bytes,
+                byte_len: frame.byte_len,
+                format: prism_ipc::FrameFormat::Rgba32Float,
+            };
+            (Ok(Response::FrameCaptured(meta)), Some(frame.fd))
+        }
+        Err(e) => (Err(format!("capture-frame: {e:#}")), None),
     }
 }
 

@@ -15,6 +15,7 @@ pub mod encode_synth;
 pub mod error;
 pub mod instance;
 pub mod intermediate;
+pub mod intermediate_capture;
 pub mod lut3d;
 pub mod oneshot;
 pub mod pipeline;

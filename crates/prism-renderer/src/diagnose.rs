@@ -623,7 +623,7 @@ fn create_view_1x1(device: &Device, image: vk::Image, format: vk::Format) -> Res
     unsafe { device.raw.create_image_view(&info, None) }.vk_ctx("create_image_view (diagnose 1×1)")
 }
 
-fn create_host_buffer(
+pub(crate) fn create_host_buffer(
     device: &Device,
     size: vk::DeviceSize,
     usage: vk::BufferUsageFlags,
