@@ -27,6 +27,7 @@
 mod calibrate;
 mod calibrate_lut3d;
 mod characterize;
+mod color3d;
 mod common;
 mod gamut;
 mod gui;

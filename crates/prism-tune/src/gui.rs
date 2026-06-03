@@ -20,12 +20,22 @@ use std::os::unix::fs::FileExt;
 
 use anyhow::{bail, Context, Result};
 use damascene_core::prelude::*;
+use damascene_core::scene::{AxisKind, PointShape, PointStyle, SceneSpec, SizeMode};
 use prism_ipc::socket::Socket;
 use prism_ipc::{
     ColorState, FrameFormat, FrameMeta, Output, OutputAction, Request, Response, ResponseCurveState,
 };
 
+use crate::color3d::{self, GamutScene};
 use crate::common::{send_action, srgb_oetf};
+
+/// Cloud-sample decimation cap (per axis). The cloud is deduped in Lab
+/// afterwards, so this only bounds the pre-dedup work, not the final
+/// point count.
+const CLOUD_MAX_SIDE: usize = 256;
+/// Preview-image decimation cap (per axis) — keeps the preview texture
+/// light while staying crisp enough to read.
+const PREVIEW_MAX_SIDE: usize = 960;
 
 /// Query every connected output, sorted by connector name.
 fn query_outputs() -> Result<Vec<Output>> {
@@ -99,6 +109,8 @@ struct TuneGui {
     /// Tonemapped preview of the most recently fetched intermediate
     /// frame (decimated, BT.2020→sRGB). `None` until the first fetch.
     preview: Option<Image>,
+    /// 3D gamut point cloud + reference cages built from the same fetch.
+    gamut: Option<GamutScene>,
     selection: Selection,
 }
 
@@ -110,6 +122,7 @@ impl TuneGui {
             fields: Fields::default(),
             status: String::new(),
             preview: None,
+            gamut: None,
             selection: Selection::default(),
         };
         gui.reload(None);
@@ -149,6 +162,7 @@ impl TuneGui {
             fields: Fields::default(),
             status: "Mock state — no prism connection.".to_string(),
             preview: None,
+            gamut: None,
             selection: Selection::default(),
         };
         gui.sync_fields();
@@ -226,10 +240,15 @@ impl TuneGui {
             .current()
             .map(|o| o.color.sdr_reference_nits)
             .unwrap_or(203.0);
-        match capture_preview(&output, white) {
-            Ok((image, w, h)) => {
+        match capture_frame(&output, white) {
+            Ok((image, samples, w, h)) => {
+                let gamut = color3d::build_gamut_scene(&samples, white);
+                self.status = format!(
+                    "Fetched {w}×{h} frame from {output} · {} distinct colors.",
+                    gamut.point_count
+                );
                 self.preview = Some(image);
-                self.status = format!("Fetched {w}×{h} frame from {output}.");
+                self.gamut = Some(gamut);
             }
             Err(e) => self.status = format!("Fetch failed: {e:#}"),
         }
@@ -486,9 +505,43 @@ impl App for TuneGui {
                     ],
                 );
 
+                let gamut_card = match &self.gamut {
+                    Some(g) => {
+                        let scene = SceneSpec::new()
+                            .points_styled(
+                                g.points.clone(),
+                                PointStyle {
+                                    size: 5.0,
+                                    shape: PointShape::Circle,
+                                    size_mode: SizeMode::ScreenSpace,
+                                },
+                            )
+                            .lines(g.cages.clone())
+                            .axis_titles("a*", "L*", "b*")
+                            .axis_bounds(AxisKind::Y, 0.0, 100.0);
+                        titled_card(
+                            "Gamut cloud · CIELAB — drag to orbit, wheel to zoom",
+                            [chart3d(scene)
+                                .width(Size::Fill(1.0))
+                                .height(Size::Fixed(480.0))],
+                        )
+                    }
+                    None => titled_card(
+                        "Gamut cloud · CIELAB",
+                        [
+                            column([text("Fetch a frame to plot its colors in Lab space.")
+                                .muted()
+                                .small()])
+                            .height(Size::Fixed(48.0))
+                            .justify(Justify::Center),
+                        ],
+                    ),
+                };
+
                 column([
                     header,
                     preview_card,
+                    gamut_card,
                     color_state_card(&output.color),
                     sdr_card,
                     response_card,
@@ -592,13 +645,14 @@ fn triple_row(
     .gap(tokens::SPACE_1)
 }
 
-/// Request a frame capture for `output`, receive the memfd, and tonemap
-/// it into a decimated sRGB preview. Returns the preview image plus the
+/// Request a frame capture for `output`, receive the memfd, and process
+/// it into both a decimated sRGB preview and a coarser set of raw
+/// BT.2020-linear samples for the gamut cloud. Returns those plus the
 /// captured frame's full pixel dimensions (for the status line).
 ///
 /// Uses a fresh one-shot connection so the `recvmsg` fd path in
 /// [`Socket::send_recv_fd`] has no buffered read-ahead to race.
-fn capture_preview(output: &str, white_nits: f64) -> Result<(Image, u32, u32)> {
+fn capture_frame(output: &str, white_nits: f64) -> Result<(Image, Vec<[f32; 3]>, u32, u32)> {
     let mut socket = Socket::connect()
         .context("connect to PRISM_SOCKET (is prism running, and are you in its env?)")?;
     let (reply, fd) = socket
@@ -612,17 +666,18 @@ fn capture_preview(output: &str, white_nits: f64) -> Result<(Image, u32, u32)> {
         Err(e) => bail!("prism returned an error: {e}"),
     };
     let fd = fd.ok_or_else(|| anyhow::anyhow!("server replied FrameCaptured without an fd"))?;
-    let image = tonemap_frame(File::from(fd), &meta, white_nits)?;
-    Ok((image, meta.width, meta.height))
+    let (image, samples) = process_frame(File::from(fd), &meta, white_nits)?;
+    Ok((image, samples, meta.width, meta.height))
 }
 
-/// Decimate + tonemap a captured BT.2020 intermediate frame into an
-/// sRGB preview `Image`. The capture is full-resolution; we sample on a
-/// grid so the preview texture stays small. Each sampled texel is
-/// normalized by `white_nits`, converted BT.2020→sRGB (BT.709 primaries),
-/// clamped, and sRGB-encoded. Out-of-gamut / over-white pixels simply
-/// clip — fine for a "this was a recent frame" thumbnail.
-fn tonemap_frame(file: File, meta: &FrameMeta, white_nits: f64) -> Result<Image> {
+/// Read a captured BT.2020 intermediate frame once and derive two views:
+/// a tonemapped sRGB preview `Image` (decimated to [`PREVIEW_MAX_SIDE`])
+/// and a coarser grid of raw BT.2020-linear samples (to
+/// [`CLOUD_MAX_SIDE`]) for the gamut cloud. The preview normalizes by
+/// `white_nits` and converts BT.2020→sRGB (clamping out-of-gamut /
+/// over-white); the cloud samples stay raw — the gamut builder owns that
+/// color math.
+fn process_frame(file: File, meta: &FrameMeta, white_nits: f64) -> Result<(Image, Vec<[f32; 3]>)> {
     match meta.format {
         FrameFormat::Rgba32Float => {}
     }
@@ -640,42 +695,60 @@ fn tonemap_frame(file: File, meta: &FrameMeta, white_nits: f64) -> Result<Image>
         bail!("captured frame has zero dimension ({w}×{h})");
     }
 
-    // Cap the longest side to keep the preview texture light.
-    const MAX_SIDE: usize = 960;
-    let step = (w.max(h) / MAX_SIDE).max(1);
+    let read_rgb = |off: usize| -> [f32; 3] {
+        [
+            f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]),
+            f32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]),
+            f32::from_le_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]),
+        ]
+    };
+
+    // Preview: tonemap a fine grid into an RGBA8 image.
+    let pstep = (w.max(h) / PREVIEW_MAX_SIDE).max(1);
     let scale = if white_nits > 0.0 {
         1.0 / white_nits
     } else {
         1.0
     };
-
-    let read_f32 = |off: usize| -> f64 {
-        f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as f64
-    };
-
     let mut pixels: Vec<u8> = Vec::new();
-    let (mut out_w, mut out_h) = (0u32, 0u32);
+    let (mut pw, mut ph) = (0u32, 0u32);
     let mut y = 0;
     while y < h {
         let row = y * stride;
         let mut cols = 0u32;
         let mut x = 0;
         while x < w {
-            let off = row + x * 16;
+            let rgb = read_rgb(row + x * 16);
             let [r, g, b] = bt2020_to_srgb8(
-                read_f32(off) * scale,
-                read_f32(off + 4) * scale,
-                read_f32(off + 8) * scale,
+                rgb[0] as f64 * scale,
+                rgb[1] as f64 * scale,
+                rgb[2] as f64 * scale,
             );
             pixels.extend_from_slice(&[r, g, b, 255]);
             cols += 1;
-            x += step;
+            x += pstep;
         }
-        out_w = cols;
-        out_h += 1;
-        y += step;
+        pw = cols;
+        ph += 1;
+        y += pstep;
     }
-    Ok(Image::from_rgba8(out_w, out_h, pixels))
+    let image = Image::from_rgba8(pw, ph, pixels);
+
+    // Cloud: a coarser grid of raw BT.2020-linear samples.
+    let cstep = (w.max(h) / CLOUD_MAX_SIDE).max(1);
+    let mut samples: Vec<[f32; 3]> = Vec::new();
+    let mut y = 0;
+    while y < h {
+        let row = y * stride;
+        let mut x = 0;
+        while x < w {
+            samples.push(read_rgb(row + x * 16));
+            x += cstep;
+        }
+        y += cstep;
+    }
+
+    Ok((image, samples))
 }
 
 /// BT.2020 linear (relative to white = 1.0) → 8-bit sRGB. The 3×3 is
