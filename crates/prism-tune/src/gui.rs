@@ -20,7 +20,7 @@ use std::os::unix::fs::FileExt;
 
 use anyhow::{bail, Context, Result};
 use damascene_core::prelude::*;
-use damascene_core::scene::{AxisKind, PointShape, PointStyle, SceneSpec, SizeMode};
+use damascene_core::scene::{PointShape, PointStyle, SceneSpec, SizeMode};
 use prism_ipc::socket::Socket;
 use prism_ipc::{
     ColorState, FrameFormat, FrameMeta, Output, OutputAction, Request, Response, ResponseCurveState,
@@ -242,7 +242,7 @@ impl TuneGui {
             .unwrap_or(203.0);
         match capture_frame(&output, white) {
             Ok((image, samples, w, h)) => {
-                let gamut = color3d::build_gamut_scene(&samples, white);
+                let gamut = color3d::build_gamut_scene(&samples);
                 self.status = format!(
                     "Fetched {w}×{h} frame from {output} · {} distinct colors.",
                     gamut.point_count
@@ -507,6 +507,9 @@ impl App for TuneGui {
 
                 let gamut_card = match &self.gamut {
                     Some(g) => {
+                        // No L* clip: the cloud is absolute (anchored to
+                        // REFERENCE_WHITE_NITS), so content brighter than
+                        // reference white legitimately sits above L* = 100.
                         let scene = SceneSpec::new()
                             .points_styled(
                                 g.points.clone(),
@@ -517,10 +520,9 @@ impl App for TuneGui {
                                 },
                             )
                             .lines(g.cages.clone())
-                            .axis_titles("a*", "L*", "b*")
-                            .axis_bounds(AxisKind::Y, 0.0, 100.0);
+                            .axis_titles("a*", "L*", "b*");
                         titled_card(
-                            "Gamut cloud · CIELAB — drag to orbit, wheel to zoom",
+                            "Gamut cloud · absolute CIELAB (203-nit white) — drag to orbit",
                             [chart3d(scene)
                                 .width(Size::Fill(1.0))
                                 .height(Size::Fixed(480.0))],

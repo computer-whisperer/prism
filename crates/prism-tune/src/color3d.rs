@@ -4,9 +4,16 @@
 //! tristim git rev) — the needed subset is small and standard.
 //!
 //! The cloud and cages live in the same Lab frame: world X = a*, Y = L*
-//! (up), Z = b*, all referenced to D65 (BT.2020's white). Sample colors
-//! are normalized so the output's SDR-reference white lands at L* = 100,
-//! matching the cube-corner white of the cages.
+//! (up), Z = b*, all referenced to D65 (BT.2020's white).
+//!
+//! Measurements are **absolute**: the intermediate is absolute-nits
+//! BT.2020 linear, so the cloud is anchored to a fixed reference white
+//! ([`REFERENCE_WHITE_NITS`] → L* = 100) rather than the output's
+//! per-display `sdr_reference_nits`. That keeps two outputs — or SDR vs.
+//! HDR content — directly comparable, and lets content brighter than
+//! reference white extend above L* = 100 (so the L* axis isn't clipped).
+//! The cube-corner white of each cage sits at the same L* = 100, so a
+//! reference-white-luminance sample lands exactly on the cage white.
 
 use std::collections::HashSet;
 
@@ -15,6 +22,12 @@ use damascene_core::scene::{LineData, LinesHandle};
 use damascene_core::scene::{LineSegment, PointData, PointsHandle, ScenePoint};
 
 use crate::common::srgb_oetf;
+
+/// Absolute reference white the Lab frame is anchored to: a sample at
+/// this luminance maps to L* = 100. ITU-R BT.2408 HDR reference
+/// ("graphics") white. Fixed (not the output's `sdr_reference_nits`) so
+/// the gamut plot reads in absolute terms.
+pub const REFERENCE_WHITE_NITS: f64 = 203.0;
 
 /// D65 reference white in XYZ (Y normalized to 1).
 const D65: [f64; 3] = [0.950_47, 1.0, 1.088_83];
@@ -98,15 +111,12 @@ fn point_color(bt2020: [f64; 3]) -> [f32; 4] {
     [enc(sr), enc(sg), enc(sb), 1.0]
 }
 
-/// Build the point cloud + cages from white-normalizable BT.2020
-/// absolute-nits samples. Points are deduplicated on a Lab voxel grid so
-/// large flat regions collapse to one mark instead of thousands.
-pub fn build_gamut_scene(samples: &[[f32; 3]], white_nits: f64) -> GamutScene {
-    let scale = if white_nits > 0.0 {
-        1.0 / white_nits
-    } else {
-        1.0
-    };
+/// Build the point cloud + cages from BT.2020 absolute-nits samples,
+/// anchored to the fixed [`REFERENCE_WHITE_NITS`] (absolute, not relative
+/// to any per-output white). Points are deduplicated on a Lab voxel grid
+/// so large flat regions collapse to one mark instead of thousands.
+pub fn build_gamut_scene(samples: &[[f32; 3]]) -> GamutScene {
+    let scale = 1.0 / REFERENCE_WHITE_NITS;
 
     // Lab voxel dedup: quantize to `CELL`-sized cells, keep one per cell.
     const CELL: f64 = 2.0;
@@ -228,8 +238,10 @@ mod tests {
 
     #[test]
     fn reference_white_sample_lands_at_l100() {
-        // A BT.2020 sample at exactly the reference white nits is L*≈100.
-        let scene = build_gamut_scene(&[[203.0, 203.0, 203.0]], 203.0);
+        // A BT.2020 sample at exactly REFERENCE_WHITE_NITS is L*≈100,
+        // independent of any per-output white.
+        let w = REFERENCE_WHITE_NITS as f32;
+        let scene = build_gamut_scene(&[[w, w, w]]);
         let (data, _rev) = scene.points.snapshot();
         assert_eq!(scene.point_count, 1);
         assert!(approx(data.points[0].position.y as f64, 100.0, 0.1));
@@ -238,7 +250,7 @@ mod tests {
     #[test]
     fn cloud_dedups_identical_samples() {
         let samples = vec![[100.0f32, 50.0, 25.0]; 1000];
-        let scene = build_gamut_scene(&samples, 203.0);
+        let scene = build_gamut_scene(&samples);
         assert_eq!(
             scene.point_count, 1,
             "identical samples collapse to one Lab cell"
