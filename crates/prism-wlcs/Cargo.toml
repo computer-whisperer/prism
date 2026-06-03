@@ -28,4 +28,9 @@ tracing.workspace = true
 wlcs = "0.1"
 # Raw wl_display / wl_proxy access for position_window_absolute. Pinned to
 # match the wayland-sys that `wlcs` resolves to so the pointer types unify.
-wayland-sys = { version = "0.31", features = ["client", "server"] }
+# `dlopen` is enabled deliberately: anything sharing this workspace with the
+# prism-tune GUI pulls winit, which forces `wayland-sys/dlopen` ON for the whole
+# feature-unified build. Requesting it here too means the FFI below uses the
+# handle-based (`WAYLAND_CLIENT_HANDLE`) API consistently whether this crate is
+# built standalone or alongside the GUI.
+wayland-sys = { version = "0.31", features = ["client", "server", "dlopen"] }
