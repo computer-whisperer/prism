@@ -638,7 +638,13 @@ impl App for TuneGui {
                 ])
                 .gap(tokens::SPACE_1);
 
-                let gamut_body: El = match &self.gamut {
+                let has_geometry = self.gamut.as_ref().is_some_and(|g| {
+                    g.point_count > 0
+                        || g.cage_segments > 0
+                        || g.shell_segments > 0
+                        || g.cage_label_count > 0
+                });
+                let gamut_body: El = match self.gamut.as_ref().filter(|_| has_geometry) {
                     Some(g) => {
                         // Axes are unclipped: both spaces are absolute, so
                         // content brighter than reference white sits above
@@ -647,20 +653,32 @@ impl App for TuneGui {
                             GamutSpace::Cielab => ("a*", "L*", "b*"),
                             GamutSpace::Bt2020Rgb => ("R (nits)", "G (nits)", "B (nits)"),
                         };
-                        let scene = SceneSpec::new()
-                            .points_styled(
+                        // The damascene wgpu backend rejects empty geometry
+                        // buffers, so add each mark only when it has data —
+                        // the cloud (no frame yet), the cages (all toggled
+                        // off), the shell (no mesh), and the labels can each
+                        // be empty independently.
+                        let mut scene = SceneSpec::new();
+                        if g.point_count > 0 {
+                            scene = scene.points_styled(
                                 g.points.clone(),
                                 PointStyle {
                                     size: 5.0,
                                     shape: PointShape::Circle,
                                     size_mode: SizeMode::ScreenSpace,
                                 },
-                            )
-                            .lines(g.cages.clone())
-                            .lines(g.shell.clone())
+                            );
+                        }
+                        if g.cage_segments > 0 {
+                            scene = scene.lines(g.cages.clone());
+                        }
+                        if g.shell_segments > 0 {
+                            scene = scene.lines(g.shell.clone());
+                        }
+                        if g.cage_label_count > 0 {
                             // A small square marker + persistent name at each
                             // enabled cage's green primary.
-                            .points_labeled(
+                            scene = scene.points_labeled(
                                 g.cage_label_geo.clone(),
                                 PointStyle {
                                     size: 5.0,
@@ -668,8 +686,9 @@ impl App for TuneGui {
                                     size_mode: SizeMode::ScreenSpace,
                                 },
                                 g.cage_labels.clone(),
-                            )
-                            .axis_titles(tx, ty, tz);
+                            );
+                        }
+                        scene = scene.axis_titles(tx, ty, tz);
                         chart3d(scene)
                             .width(Size::Fill(1.0))
                             .height(Size::Fixed(480.0))

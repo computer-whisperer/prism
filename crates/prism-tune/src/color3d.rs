@@ -96,6 +96,14 @@ pub struct GamutScene {
     pub cage_labels: PointLabels,
     /// Distinct point count after voxel dedup (for the status line).
     pub point_count: usize,
+    /// Reference-cage line-segment count. The damascene wgpu backend
+    /// rejects empty geometry buffers, so callers must skip a mark whose
+    /// count is zero rather than upload it.
+    pub cage_segments: usize,
+    /// Measured-shell line-segment count (see [`Self::cage_segments`]).
+    pub shell_segments: usize,
+    /// Cage-label marker count (== enabled cages; see [`Self::cage_segments`]).
+    pub cage_label_count: usize,
 }
 
 /// The measured gamut shell's normal patch-edge color (a distinct magenta,
@@ -266,20 +274,26 @@ pub fn build_gamut_scene(
         anchor_txt.push(g.name.to_string());
     }
 
-    let shell_segments = shell.map(|m| shell_segments(m, space)).unwrap_or_default();
+    let shell_segs = shell.map(|m| shell_segments(m, space)).unwrap_or_default();
 
     let point_count = points.len();
+    let cage_segments = cages.len();
+    let shell_segments = shell_segs.len();
+    let cage_label_count = anchor_pts.len();
     GamutScene {
         points: PointsHandle::new(PointData { points }),
         cages: LinesHandle::new(LineData { segments: cages }),
         shell: LinesHandle::new(LineData {
-            segments: shell_segments,
+            segments: shell_segs,
         }),
         cage_label_geo: PointsHandle::new(PointData { points: anchor_pts }),
         cage_labels: PointLabels::new(anchor_txt)
             .always()
             .placement(LabelPlacement::Above),
         point_count,
+        cage_segments,
+        shell_segments,
+        cage_label_count,
     }
 }
 
