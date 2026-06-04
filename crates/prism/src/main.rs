@@ -1174,7 +1174,10 @@ fn run_integrated(
                         // Client-facing mastering peak — independent of the
                         // infoframe's max-luminance. None here ⇒ advertise
                         // max-luminance (resolved in effective_advertised_peak_nits).
-                        output_config.advertised_peak_nits = hdr_cfg.advertised_peak_nits;
+                        // FloatOrInt is range-checked [1, 10000] at parse
+                        // time; the protocol wants whole cd/m², so round here.
+                        output_config.advertised_peak_nits =
+                            hdr_cfg.advertised_peak_nits.map(|v| v.0.round() as u32);
                         tracing::info!(
                             connector = %name,
                             "HDR config present: fp16 scanout + PQ encode + KMS signaling"

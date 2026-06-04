@@ -293,8 +293,16 @@ pub struct HdrConfig {
     /// so a calibration pass can tune what clients are told the display
     /// reaches independently of the panel signaling. Defaults to
     /// `max_luminance` when unset.
+    ///
+    /// KDL spelling — a property on the `hdr` node, int or float
+    /// (`FloatOrInt` so both literal forms parse; a plain `u32`/`f64`
+    /// field rejects the other literal kind, and one bad property
+    /// throws the whole config back to defaults):
+    /// `hdr "pq" max-luminance=400 advertised-peak-nits=250.0`
+    /// Range-checked [1, 10000] at parse time; rounded to whole cd/m²
+    /// at bringup (the protocol field is integer).
     #[knuffel(property)]
-    pub advertised_peak_nits: Option<u32>,
+    pub advertised_peak_nits: Option<FloatOrInt<1, 10_000>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -778,6 +786,59 @@ mod tests {
             model: model.map(|x| x.to_string()),
             serial: serial.map(|x| x.to_string()),
         }
+    }
+
+    /// The KDL spelling of the `hdr` block: knuffel kebab-cases field
+    /// names, so `advertised_peak_nits` must parse as
+    /// `advertised-peak-nits=…` — and it must accept BOTH float and
+    /// integer literals, hence `FloatOrInt` (a plain `u32` field
+    /// rejects `250.0`, a plain `f64` rejects `250`, and one bad
+    /// property throws away the user's whole config — the regression
+    /// this test pins).
+    #[test]
+    fn parse_hdr_color_block() {
+        fn parse_hdr(text: &str) -> HdrConfig {
+            let outputs: Vec<Output> = knuffel::parse("test.kdl", text).unwrap();
+            outputs[0].color.as_ref().unwrap().hdr.clone().unwrap()
+        }
+
+        // Float literal — what a nits value naturally looks like.
+        let hdr = parse_hdr(
+            r#"
+output "DP-4" {
+    color {
+        hdr "pq" max-luminance=400 advertised-peak-nits=250.0
+    }
+}
+"#,
+        );
+        assert_eq!(hdr.mode, HdrMode::Pq);
+        assert_eq!(hdr.max_luminance, 400);
+        assert_eq!(hdr.advertised_peak_nits.map(|v| v.0), Some(250.0));
+
+        // Integer literal — FloatOrInt must accept this form too.
+        let hdr = parse_hdr(
+            r#"
+output "DP-4" {
+    color {
+        hdr "pq" max-luminance=400 advertised-peak-nits=465
+    }
+}
+"#,
+        );
+        assert_eq!(hdr.advertised_peak_nits.map(|v| v.0), Some(465.0));
+
+        // Omitted ⇒ None (advertise max-luminance).
+        let hdr = parse_hdr(
+            r#"
+output "DP-4" {
+    color {
+        hdr "pq" max-luminance=400
+    }
+}
+"#,
+        );
+        assert_eq!(hdr.advertised_peak_nits, None);
     }
 
     #[test]
