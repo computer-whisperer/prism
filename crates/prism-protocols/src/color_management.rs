@@ -148,6 +148,15 @@ pub struct ImageDescription {
     /// per spec — `None` means the client didn't supply them.
     pub max_cll: Option<u32>,
     pub max_fall: Option<u32>,
+    /// True for the pre-defined `create_windows_scrgb` description.
+    /// Windows-scRGB is the one encoding whose `reference_lum` (80) is a
+    /// fixed value→nits *encoding scale* rather than a perceptual
+    /// reference white — the spec says its reference white is unknown
+    /// and "should be assumed 2.5375 = 203 cd/m² (BT.2408)" for
+    /// compositor processing. Luminance anchoring keys off this flag
+    /// (see [`decode_luminance_scale`]); parametric ext-linear
+    /// descriptions stay on the normalized 1.0-=-reference-white rule.
+    pub windows_scrgb: bool,
 }
 
 /// Primary color volume — named or explicit.
@@ -262,6 +271,14 @@ impl SurfaceColorFeedbackSlot {
     }
 }
 
+/// The assumed perceptual reference white of the Windows-scRGB encoding,
+/// in cd/m². Per `create_windows_scrgb` in color-management-v1.xml: "The
+/// reference white level of Windows-scRGB is unknown. If a reference
+/// white level must be assumed for compositor processing, it should be
+/// R=G=B=2.5375 corresponding to 203 cd/m² of Report ITU-R BT.2408-7."
+/// (2.5375 × 80 = 203.)
+const WINDOWS_SCRGB_ASSUMED_REF_NITS: f32 = 203.0;
+
 /// The post-EOTF luminance multiplier the decode shader applies to land
 /// post-EOTF values in the anchored absolute-nits working space (the decode
 /// push's `sdr_white_nits`). It folds the per-transfer EOTF convention and the
@@ -271,25 +288,46 @@ impl SurfaceColorFeedbackSlot {
 /// output reference-white level `output_ref_nits`, the spec's anchoring
 /// requirement) and false for absolute (reproduce declared luminance literally).
 ///
-/// Three EOTF conventions:
+/// Four EOTF conventions:
 /// - **PQ** (code 2): the EOTF already yields absolute nits, with the content's
 ///   reference white at `reference_lum`. Absolute → `1.0` (pass-through);
 ///   anchored → `output_ref_nits / reference_lum`.
-/// - **ext-linear** (code 0, e.g. Windows-scRGB): `reference_lum` is the fixed
-///   value→nits *encoding scale* (scRGB pins 1.0 = 80 cd/m²), not a recoverable
-///   reference white. Always literal (`reference_lum`); anchoring would corrupt
-///   the encoding, so it is deliberately not applied here.
+/// - **Windows-scRGB** (code 0 + `windows_scrgb`): `reference_lum` (80) is the
+///   fixed value→nits *encoding scale*; the encoding's perceptual reference
+///   white sits at signal 2.5375 = 203 cd/m² (assumed, per spec). Absolute →
+///   the literal encoding scale (Windows' own treatment). Anchored → map the
+///   assumed 203-nit level onto the output reference:
+///   `80 × output_ref_nits / 203`. At the default `sdr_reference_nits = 203`
+///   this is bit-identical to the literal scale, so HDR games (DXVK /
+///   vkd3d-proton, which author absolute scRGB) are unchanged there; at other
+///   settings their diffuse white follows the user's reference slider like
+///   every other anchored surface — clients that need literal reproduction
+///   request the absolute intent.
+/// - **parametric ext-linear** (code 0, not windows_scrgb): per the spec's TF
+///   definition ("normalised electrical values are equal the normalised
+///   optical values") signal 1.0 sits at the declared reference white — same
+///   anchoring shape as the normalized TFs. Absolute → `reference_lum`;
+///   anchored → `output_ref_nits`.
 /// - **normalized** (sRGB / gamma22 / BT.1886): the EOTF yields `[0,1]` with
 ///   `1.0` at the reference white. Absolute → `reference_lum`; anchored →
 ///   `output_ref_nits`.
 fn decode_luminance_scale(
     transfer: i32,
+    windows_scrgb: bool,
     anchored: bool,
     reference_lum: f32,
     output_ref_nits: f32,
 ) -> f32 {
     match transfer {
-        // ext-linear: keep the literal value→nits encoding scale.
+        // Windows-scRGB: anchor the assumed 203-nit reference level onto
+        // the output reference; keep the literal encoding scale for the
+        // absolute intents.
+        0 if windows_scrgb && anchored => {
+            reference_lum * output_ref_nits / WINDOWS_SCRGB_ASSUMED_REF_NITS
+        }
+        0 if windows_scrgb => reference_lum,
+        // Parametric ext-linear: 1.0 = declared reference white.
+        0 if anchored => output_ref_nits,
         0 => reference_lum,
         // PQ: EOTF already absolute nits. `max(1.0)` guards a degenerate
         // zero/sub-nit declared reference white.
@@ -373,8 +411,13 @@ pub fn description_to_params(
     } else {
         prism_frame::primaries_to_bt2020(&chroma)
     };
-    let sdr_white_nits =
-        decode_luminance_scale(transfer, !absolute, reference_lum, output_ref_nits);
+    let sdr_white_nits = decode_luminance_scale(
+        transfer,
+        desc.windows_scrgb,
+        !absolute,
+        reference_lum,
+        output_ref_nits,
+    );
     // YUV→RGB coefficients for YUV-sampled surfaces follow the primaries:
     // BT.2020 → the BT.2020 NCL matrix; everything else (sRGB/BT.709, the
     // SDR-video default) → BT.709. Ignored unless the surface is YUV.
@@ -572,6 +615,7 @@ pub fn build_output_preferred(
             }),
             max_cll: Some(hdr.max_cll as u32),
             max_fall: Some(hdr.max_fall as u32),
+            windows_scrgb: false,
         })
     } else {
         // SDR. gamma22 is the spec-recommended modern default
@@ -585,6 +629,7 @@ pub fn build_output_preferred(
             mastering_luminance: None,
             max_cll: None,
             max_fall: None,
+            windows_scrgb: false,
         })
     }
 }
@@ -605,6 +650,7 @@ fn default_sdr_description(cm: &ColorManagementState) -> Arc<ImageDescription> {
         mastering_luminance: None,
         max_cll: None,
         max_fall: None,
+        windows_scrgb: false,
     })
 }
 
@@ -804,6 +850,10 @@ impl Dispatch<WpColorManagerV1, ()> for PrismState {
                     mastering_luminance: None,
                     max_cll: None,
                     max_fall: None,
+                    // Marks the 80-per-unit encoding scale + assumed
+                    // 203-nit reference white for luminance anchoring
+                    // (see `decode_luminance_scale`).
+                    windows_scrgb: true,
                 });
                 // Spec: the result allows no `get_information`; just go
                 // straight to `ready` (low 32 bits of the identity).
@@ -1243,6 +1293,7 @@ fn build_description(
         mastering_luminance: inner.mastering_luminance,
         max_cll: inner.max_cll,
         max_fall: inner.max_fall,
+        windows_scrgb: false,
     }))
 }
 
@@ -1592,34 +1643,52 @@ mod luminance_tests {
     fn normalized_absolute_reproduces_declared_luminance() {
         // Absolute: 1.0 → the content's own declared reference luminance,
         // regardless of the output level. (The historical behavior.)
-        approx(decode_luminance_scale(SRGB, false, 100.0, HDR_REF), 100.0);
-        approx(decode_luminance_scale(SRGB, false, 80.0, SDR_REF), 80.0);
+        approx(
+            decode_luminance_scale(SRGB, false, false, 100.0, HDR_REF),
+            100.0,
+        );
+        approx(
+            decode_luminance_scale(SRGB, false, false, 80.0, SDR_REF),
+            80.0,
+        );
     }
 
     #[test]
     fn normalized_anchored_maps_white_to_output_level() {
         // Perceptual / relative: 1.0 → the output reference-white level,
         // independent of what the client declared.
-        approx(decode_luminance_scale(SRGB, true, 100.0, HDR_REF), HDR_REF);
-        approx(decode_luminance_scale(SRGB, true, 250.0, SDR_REF), SDR_REF);
+        approx(
+            decode_luminance_scale(SRGB, false, true, 100.0, HDR_REF),
+            HDR_REF,
+        );
+        approx(
+            decode_luminance_scale(SRGB, false, true, 250.0, SDR_REF),
+            SDR_REF,
+        );
     }
 
     #[test]
     fn pq_absolute_is_passthrough() {
         // PQ EOTF already yields absolute nits; absolute keeps them.
-        approx(decode_luminance_scale(PQ, false, 203.0, HDR_REF), 1.0);
-        approx(decode_luminance_scale(PQ, false, 1000.0, SDR_REF), 1.0);
+        approx(
+            decode_luminance_scale(PQ, false, false, 203.0, HDR_REF),
+            1.0,
+        );
+        approx(
+            decode_luminance_scale(PQ, false, false, 1000.0, SDR_REF),
+            1.0,
+        );
     }
 
     #[test]
     fn pq_anchored_rescales_reference_white_to_output() {
         // BT.2408 reference-white content (203) on a 203-nit HDR panel is a
         // no-op — the property that keeps HDR video pass-through.
-        approx(decode_luminance_scale(PQ, true, 203.0, HDR_REF), 1.0);
+        approx(decode_luminance_scale(PQ, false, true, 203.0, HDR_REF), 1.0);
         // Content authored to a different reference white is rescaled so its
         // diffuse white lands on the output level.
         approx(
-            decode_luminance_scale(PQ, true, 100.0, HDR_REF),
+            decode_luminance_scale(PQ, false, true, 100.0, HDR_REF),
             HDR_REF / 100.0,
         );
     }
@@ -1627,26 +1696,61 @@ mod luminance_tests {
     #[test]
     fn pq_anchored_guards_degenerate_reference() {
         // A zero / sub-nit declared reference must not divide by ~0.
-        let s = decode_luminance_scale(PQ, true, 0.0, HDR_REF);
+        let s = decode_luminance_scale(PQ, false, true, 0.0, HDR_REF);
         assert!(s.is_finite() && s > 0.0, "got {s}");
     }
 
     #[test]
-    fn ext_linear_keeps_encoding_scale_regardless_of_intent() {
-        // scRGB pins value 1.0 = 80 cd/m² as an encoding scale; anchoring must
-        // NOT remap it (that would corrupt the DXVK/vkd3d HDR-games path). Both
-        // intents yield the literal encoding scale on any output.
+    fn windows_scrgb_absolute_keeps_encoding_scale() {
+        // Absolute intents reproduce the literal Windows mapping:
+        // 1.0 = 80 cd/m² on any output.
         approx(
-            decode_luminance_scale(EXT_LINEAR, false, 80.0, HDR_REF),
+            decode_luminance_scale(EXT_LINEAR, true, false, 80.0, HDR_REF),
             80.0,
         );
         approx(
-            decode_luminance_scale(EXT_LINEAR, true, 80.0, HDR_REF),
+            decode_luminance_scale(EXT_LINEAR, true, false, 80.0, 400.0),
             80.0,
         );
+    }
+
+    #[test]
+    fn windows_scrgb_anchored_maps_assumed_reference_to_output() {
+        // The encoding's assumed reference white (signal 2.5375 = 203 cd/m²,
+        // BT.2408 per create_windows_scrgb) anchors onto the output level.
+        // At a 203-nit output this is bit-identical to the literal scale —
+        // DXVK/vkd3d HDR games are unchanged at the default setting.
         approx(
-            decode_luminance_scale(EXT_LINEAR, true, 80.0, SDR_REF),
+            decode_luminance_scale(EXT_LINEAR, true, true, 80.0, HDR_REF),
             80.0,
+        );
+        // A brighter configured reference lifts the whole encoding with it:
+        // a client placing UI white at signal 2.5375 lands exactly on the
+        // output reference (2.5375 × 80 × 400/203 = 400).
+        approx(
+            decode_luminance_scale(EXT_LINEAR, true, true, 80.0, 400.0),
+            80.0 * 400.0 / 203.0,
+        );
+        // And on an 80-nit SDR-style reference it dims to match anchored
+        // SDR app white rather than overshooting.
+        approx(
+            decode_luminance_scale(EXT_LINEAR, true, true, 80.0, SDR_REF),
+            80.0 * SDR_REF / 203.0,
+        );
+    }
+
+    #[test]
+    fn parametric_ext_linear_follows_normalized_anchoring() {
+        // Per the spec's TF definition, parametric ext-linear puts signal
+        // 1.0 at the declared reference white — anchoring behaves exactly
+        // like the normalized TFs (only the EOTF differs).
+        approx(
+            decode_luminance_scale(EXT_LINEAR, false, true, 100.0, HDR_REF),
+            HDR_REF,
+        );
+        approx(
+            decode_luminance_scale(EXT_LINEAR, false, false, 100.0, HDR_REF),
+            100.0,
         );
     }
 }
