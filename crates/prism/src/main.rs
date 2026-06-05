@@ -1817,6 +1817,15 @@ fn run_integrated(
         // niri calling `update_keyboard_focus` from `refresh()`.
         state.update_keyboard_focus();
 
+        // Mirror layout state into the window-list and workspace protocol
+        // objects (ext-foreign-toplevel-list, wlr-foreign-toplevel-management,
+        // ext-workspace). Diff-based: events go out only on change. Must run
+        // after update_keyboard_focus() so the wlr `activated` state reflects
+        // this cycle's final focus; niri calls these from the same point in
+        // its post-dispatch refresh.
+        prism_protocols::foreign_toplevel::refresh(&mut state);
+        prism_protocols::ext_workspace::refresh(&mut state);
+
         state
             .display_handle
             .flush_clients()

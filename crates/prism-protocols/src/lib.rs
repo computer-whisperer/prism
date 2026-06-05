@@ -10,6 +10,8 @@ pub mod client;
 pub mod color_management;
 pub mod dmabuf_sync;
 pub mod drm_syncobj;
+pub mod ext_workspace;
+pub mod foreign_toplevel;
 pub mod input_state;
 pub mod layer_shell;
 pub mod output_power;

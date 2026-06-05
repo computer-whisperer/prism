@@ -271,6 +271,14 @@ pub struct PrismState {
     /// extension interfaces lives in [`crate::color_management`]; this
     /// struct just owns the state the dispatch code references.
     pub color_management: crate::color_management::ColorManagementState,
+    /// ext-foreign-toplevel-list + wlr-foreign-toplevel-management window
+    /// lists (taskbars / status bars). Kept in sync with the layout by
+    /// [`crate::foreign_toplevel::refresh`], called once per dispatch cycle.
+    pub foreign_toplevel_state: crate::foreign_toplevel::ForeignToplevelManagerState,
+    /// ext-workspace-v1 workspace observation/control (status bars). Kept in
+    /// sync with the layout by [`crate::ext_workspace::refresh`], called once
+    /// per dispatch cycle.
+    pub ext_workspace_state: crate::ext_workspace::ExtWorkspaceManagerState,
     /// `wp_fractional_scale_v1`. Smithay handles the protocol; we
     /// own a handle so we can call
     /// [`smithay::wayland::fractional_scale::with_fractional_scale`]
@@ -698,6 +706,13 @@ impl PrismState {
         // the frame resource), so nothing to store here.
         crate::screencopy::create_screencopy_global(&dh);
 
+        // Window lists (ext-foreign-toplevel-list + wlr-foreign-toplevel-
+        // management) and ext-workspace-v1 — taskbar / status-bar support.
+        // Hand-rolled niri ports; kept in sync with the layout by the
+        // per-dispatch-cycle refresh() calls in the main loop.
+        let foreign_toplevel_state = crate::foreign_toplevel::ForeignToplevelManagerState::new(&dh);
+        let ext_workspace_state = crate::ext_workspace::ExtWorkspaceManagerState::new(&dh);
+
         // wp_cursor_shape_v1 — clients request a named cursor shape (text,
         // pointer, grab, …) instead of providing a buffer. smithay routes
         // each request through `SeatHandler::cursor_image(Named(icon))`, so
@@ -765,6 +780,8 @@ impl PrismState {
             viewporter,
             presentation,
             color_management,
+            foreign_toplevel_state,
+            ext_workspace_state,
             fractional_scale,
             single_pixel_buffer,
             content_type,
@@ -1479,8 +1496,14 @@ impl OutputHandler for PrismState {
     fn output_bound(
         &mut self,
         output: smithay::output::Output,
-        _wl_output: smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
+        wl_output: smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
     ) {
+        // A late-bound wl_output needs retroactive enter events on the
+        // foreign-toplevel handles (toplevel output_enter) and ext-workspace
+        // groups (group output_enter) the same client already holds.
+        crate::foreign_toplevel::on_output_bound(self, &output, &wl_output);
+        crate::ext_workspace::on_output_bound(self, &output, &wl_output);
+
         // Logged at info so the integration test can confirm clients
         // see our wl_output advertisements.
         tracing::info!(connector = %output.name(), "client bound wl_output");
@@ -3140,7 +3163,18 @@ fn dispatch_surface_output_from_layout(state: &mut PrismState, surface: &WlSurfa
 /// queueing — animations on subsurface-backed content (Firefox web
 /// content, GTK4 decorations) freeze until something else nudges the
 /// output (e.g. cursor motion).
-fn queue_redraw_for_surface(state: &mut PrismState, surface: &WlSurface) {
+/// Queue redraw on every output. Coarser than ideal, but conservative —
+/// used by protocol request paths (foreign-toplevel activate, ext-workspace
+/// activate/assign) whose layout effects can span outputs. Same shape as
+/// `queue_redraw_all` in prism-input.
+pub(crate) fn queue_redraw_all(state: &mut PrismState) {
+    let ids: Vec<_> = state.outputs.keys().cloned().collect();
+    for id in ids {
+        state.output_redraw.entry(id).or_default().queue_redraw();
+    }
+}
+
+pub(crate) fn queue_redraw_for_surface(state: &mut PrismState, surface: &WlSurface) {
     // Walk up the parent chain to the root of the surface tree. For a
     // toplevel root surface this is a single None-check.
     let mut root = surface.clone();

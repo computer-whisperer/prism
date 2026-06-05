@@ -1,0 +1,4 @@
+# `Output` hashes by its internal Arc pointer identity; the interior
+# Mutex/atomics never affect Hash/Eq, so HashMap<Output, _> keys are sound.
+# Same exception niri carries for the same maps (ext-workspace groups etc.).
+ignore-interior-mutability = ["smithay::output::Output"]
