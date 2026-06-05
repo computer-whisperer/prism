@@ -1878,8 +1878,20 @@ impl CompositorHandler for PrismState {
                             });
                         let (mapped, default_column_width) = {
                             let config = self.config.borrow();
-                            let m =
+                            let mut m =
                                 Mapped::new(window, ResolvedWindowRules::default(), hook, &config);
+                            // Resolve the window's actual rules. niri computes
+                            // them against the *Unmapped* window at
+                            // initial-configure time and hands the result to
+                            // `Mapped::new`; prism doesn't track unmapped
+                            // windows yet, so resolve against the just-built
+                            // Mapped instead — same matcher inputs (app-id /
+                            // title are committed by map time). Without this,
+                            // every window ran with default (empty) rules and
+                            // the whole window-rule config section was inert.
+                            // `is_at_startup = false`: prism has no startup
+                            // phase, so `match at-startup=true` never applies.
+                            m.recompute_window_rules(&config.window_rules, false);
                             // Without an explicit per-window-rule width,
                             // fall back to the configured default. niri
                             // resolves this via

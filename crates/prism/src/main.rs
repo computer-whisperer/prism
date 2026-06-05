@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1801,6 +1802,23 @@ fn run_integrated(
         // layout owns keyboard focus (no lock screen / overlay UI
         // intercepting); for prism today that's always.
         state.layout.refresh(true);
+
+        // Re-resolve window rules for windows whose match inputs changed this
+        // cycle — focus, urgency, floating, cast-target all set
+        // `need_to_recompute_rules`, so this is a cheap no-op pass otherwise.
+        // niri runs `refresh_window_rules()` at the same point, right after
+        // its layout refresh. The triggering event already queued a redraw;
+        // the damage tracker picks up any visual change via the elements'
+        // content tokens on that frame. (Known gap vs niri: app-id / title
+        // changes don't set the flag yet — prism has no
+        // `app_id_changed`/`title_changed` handlers.)
+        {
+            let config = Rc::clone(&state.config);
+            let config = config.borrow();
+            state.layout.with_windows_mut(|mapped, _output| {
+                mapped.recompute_window_rules_if_needed(&config.window_rules, false);
+            });
+        }
 
         // Re-evaluate what's under the pointer after this cycle's layout
         // changes. A window that moved, resized, or restacked under a
