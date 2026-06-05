@@ -26,11 +26,14 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use prism_animation::Clock;
-use prism_config::Config;
+use prism_config::{Config, PresetSize};
 use prism_frame::{DrmFourcc, DrmModifier};
 use prism_layout::cursor::{CursorManager, CursorTextureCache, RenderCursor};
-use prism_layout::layout::{ActivateWindow, AddWindowTarget, Layout};
-use prism_layout::window::{Mapped, ResolvedWindowRules};
+use prism_layout::layout::{ActivateWindow, AddWindowTarget, Layout, LayoutElement as _};
+use prism_layout::utils::{output_matches_name, update_tiled_state};
+use prism_layout::window::{
+    InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef,
+};
 use prism_renderer::{vk, DrmDevId};
 use smithay::backend::allocator::dmabuf::Dmabuf as SmithayDmabuf;
 use smithay::backend::allocator::Format as DrmFormat;
@@ -67,6 +70,7 @@ use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Sub
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::ConstraintAdjustment;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
@@ -332,6 +336,18 @@ pub struct PrismState {
     /// happens after the event loop is built, so this is a
     /// theoretical window).
     pub loop_handle: Option<LoopHandle<'static, PrismState>>,
+    /// Toplevels that exist but aren't in the layout yet, keyed by
+    /// root wl_surface. A window lives here from `new_toplevel` until
+    /// its first buffer commit maps it into the layout. The initial
+    /// configure is computed against this record (window rules,
+    /// default column width, target output/workspace — see
+    /// [`Self::send_initial_configure`]) so clients draw their first
+    /// buffer at the size the layout intends, instead of mapping at
+    /// their own natural size and getting resized into the column a
+    /// commit later (which left the view-offset fit computed against
+    /// the wrong width — the "new window opens partially scrolled"
+    /// bug). Mirrors niri's `unmapped_windows`.
+    pub unmapped_windows: HashMap<WlSurface, Unmapped>,
     /// xwayland-satellite integration: the bound X11 sockets and their
     /// on-demand spawn watch. `None` when disabled by config, when the
     /// installed satellite is too old, or before [`crate::xwayland`] setup
@@ -790,6 +806,7 @@ impl PrismState {
             drm_syncobj_state: None,
             primary_gpu_id: primary_gpu,
             loop_handle: None,
+            unmapped_windows: HashMap::new(),
             satellite: None,
             layer_shell_state,
             session,
@@ -1489,6 +1506,439 @@ impl PrismState {
         }
     }
 
+    /// Resolve window rules + target placement for an unmapped toplevel
+    /// and send its initial configure, sized by the layout (default
+    /// column width × working-area height, or the floating / fullscreen
+    /// / maximized variants). The resolved state is recorded on the
+    /// `Unmapped` record and consumed by [`Self::map_unmapped_toplevel`].
+    /// Sending a concrete size here is what makes clients draw their
+    /// first buffer at the width the column will actually have — mapping
+    /// at the client's own natural size left the view-offset fit
+    /// computed against the wrong width (the "new window opens partially
+    /// scrolled" bug). Ported from niri's `State::send_initial_configure`.
+    fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
+        // The output hosting the pointer — fallback target monitor. niri
+        // uses its focus-follows-mouse infra plus the last-active
+        // monitor here; prism approximates with the pointer position
+        // until focus tracking drives `active_monitor_idx` on its own
+        // (same approximation the map path used before this port).
+        // Computed up front: it's a `&self` method call, which can't
+        // overlap the `&mut` borrow of the unmapped record below.
+        let pointer_output = self
+            .output_containing((self.pointer_pos.x as i32, self.pointer_pos.y as i32))
+            .as_ref()
+            .and_then(|id| self.wl_outputs.get(id))
+            .cloned();
+
+        let Some(unmapped) = self.unmapped_windows.get_mut(toplevel.wl_surface()) else {
+            tracing::error!(
+                "window must be present in unmapped_windows in send_initial_configure()"
+            );
+            return;
+        };
+
+        let config = self.config.borrow();
+        // `is_at_startup = false`: prism has no startup phase, so
+        // `match at-startup=true` never applies.
+        let rules = ResolvedWindowRules::compute(
+            &config.window_rules,
+            WindowRef::Unmapped(unmapped),
+            false,
+        );
+
+        let Unmapped { window, state, .. } = unmapped;
+
+        let InitialConfigureState::NotConfigured {
+            wants_fullscreen,
+            wants_maximized,
+        } = state
+        else {
+            tracing::error!("window must not be already configured in send_initial_configure()");
+            return;
+        };
+
+        // Pick the target monitor. First, check if we had a workspace
+        // set in the window rules.
+        let mon = rules
+            .open_on_workspace
+            .as_deref()
+            .and_then(|name| self.layout.monitor_for_workspace(name));
+
+        // If not, check if we had an output set in the window rules.
+        let mon = mon.or_else(|| {
+            rules
+                .open_on_output
+                .as_deref()
+                .and_then(|name| {
+                    self.wl_outputs
+                        .values()
+                        .find(|output| output_matches_name(output, name))
+                })
+                .and_then(|o| self.layout.monitor_for_output(o))
+        });
+
+        // If not, check if the window requested one for fullscreen.
+        let mon = mon.or_else(|| {
+            wants_fullscreen
+                .as_ref()
+                .and_then(|x| x.as_ref())
+                // The monitor might not exist if the output was disconnected.
+                .and_then(|o| self.layout.monitor_for_output(o))
+        });
+
+        // If not, check if this is a dialog with a parent, to place it
+        // next to the parent.
+        let mon = mon.map(|mon| (mon, false)).or_else(|| {
+            toplevel
+                .parent()
+                .and_then(|parent| self.layout.find_window_and_output(&parent))
+                .and_then(|(_win, output)| output)
+                .and_then(|o| self.layout.monitor_for_output(o))
+                .map(|mon| (mon, true))
+        });
+
+        // If not, use the pointer's output, then the active monitor.
+        let mon = mon.or_else(|| {
+            pointer_output
+                .as_ref()
+                .and_then(|o| self.layout.monitor_for_output(o))
+                .map(|mon| (mon, false))
+        });
+        let mon = mon.or_else(|| self.layout.active_monitor_ref().map(|mon| (mon, false)));
+
+        // If we're following the parent, don't set the target output, so
+        // that when the window is mapped, it fetches the possibly changed
+        // parent's output again, and shows up there.
+        let output = mon
+            .filter(|(_, parent)| !parent)
+            .map(|(mon, _)| mon.output().clone());
+        let mon = mon.map(|(mon, _)| mon);
+
+        let mut width = None;
+        let mut floating_width = None;
+        let mut height = None;
+        let mut floating_height = None;
+        let is_full_width = rules.open_maximized.unwrap_or(false);
+        let is_floating = rules.compute_open_floating(toplevel);
+
+        // Tell the surface the preferred size and bounds for its likely
+        // output.
+        let ws = rules
+            .open_on_workspace
+            .as_deref()
+            .and_then(|name| mon.map(|mon| mon.find_named_workspace(name)))
+            .unwrap_or_else(|| {
+                mon.map(|mon| mon.active_workspace_ref())
+                    .or_else(|| self.layout.active_workspace())
+            });
+
+        let mut is_pending_maximized = false;
+        if let Some(ws) = ws {
+            // Set a fullscreen and maximized state based on the window's
+            // request and the window rules.
+            is_pending_maximized = (*wants_maximized && rules.open_maximized_to_edges.is_none())
+                || rules.open_maximized_to_edges == Some(true);
+
+            if (wants_fullscreen.is_some() && rules.open_fullscreen.is_none())
+                || rules.open_fullscreen == Some(true)
+            {
+                toplevel.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Fullscreen);
+                });
+            } else if is_pending_maximized {
+                toplevel.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Maximized);
+                });
+            }
+
+            width = ws.resolve_default_width(rules.default_width, false);
+            floating_width = ws.resolve_default_width(rules.default_width, true);
+            height = ws.resolve_default_height(rules.default_height, false);
+            floating_height = ws.resolve_default_height(rules.default_height, true);
+
+            let configure_width = if is_floating {
+                floating_width
+            } else if is_full_width {
+                Some(PresetSize::Proportion(1.))
+            } else {
+                width
+            };
+            let configure_height = if is_floating { floating_height } else { height };
+            ws.configure_new_window(
+                window,
+                configure_width,
+                configure_height,
+                is_floating,
+                &rules,
+            );
+        }
+
+        // Set the tiled state for the initial configure.
+        update_tiled_state(toplevel, config.prefer_no_csd, rules.tiled_state);
+
+        // Record the resolved settings; the map path consumes them.
+        *state = InitialConfigureState::Configured {
+            rules,
+            width,
+            height,
+            floating_width,
+            floating_height,
+            is_full_width,
+            output,
+            workspace_name: ws.and_then(|w| w.name().cloned()),
+            is_pending_maximized,
+        };
+
+        tracing::info!(
+            surface_id = ?toplevel.wl_surface().id(),
+            "sent initial configure to xdg_toplevel"
+        );
+        toplevel.send_configure();
+    }
+
+    /// Send the initial configure from an idle callback, so the client
+    /// can supply more info (title, app_id, min/max size) after the
+    /// initial commit — window rules and the open-floating heuristics
+    /// match on those. Ported from niri's `queue_initial_configure`.
+    fn queue_initial_configure(&mut self, toplevel: ToplevelSurface) {
+        let Some(loop_handle) = self.loop_handle.clone() else {
+            // No event loop handle yet (theoretical — the wayland socket
+            // binds after `set_loop_handle`); configure inline.
+            self.send_initial_configure(&toplevel);
+            return;
+        };
+        loop_handle.insert_idle(move |state| {
+            if !toplevel.alive() {
+                return;
+            }
+            if let Some(unmapped) = state.unmapped_windows.get(toplevel.wl_surface()) {
+                if unmapped.needs_initial_configure() {
+                    state.send_initial_configure(&toplevel);
+                }
+            }
+        });
+    }
+
+    /// Map a toplevel out of `unmapped_windows` into the layout,
+    /// consuming the rules / size / placement resolved at
+    /// initial-configure time. Ported from niri's map path
+    /// (handlers/compositor.rs).
+    fn map_unmapped_toplevel(&mut self, surface: &WlSurface) {
+        let Some(unmapped) = self.unmapped_windows.remove(surface) else {
+            return;
+        };
+        let Unmapped {
+            window,
+            state,
+            activation_token_data,
+        } = unmapped;
+
+        // Refresh the window's cached bbox from the committed surface
+        // tree. Without this, `Window::geometry()` returns an empty rect
+        // (the bbox is initialised to zero), so `tile.size =
+        // window.geometry().size` is (0,0) — and `Column::width()` hands
+        // the layout a zero-width column.
+        window.on_commit();
+
+        let toplevel = window.toplevel().expect("no x11 support").clone();
+
+        let (rules, width, height, is_full_width, output, workspace_id, is_pending_maximized) =
+            if let InitialConfigureState::Configured {
+                rules,
+                width,
+                height,
+                floating_width: _,
+                floating_height: _,
+                is_full_width,
+                output,
+                workspace_name,
+                is_pending_maximized,
+            } = state
+            {
+                // Check that the output is still connected.
+                let output = output.filter(|o| self.layout.monitor_for_output(o).is_some());
+
+                // Check that the workspace still exists.
+                let workspace_id = workspace_name
+                    .as_deref()
+                    .and_then(|n| self.layout.find_workspace_by_name(n))
+                    .map(|(_, ws)| ws.id());
+
+                (
+                    rules,
+                    width,
+                    height,
+                    is_full_width,
+                    output,
+                    workspace_id,
+                    is_pending_maximized,
+                )
+            } else {
+                // Can happen when a surface unmaps by attaching a null
+                // buffer while there are in-flight pending configures.
+                tracing::debug!("window mapped without proper initial configure");
+                (
+                    ResolvedWindowRules::default(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    false,
+                )
+            };
+
+        // The GTK about dialog sets min/max size after the initial
+        // configure but before mapping, so we need to compute
+        // open_floating at the last possible moment, that is here.
+        let is_floating = rules.compute_open_floating(&toplevel);
+
+        // Figure out if we should activate the window.
+        let activate = rules.open_focused.map(|focus| {
+            if focus {
+                ActivateWindow::Yes
+            } else {
+                ActivateWindow::No
+            }
+        });
+        let activate = activate.unwrap_or_else(|| {
+            // Check the token timestamp again in case the window took a
+            // while between requesting activation and mapping.
+            let token = activation_token_data
+                .filter(|token| token.timestamp.elapsed().as_secs() < TOKEN_TIMEOUT_SECS);
+            if token.is_some() {
+                ActivateWindow::Yes
+            } else {
+                ActivateWindow::Smart
+            }
+        });
+
+        // Open dialogs next to their parent window. Only consider the
+        // parent if we configured the window for the same output:
+        // normally when we're following the parent, the configured
+        // output is None; if it's set, it came from a window rule or a
+        // fullscreen request.
+        let parent = toplevel
+            .parent()
+            .and_then(|parent| self.layout.find_window_and_output(&parent))
+            .filter(|(_, parent_output)| {
+                parent_output.is_none() || output.is_none() || output.as_ref() == *parent_output
+            })
+            .map(|(mapped, _)| mapped.window.clone());
+
+        // Pre-commit hook: drives the resize animation's
+        // snapshot capture. niri also uses it for
+        // dmabuf-readiness blockers + the post-commit
+        // transaction queue, which we don't have yet.
+        //
+        // It fires before `on_commit_buffer_handler`
+        // applies the new buffer, so the window still
+        // reports its OLD size here — exactly when the
+        // resize animation needs to snapshot the
+        // pre-resize size. If this commit acks a configure
+        // we flagged to animate (`request_size(animate=true)`
+        // → `animate_next_configure` → `animate_serials`),
+        // `should_animate_commit` matches the acked serial
+        // and we store the snapshot; `Tile::update_window`
+        // later consumes it (`take_animation_snapshot`) to
+        // seed `ResizeAnimation.size_from`. Mirrors niri's
+        // `Mapped::pre_commit`.
+        let hook = add_pre_commit_hook::<PrismState, _>(surface, |state, _dh, surface| {
+            // The serial the client acked with this
+            // commit (set by ack_configure, processed
+            // before this hook). `None` before any ack.
+            let acked = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .and_then(|d| d.lock().unwrap().last_acked.as_ref().map(|c| c.serial))
+            });
+            let Some(serial) = acked else {
+                return;
+            };
+            // None until the window is mapped into the
+            // layout — initial pre-map commits no-op.
+            if let Some((mapped, _)) = state.layout.find_window_and_output_mut(surface) {
+                if mapped.should_animate_commit(serial) {
+                    mapped.store_animation_snapshot();
+                }
+            }
+        });
+
+        let mapped = {
+            let config = self.config.borrow();
+            Mapped::new(window, rules, hook, &config)
+        };
+        let id = mapped.id();
+        // The layout keys windows by their smithay `Window`
+        // (its `LayoutElement::Id`), distinct from the
+        // `MappedId` above. Clone the handle before `mapped` is
+        // moved into `add_window` so we can start the open
+        // animation afterwards.
+        let window = mapped.window.clone();
+
+        let target = if let Some(p) = &parent {
+            AddWindowTarget::NextTo(p)
+        } else if let Some(ws_id) = workspace_id {
+            AddWindowTarget::Workspace(ws_id)
+        } else if let Some(output) = &output {
+            AddWindowTarget::Output(output)
+        } else {
+            AddWindowTarget::Auto
+        };
+        let output = self
+            .layout
+            .add_window(
+                mapped,
+                target,
+                width,
+                height,
+                is_full_width,
+                is_floating,
+                activate,
+            )
+            .cloned();
+
+        // The window state cannot contain Fullscreen and Maximized at
+        // once. Therefore, if the window ended up fullscreen, then we
+        // only know that it is also maximized from the
+        // is_pending_maximized variable. Tell the layout about it here
+        // so that unfullscreening the window makes it maximized.
+        if is_pending_maximized {
+            let pending_fullscreen = self
+                .layout
+                .find_window_and_output(surface)
+                .map(|(m, _)| m.pending_sizing_mode().is_fullscreen())
+                .unwrap_or(false);
+            if pending_fullscreen {
+                self.layout.set_maximized(&window, true);
+            }
+        }
+
+        // Make the new window's monitor the active
+        // one so its tile's focus ring renders with
+        // active-color, not inactive-color. Without
+        // this `active_monitor_idx` stays pinned to
+        // monitor 0 (DP-4 in connector-name sort
+        // order) and only DP-4 windows ever look
+        // focused. niri does this from its input
+        // handlers via `layout.focus_output(&output)`;
+        // for the MVP we do it at add_window time.
+        let output_name = output.as_ref().map(|o| o.name());
+        if let Some(out) = output {
+            self.layout.focus_output(&out);
+        }
+        // Kick off the open (zoom + fade-in) animation now that
+        // the window is in the layout — niri does the same right
+        // after adding (handlers/compositor.rs).
+        self.layout.start_open_animation_for_window(&window);
+        tracing::info!(
+            ?id,
+            output = ?output_name,
+            "mapped xdg_toplevel into layout"
+        );
+    }
+
     /// Apply a freshly parsed config (file watcher / future IPC reload).
     /// Mirrors niri's `State::reload_config` (niri.rs:1421), minus the
     /// pieces prism doesn't have yet (layer rules, custom animation
@@ -1897,45 +2347,24 @@ impl CompositorHandler for PrismState {
             update_output_cursors(self);
         }
 
-        // For xdg-shell toplevels, send an initial configure on first commit so
-        // the client knows it can start drawing. Skipped here once already
-        // configured.
+        // xdg-shell toplevel lifecycle. A toplevel lives in
+        // `unmapped_windows` from `new_toplevel` until its first buffer
+        // commit. The first (buffer-less) commit triggers the initial
+        // configure — sized by the layout and recorded on the unmapped
+        // record (see `send_initial_configure`) — so the client draws
+        // its first buffer at the size the layout intends. The first
+        // commit that attaches a buffer maps the window into the layout
+        // using that recorded state. Mirrors niri's
+        // handlers/compositor.rs commit flow.
         if let Some("xdg_toplevel") = role {
-            let needs_initial_configure = with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .map(|d| {
-                        let attrs = d.lock().unwrap();
-                        !attrs.initial_configure_sent
-                    })
-                    .unwrap_or(false)
-            });
-            if needs_initial_configure {
-                if let Some(toplevel) = self
-                    .xdg_shell
-                    .toplevel_surfaces()
-                    .iter()
-                    .find(|t| t.wl_surface() == surface)
-                    .cloned()
-                {
-                    toplevel.send_configure();
-                    tracing::info!("sent initial configure to xdg_toplevel");
-                }
-            } else if self.layout.find_window_and_output(surface).is_none() {
-                // Already configured but not yet in the layout. We map
-                // on the first commit that successfully attached a
-                // buffer. The signal we read is the SurfaceTexSlot:
+            if self.unmapped_windows.contains_key(surface) {
+                // Map readiness is read off the SurfaceTexSlot:
                 // process_surface_buffer (called above) consumes any
                 // BufferAssignment::NewBuffer out of cached_state and
                 // populates this slot with a SurfaceTexture on success.
                 // So if the slot is now Some, the client has produced
                 // its first renderable frame and is ready to be mapped.
-                //
-                // Niri does this via an explicit `unmapped_windows`
-                // HashMap that tracks the pre-buffer state; we don't
-                // need that since we can read map readiness off the
-                // texture slot directly.
+                // (niri checks the attached buffer directly.)
                 let has_texture = with_states(surface, |states| {
                     states
                         .data_map
@@ -1944,161 +2373,19 @@ impl CompositorHandler for PrismState {
                         .unwrap_or(false)
                 });
                 if has_texture {
-                    if let Some(toplevel) = self
-                        .xdg_shell
-                        .toplevel_surfaces()
-                        .iter()
-                        .find(|t| t.wl_surface() == surface)
-                        .cloned()
-                    {
-                        let window = Window::new_wayland_window(toplevel);
-                        // Update the window's cached bbox from the
-                        // committed surface tree. Without this,
-                        // `Window::geometry()` returns an empty rect
-                        // (the bbox is initialised to zero), so
-                        // `tile.size = window.geometry().size` is
-                        // (0,0) — and `Column::width()` (which is
-                        // `max(tile.size.w)`) hands the layout a
-                        // zero-width column. Every column then sits
-                        // at x = sum of zeros + gaps, producing the
-                        // "stacked tiles, 16-px-offset-per-window"
-                        // visual.
-                        window.on_commit();
-                        // Pre-commit hook: drives the resize animation's
-                        // snapshot capture. niri also uses it for
-                        // dmabuf-readiness blockers + the post-commit
-                        // transaction queue, which we don't have yet.
-                        //
-                        // It fires before `on_commit_buffer_handler`
-                        // applies the new buffer, so the window still
-                        // reports its OLD size here — exactly when the
-                        // resize animation needs to snapshot the
-                        // pre-resize size. If this commit acks a configure
-                        // we flagged to animate (`request_size(animate=true)`
-                        // → `animate_next_configure` → `animate_serials`),
-                        // `should_animate_commit` matches the acked serial
-                        // and we store the snapshot; `Tile::update_window`
-                        // later consumes it (`take_animation_snapshot`) to
-                        // seed `ResizeAnimation.size_from`. Mirrors niri's
-                        // `Mapped::pre_commit`.
-                        let hook =
-                            add_pre_commit_hook::<PrismState, _>(surface, |state, _dh, surface| {
-                                // The serial the client acked with this
-                                // commit (set by ack_configure, processed
-                                // before this hook). `None` before any ack.
-                                let acked = with_states(surface, |states| {
-                                    states
-                                        .data_map
-                                        .get::<XdgToplevelSurfaceData>()
-                                        .and_then(|d| {
-                                            d.lock().unwrap().last_acked.as_ref().map(|c| c.serial)
-                                        })
-                                });
-                                let Some(serial) = acked else {
-                                    return;
-                                };
-                                // None until the window is mapped into the
-                                // layout — initial pre-map commits no-op.
-                                if let Some((mapped, _)) =
-                                    state.layout.find_window_and_output_mut(surface)
-                                {
-                                    if mapped.should_animate_commit(serial) {
-                                        mapped.store_animation_snapshot();
-                                    }
-                                }
-                            });
-                        let (mapped, default_column_width) = {
-                            let config = self.config.borrow();
-                            let mut m =
-                                Mapped::new(window, ResolvedWindowRules::default(), hook, &config);
-                            // Resolve the window's actual rules. niri computes
-                            // them against the *Unmapped* window at
-                            // initial-configure time and hands the result to
-                            // `Mapped::new`; prism doesn't track unmapped
-                            // windows yet, so resolve against the just-built
-                            // Mapped instead — same matcher inputs (app-id /
-                            // title are committed by map time). Without this,
-                            // every window ran with default (empty) rules and
-                            // the whole window-rule config section was inert.
-                            // `is_at_startup = false`: prism has no startup
-                            // phase, so `match at-startup=true` never applies.
-                            m.recompute_window_rules(&config.window_rules, false);
-                            // Without an explicit per-window-rule width,
-                            // fall back to the configured default. niri
-                            // resolves this via
-                            // `ws.resolve_default_width(rules.default_width, false)`
-                            // which collapses to `options.layout.default_column_width`
-                            // when no rule overrides. Skipping this is
-                            // what makes new windows arrive at width 0
-                            // — `resolve_scrolling_width` then falls back
-                            // to `Fixed(window.size().w)` which is 0 for
-                            // a just-mapped surface.
-                            let w = config.layout.default_column_width;
-                            (m, w)
-                        };
-                        let id = mapped.id();
-                        // The layout keys windows by their smithay `Window`
-                        // (its `LayoutElement::Id`), distinct from the
-                        // `MappedId` above. Clone the handle before `mapped` is
-                        // moved into `add_window` so we can start the open
-                        // animation afterwards.
-                        let window = mapped.window.clone();
-                        // Place the new window on the output that
-                        // currently hosts the pointer (rather than
-                        // always falling back to the layout's active
-                        // monitor, which today is just whichever
-                        // output got added first — DP-4 in the
-                        // current hardware-test setup). niri uses
-                        // its `focus_follows_mouse` infra plus the
-                        // last-active monitor to make this choice;
-                        // we approximate by reading
-                        // `state.pointer_pos` directly. When focus
-                        // tracking lands the `Auto` path will be
-                        // sufficient on its own.
-                        let pointer_output_id = self.output_containing((
-                            self.pointer_pos.x as i32,
-                            self.pointer_pos.y as i32,
-                        ));
-                        let pointer_output = pointer_output_id
-                            .as_ref()
-                            .and_then(|id| self.wl_outputs.get(id))
-                            .cloned();
-                        let target = match pointer_output.as_ref() {
-                            Some(out) => AddWindowTarget::Output(out),
-                            None => AddWindowTarget::Auto,
-                        };
-                        let output = self.layout.add_window(
-                            mapped,
-                            target,
-                            default_column_width,
-                            None,
-                            false,
-                            false,
-                            ActivateWindow::Smart,
-                        );
-                        // Make the new window's monitor the active
-                        // one so its tile's focus ring renders with
-                        // active-color, not inactive-color. Without
-                        // this `active_monitor_idx` stays pinned to
-                        // monitor 0 (DP-4 in connector-name sort
-                        // order) and only DP-4 windows ever look
-                        // focused. niri does this from its input
-                        // handlers via `layout.focus_output(&output)`;
-                        // for the MVP we do it at add_window time.
-                        let output_for_focus = output.cloned();
-                        let output_name = output_for_focus.as_ref().map(|o| o.name());
-                        if let Some(out) = output_for_focus {
-                            self.layout.focus_output(&out);
-                        }
-                        // Kick off the open (zoom + fade-in) animation now that
-                        // the window is in the layout — niri does the same right
-                        // after adding (handlers/compositor.rs).
-                        self.layout.start_open_animation_for_window(&window);
-                        tracing::info!(
-                            ?id,
-                            output = ?output_name,
-                            "mapped xdg_toplevel into layout"
-                        );
+                    // The toplevel got mapped.
+                    self.map_unmapped_toplevel(surface);
+                } else {
+                    // The toplevel remains unmapped: send the initial
+                    // configure if it hasn't been sent yet. Deferred to
+                    // an idle callback so the client can supply more
+                    // info (title, app_id, min/max size) after this
+                    // commit — window rules and the open-floating
+                    // heuristics match on those.
+                    let unmapped = &self.unmapped_windows[surface];
+                    if unmapped.needs_initial_configure() {
+                        let toplevel = unmapped.toplevel().clone();
+                        self.queue_initial_configure(toplevel);
                     }
                 }
             } else if let Some((mapped, _)) = self.layout.find_window_and_output(surface) {
@@ -2318,8 +2605,19 @@ impl XdgShellHandler for PrismState {
             surface_id = ?surface.wl_surface().id(),
             "new xdg_toplevel"
         );
-        // Initial configure is sent on first commit via the CompositorHandler
-        // hook above (so the client has a chance to set title / app_id first).
+        // Track the window as unmapped until its first buffer commit.
+        // The initial configure is sent from the commit handler (so the
+        // client has a chance to set title / app_id first); the rules +
+        // size resolved there are stored on this record and consumed
+        // when the window maps. Mirrors niri's `new_toplevel`.
+        let wl_surface = surface.wl_surface().clone();
+        let window = Window::new_wayland_window(surface);
+        let existing = self
+            .unmapped_windows
+            .insert(wl_surface, Unmapped::new(window));
+        if existing.is_some() {
+            tracing::error!("new_toplevel got called for an existing window");
+        }
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -2421,27 +2719,77 @@ impl XdgShellHandler for PrismState {
     // directional, not toggles. `set_fullscreen` / `set_maximized` push a
     // fresh configure to the client themselves, so we only owe a redraw.
 
-    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
-        // `_output`: a client may request fullscreen on a specific
-        // monitor. We fullscreen on the window's current output, matching
-        // the keybind behaviour; honouring a cross-output target would
-        // mean moving the window first and isn't wired up yet.
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
+        // A pre-map request (mpv --fullscreen, games): record it on the
+        // unmapped record so the initial configure carries the
+        // fullscreen state (and targets the requested output). Only the
+        // not-yet-configured state is handled; a request landing between
+        // initial configure and map is rare enough to skip (niri
+        // re-configures in that window — port if it bites).
+        if let Some(unmapped) = self.unmapped_windows.get_mut(surface.wl_surface()) {
+            if let InitialConfigureState::NotConfigured {
+                wants_fullscreen, ..
+            } = &mut unmapped.state
+            {
+                *wants_fullscreen = Some(output.as_ref().and_then(Output::from_resource));
+            }
+            return;
+        }
+        // `output` for mapped windows: a client may request fullscreen
+        // on a specific monitor. We fullscreen on the window's current
+        // output, matching the keybind behaviour; honouring a
+        // cross-output target would mean moving the window first and
+        // isn't wired up yet.
         self.set_window_fullscreen(&surface, true);
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        if let Some(unmapped) = self.unmapped_windows.get_mut(surface.wl_surface()) {
+            if let InitialConfigureState::NotConfigured {
+                wants_fullscreen, ..
+            } = &mut unmapped.state
+            {
+                *wants_fullscreen = None;
+            }
+            return;
+        }
         self.set_window_fullscreen(&surface, false);
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(unmapped) = self.unmapped_windows.get_mut(surface.wl_surface()) {
+            if let InitialConfigureState::NotConfigured {
+                wants_maximized, ..
+            } = &mut unmapped.state
+            {
+                *wants_maximized = true;
+            }
+            return;
+        }
         self.set_window_maximized(&surface, true);
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(unmapped) = self.unmapped_windows.get_mut(surface.wl_surface()) {
+            if let InitialConfigureState::NotConfigured {
+                wants_maximized, ..
+            } = &mut unmapped.state
+            {
+                *wants_maximized = false;
+            }
+            return;
+        }
         self.set_window_maximized(&surface, false);
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // The toplevel may die before ever mapping (client crashed, or
+        // closed its window before attaching a buffer) — drop the
+        // unmapped record and we're done.
+        if self.unmapped_windows.remove(surface.wl_surface()).is_some() {
+            return;
+        }
+
         // Pop the window out of the layout so the columns behind it
         // can fall into the freed slot. Without this the layout keeps
         // a tile for a window whose surface is gone — invisible (no
@@ -2732,6 +3080,14 @@ delegate_drm_syncobj!(PrismState);
 // any libinput device fires; we reject serial-bearing tokens in that
 // window since we have no last-enter to compare against.
 
+/// 10s activation-token window — matches niri's
+/// `XDG_ACTIVATION_TOKEN_TIMEOUT` and the typical "user just clicked"
+/// interval. Older tokens are stale (the user has moved on); silently
+/// drop. Checked both at `request_activation` and again at map time
+/// (`map_unmapped_toplevel`), in case the window took a while between
+/// requesting activation and mapping.
+const TOKEN_TIMEOUT_SECS: u64 = 10;
+
 impl XdgActivationHandler for PrismState {
     fn activation_state(&mut self) -> &mut XdgActivationState {
         &mut self.xdg_activation
@@ -2775,10 +3131,6 @@ impl XdgActivationHandler for PrismState {
         token_data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
-        // 10s window — matches niri's `XDG_ACTIVATION_TOKEN_TIMEOUT`
-        // and the typical "user just clicked" interval. Older tokens
-        // are stale (the user has moved on); silently drop.
-        const TOKEN_TIMEOUT_SECS: u64 = 10;
         if token_data.timestamp.elapsed().as_secs() < TOKEN_TIMEOUT_SECS {
             if let Some((mapped, _)) = self.layout.find_window_and_output(&surface) {
                 let window = mapped.window.clone();
@@ -2791,14 +3143,16 @@ impl XdgActivationHandler for PrismState {
                 for id in ids {
                     self.output_redraw.entry(id).or_default().queue_redraw();
                 }
+            } else if let Some(unmapped) = self.unmapped_windows.get_mut(&surface) {
+                // Surface not yet mapped: queue the token on the
+                // unmapped-window record. The map path re-checks the
+                // timestamp and activates the window on its first
+                // commit — covers the common case where the
+                // just-spawned client's window arrives milliseconds
+                // after the activation token. Mirrors niri
+                // (handlers/mod.rs).
+                unmapped.activation_token_data = Some(token_data);
             }
-            // Surface not yet mapped: today we drop the token. niri
-            // queues it on the unmapped-window record so the window
-            // gets activated on its first commit; we don't have that
-            // bookkeeping yet (no `unmapped_windows` map), so the
-            // common case where the just-spawned client's window
-            // arrives milliseconds after the activation token won't
-            // pre-focus. Track as a follow-up if it bites.
         }
         self.xdg_activation.remove_token(&token);
     }
