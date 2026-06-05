@@ -1156,10 +1156,12 @@ fn run_integrated(
             let mut output_config = default_output_config.clone();
             if let Some(cfg) = find_connector_config(&name, &edid, &config.outputs.0) {
                 if let Some(color) = cfg.color.as_ref() {
-                    // HDR-on overrides max_bpc to 10 + flips depth to
-                    // fp16 + flips encode chain to PQ. Done before
-                    // the bare-max_bpc branch so an explicit max_bpc
-                    // in config is still honored as the ceiling.
+                    // HDR-on flips depth to fp16 + the encode chain to
+                    // PQ; fp16 depth implies connector max-bpc 10 via
+                    // apply_color_signaling. An explicit `max-bpc` in
+                    // the config is IGNORED when `hdr` is present (this
+                    // branch wins) — the line only matters for choosing
+                    // 8- vs 10-bit scanout in SDR mode.
                     if let Some(hdr_cfg) = color.hdr.as_ref() {
                         output_config.hdr = Some(resolve_hdr_signaling(hdr_cfg));
                         output_config.depth = prism_drm::ScanoutDepth::Fp16;

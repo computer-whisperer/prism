@@ -70,6 +70,14 @@ enum TopCommand {
     /// `(gain, gamma)` model from `calibrate` doesn't reproduce
     /// white-point on a panel with intensity-dependent primaries.
     CalibrateLut3d(calibrate_lut3d::CalibrateLut3dArgs),
+    /// Rebuild the inverse 3D LUT from a previous `calibrate-lut3d`
+    /// measurement CSV — pure offline math, no colorimeter, no running
+    /// prism. The forward measurements (channel sweeps + 3D grid) are
+    /// honest data even when the original bake produced a broken LUT;
+    /// this re-runs the inversion with the current algorithm and
+    /// overwrites the `.lut`. Reads the `.gamut.json` sidecar next to
+    /// the CSV for the measured white/black anchors when present.
+    RebakeLut3d(calibrate_lut3d::RebakeLut3dArgs),
     /// Raw response-curve characterization — sweep a channel across a
     /// range of commanded values, log XYZ per sample. Diagnostic
     /// (no fitting, no compositor writes). Use to investigate panel
@@ -126,6 +134,7 @@ fn main() -> Result<()> {
         TopCommand::Msg(cmd) => run_msg(cmd),
         TopCommand::Calibrate(args) => calibrate::run(args),
         TopCommand::CalibrateLut3d(args) => calibrate_lut3d::run(args),
+        TopCommand::RebakeLut3d(args) => calibrate_lut3d::run_rebake(args),
         TopCommand::Characterize(args) => characterize::run(args),
         TopCommand::ValidateLut3d(args) => validate_lut3d::run(args),
         TopCommand::Gui => gui::run(),

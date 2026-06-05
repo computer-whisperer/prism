@@ -190,20 +190,28 @@ struct ChannelResponse {
 }
 
 impl ChannelResponse {
-    /// Coarse Y-per-cmd gain from the brightest non-clamped sample.
-    /// Used by the inverter to seed its initial guess — a single
-    /// number per channel that's roughly the slope of the linear
-    /// region. Skips the very first sample (often dominated by the
-    /// colorimeter noise floor) to avoid the toe inflating the gain.
+    /// Coarse Y-per-cmd gain — the steepest per-sample secant
+    /// `Y / scanout` across the sweep. Used by the inverter to seed
+    /// its initial guess — a single number per channel that's roughly
+    /// the slope of the linear region.
+    ///
+    /// Steepest (not last) because the sweep may have run deep into
+    /// saturation before the cliff detector fired: the last sample's
+    /// secant then under-reports the tracking-region slope severalfold,
+    /// which over-scales every Newton seed into the flat zone where the
+    /// Jacobian is near-singular (the root cause of the catastrophic
+    /// garbage cells in the 2026-06 PG27UCDM bake). The steepest secant
+    /// is the tracking-region slope regardless of how much saturated
+    /// tail the sweep collected. Skips the very first sample (often
+    /// dominated by the colorimeter noise floor) to avoid toe noise
+    /// inflating the gain.
     fn approx_gain_y_per_cmd(&self) -> f64 {
-        // Find the last sample at or below max_cmd (i.e. pre-cliff).
-        let last = self
-            .samples
+        self.samples
             .iter()
-            .rev()
-            .find(|s| s.scanout <= self.max_cmd)
-            .unwrap_or(self.samples.last().unwrap());
-        last.xyz.y / last.scanout.max(1e-6)
+            .skip(1)
+            .map(|s| s.xyz.y / s.scanout.max(1e-6))
+            .fold(f64::NEG_INFINITY, f64::max)
+            .max(1e-6)
     }
 }
 
@@ -244,8 +252,7 @@ fn request_for_scanout(response: &ChannelResponse, target_scanout: f64) -> f64 {
 }
 
 /// 3D forward measurement grid in diagnosed scanout-space. Each entry stores the
-/// panel's true emission (black already subtracted) at a specific
-/// (R, G, B) scanout triple. Per-axis values are
+/// panel's absolute emission at a specific (R, G, B) scanout triple. Per-axis values are
 /// log-spaced from `args.min_cmd` up to each channel's discovered
 /// saturation peak — so all `cube_edge³` measurements land in the
 /// useful range and none are wasted above saturation.
@@ -266,7 +273,8 @@ struct ResponseGrid {
     /// Each list has exactly `cube_edge` entries; entries are positive
     /// (no zero corner — handled at the inversion edge case instead).
     axis_cmds: [Vec<f64>; 3],
-    /// Black-subtracted XYZ at each grid point.
+    /// Absolute (raw) XYZ at each grid point — the reformed bake works
+    /// in absolute emission throughout; no black subtraction here.
     xyz: Vec<Xyz>,
 }
 
@@ -485,6 +493,105 @@ impl TierTally {
     }
 }
 
+/// Saturation noise-floor guard: the Spyder reads ~0.3 cd/m² of ambient
+/// even on black, so the first couple of B samples on a weak-blue panel
+/// can show Y in the [0.3, 0.5] range where consecutive-sample
+/// comparisons are pure noise. Requiring both samples above 1.0 cd/m²
+/// keeps the cliff detector off toe-region wobble — the panel's actual
+/// saturation lives well above 1 nit per channel.
+const SATURATION_NOISE_FLOOR_Y: f64 = 1.0;
+
+/// Marginal-response efficiency below which a channel counts as
+/// saturated: the secant slope ΔY/Δscanout between consecutive sweep
+/// samples, relative to the steepest per-sample secant seen so far
+/// (the tracking-region gain). The old detector compared consecutive Y
+/// as a plain ratio (`< 1.05`), which a half-decade sweep step
+/// straddling the knee sails past — the 2026-06 PG27UCDM run measured
+/// Y ratio 1.099 across the 316→997 scanout step while the panel ran
+/// at 4.6% marginal efficiency, so the entire flat zone entered the
+/// forward grid and poisoned the inversion. 0.30 is deliberately
+/// sensitive: a false positive only triggers the knee bisection, which
+/// walks back up to wherever tracking actually ends.
+const SATURATION_EFFICIENCY_MIN: f64 = 0.30;
+
+/// Knee-refinement bisection steps after saturation triggers. Each is
+/// one extra measurement; 3 narrows a half-decade bracket to ~15% in
+/// cmd — plenty for an axis bound.
+const KNEE_REFINE_STEPS: usize = 3;
+
+/// Drive one per-channel patch and measure it: set the patch, diagnose
+/// the actual scanout coordinate, settle, measure, black-subtract, and
+/// emit the stderr line + CSV row. Shared between the phase-1 discovery
+/// sweep and the knee-refinement bisection so refinement samples land
+/// in the log with the same shape.
+#[allow(clippy::too_many_arguments)]
+fn measure_channel_patch(
+    channel: Channel,
+    cmd: f64,
+    row_idx: usize,
+    args: &CalibrateLut3dArgs,
+    baseline: &OutputBaseline,
+    settle: Duration,
+    black_xyz: &Xyz,
+    device: &mut Colorimeter,
+    patch: &mut PatchSurface,
+    setup: &Setup,
+    cal: &Calibration,
+    tally: &mut TierTally,
+    log: Option<&mut (PathBuf, BufWriter<File>)>,
+) -> Result<ChannelSample> {
+    set_channel_patch(patch, baseline, channel, cmd)?;
+    let mut requested_rgb = [0.0_f64; 3];
+    requested_rgb[channel.idx()] = cmd;
+    let scanout_rgb = diagnose_scanout_cmd(&args.output, baseline, requested_rgb)?;
+    let scanout_cmd = scanout_rgb[channel.idx()];
+    thread::sleep(settle);
+    let (raw_xyz, tier) = measure_single_adaptive(device, setup, cal, args.fast_integration_ms)
+        .context("phase 1 measure")?;
+    tally.record(tier);
+    // True emission above the black floor. Clamp to zero so the
+    // toe can't go negative from measurement noise — the inverter
+    // assumes non-negative XYZ for its line search.
+    let xyz = Xyz {
+        x: (raw_xyz.x - black_xyz.x).max(0.0),
+        y: (raw_xyz.y - black_xyz.y).max(0.0),
+        z: (raw_xyz.z - black_xyz.z).max(0.0),
+    };
+    eprintln!(
+        "  {} cmd {:>8.2} scanout {:>8.2} → X={:>8.3}  Y={:>8.3}  Z={:>8.3}  (raw Y={:.3}, less black {:.3}){}",
+        channel.label(),
+        cmd,
+        scanout_cmd,
+        xyz.x,
+        xyz.y,
+        xyz.z,
+        raw_xyz.y,
+        black_xyz.y,
+        tier_suffix(tier),
+    );
+    if let Some((_, w)) = log {
+        // Log the BLACK-SUBTRACTED values — that's the model the rest
+        // of the pipeline operates on. Raw values are still recoverable
+        // as (logged + black_xyz from the header line written above).
+        writeln!(
+            w,
+            "{},{},{:.4},{:.4},{:.4},{:.4},{:.4}",
+            channel.label(),
+            row_idx,
+            cmd,
+            scanout_cmd,
+            xyz.x,
+            xyz.y,
+            xyz.z,
+        )?;
+    }
+    Ok(ChannelSample {
+        requested: cmd,
+        scanout: scanout_cmd,
+        xyz,
+    })
+}
+
 pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     let baseline =
         query_output_baseline(&args.output).context("query baseline output state via prism IPC")?;
@@ -632,100 +739,129 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         let mut max_cmd = targets[0];
         let mut max_requested = targets[0];
         let mut peak_y = 0.0_f64;
-        for (i, &cmd) in targets.iter().enumerate() {
-            set_channel_patch(&mut patch, &baseline, channel, cmd)?;
-            let mut requested_rgb = [0.0_f64; 3];
-            requested_rgb[channel.idx()] = cmd;
-            let scanout_rgb = diagnose_scanout_cmd(&args.output, &baseline, requested_rgb)?;
-            let scanout_cmd = scanout_rgb[channel.idx()];
-            thread::sleep(settle);
-            let (raw_xyz, tier) =
-                measure_single_adaptive(&mut device, &setup, &cal, args.fast_integration_ms)
-                    .context("phase 1 measure")?;
-            phase1_tally.record(tier);
-            // True emission above the black floor. Clamp to zero so the
-            // toe can't go negative from measurement noise — the inverter
-            // assumes non-negative XYZ for its line search.
-            let xyz = Xyz {
-                x: (raw_xyz.x - black_xyz.x).max(0.0),
-                y: (raw_xyz.y - black_xyz.y).max(0.0),
-                z: (raw_xyz.z - black_xyz.z).max(0.0),
-            };
-            eprintln!(
-                "  {} cmd {:>8.2} scanout {:>8.2} → X={:>8.3}  Y={:>8.3}  Z={:>8.3}  (raw Y={:.3}, less black {:.3}){}",
-                channel.label(),
+        // Steepest per-sample secant Y/scanout seen so far — the
+        // tracking-region gain the saturation detector measures
+        // marginal response against.
+        let mut best_gain = 0.0_f64;
+        let mut row_idx = 0usize;
+        for &cmd in targets.iter() {
+            row_idx += 1;
+            let sample = measure_channel_patch(
+                channel,
                 cmd,
-                scanout_cmd,
-                xyz.x,
-                xyz.y,
-                xyz.z,
-                raw_xyz.y,
-                black_xyz.y,
-                tier_suffix(tier),
-            );
-            if let Some((_, w)) = log.as_mut() {
-                // Log the BLACK-SUBTRACTED values — that's the model
-                // the rest of the pipeline operates on. Raw values
-                // are still recoverable as (logged + black_xyz from
-                // the header line written above).
-                writeln!(
-                    w,
-                    "{},{},{:.4},{:.4},{:.4},{:.4},{:.4}",
-                    channel.label(),
-                    i + 1,
-                    cmd,
-                    scanout_cmd,
-                    xyz.x,
-                    xyz.y,
-                    xyz.z,
-                )?;
-            }
-            // Saturation: if Y is no longer increasing meaningfully and
-            // we've already taken at least 3 samples, stop early. Catches
-            // the cliff without forcing the rest of the sweep through it.
-            //
-            // Guard against false positives at the noise floor: the
-            // Spyder reads ~0.3 cd/m² of ambient even on black, so the
-            // first couple of B samples on a weak-blue panel can show
-            // Y in the [0.3, 0.5] range where consecutive-sample ratios
-            // are pure noise. Requiring BOTH samples to be above 1.0
-            // cd/m² keeps the cliff-detector from triggering on toe-
-            // region wobble — the panel's actual saturation lives well
-            // above 1 nit per channel.
-            const SATURATION_NOISE_FLOOR_Y: f64 = 1.0;
-            if let Some(prev) = samples.last() {
-                let ratio = xyz.y / prev.xyz.y.max(0.01);
-                let requested_ratio = cmd / prev.requested.max(0.01);
-                let scanout_ratio = scanout_cmd / prev.scanout.max(0.01);
-                let both_above_floor =
-                    xyz.y > SATURATION_NOISE_FLOOR_Y && prev.xyz.y > SATURATION_NOISE_FLOOR_Y;
+                row_idx,
+                &args,
+                &baseline,
+                settle,
+                &black_xyz,
+                &mut device,
+                &mut patch,
+                &setup,
+                &cal,
+                &mut phase1_tally,
+                log.as_mut(),
+            )?;
+            if let Some(&prev) = samples.last() {
+                let requested_ratio = sample.requested / prev.requested.max(0.01);
+                let scanout_ratio = sample.scanout / prev.scanout.max(0.01);
+                let both_above_floor = sample.xyz.y > SATURATION_NOISE_FLOOR_Y
+                    && prev.xyz.y > SATURATION_NOISE_FLOOR_Y;
+                // Compositor clamp: requests grow but the encode chain
+                // emits the same scanout value. Nothing above prev is
+                // reachable — stop, no refinement possible.
                 let scanout_plateaued = requested_ratio >= 1.2 && scanout_ratio < 1.01;
-                let panel_plateaued = requested_ratio >= 1.2 && ratio < 1.05 && both_above_floor;
-                if samples.len() >= 3 && (scanout_plateaued || panel_plateaued) {
+                // Panel saturation: scanout grows but emission doesn't
+                // follow. Judged on marginal efficiency (secant slope
+                // between consecutive samples vs the tracking-region
+                // gain), not a plain Y ratio — a half-decade sweep step
+                // that straddles the knee still shows Y growth even
+                // when the panel spends most of the step flat.
+                let marginal =
+                    (sample.xyz.y - prev.xyz.y) / (sample.scanout - prev.scanout).max(1e-6);
+                let panel_saturated = requested_ratio >= 1.2
+                    && both_above_floor
+                    && best_gain > 0.0
+                    && marginal < SATURATION_EFFICIENCY_MIN * best_gain;
+                if samples.len() >= 3 && scanout_plateaued {
                     eprintln!(
-                        "  {} saturation detected at cmd {:.1} (Y ratio {:.2}, requested ratio {:.2}, scanout ratio {:.2}); \
+                        "  {} scanout plateaued at request {:.1} (compositor clamp at scanout {:.1}); \
                          stopping sweep early",
                         channel.label(),
-                        cmd,
-                        ratio,
-                        requested_ratio,
-                        scanout_ratio,
+                        sample.requested,
+                        sample.scanout,
                     );
+                    peak_y = peak_y.max(sample.xyz.y);
                     max_cmd = prev.scanout;
                     max_requested = prev.requested;
                     break;
                 }
+                if samples.len() >= 3 && panel_saturated {
+                    eprintln!(
+                        "  {} saturation detected between scanout {:.1} and {:.1} \
+                         (marginal efficiency {:.0}% of tracking gain); refining knee",
+                        channel.label(),
+                        prev.scanout,
+                        sample.scanout,
+                        100.0 * marginal / best_gain,
+                    );
+                    // The saturated sample still observes the channel's
+                    // true peak emission — fold it in even though its
+                    // cmd is past the usable range.
+                    peak_y = peak_y.max(sample.xyz.y);
+                    // The knee lies inside (prev, sample]. Bisect in
+                    // log-request space, keeping the highest cmd whose
+                    // marginal response against the tracking-side
+                    // bracket still clears the efficiency bar. Each
+                    // still-tracking midpoint is a valid sweep sample —
+                    // push it so the request→scanout mapping gains
+                    // resolution right where the axis bound lands.
+                    let mut lo = prev;
+                    let mut hi_requested = sample.requested;
+                    for _ in 0..KNEE_REFINE_STEPS {
+                        let mid_requested = (0.5 * (lo.requested.ln() + hi_requested.ln())).exp();
+                        row_idx += 1;
+                        let mid = measure_channel_patch(
+                            channel,
+                            mid_requested,
+                            row_idx,
+                            &args,
+                            &baseline,
+                            settle,
+                            &black_xyz,
+                            &mut device,
+                            &mut patch,
+                            &setup,
+                            &cal,
+                            &mut phase1_tally,
+                            log.as_mut(),
+                        )?;
+                        peak_y = peak_y.max(mid.xyz.y);
+                        let m = (mid.xyz.y - lo.xyz.y) / (mid.scanout - lo.scanout).max(1e-6);
+                        if m >= SATURATION_EFFICIENCY_MIN * best_gain {
+                            samples.push(mid);
+                            lo = mid;
+                        } else {
+                            hi_requested = mid.requested;
+                        }
+                    }
+                    eprintln!(
+                        "  {} knee localized: max usable scanout {:.1} (request {:.1})",
+                        channel.label(),
+                        lo.scanout,
+                        lo.requested,
+                    );
+                    max_cmd = lo.scanout;
+                    max_requested = lo.requested;
+                    break;
+                }
             }
-            if xyz.y > peak_y {
-                peak_y = xyz.y;
+            peak_y = peak_y.max(sample.xyz.y);
+            if sample.xyz.y > SATURATION_NOISE_FLOOR_Y {
+                best_gain = best_gain.max(sample.xyz.y / sample.scanout.max(1e-6));
             }
-            max_cmd = scanout_cmd;
-            max_requested = cmd;
-            samples.push(ChannelSample {
-                requested: cmd,
-                scanout: scanout_cmd,
-                xyz,
-            });
+            max_cmd = sample.scanout;
+            max_requested = sample.requested;
+            samples.push(sample);
         }
         if samples.len() < 4 {
             anyhow::bail!(
@@ -904,68 +1040,32 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         "\n--- phase 3: invert {}³ forward grid → {}³ inverse LUT ---",
         args.cube_edge_cmd, args.cube_edge
     );
-    let (entries, residuals) = build_inverse_lut(
+    // The mesh's measured corners anchor the bake's projection: white
+    // for the peak-luminance surface, black for the bleed floor (the
+    // standalone phase-0 floor is the fallback when the mesh somehow
+    // lacks its (0,0,0) vertex).
+    let bake_white = [gamut_mesh.white.x, gamut_mesh.white.y, gamut_mesh.white.z];
+    let bake_floor = gamut_mesh
+        .black()
+        .map(|b| [b.x, b.y, b.z])
+        .unwrap_or(black_floor_xyz);
+    let (entries, residuals) =
+        build_inverse_lut(args.cube_edge, &grid, bake_white, bake_floor, seed_gain);
+    // Bake health — computed unconditionally and surfaced on stderr.
+    // The percentile split used to live only in the CSV, where a
+    // catastrophic bake (in-gamut p50 of 72 cd/m²!) hid behind a verify
+    // verdict that never sampled the broken range.
+    let panel_total_peak: f64 = responses.iter().map(|r| r.peak_y).sum();
+    let health = summarize_bake_health(
         args.cube_edge,
-        &grid,
-        &gamut_mesh,
-        seed_gain,
-        black_floor_xyz,
+        &residuals,
+        panel_total_peak,
+        bake_white[1],
+        grid.min_emission().y,
     );
+    health.report(panel_total_peak);
     if let Some((_, w)) = log.as_mut() {
-        // Split residual stats by whether the target was in-gamut for
-        // the panel (target_Y ≤ panel total peak). Out-of-gamut grids
-        // always have huge residuals — the inverter clamps cmd to
-        // max_cmd and the panel physically can't reach the target —
-        // so mixing them into the percentile dilutes the signal we
-        // actually care about: "did Newton converge for the points
-        // verify will actually sample?"
-        let panel_total_peak: f64 = responses.iter().map(|r| r.peak_y).sum();
-        let n = args.cube_edge as usize;
-        let denom = (args.cube_edge - 1) as f32;
-        let mut in_gamut: Vec<f64> = Vec::new();
-        let mut out_of_gamut: Vec<f64> = Vec::new();
-        for k in 0..n {
-            let bz_in = pq_eotf(k as f32 / denom) as f64;
-            for j in 0..n {
-                let g_in = pq_eotf(j as f32 / denom) as f64;
-                for i in 0..n {
-                    let r_in = pq_eotf(i as f32 / denom) as f64;
-                    let target_y = bt2020_to_xyz(r_in, g_in, bz_in)[1];
-                    let idx = (k * n + j) * n + i;
-                    if target_y <= panel_total_peak {
-                        in_gamut.push(residuals[idx]);
-                    } else {
-                        out_of_gamut.push(residuals[idx]);
-                    }
-                }
-            }
-        }
-        let pct = |v: &mut Vec<f64>, p: f64| {
-            if v.is_empty() {
-                return f64::NAN;
-            }
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            v[((v.len() - 1) as f64 * p) as usize]
-        };
-        writeln!(
-            w,
-            "# inversion residuals (in-gamut, target_Y ≤ {:.1} cd/m²): n={} p50={:.4} p90={:.4} p99={:.4} max={:.4} cd/m²",
-            panel_total_peak,
-            in_gamut.len(),
-            pct(&mut in_gamut, 0.50),
-            pct(&mut in_gamut, 0.90),
-            pct(&mut in_gamut, 0.99),
-            pct(&mut in_gamut, 1.0),
-        )?;
-        writeln!(
-            w,
-            "# inversion residuals (out-of-gamut): n={} p50={:.4} p90={:.4} p99={:.4} max={:.4} cd/m² (expected — panel cap'd)",
-            out_of_gamut.len(),
-            pct(&mut out_of_gamut, 0.50),
-            pct(&mut out_of_gamut, 0.90),
-            pct(&mut out_of_gamut, 0.99),
-            pct(&mut out_of_gamut, 1.0),
-        )?;
+        health.write_csv(w, panel_total_peak)?;
     }
     let peak_nits = [
         responses[0].peak_y as f32,
@@ -1054,7 +1154,6 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         Some(verify_white_point(
             &args,
             &baseline,
-            &peak_nits,
             &entries,
             &grid,
             &mut device,
@@ -1087,7 +1186,13 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     }
 
     if let Some(verify) = verify_result.as_ref() {
-        let verdict = if verify.max_duv < 0.01 && verify.max_y_err_pct < 5.0 {
+        // The bake-health neutral check vetoes the verify verdict: a
+        // sweep of N patches can land between broken cells, but the
+        // residuals see every cell.
+        let verdict = if !health.ok() {
+            "⚠ POOR — neutral-axis inversion failures; the LUT contains broken cells \
+             (see bake health above)."
+        } else if verify.max_duv < 0.01 && verify.max_y_err_pct < 5.0 {
             "✓ EXCELLENT — calibration verified within colorimeter noise."
         } else if verify.max_duv < 0.02 && verify.max_y_err_pct < 10.0 {
             "✓ ACCEPTABLE — minor drift, usable for general desktop work."
@@ -1143,8 +1248,8 @@ struct VerifyResult {
 
 /// Drive the panel through the cube_edge³ Cartesian product of per-
 /// axis log-spaced requests and record one (diagnosed scanout, XYZ)
-/// measurement at each vertex. Returns the populated [`ResponseGrid`],
-/// with the black floor already subtracted from every sample.
+/// measurement at each vertex. Returns the populated [`ResponseGrid`]
+/// holding absolute (raw) XYZ per sample.
 ///
 /// Request axes are chosen from the Phase 1 request→diagnosed-scanout
 /// curve so the measured grid is log-spaced in actual emitted scanout
@@ -1381,20 +1486,49 @@ fn diagnosed_axes_from_stats(
     Ok(out)
 }
 
+/// Verify-sweep target luminances. HDR spans the calibrated range up
+/// to (almost) the measured white peak at the grid's max command. The
+/// old bound — `0.8 × min(per-channel peak_y)` — was the *blue*
+/// subpixel's solo Y share (~36 nits on a QD-OLED): it left the top
+/// ~90% of the white range unverified, and a bake with garbage cells
+/// at 230 nits sailed through with an "excellent" verdict. The 0.9
+/// factor keeps the top patch off the exact gamut surface (where
+/// legitimate projection slack lives) while sweeping the full usable
+/// range; 7 log-spaced patches keep the gaps between them under one
+/// octave.
+fn verify_white_targets(hdr_active: bool, grid_white_y: f64, sdr_reference_nits: f64) -> Vec<f64> {
+    if hdr_active {
+        let hi = (grid_white_y * 0.9).max(2.0);
+        let lo = (hi * 0.02).max(1.0);
+        let lo_ln = lo.ln();
+        let hi_ln = hi.max(lo * 1.5).ln();
+        (0..7)
+            .map(|i| {
+                let f = i as f64 / 6.0;
+                (lo_ln + f * (hi_ln - lo_ln)).exp()
+            })
+            .collect()
+    } else {
+        vec![0.10, 0.25, 0.50, 0.75, 0.95]
+            .into_iter()
+            .map(|f| f * sdr_reference_nits)
+            .collect()
+    }
+}
+
 /// Render BT.2020 D65 white at a range of luminances through the
 /// freshly-pushed LUT and measure how close the panel lands on the
 /// reference. Δu'v' large means the LUT's chromaticity inversion is
 /// off; Y-error large means the LUT's luminance inversion is off.
 ///
-/// Targets mirror `calibrate`'s verify phase so reports are comparable
-/// across the two pipelines:
-/// - HDR: log-space `[0.05 × hi, hi]` with `hi = 0.8 × min(peak_y)`.
-/// - SDR: fixed fractions of `sdr_reference_nits`.
+/// Targets come from [`verify_white_targets`]:
+/// - HDR: log-space up to 0.9 × the measured white peak.
+/// - SDR: fixed fractions of `sdr_reference_nits` (mirrors
+///   `calibrate`'s verify phase so reports are comparable).
 #[allow(clippy::too_many_arguments)]
 fn verify_white_point(
     args: &CalibrateLut3dArgs,
     baseline: &OutputBaseline,
-    peak_nits: &[f32; 3],
     lut_entries: &[[f32; 3]],
     grid: &ResponseGrid,
     device: &mut tristim_driver::Colorimeter,
@@ -1406,25 +1540,11 @@ fn verify_white_point(
     const D65: (f64, f64) = (0.3127, 0.3290);
     let (d65_up, d65_vp) = xy_to_uv_prime(D65);
 
-    let targets: Vec<f64> = if baseline.hdr_active {
-        let min_peak_y = peak_nits.iter().copied().fold(f32::INFINITY, f32::min) as f64;
-        let hi = (min_peak_y * 0.8).max(2.0);
-        let lo = (hi * 0.05).max(1.0);
-        let lo_ln = lo.ln();
-        let hi_ln = hi.max(lo * 1.5).ln();
-        (0..5)
-            .map(|i| {
-                let f = i as f64 / 4.0;
-                (lo_ln + f * (hi_ln - lo_ln)).exp()
-            })
-            .collect()
-    } else {
-        let r = baseline.sdr_reference_nits;
-        vec![0.10, 0.25, 0.50, 0.75, 0.95]
-            .into_iter()
-            .map(|f| f * r)
-            .collect()
-    };
+    let targets = verify_white_targets(
+        baseline.hdr_active,
+        grid.forward(grid.max_cmd()).y,
+        baseline.sdr_reference_nits,
+    );
 
     let settle = Duration::from_millis(args.settle_ms);
     let mut max_duv = 0.0_f64;
@@ -1664,9 +1784,9 @@ fn log_spaced_targets(lo: f64, hi: f64, n: usize) -> Vec<f64> {
 fn build_inverse_lut(
     cube_edge: u32,
     grid: &ResponseGrid,
-    mesh: &crate::gamut::GamutMesh,
+    white: [f64; 3],
+    floor: [f64; 3],
     seed_gain: [f64; 3],
-    black_floor_xyz: [f64; 3],
 ) -> (Vec<[f32; 3]>, Vec<f64>) {
     let n = cube_edge as usize;
     let denom = (cube_edge - 1) as f32;
@@ -1674,12 +1794,12 @@ fn build_inverse_lut(
     let mut residuals = Vec::with_capacity(n * n * n);
     let mut total_residual = 0.0_f64;
     let mut worst_residual = 0.0_f64;
-    let floor = mesh
-        .black()
-        .map(|b| [b.x, b.y, b.z])
-        .unwrap_or(black_floor_xyz);
-    let white = [mesh.white.x, mesh.white.y, mesh.white.z];
     let white_uv = uv_prime(white);
+    // Warm-start chain: each cell offers its solved cmd as a fallback
+    // seed to the next cell in scan order. Adjacent cells' targets
+    // differ by one PQ grid step, so a converged neighbor is an
+    // excellent second seed wherever the analytic one misbehaves.
+    let mut prev_cmd: Option<[f64; 3]> = None;
     for k in 0..n {
         let bz_in = pq_eotf(k as f32 / denom) as f64;
         for j in 0..n {
@@ -1687,8 +1807,10 @@ fn build_inverse_lut(
             for i in 0..n {
                 let r_in = pq_eotf(i as f32 / denom) as f64;
                 let target_xyz = bt2020_to_xyz(r_in, g_in, bz_in);
-                let (cmd, residual) =
-                    project_and_invert(grid, seed_gain, target_xyz, floor, white[1], white_uv);
+                let (cmd, residual) = project_and_invert(
+                    grid, seed_gain, target_xyz, floor, white[1], white_uv, prev_cmd,
+                );
+                prev_cmd = Some(cmd);
                 total_residual += residual;
                 if residual > worst_residual {
                     worst_residual = residual;
@@ -1706,6 +1828,192 @@ fn build_inverse_lut(
     (entries, residuals)
 }
 
+/// Neutral-axis health check: gray-diagonal LUT cells with target Y at
+/// or below this fraction of the measured white peak must invert
+/// cleanly — they're unambiguously inside the reachable volume. The
+/// margin keeps legitimate near-peak projection slack (the panel's
+/// native white chromaticity isn't exactly D65) out of the check.
+const NEUTRAL_CHECK_WHITE_FRAC: f64 = 0.8;
+/// A checked neutral cell fails when its residual exceeds
+/// `max(2% of target Y, 1 cd/m²)` — generous against colorimeter noise
+/// and trilinear model error, far below visible breakage.
+const NEUTRAL_TOL_FRAC: f64 = 0.02;
+const NEUTRAL_TOL_MIN_NITS: f64 = 1.0;
+
+/// Percentile summary of one residual population.
+struct ResidualStats {
+    n: usize,
+    p50: f64,
+    p90: f64,
+    p99: f64,
+    max: f64,
+}
+
+impl ResidualStats {
+    fn from(mut v: Vec<f64>) -> Self {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pick = |p: f64| -> f64 {
+            if v.is_empty() {
+                f64::NAN
+            } else {
+                v[((v.len() - 1) as f64 * p) as usize]
+            }
+        };
+        let (p50, p90, p99, max) = (pick(0.50), pick(0.90), pick(0.99), pick(1.0));
+        ResidualStats {
+            n: v.len(),
+            p50,
+            p90,
+            p99,
+            max,
+        }
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "n={} p50={:.4} p90={:.4} p99={:.4} max={:.4} cd/m²",
+            self.n, self.p50, self.p90, self.p99, self.max
+        )
+    }
+}
+
+/// Bake-health summary from the inversion residuals: the in/out-of-
+/// gamut percentile split plus a strict neutral-axis check. Computed
+/// unconditionally (not just for the CSV) so a broken bake is loud on
+/// stderr and can poison the final verdict.
+struct BakeHealth {
+    in_gamut: ResidualStats,
+    out_of_gamut: ResidualStats,
+    /// Gray-diagonal cells inside the strict neutral check (see
+    /// [`NEUTRAL_CHECK_WHITE_FRAC`]) whose residual exceeded tolerance.
+    /// Any failure here means broken LUT cells — this is exactly the
+    /// shape of the 2026-06 PG27UCDM bug where the 230-nit white cell
+    /// baked to cmd (0, 0, 157): pure blue.
+    neutral_failures: usize,
+    neutral_checked: usize,
+    neutral_worst: f64,
+    neutral_worst_y: f64,
+}
+
+impl BakeHealth {
+    fn ok(&self) -> bool {
+        self.neutral_failures == 0
+    }
+
+    fn report(&self, panel_total_peak: f64) {
+        eprintln!(
+            "  in-gamut (target_Y ≤ {:.1} cd/m²): {}",
+            panel_total_peak,
+            self.in_gamut.line(),
+        );
+        eprintln!(
+            "  out-of-gamut: {} (expected — panel cap'd)",
+            self.out_of_gamut.line(),
+        );
+        if self.ok() {
+            eprintln!(
+                "  neutral axis: {}/{} cells inverted within tolerance",
+                self.neutral_checked, self.neutral_checked,
+            );
+        } else {
+            eprintln!(
+                "  ⚠ neutral axis: {}/{} cells FAILED inversion (worst {:.1} cd/m² at \
+                 target {:.1} cd/m²) — the LUT contains broken cells; do not trust this bake",
+                self.neutral_failures,
+                self.neutral_checked,
+                self.neutral_worst,
+                self.neutral_worst_y,
+            );
+        }
+    }
+
+    fn write_csv(&self, w: &mut impl Write, panel_total_peak: f64) -> std::io::Result<()> {
+        writeln!(
+            w,
+            "# inversion residuals (in-gamut, target_Y ≤ {:.1} cd/m²): {}",
+            panel_total_peak,
+            self.in_gamut.line(),
+        )?;
+        writeln!(
+            w,
+            "# inversion residuals (out-of-gamut): {} (expected — panel cap'd)",
+            self.out_of_gamut.line(),
+        )?;
+        writeln!(
+            w,
+            "# neutral-axis health: failures={}/{} worst={:.4} cd/m² at target_y={:.4}",
+            self.neutral_failures, self.neutral_checked, self.neutral_worst, self.neutral_worst_y,
+        )
+    }
+}
+
+/// Split the bake residuals into in/out-of-gamut percentile stats
+/// (in-gamut = target_Y within the panel's summed per-channel peak —
+/// out-of-gamut cells are *expected* to carry projection residuals)
+/// and run the strict neutral-axis check against the measured white
+/// peak `white_y`.
+///
+/// `neutral_lo_y` bounds the neutral check from below — pass the
+/// grid's min-corner emission Y. Targets dimmer than the dimmest
+/// measured sample are unrepresentable by the forward model (its
+/// trilinear clamp over-predicts them by construction), so their
+/// bounded sub-nit residuals are projection cost, not bake breakage.
+fn summarize_bake_health(
+    cube_edge: u32,
+    residuals: &[f64],
+    panel_total_peak: f64,
+    white_y: f64,
+    neutral_lo_y: f64,
+) -> BakeHealth {
+    let n = cube_edge as usize;
+    let denom = (cube_edge - 1) as f32;
+    let mut in_gamut: Vec<f64> = Vec::new();
+    let mut out_of_gamut: Vec<f64> = Vec::new();
+    let mut neutral_failures = 0usize;
+    let mut neutral_checked = 0usize;
+    let mut neutral_worst = 0.0_f64;
+    let mut neutral_worst_y = 0.0_f64;
+    for k in 0..n {
+        let bz_in = pq_eotf(k as f32 / denom) as f64;
+        for j in 0..n {
+            let g_in = pq_eotf(j as f32 / denom) as f64;
+            for i in 0..n {
+                let r_in = pq_eotf(i as f32 / denom) as f64;
+                let target_y = bt2020_to_xyz(r_in, g_in, bz_in)[1];
+                let idx = (k * n + j) * n + i;
+                let residual = residuals[idx];
+                if target_y <= panel_total_peak {
+                    in_gamut.push(residual);
+                } else {
+                    out_of_gamut.push(residual);
+                }
+                if i == j
+                    && j == k
+                    && target_y >= neutral_lo_y
+                    && target_y <= NEUTRAL_CHECK_WHITE_FRAC * white_y
+                {
+                    neutral_checked += 1;
+                    if residual > (target_y * NEUTRAL_TOL_FRAC).max(NEUTRAL_TOL_MIN_NITS) {
+                        neutral_failures += 1;
+                        if residual > neutral_worst {
+                            neutral_worst = residual;
+                            neutral_worst_y = target_y;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    BakeHealth {
+        in_gamut: ResidualStats::from(in_gamut),
+        out_of_gamut: ResidualStats::from(out_of_gamut),
+        neutral_failures,
+        neutral_checked,
+        neutral_worst,
+        neutral_worst_y,
+    }
+}
+
 /// Tolerance for "in-gamut": residual XYZ error in cd/m². 0.5 cd/m² is
 /// well below the colorimeter's noise floor, so it admits any honest
 /// Newton convergence but rejects the "parked at max_cmd" residuals
@@ -1718,6 +2026,19 @@ const PROJECT_SATURATION_FRAC: f64 = 0.995;
 /// Chroma-compression bisection step count. 16 halvings ⇒ ~1e-5 fraction,
 /// far below any meaningful u'v' precision.
 const PROJECT_BISECTION_STEPS: usize = 16;
+
+/// Default Newton seed for a target luminance: distribute Y across the
+/// channels by BT.2020 D65 weights, scaled by each channel's
+/// tracking-region gain. A sane additive guess even though the panel
+/// itself is sub-additive — Newton refines from there.
+fn default_seed_cmd(seed_gain: [f64; 3], max_cmd: [f64; 3], target_y: f64) -> [f64; 3] {
+    const D65_WEIGHTS: [f64; 3] = [0.2627, 0.6780, 0.0593];
+    [
+        ((target_y * D65_WEIGHTS[0]) / seed_gain[0].max(1e-6)).clamp(0.0, max_cmd[0]),
+        ((target_y * D65_WEIGHTS[1]) / seed_gain[1].max(1e-6)).clamp(0.0, max_cmd[1]),
+        ((target_y * D65_WEIGHTS[2]) / seed_gain[2].max(1e-6)).clamp(0.0, max_cmd[2]),
+    ]
+}
 
 /// Project an absolute-XYZ target into the panel's reachable volume and
 /// invert. Four cases, applied in order:
@@ -1748,6 +2069,14 @@ const PROJECT_BISECTION_STEPS: usize = 16;
 /// Newton's local convergence against the projected target. That makes
 /// the build-time residual percentiles a uniform "how much did the bake
 /// have to project away from the request?" diagnostic.
+///
+/// `prev_cmd` is a warm-start candidate — typically the solved cmd of
+/// the adjacent LUT cell, whose target differs by one grid step. Newton
+/// runs from the default analytic seed first; if that fails to converge
+/// it retries from `prev_cmd` and keeps the better result. This breaks
+/// the deterministic failure mode where the analytic seed (a function
+/// of target Y only) lands in an ill-conditioned region and every
+/// chroma-bisection step replays the identical divergence.
 fn project_and_invert(
     grid: &ResponseGrid,
     seed_gain: [f64; 3],
@@ -1755,6 +2084,7 @@ fn project_and_invert(
     floor: [f64; 3],
     white_y: f64,
     white_uv: Option<(f64, f64)>,
+    prev_cmd: Option<[f64; 3]>,
 ) -> ([f64; 3], f64) {
     // Below-floor: emit panel black with its measured chromaticity.
     if target_abs[1] <= floor[1] {
@@ -1790,8 +2120,26 @@ fn project_and_invert(
             + (emitted.z - target_abs[2]).powi(2))
         .sqrt()
     };
+    // Newton from the analytic seed; on non-convergence retry from the
+    // neighbor-cell warm start and keep whichever lands closer.
+    let invert_best = |target: [f64; 3]| -> ([f64; 3], f64) {
+        let seed = default_seed_cmd(seed_gain, max_cmd, target[1]);
+        let (cmd, residual) = invert_one(grid, seed, target);
+        if residual < PROJECT_TOL_NITS {
+            return (cmd, residual);
+        }
+        let Some(warm) = prev_cmd else {
+            return (cmd, residual);
+        };
+        let (cmd_w, residual_w) = invert_one(grid, warm, target);
+        if residual_w < residual {
+            (cmd_w, residual_w)
+        } else {
+            (cmd, residual)
+        }
+    };
 
-    let (cmd0, residual0_to_working) = invert_one(grid, seed_gain, working_target);
+    let (cmd0, residual0_to_working) = invert_best(working_target);
     if in_gamut(&cmd0, residual0_to_working) {
         return (cmd0, residual_to_target(&cmd0));
     }
@@ -1809,7 +2157,7 @@ fn project_and_invert(
         let u = u_w + scale * (u_t - u_w);
         let v = v_w + scale * (v_t - v_w);
         let compressed = xyz_from_uv_y(u, v, working_target[1]);
-        let (cmd, residual_to_compressed) = invert_one(grid, seed_gain, compressed);
+        let (cmd, residual_to_compressed) = invert_best(compressed);
         if in_gamut(&cmd, residual_to_compressed) {
             best_cmd = cmd;
             lo = scale;
@@ -1841,14 +2189,10 @@ fn xyz_from_uv_y(u: f64, v: f64, y: f64) -> [f64; 3] {
 }
 
 /// Damped-Newton-with-backtracking-line-search inversion of one
-/// target XYZ against the 3D measured forward grid. Returns the
-/// commanded triple plus the residual norm.
-///
-/// `seed_gain` is the per-channel Y-per-cmd approximation from the
-/// per-channel discovery sweep; used to seed Newton near the right
-/// scale. The grid's trilinear forward + analytic Jacobian do the
-/// actual convergence — full-step gradients aren't directly visible
-/// here because they live inside `grid.jacobian`.
+/// target XYZ against the 3D measured forward grid, starting from an
+/// explicit `seed_cmd` (see [`default_seed_cmd`] for the analytic
+/// choice; callers may also warm-start from a neighboring cell's
+/// solution). Returns the commanded triple plus the residual norm.
 ///
 /// Why damped + line-search: the grid's forward is non-linear and
 /// the Jacobian is constant only within a cell; stepping across
@@ -1856,19 +2200,14 @@ fn xyz_from_uv_y(u: f64, v: f64, y: f64) -> [f64; 3] {
 /// only steps that reduce the residual norm; halve until they do.
 fn invert_one(
     grid: &ResponseGrid,
-    seed_gain: [f64; 3],
+    seed_cmd: [f64; 3],
     target_emission: [f64; 3],
 ) -> ([f64; 3], f64) {
-    // BT.2020 D65 weights distribute Y across primaries — a sane
-    // additive seed even though the panel itself is sub-additive.
-    // Newton refines from there.
-    const D65_WEIGHTS: [f64; 3] = [0.2627, 0.6780, 0.0593];
     let max_cmd = grid.max_cmd();
-    let target_y = target_emission[1];
     let mut cmd = [
-        ((target_y * D65_WEIGHTS[0]) / seed_gain[0].max(1e-6)).clamp(0.0, max_cmd[0]),
-        ((target_y * D65_WEIGHTS[1]) / seed_gain[1].max(1e-6)).clamp(0.0, max_cmd[1]),
-        ((target_y * D65_WEIGHTS[2]) / seed_gain[2].max(1e-6)).clamp(0.0, max_cmd[2]),
+        seed_cmd[0].clamp(0.0, max_cmd[0]),
+        seed_cmd[1].clamp(0.0, max_cmd[1]),
+        seed_cmd[2].clamp(0.0, max_cmd[2]),
     ];
 
     const MAX_ITERS: usize = 40;
@@ -1879,6 +2218,11 @@ fn invert_one(
     if res_norm < TOL {
         return (cmd, res_norm);
     }
+    // Best command seen across the whole search — the singular-Jacobian
+    // recovery below can transiently make things worse before Newton
+    // re-converges, so never return anything but the best.
+    let mut best_cmd = cmd;
+    let mut best_res = res_norm;
 
     for _ in 0..MAX_ITERS {
         let jac = grid.jacobian(cmd);
@@ -1889,9 +2233,25 @@ fn invert_one(
             xyz.z - target_emission[2],
         ];
         let Some(jac_inv) = mat3_inverse(&jac) else {
-            // Singular Jacobian: cmd is parked at a grid corner where
-            // some axis span is degenerate. Surface the current best.
-            return (cmd, res_norm);
+            // Singular Jacobian: cmd sits in a saturated (flat) cell of
+            // the grid — a whole Jacobian row vanishes wherever an axis
+            // segment is past the panel's knee, which happens when the
+            // sweep collected saturated samples (the seed can land
+            // there directly). Flat regions live at the TOP of the
+            // range, so pulling the command halfway toward black
+            // re-enters responsive territory within a few steps; Newton
+            // then walks the responsive channels back up. The old code
+            // returned immediately here, baking the parked seed into
+            // the LUT as a garbage cell.
+            for c in cmd.iter_mut() {
+                *c *= 0.5;
+            }
+            res_norm = predicted_residual_norm(grid, &cmd, &target_emission);
+            if res_norm < best_res {
+                best_res = res_norm;
+                best_cmd = cmd;
+            }
+            continue;
         };
         let full_step = mat3_mul_vec(&jac_inv, &residual);
 
@@ -1912,13 +2272,25 @@ fn invert_one(
             alpha *= 0.5;
         }
         if !accepted {
-            return (cmd, res_norm);
+            return if best_res < res_norm {
+                (best_cmd, best_res)
+            } else {
+                (cmd, res_norm)
+            };
+        }
+        if res_norm < best_res {
+            best_res = res_norm;
+            best_cmd = cmd;
         }
         if res_norm < TOL {
             return (cmd, res_norm);
         }
     }
-    (cmd, res_norm)
+    if best_res < res_norm {
+        (best_cmd, best_res)
+    } else {
+        (cmd, res_norm)
+    }
 }
 
 /// L2 norm of (grid.forward(cmd) - target_emission). Helper for
@@ -2119,6 +2491,363 @@ fn print_kdl_block(
     println!("}}");
 }
 
+// ── Offline rebake from a measurement CSV ────────────────────────────────────
+//
+// The forward measurements (phase-1 channel sweeps + phase-2 3D grid)
+// are honest panel data even when the bake that followed them produced
+// a broken LUT. `rebake-lut3d` re-runs the inversion with the current
+// algorithm against a previous run's CSV — pure CPU math, no
+// colorimeter, no running prism, no re-rigging a fragile panel/sensor
+// setup. White/black anchors come from the `.gamut.json` sidecar the
+// original run wrote next to the CSV.
+
+#[derive(Args)]
+pub struct RebakeLut3dArgs {
+    /// Measurement-log CSV written by a previous `calibrate-lut3d` run.
+    pub csv: PathBuf,
+    /// Output `.lut` path. Defaults to the CSV path with its extension
+    /// replaced by `.lut` — i.e. the same file the original run wrote.
+    #[arg(long)]
+    pub lut_path: Option<PathBuf>,
+    /// Inverse-LUT cube edge. Must match the compositor's compiled
+    /// LUT texture size (33).
+    #[arg(long, default_value_t = 33)]
+    pub cube_edge: u32,
+}
+
+/// One parsed `3D,…` grid row.
+struct GridRow {
+    i: usize,
+    j: usize,
+    k: usize,
+    scanout: [f64; 3],
+    xyz: Xyz,
+}
+
+/// Everything the rebake needs out of a calibrate-lut3d CSV.
+struct ParsedCsvLog {
+    /// Raw (pre-subtraction) floor from the `# black_floor` comment.
+    black_floor_xyz: [f64; 3],
+    /// Phase-1 channel sweeps, black-subtracted as logged.
+    channel_samples: [Vec<ChannelSample>; 3],
+    /// Phase-2 grid edge from the header comments.
+    cube_edge_cmd: usize,
+    grid_rows: Vec<GridRow>,
+}
+
+/// Pull the unsigned integer following `key` out of a comment line
+/// (e.g. `cube_edge_cmd=9`).
+fn parse_kv_usize(line: &str, key: &str) -> Option<usize> {
+    let start = line.find(key)? + key.len();
+    let digits: String = line[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// Pull `X=… Y=… Z=…` floats out of a comment line.
+fn parse_xyz_tokens(line: &str) -> Option<[f64; 3]> {
+    let grab = |key: &str| -> Option<f64> {
+        let start = line.find(key)? + key.len();
+        line[start..]
+            .split_whitespace()
+            .next()
+            .and_then(|tok| tok.parse().ok())
+    };
+    Some([grab("X=")?, grab("Y=")?, grab("Z=")?])
+}
+
+/// Parse a calibrate-lut3d measurement CSV. Tolerant by construction:
+/// comment lines are scanned only for the black floor + grid edge,
+/// data lines are dispatched on their first field, and anything else
+/// (column headers, verify rows, future row kinds) is skipped.
+fn parse_csv_log(text: &str) -> Result<ParsedCsvLog> {
+    let mut black_floor_xyz: Option<[f64; 3]> = None;
+    let mut cube_edge_cmd: Option<usize> = None;
+    let mut channel_samples: [Vec<ChannelSample>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut grid_rows: Vec<GridRow> = Vec::new();
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(comment) = line.strip_prefix('#') {
+            if black_floor_xyz.is_none() && comment.contains("black_floor") {
+                black_floor_xyz = parse_xyz_tokens(comment);
+            }
+            if cube_edge_cmd.is_none() {
+                cube_edge_cmd = parse_kv_usize(comment, "cube_edge_cmd=");
+            }
+            continue;
+        }
+        let fields: Vec<&str> = line.split(',').collect();
+        let num = |idx: usize| -> Result<f64> {
+            fields
+                .get(idx)
+                .ok_or_else(|| anyhow::anyhow!("CSV line {}: missing field {idx}", lineno + 1))?
+                .parse::<f64>()
+                .map_err(|e| {
+                    anyhow::anyhow!("CSV line {}: field {idx} not a number: {e}", lineno + 1)
+                })
+        };
+        match fields[0] {
+            "R" | "G" | "B" if fields.len() >= 7 => {
+                let ch = match fields[0] {
+                    "R" => 0,
+                    "G" => 1,
+                    _ => 2,
+                };
+                channel_samples[ch].push(ChannelSample {
+                    requested: num(2)?,
+                    scanout: num(3)?,
+                    xyz: Xyz {
+                        x: num(4)?,
+                        y: num(5)?,
+                        z: num(6)?,
+                    },
+                });
+            }
+            "3D" if fields.len() >= 13 => {
+                let index = |idx: usize| -> Result<usize> {
+                    fields[idx].parse::<usize>().map_err(|e| {
+                        anyhow::anyhow!("CSV line {}: field {idx} not an index: {e}", lineno + 1)
+                    })
+                };
+                grid_rows.push(GridRow {
+                    i: index(1)?,
+                    j: index(2)?,
+                    k: index(3)?,
+                    scanout: [num(7)?, num(8)?, num(9)?],
+                    xyz: Xyz {
+                        x: num(10)?,
+                        y: num(11)?,
+                        z: num(12)?,
+                    },
+                });
+            }
+            // Column headers, verify rows, future row kinds.
+            _ => {}
+        }
+    }
+    let black_floor_xyz = black_floor_xyz
+        .ok_or_else(|| anyhow::anyhow!("CSV missing the `# black_floor` comment line"))?;
+    let cube_edge_cmd = cube_edge_cmd
+        .ok_or_else(|| anyhow::anyhow!("CSV missing `cube_edge_cmd=` in its header comments"))?;
+    anyhow::ensure!(!grid_rows.is_empty(), "CSV contains no `3D,…` grid rows");
+    Ok(ParsedCsvLog {
+        black_floor_xyz,
+        channel_samples,
+        cube_edge_cmd,
+        grid_rows,
+    })
+}
+
+/// Rebuild the [`ResponseGrid`] from parsed 3D rows: XYZ placed by
+/// (i, j, k), per-axis scanout coordinates re-derived through the same
+/// averaging + separability validation the live sweep uses.
+fn grid_from_rows(cube_edge_cmd: usize, rows: &[GridRow]) -> Result<ResponseGrid> {
+    let n = cube_edge_cmd;
+    anyhow::ensure!(n >= 2, "cube_edge_cmd must be ≥ 2");
+    let total = n * n * n;
+    anyhow::ensure!(
+        rows.len() == total,
+        "expected {total} 3D grid rows ({n}³), found {}",
+        rows.len(),
+    );
+    let mut xyz: Vec<Option<Xyz>> = vec![None; total];
+    let mut sum: [Vec<f64>; 3] = std::array::from_fn(|_| vec![0.0_f64; n]);
+    let mut count: [Vec<usize>; 3] = std::array::from_fn(|_| vec![0_usize; n]);
+    let mut min: [Vec<f64>; 3] = std::array::from_fn(|_| vec![f64::INFINITY; n]);
+    let mut max: [Vec<f64>; 3] = std::array::from_fn(|_| vec![f64::NEG_INFINITY; n]);
+    for r in rows {
+        anyhow::ensure!(
+            r.i < n && r.j < n && r.k < n,
+            "3D row index ({},{},{}) out of range for edge {n}",
+            r.i,
+            r.j,
+            r.k,
+        );
+        let idx = (r.k * n + r.j) * n + r.i;
+        anyhow::ensure!(
+            xyz[idx].is_none(),
+            "duplicate 3D row for ({},{},{})",
+            r.i,
+            r.j,
+            r.k,
+        );
+        xyz[idx] = Some(r.xyz);
+        for (axis, ai) in [(0, r.i), (1, r.j), (2, r.k)] {
+            let v = r.scanout[axis];
+            sum[axis][ai] += v;
+            count[axis][ai] += 1;
+            min[axis][ai] = min[axis][ai].min(v);
+            max[axis][ai] = max[axis][ai].max(v);
+        }
+    }
+    let axis_cmds = diagnosed_axes_from_stats(sum, count, min, max)?;
+    Ok(ResponseGrid {
+        cube_edge: n,
+        axis_cmds,
+        // Coverage is total: rows.len() == n³ with no duplicates.
+        xyz: xyz
+            .into_iter()
+            .map(|o| o.expect("full grid coverage checked above"))
+            .collect(),
+    })
+}
+
+fn json_vec3(v: &serde_json::Value) -> Option<[f64; 3]> {
+    let arr = v.as_array()?;
+    if arr.len() != 3 {
+        return None;
+    }
+    Some([arr[0].as_f64()?, arr[1].as_f64()?, arr[2].as_f64()?])
+}
+
+/// Load the white + black anchors from a `.gamut.json` sidecar. Only
+/// the two corner measurements feed the bake; the rest of the mesh
+/// stays on disk for the inspector.
+fn load_gamut_anchors(path: &std::path::Path) -> Result<([f64; 3], Option<[f64; 3]>)> {
+    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let doc: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(f))
+        .with_context(|| format!("parse {}", path.display()))?;
+    let white = json_vec3(&doc["white_xyz"])
+        .ok_or_else(|| anyhow::anyhow!("{}: missing/invalid white_xyz", path.display()))?;
+    let black = doc["vertices"].as_array().and_then(|vs| {
+        vs.iter()
+            .find(|v| json_vec3(&v["code_value"]) == Some([0.0, 0.0, 0.0]))
+            .and_then(|v| json_vec3(&v["xyz"]))
+    });
+    Ok((white, black))
+}
+
+pub fn run_rebake(args: RebakeLut3dArgs) -> Result<()> {
+    let text = std::fs::read_to_string(&args.csv)
+        .with_context(|| format!("read {}", args.csv.display()))?;
+    let parsed = parse_csv_log(&text)?;
+    eprintln!(
+        "Parsed {}: {}³ grid rows, channel sweeps R={} G={} B={}, black floor Y={:.4}",
+        args.csv.display(),
+        parsed.cube_edge_cmd,
+        parsed.channel_samples[0].len(),
+        parsed.channel_samples[1].len(),
+        parsed.channel_samples[2].len(),
+        parsed.black_floor_xyz[1],
+    );
+
+    // Rebuild the per-channel responses just enough for the Newton seed
+    // gain + the header peaks. The grid axes come from the 3D rows
+    // themselves, so the phase-1 saturation bound plays no role here.
+    let mut responses: [Option<ChannelResponse>; 3] = [None, None, None];
+    for ch in 0..3 {
+        let samples = parsed.channel_samples[ch].clone();
+        anyhow::ensure!(
+            samples.len() >= 2,
+            "{} channel: {} sweep row(s) in CSV — too few to derive a seed gain",
+            ["R", "G", "B"][ch],
+            samples.len(),
+        );
+        let peak_y = samples.iter().map(|s| s.xyz.y).fold(0.0_f64, f64::max);
+        let last = *samples.last().unwrap();
+        responses[ch] = Some(ChannelResponse {
+            samples,
+            max_cmd: last.scanout,
+            max_requested: last.requested,
+            peak_y,
+        });
+    }
+    let responses = [
+        responses[0].take().unwrap(),
+        responses[1].take().unwrap(),
+        responses[2].take().unwrap(),
+    ];
+    let seed_gain = [
+        responses[0].approx_gain_y_per_cmd(),
+        responses[1].approx_gain_y_per_cmd(),
+        responses[2].approx_gain_y_per_cmd(),
+    ];
+    let grid = grid_from_rows(parsed.cube_edge_cmd, &parsed.grid_rows)?;
+
+    // White/black anchors from the sidecar mesh when present; fall back
+    // to the grid's max-cmd corner + the CSV's raw floor.
+    let sidecar = args.csv.with_extension("gamut.json");
+    let (bake_white, bake_floor) = match load_gamut_anchors(&sidecar) {
+        Ok((white, black)) => {
+            eprintln!(
+                "Gamut anchors from {}: white Y={:.1}, black Y={:.4}",
+                sidecar.display(),
+                white[1],
+                black.unwrap_or(parsed.black_floor_xyz)[1],
+            );
+            (white, black.unwrap_or(parsed.black_floor_xyz))
+        }
+        Err(e) => {
+            let corner = grid.forward(grid.max_cmd());
+            eprintln!(
+                "No usable gamut sidecar ({e:#}); using the grid's max-cmd corner as \
+                 white (Y={:.1}) and the CSV floor as black",
+                corner.y,
+            );
+            ([corner.x, corner.y, corner.z], parsed.black_floor_xyz)
+        }
+    };
+
+    eprintln!(
+        "\n--- rebake: invert {}³ forward grid → {}³ inverse LUT ---",
+        parsed.cube_edge_cmd, args.cube_edge,
+    );
+    let (entries, residuals) =
+        build_inverse_lut(args.cube_edge, &grid, bake_white, bake_floor, seed_gain);
+    let panel_total_peak: f64 = responses.iter().map(|r| r.peak_y).sum();
+    let health = summarize_bake_health(
+        args.cube_edge,
+        &residuals,
+        panel_total_peak,
+        bake_white[1],
+        grid.min_emission().y,
+    );
+    health.report(panel_total_peak);
+
+    let peak_nits = [
+        responses[0].peak_y as f32,
+        responses[1].peak_y as f32,
+        responses[2].peak_y as f32,
+    ];
+    let black_point_f32 = [
+        parsed.black_floor_xyz[0] as f32,
+        parsed.black_floor_xyz[1] as f32,
+        parsed.black_floor_xyz[2] as f32,
+    ];
+    let lut_path = args
+        .lut_path
+        .clone()
+        .unwrap_or_else(|| args.csv.with_extension("lut"));
+    save_lut3d_file(
+        &lut_path,
+        args.cube_edge,
+        peak_nits,
+        black_point_f32,
+        &entries,
+    )
+    .with_context(|| format!("write LUT file {}", lut_path.display()))?;
+    eprintln!(
+        "\nWrote {} (cube_edge={}, peaks={:?}, black_xyz={:?})",
+        lut_path.display(),
+        args.cube_edge,
+        peak_nits,
+        black_point_f32,
+    );
+    eprintln!(
+        "Existing config pointing at this path picks it up on prism restart; \
+         no measurement-side files were touched."
+    );
+    if !health.ok() {
+        anyhow::bail!("bake health check failed — see the neutral-axis report above");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2178,7 +2907,8 @@ mod tests {
 
         for &l in &[10.0, 50.0, 200.0] {
             let target = bt2020_to_xyz(l, l, l);
-            let (cmd, residual) = invert_one(&grid, seed_gain, target);
+            let seed = default_seed_cmd(seed_gain, grid.max_cmd(), target[1]);
+            let (cmd, residual) = invert_one(&grid, seed, target);
             assert!(
                 residual < 0.5,
                 "L={l}: residual {residual} too large; cmd={cmd:?} target={target:?}"
@@ -2225,7 +2955,7 @@ mod tests {
             + (target[2] - white_xyz.z).powi(2))
         .sqrt();
         let (cmd, residual) =
-            super::project_and_invert(&grid, seed_gain, target, floor, white_y, white_uv);
+            super::project_and_invert(&grid, seed_gain, target, floor, white_y, white_uv, None);
         // cmd should land at (or very near) the corner.
         for c in 0..3 {
             assert!(
@@ -2255,7 +2985,8 @@ mod tests {
         let grid = synth_grid(9, r_pri, g_pri, b_pri, 1000.0);
         let seed_gain = [r_pri[1], g_pri[1], b_pri[1]];
         let target = bt2020_to_xyz(50.0, 0.0, 0.0);
-        let (cmd, _residual) = invert_one(&grid, seed_gain, target);
+        let seed = default_seed_cmd(seed_gain, grid.max_cmd(), target[1]);
+        let (cmd, _residual) = invert_one(&grid, seed, target);
         // cmd_R dominates (close to 50, within trilinear noise).
         assert!((cmd[0] - 50.0).abs() < 5.0, "cmd_R={}", cmd[0]);
         // cmd_G, cmd_B small relative to cmd_R.
@@ -2330,6 +3061,210 @@ mod tests {
         let max_corner = grid.lookup(n - 1, n - 1, n - 1);
         assert!((above.x - max_corner.x).abs() < 1e-9);
         assert!((above.y - max_corner.y).abs() < 1e-9);
+    }
+
+    /// Build a hard-clipping panel: linear response up to `knee` nits
+    /// of per-channel cmd, flat above — the shape of an OLED driven
+    /// past its per-channel current limit. Axes span well past the
+    /// knee, mirroring a sweep whose saturation detection missed.
+    fn synth_clipping_grid(
+        cube_edge: usize,
+        r_pri: [f64; 3],
+        g_pri: [f64; 3],
+        b_pri: [f64; 3],
+        max_cmd: f64,
+        knee: f64,
+    ) -> ResponseGrid {
+        let axis = log_spaced_targets(1.0, max_cmd, cube_edge);
+        let axis_cmds = [axis.clone(), axis.clone(), axis];
+        let mut xyz = Vec::with_capacity(cube_edge.pow(3));
+        for k in 0..cube_edge {
+            let cb = axis_cmds[2][k].min(knee);
+            for j in 0..cube_edge {
+                let cg = axis_cmds[1][j].min(knee);
+                for i in 0..cube_edge {
+                    let cr = axis_cmds[0][i].min(knee);
+                    xyz.push(Xyz {
+                        x: r_pri[0] * cr + g_pri[0] * cg + b_pri[0] * cb,
+                        y: r_pri[1] * cr + g_pri[1] * cg + b_pri[1] * cb,
+                        z: r_pri[2] * cr + g_pri[2] * cg + b_pri[2] * cb,
+                    });
+                }
+            }
+        }
+        ResponseGrid {
+            cube_edge,
+            axis_cmds,
+            xyz,
+        }
+    }
+
+    /// Regression for the 2026-06 PG27UCDM bake: a forward grid whose
+    /// top segment is deep in panel saturation, combined with a seed
+    /// gain computed from the saturated tail (2.5× under the tracking
+    /// slope), must NOT produce broken neutral-axis cells. The pre-fix
+    /// bake parked Newton in the flat zone and baked a 230-nit white
+    /// to cmd (0, 0, 157) — pure blue — while reporting "excellent".
+    #[test]
+    fn saturated_grid_bake_keeps_neutral_axis_healthy() {
+        let r_pri = [0.6370, 0.2627, 0.0000];
+        let g_pri = [0.1446, 0.6780, 0.0281];
+        let b_pri = [0.1689, 0.0593, 1.0610];
+        let knee = 400.0;
+        let grid = synth_clipping_grid(9, r_pri, g_pri, b_pri, 1000.0, knee);
+        // The OLD broken seed gain: per-channel peak emission over the
+        // saturated max scanout (pri × 400 / 1000).
+        let bad_seed_gain = [
+            r_pri[1] * knee / 1000.0,
+            g_pri[1] * knee / 1000.0,
+            b_pri[1] * knee / 1000.0,
+        ];
+        let white_xyz = grid.forward(grid.max_cmd());
+        let white = [white_xyz.x, white_xyz.y, white_xyz.z];
+        let cube_edge = 17_u32;
+        let (entries, residuals) =
+            build_inverse_lut(cube_edge, &grid, white, [0.0; 3], bad_seed_gain);
+        let health = summarize_bake_health(
+            cube_edge,
+            &residuals,
+            white_xyz.y,
+            white_xyz.y,
+            grid.min_emission().y,
+        );
+        assert!(
+            health.ok(),
+            "neutral-axis failures: {}/{} (worst {:.2} cd/m² at target {:.2} cd/m²)",
+            health.neutral_failures,
+            health.neutral_checked,
+            health.neutral_worst,
+            health.neutral_worst_y,
+        );
+        // And the gray diagonal must command near-neutral triples —
+        // no (0, 0, B)-shaped garbage anywhere below the white peak.
+        let n = cube_edge as usize;
+        let denom = (cube_edge - 1) as f32;
+        for d in 0..n {
+            let target_y = bt2020_to_xyz(
+                pq_eotf(d as f32 / denom) as f64,
+                pq_eotf(d as f32 / denom) as f64,
+                pq_eotf(d as f32 / denom) as f64,
+            )[1];
+            if target_y < 1.0 || target_y > 0.8 * white_xyz.y {
+                continue;
+            }
+            let cmd = entries[(d * n + d) * n + d];
+            let lo = cmd.iter().copied().fold(f32::INFINITY, f32::min);
+            let hi = cmd.iter().copied().fold(0.0_f32, f32::max);
+            assert!(
+                lo > 0.0 && hi / lo.max(1e-3) < 3.0,
+                "diagonal cell {d} (target {target_y:.1} cd/m²) has wildly \
+                 unbalanced cmd {cmd:?}",
+            );
+        }
+    }
+
+    /// The seed gain must come from the tracking region even when the
+    /// sweep ran deep into saturation before stopping — the old
+    /// last-sample pick under-reported by the saturation factor.
+    #[test]
+    fn approx_gain_uses_tracking_region_not_saturated_tail() {
+        let slope = 0.3;
+        let knee = 350.0;
+        let samples: Vec<ChannelSample> = [1.0, 3.16, 10.0, 31.6, 100.0, 316.0, 1000.0]
+            .iter()
+            .map(|&s| ChannelSample {
+                requested: s,
+                scanout: s,
+                xyz: Xyz {
+                    x: 0.0,
+                    y: slope * s.min(knee),
+                    z: 0.0,
+                },
+            })
+            .collect();
+        let response = ChannelResponse {
+            samples,
+            max_cmd: 1000.0,
+            max_requested: 1000.0,
+            peak_y: slope * knee,
+        };
+        let gain = response.approx_gain_y_per_cmd();
+        assert!(
+            (gain - slope).abs() < slope * 0.05,
+            "gain {gain} should be ≈ tracking slope {slope}, not the \
+             saturated secant {}",
+            slope * knee / 1000.0,
+        );
+    }
+
+    /// Verify-sweep targets must span up to (almost) the measured
+    /// white peak — including the mid-range zone the old
+    /// min-channel-peak bound never sampled.
+    #[test]
+    fn verify_targets_span_measured_white_peak() {
+        let t = verify_white_targets(true, 457.0, 203.0);
+        assert_eq!(t.len(), 7);
+        let top = *t.last().unwrap();
+        assert!(
+            (400.0..457.0).contains(&top),
+            "top verify target {top} should approach the 457-nit white peak",
+        );
+        assert!(
+            t.iter().any(|&v| (150.0..330.0).contains(&v)),
+            "verify sweep must cover the mid-range whites: {t:?}",
+        );
+        // SDR branch unchanged: fractions of the reference white.
+        let sdr = verify_white_targets(false, 457.0, 200.0);
+        assert_eq!(sdr, vec![20.0, 50.0, 100.0, 150.0, 190.0]);
+    }
+
+    /// CSV log → ParsedCsvLog → ResponseGrid round-trip on a minimal
+    /// synthetic log with the exact row shapes the live run writes
+    /// (header comments, channel rows, 3D rows, verify rows).
+    #[test]
+    fn parse_csv_log_rebuilds_grid() {
+        let csv = "\
+# prism-tune calibrate-lut3d — output=TEST mode=HDR cube_edge=33 cube_edge_cmd=2 samples_per_channel=4 settle_ms=32 window=0.02
+channel,sample_idx,requested_nits,scanout_nits,X,Y,Z
+# black_floor (raw, pre-subtract): X=0.0500 Y=0.0700 Z=0.1200 cd/m²
+R,1,1.0000,1.0000,0.6370,0.2627,0.0000
+R,2,10.0000,10.0000,6.3700,2.6270,0.0000
+G,1,1.0000,1.0000,0.1446,0.6780,0.0281
+G,2,10.0000,10.0000,1.4460,6.7800,0.2810
+B,1,1.0000,1.0000,0.1689,0.0593,1.0610
+B,2,10.0000,10.0000,1.6890,0.5930,10.6100
+# phase 2: 3D forward grid sweep, cube_edge_cmd=2 (8 patches)
+phase,i,j,k,requested_r,requested_g,requested_b,scanout_r,scanout_g,scanout_b,X,Y,Z
+3D,0,0,0,1,1,1,1.0,1.0,1.0,0.9505,1.0000,1.0891
+3D,1,0,0,10,1,1,10.0,1.0,1.0,6.6835,3.3643,1.0891
+3D,0,1,0,1,10,1,1.0,10.0,1.0,2.2519,7.1020,1.3420
+3D,1,1,0,10,10,1,10.0,10.0,1.0,7.9849,9.4663,1.3420
+3D,0,0,1,1,1,10,1.0,1.0,10.0,2.4706,1.5337,10.6381
+3D,1,0,1,10,1,10,10.0,1.0,10.0,8.2036,3.8980,10.6381
+3D,0,1,1,1,10,10,1.0,10.0,10.0,3.7720,7.6357,10.8910
+3D,1,1,1,10,10,10,10.0,10.0,10.0,9.5050,10.0000,10.8910
+verify,W,1,1.4394,1.4082,1.4885,1.6542
+# inverse LUT written to whatever.lut (cube_edge=33, in_tf=1, peaks=R=1 G=1 B=1, black_xyz=(0,0,0))
+";
+        let parsed = parse_csv_log(csv).unwrap();
+        assert_eq!(parsed.black_floor_xyz, [0.05, 0.07, 0.12]);
+        assert_eq!(parsed.cube_edge_cmd, 2);
+        for ch in 0..3 {
+            assert_eq!(parsed.channel_samples[ch].len(), 2, "channel {ch}");
+        }
+        assert_eq!(parsed.grid_rows.len(), 8);
+
+        let grid = grid_from_rows(parsed.cube_edge_cmd, &parsed.grid_rows).unwrap();
+        for axis in 0..3 {
+            assert_eq!(grid.axis_cmds[axis], vec![1.0, 10.0], "axis {axis}");
+        }
+        // Placement: the (1,0,1) row landed at its (i,j,k) slot.
+        let v = grid.lookup(1, 0, 1);
+        assert!((v.x - 8.2036).abs() < 1e-9);
+        assert!((v.y - 3.8980).abs() < 1e-9);
+        assert!((v.z - 10.6381).abs() < 1e-9);
+        // Missing/duplicate coverage is rejected.
+        assert!(grid_from_rows(3, &parsed.grid_rows).is_err());
     }
 
     /// Trilinear interp at the midpoint between two grid points
