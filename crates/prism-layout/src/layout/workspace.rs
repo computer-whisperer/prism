@@ -1639,9 +1639,7 @@ impl<W: LayoutElement> Workspace<W> {
             .render(view_rect, floating_focus_ring, ctx, out);
     }
 
-    /// Emit the workspace's overview shadow into `out`. Shadow is
-    /// currently a no-op stub; the call remains so the consumer in
-    /// `monitor.rs` ports unchanged.
+    /// Emit the workspace's overview shadow into `out`.
     pub fn render_shadow(&self, out: &mut Vec<RenderEl>) {
         self.shadow.render(Point::from((0., 0.)), out);
     }

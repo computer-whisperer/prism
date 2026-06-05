@@ -31,7 +31,8 @@ pub use diagnose::{decode_scanout_texel, DiagnosedNits, EncodeDiagnoseProbe};
 pub use dmabuf::{ImportedImage, YuvKind};
 pub use element::{
     lower_elements, make_projector, srgb_to_bt2020_nits, AlphaMode, BorderEl, FrameElementMeta,
-    LoweredFrame, RenderEl, RoundedBoxEl, SolidColorEl, SurfaceClip, SurfaceColorParams, SurfaceEl,
+    LoweredFrame, RenderEl, RoundedBoxEl, ShadowEl, SolidColorEl, SurfaceClip, SurfaceColorParams,
+    SurfaceEl,
 };
 pub use encode_synth::{EncodeConfig, EncodeFragment, EncodePushSynth, LutOutputDomain};
 pub use error::{RendererError, Result};

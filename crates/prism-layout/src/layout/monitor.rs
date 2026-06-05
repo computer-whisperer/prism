@@ -1702,7 +1702,6 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     /// Render the overview-mode shadow under each workspace card.
-    /// Stubbed to a no-op (matches the rest of the Shadow port).
     pub fn render_workspace_shadows(&self, out: &mut Vec<RenderEl>) {
         let Some(_progress) = self.overview_progress.as_ref().map(|p| p.clamped_value()) else {
             return;

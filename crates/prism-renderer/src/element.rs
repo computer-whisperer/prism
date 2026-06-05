@@ -332,12 +332,7 @@ impl SurfaceClip {
 
     fn apply_to_push(&self, push: &mut DecodePush) {
         push.sdf_mode = 1;
-        push.sdf_box = [
-            self.rect.loc.x as f32,
-            self.rect.loc.y as f32,
-            (self.rect.loc.x + self.rect.size.w) as f32,
-            (self.rect.loc.y + self.rect.size.h) as f32,
-        ];
+        push.sdf_box = rect_min_max(self.rect);
         push.sdf_radii = self.radii;
     }
 }
@@ -627,14 +622,7 @@ impl RoundedBoxEl {
             white_view,
             output_peak_nits_rgb,
         );
-        let loc = self.geometry.loc;
-        let size = self.geometry.size;
-        draw.push.sdf_box = [
-            loc.x as f32,
-            loc.y as f32,
-            (loc.x + size.w) as f32,
-            (loc.y + size.h) as f32,
-        ];
+        draw.push.sdf_box = rect_min_max(self.geometry);
         draw.push.sdf_radii = self.radii;
         match self.inset {
             Some(inset) => {
@@ -683,6 +671,68 @@ fn push_rounded_box_bands(
     }
 }
 
+/// Window / layer drop shadow — a Gaussian-blurred rounded box (Evan
+/// Wallace's analytic approximation, ported from niri's shadow shader),
+/// with the window region optionally cut out so translucent windows don't
+/// sit on their own shadow. One quad; never occludes.
+pub struct ShadowEl {
+    /// Stable cross-frame id (the owning `Shadow`'s allocated id).
+    pub id: ElementId,
+    /// Quad rect in logical pixels — the shadow box expanded by the blur
+    /// reach (3σ) on all sides.
+    pub geometry: Rectangle<f64, Logical>,
+    /// The box casting the shadow: window rect offset by the configured
+    /// shadow offset and grown by `spread`. Logical pixels.
+    pub shadow_box: Rectangle<f64, Logical>,
+    /// Per-corner radii of `shadow_box`, `[tl, tr, br, bl]` logical px.
+    /// The blur itself uses only `tl` (niri's single-radius limitation);
+    /// the low-sigma crisp path honors all four.
+    pub radii: [f32; 4],
+    /// Gaussian sigma in logical px (`softness / 2`, CSS box-shadow
+    /// convention). `< 0.1` renders a crisp rounded rect.
+    pub sigma: f32,
+    /// Cut-out (`draw-behind-window false`): the window's own rounded box,
+    /// inside which the shadow does not paint.
+    pub cutout: Option<SurfaceClip>,
+    pub color_bt2020_nits: [f32; 4],
+}
+
+impl ShadowEl {
+    pub fn to_draw(
+        &self,
+        project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        white_view: vk::ImageView,
+        output_peak_nits_rgb: [f32; 3],
+    ) -> ElementDraw {
+        let mut draw = solid_color_draw(
+            project(self.geometry),
+            self.color_bt2020_nits,
+            white_view,
+            output_peak_nits_rgb,
+        );
+        draw.push.sdf_mode = 3;
+        draw.push.sdf_box = rect_min_max(self.shadow_box);
+        draw.push.sdf_radii = self.radii;
+        draw.push.sdf_sigma = self.sigma;
+        if let Some(cutout) = &self.cutout {
+            draw.push.sdf_box2 = rect_min_max(cutout.rect);
+            draw.push.sdf_radii2 = cutout.radii;
+        }
+        draw
+    }
+}
+
+/// A logical rect as the `[x_min, y_min, x_max, y_max]` f32 quadruple the
+/// SDF push constants use.
+fn rect_min_max(r: Rectangle<f64, Logical>) -> [f32; 4] {
+    [
+        r.loc.x as f32,
+        r.loc.y as f32,
+        (r.loc.x + r.size.w) as f32,
+        (r.loc.y + r.size.h) as f32,
+    ]
+}
+
 /// Tagged dispatch over the element vocabulary. Callers build a
 /// `Vec<RenderEl>` from the layout walk; the render path calls
 /// [`RenderEl::lower`] on each to flatten into the [`ElementDraw`]
@@ -692,6 +742,7 @@ pub enum RenderEl {
     SolidColor(SolidColorEl),
     Border(BorderEl),
     RoundedBox(RoundedBoxEl),
+    Shadow(ShadowEl),
 }
 
 impl RenderEl {
@@ -702,6 +753,7 @@ impl RenderEl {
             Self::SolidColor(s) => s.id,
             Self::Border(b) => b.id,
             Self::RoundedBox(r) => r.id,
+            Self::Shadow(s) => s.id,
         }
     }
 
@@ -712,6 +764,7 @@ impl RenderEl {
             Self::SolidColor(s) => s.geometry,
             Self::Border(b) => b.geometry,
             Self::RoundedBox(r) => r.geometry,
+            Self::Shadow(s) => s.geometry,
         }
     }
 
@@ -733,6 +786,7 @@ impl RenderEl {
             Self::SolidColor(s) => s.color_bt2020_nits[3] *= factor,
             Self::Border(b) => b.color_bt2020_nits[3] *= factor,
             Self::RoundedBox(r) => r.color_bt2020_nits[3] *= factor,
+            Self::Shadow(s) => s.color_bt2020_nits[3] *= factor,
         }
     }
 
@@ -784,6 +838,13 @@ impl RenderEl {
                 r.radii = r.radii.map(|v| v * factor as f32);
                 r.inset = r.inset.map(|inset| inset.map(|v| v * factor));
             }
+            Self::Shadow(s) => {
+                s.geometry = scaled(s.geometry, center, factor);
+                s.shadow_box = scaled(s.shadow_box, center, factor);
+                s.radii = s.radii.map(|v| v * factor as f32);
+                s.sigma *= factor as f32;
+                s.cutout = s.cutout.map(|c| scaled_clip(c, center, factor));
+            }
         }
     }
 
@@ -806,7 +867,7 @@ impl RenderEl {
                     s.clip = Some(clip);
                 }
             }
-            Self::Border(_) | Self::RoundedBox(_) => {}
+            Self::Border(_) | Self::RoundedBox(_) | Self::Shadow(_) => {}
         }
     }
 
@@ -860,6 +921,8 @@ impl RenderEl {
                 }
                 push_rounded_box_bands(r.geometry, r.radii, out);
             }
+            // A shadow is translucent everywhere — never an occluder.
+            Self::Shadow(_) => {}
         }
     }
 
@@ -897,6 +960,24 @@ impl RenderEl {
                     .iter()
                     .fold(c, |h, t| (h ^ t.to_bits()).wrapping_mul(FNV_PRIME))
             }
+            Self::Shadow(s) => {
+                // Shadow box + cut-out fingerprint relative to the quad
+                // origin, like the surface clip: moves stay pure geometry
+                // diffs, radius/sigma/color changes re-damage in place.
+                let origin = s.geometry.loc;
+                let rel = [
+                    (s.shadow_box.loc.x - origin.x) as f32,
+                    (s.shadow_box.loc.y - origin.y) as f32,
+                    s.shadow_box.size.w as f32,
+                    s.shadow_box.size.h as f32,
+                    s.sigma,
+                ];
+                let c = fnv_f32s(&s.color_bt2020_nits) ^ fnv_f32s(&s.radii) ^ fnv_f32s(&rel);
+                match &s.cutout {
+                    None => c,
+                    Some(cutout) => cutout.mix_token(c, origin),
+                }
+            }
         }
     }
 
@@ -912,6 +993,7 @@ impl RenderEl {
             Self::SolidColor(s) => out.push(s.to_draw(project, white_view, output_peak_nits_rgb)),
             Self::Border(b) => b.push_draws(project, white_view, output_peak_nits_rgb, out),
             Self::RoundedBox(r) => out.push(r.to_draw(project, white_view, output_peak_nits_rgb)),
+            Self::Shadow(s) => out.push(s.to_draw(project, white_view, output_peak_nits_rgb)),
         }
     }
 }
@@ -1123,6 +1205,77 @@ mod tests {
             rect: rect(x, y, w, h),
             radii: [radius; 4],
         }
+    }
+
+    fn shadow(quad: Rectangle<f64, Logical>, cutout: Option<SurfaceClip>) -> RenderEl {
+        RenderEl::Shadow(ShadowEl {
+            id: ElementId::alloc(),
+            geometry: quad,
+            shadow_box: rect(
+                quad.loc.x + 45.0,
+                quad.loc.y + 45.0,
+                quad.size.w - 90.0,
+                quad.size.h - 90.0,
+            ),
+            radii: [16.0; 4],
+            sigma: 15.0,
+            cutout,
+            color_bt2020_nits: [0.0, 0.0, 0.0, 0.47],
+        })
+    }
+
+    /// A shadow never occludes, even at alpha 1 with no cut-out.
+    #[test]
+    fn shadow_never_occludes() {
+        let els = vec![
+            solid(rect(30.0, 30.0, 40.0, 40.0), 1.0),
+            shadow(rect(0.0, 0.0, 200.0, 200.0), None),
+        ];
+        assert_eq!(cull_occluded(&els), vec![true, true]);
+    }
+
+    /// Shadow push-constant mapping: mode 3, shadow box, sigma, cut-out.
+    #[test]
+    fn shadow_to_draw_push_fields() {
+        let project = make_projector(Size::from((400.0, 300.0)));
+        let RenderEl::Shadow(s) = shadow(
+            rect(0.0, 0.0, 200.0, 200.0),
+            Some(clip(50.0, 50.0, 100.0, 100.0, 12.0)),
+        ) else {
+            unreachable!()
+        };
+        let draw = s.to_draw(&project, vk::ImageView::null(), [1000.0; 3]);
+        assert_eq!(draw.push.sdf_mode, 3);
+        assert_eq!(draw.push.sdf_box, [45.0, 45.0, 155.0, 155.0]);
+        assert_eq!(draw.push.sdf_radii, [16.0; 4]);
+        assert_eq!(draw.push.sdf_sigma, 15.0);
+        assert_eq!(draw.push.sdf_box2, [50.0, 50.0, 150.0, 150.0]);
+        assert_eq!(draw.push.sdf_radii2, [12.0; 4]);
+
+        // Without a cut-out the box2 stays empty (max == min == 0 disables it).
+        let RenderEl::Shadow(s) = shadow(rect(0.0, 0.0, 200.0, 200.0), None) else {
+            unreachable!()
+        };
+        let draw = s.to_draw(&project, vk::ImageView::null(), [1000.0; 3]);
+        assert_eq!(draw.push.sdf_box2, [0.0; 4]);
+    }
+
+    /// Shadow content token is origin-relative (moves are pure geometry
+    /// diffs) and sensitive to sigma.
+    #[test]
+    fn shadow_token_origin_relative_and_sigma_sensitive() {
+        let at = |loc: f64, sigma: f32| {
+            let RenderEl::Shadow(mut s) = shadow(
+                rect(loc, loc, 200.0, 200.0),
+                Some(clip(loc + 50.0, loc + 50.0, 100.0, 100.0, 12.0)),
+            ) else {
+                unreachable!()
+            };
+            s.sigma = sigma;
+            RenderEl::Shadow(s).content_token()
+        };
+        assert_eq!(at(0.0, 15.0), at(70.0, 15.0));
+        assert_ne!(at(0.0, 15.0), at(0.0, 20.0));
     }
 
     /// `would_clip` (niri's `will_clip`): false only for elements inside the

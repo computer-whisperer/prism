@@ -62,7 +62,9 @@ pub struct DecodePush {
     /// Rounded-corner SDF coverage mode (see `shaders/decode.frag`):
     /// 0 = off (sdf fields ignored), 1 = fill (alpha ×= rounded-box
     /// coverage), 2 = ring (alpha ×= outer − inner coverage; a hollow
-    /// border band of per-side thickness `sdf_inset`).
+    /// border band of per-side thickness `sdf_inset`), 3 = shadow
+    /// (Gaussian-blurred rounded box per `sdf_sigma`, minus the
+    /// `sdf_box2`/`sdf_radii2` cut-out).
     pub sdf_mode: i32,
     /// Logical size of the output view — lets the vertex shader recover
     /// fragment positions in logical pixels for the SDF. Set centrally by
@@ -79,14 +81,23 @@ pub struct DecodePush {
     /// Ring mode only: per-side band thickness in logical pixels —
     /// top, right, bottom, left (CSS order, matches `BorderEl::thickness`).
     pub sdf_inset: [f32; 4],
+    /// Shadow mode only: cut-out rounded box (the window rect the shadow
+    /// must not paint behind), logical px min/max. Empty (max ≤ min)
+    /// disables the cut-out.
+    pub sdf_box2: [f32; 4],
+    /// Shadow mode only: per-corner radii of the cut-out box.
+    pub sdf_radii2: [f32; 4],
+    /// Shadow mode only: Gaussian sigma in logical px (softness / 2, the
+    /// CSS box-shadow convention). Below 0.1 → crisp rounded rect.
+    pub sdf_sigma: f32,
 }
 
 /// The GLSL `Push` block lays out to exactly this size under std430 rules;
 /// a drifting Rust-side struct (reordered fields, accidental padding) would
-/// silently corrupt every per-element parameter, so pin it. 208 bytes is
+/// silently corrupt every per-element parameter, so pin it. 244 bytes is
 /// within the 256-byte `maxPushConstantsSize` of all desktop drivers
 /// (RADV / NVIDIA / ANV / llvmpipe).
-const _: () = assert!(std::mem::size_of::<DecodePush>() == 208);
+const _: () = assert!(std::mem::size_of::<DecodePush>() == 244);
 
 impl DecodePush {
     pub fn identity_srgb(dst: [f32; 4], src: [f32; 4]) -> Self {
@@ -111,6 +122,9 @@ impl DecodePush {
             sdf_box: [0.0; 4],
             sdf_radii: [0.0; 4],
             sdf_inset: [0.0; 4],
+            sdf_box2: [0.0; 4],
+            sdf_radii2: [0.0; 4],
+            sdf_sigma: 0.0,
         }
     }
 
@@ -136,6 +150,9 @@ impl DecodePush {
             sdf_box: [0.0; 4],
             sdf_radii: [0.0; 4],
             sdf_inset: [0.0; 4],
+            sdf_box2: [0.0; 4],
+            sdf_radii2: [0.0; 4],
+            sdf_sigma: 0.0,
         }
     }
 }
