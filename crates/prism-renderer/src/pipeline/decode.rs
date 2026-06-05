@@ -59,7 +59,34 @@ pub struct DecodePush {
     /// Placed last (after the trailing `vec4`) so it needs no std430 alignment
     /// padding.
     pub alpha_mode: i32,
+    /// Rounded-corner SDF coverage mode (see `shaders/decode.frag`):
+    /// 0 = off (sdf fields ignored), 1 = fill (alpha ×= rounded-box
+    /// coverage), 2 = ring (alpha ×= outer − inner coverage; a hollow
+    /// border band of per-side thickness `sdf_inset`).
+    pub sdf_mode: i32,
+    /// Logical size of the output view — lets the vertex shader recover
+    /// fragment positions in logical pixels for the SDF. Set centrally by
+    /// `lower_elements` on every draw; direct `ElementDraw` constructors
+    /// (tests, capture probes) leave it zero, which is fine for
+    /// `sdf_mode == 0`. Pairs with `sdf_mode` (two `i32`s then a `vec2`)
+    /// so the trailing `vec4`s stay 16-aligned without padding.
+    pub view_size_log: [f32; 2],
+    /// Rounded box in output-space logical pixels: x_min, y_min, x_max, y_max.
+    pub sdf_box: [f32; 4],
+    /// Per-corner radii in logical pixels: top-left, top-right, bottom-right,
+    /// bottom-left (matches `prism_config::CornerRadius` order).
+    pub sdf_radii: [f32; 4],
+    /// Ring mode only: per-side band thickness in logical pixels —
+    /// top, right, bottom, left (CSS order, matches `BorderEl::thickness`).
+    pub sdf_inset: [f32; 4],
 }
+
+/// The GLSL `Push` block lays out to exactly this size under std430 rules;
+/// a drifting Rust-side struct (reordered fields, accidental padding) would
+/// silently corrupt every per-element parameter, so pin it. 208 bytes is
+/// within the 256-byte `maxPushConstantsSize` of all desktop drivers
+/// (RADV / NVIDIA / ANV / llvmpipe).
+const _: () = assert!(std::mem::size_of::<DecodePush>() == 208);
 
 impl DecodePush {
     pub fn identity_srgb(dst: [f32; 4], src: [f32; 4]) -> Self {
@@ -79,6 +106,11 @@ impl DecodePush {
             // from the buffer fourcc. Direct callers (the #48 smoke test) feed
             // an opaque texture, where forcing alpha = 1.0 is a no-op.
             alpha_mode: 0,
+            sdf_mode: 0,
+            view_size_log: [0.0; 2],
+            sdf_box: [0.0; 4],
+            sdf_radii: [0.0; 4],
+            sdf_inset: [0.0; 4],
         }
     }
 
@@ -99,6 +131,11 @@ impl DecodePush {
             // 1×1 white texel is opaque (alpha = 1.0); the element's own alpha
             // rides `tint.a`, which is applied independently of this mode.
             alpha_mode: 0,
+            sdf_mode: 0,
+            view_size_log: [0.0; 2],
+            sdf_box: [0.0; 4],
+            sdf_radii: [0.0; 4],
+            sdf_inset: [0.0; 4],
         }
     }
 }

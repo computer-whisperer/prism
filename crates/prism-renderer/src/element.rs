@@ -100,6 +100,7 @@ pub fn lower_elements(
     output_peak_nits_rgb: [f32; 3],
 ) -> LoweredFrame {
     let project = make_projector(view_size);
+    let view_size_log = [view_size.w as f32, view_size.h as f32];
     let visible = cull_occluded(elements);
     let mut draws = Vec::with_capacity(elements.len());
     let mut meta = Vec::with_capacity(elements.len());
@@ -112,7 +113,14 @@ pub fn lower_elements(
             content_token: el.content_token(),
         });
         if visible[i] {
+            let start = draws.len();
             el.lower(&project, white_view, output_peak_nits_rgb, &mut draws);
+            // The vertex shader inverts the projection to recover logical
+            // pixel positions for the rounded-corner SDF; thread the view
+            // size into every draw here rather than through each `to_draw`.
+            for draw in &mut draws[start..] {
+                draw.push.view_size_log = view_size_log;
+            }
         }
     }
     LoweredFrame { draws, meta }
@@ -416,10 +424,9 @@ fn solid_color_draw(
 /// Thicknesses are in clip-space units (already projected from logical
 /// pixels by the caller). Zero-thickness sides emit no draws.
 ///
-/// Rounded corners: not yet supported — when added, a per-corner SDF
-/// fragment shader and a real radius field will land here as a separate
-/// variant or extra fields. For now the border is sharp-cornered, which
-/// matches niri's default config.
+/// Sharp corners only — the stripes rasterize exactly the painted band, so
+/// this stays the cheap path for unrounded rings. Rounded rings use
+/// [`RoundedBoxEl`], whose SDF quad covers the full bounding box.
 pub struct BorderEl {
     /// Stable cross-frame id (the owning `FocusRing`'s allocated id). The four
     /// lowered stripes share it — the border is one element for damage.
@@ -502,6 +509,64 @@ impl BorderEl {
     }
 }
 
+/// Rounded-corner box — a filled rounded rect, or a hollow rounded ring
+/// (border / focus ring around a rounded window). One quad; the decode
+/// shader's per-corner SDF computes coverage per fragment and folds it into
+/// alpha (see `sdf_coverage` in `shaders/decode.frag`).
+///
+/// Used only when at least one corner radius is non-zero: the sharp case
+/// stays on [`BorderEl`] / [`SolidColorEl`], whose stripe/quad draws
+/// rasterize only the painted area instead of the full bounding box
+/// (niri makes the same split — solid buffers unless the border shader is
+/// actually needed).
+pub struct RoundedBoxEl {
+    /// Stable cross-frame id (the owning `FocusRing`'s allocated id).
+    pub id: ElementId,
+    /// Outer rect in logical pixels.
+    pub geometry: Rectangle<f64, Logical>,
+    /// Per-corner radii of the outer rect in logical pixels, clockwise from
+    /// top-left: `[tl, tr, br, bl]` (matches `prism_config::CornerRadius`).
+    /// The shader clamps each to half the shorter side.
+    pub radii: [f32; 4],
+    /// `Some([top, right, bottom, left])` (CSS order, logical pixels) draws a
+    /// hollow ring of that per-side thickness; `None` draws a filled box.
+    pub inset: Option<[f64; 4]>,
+    pub color_bt2020_nits: [f32; 4],
+}
+
+impl RoundedBoxEl {
+    pub fn to_draw(
+        &self,
+        project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
+        white_view: vk::ImageView,
+        output_peak_nits_rgb: [f32; 3],
+    ) -> ElementDraw {
+        let mut draw = solid_color_draw(
+            project(self.geometry),
+            self.color_bt2020_nits,
+            white_view,
+            output_peak_nits_rgb,
+        );
+        let loc = self.geometry.loc;
+        let size = self.geometry.size;
+        draw.push.sdf_box = [
+            loc.x as f32,
+            loc.y as f32,
+            (loc.x + size.w) as f32,
+            (loc.y + size.h) as f32,
+        ];
+        draw.push.sdf_radii = self.radii;
+        match self.inset {
+            Some(inset) => {
+                draw.push.sdf_mode = 2;
+                draw.push.sdf_inset = inset.map(|v| v as f32);
+            }
+            None => draw.push.sdf_mode = 1,
+        }
+        draw
+    }
+}
+
 /// Tagged dispatch over the element vocabulary. Callers build a
 /// `Vec<RenderEl>` from the layout walk; the render path calls
 /// [`RenderEl::lower`] on each to flatten into the [`ElementDraw`]
@@ -510,6 +575,7 @@ pub enum RenderEl {
     Surface(SurfaceEl),
     SolidColor(SolidColorEl),
     Border(BorderEl),
+    RoundedBox(RoundedBoxEl),
 }
 
 impl RenderEl {
@@ -519,6 +585,7 @@ impl RenderEl {
             Self::Surface(s) => s.id,
             Self::SolidColor(s) => s.id,
             Self::Border(b) => b.id,
+            Self::RoundedBox(r) => r.id,
         }
     }
 
@@ -528,6 +595,7 @@ impl RenderEl {
             Self::Surface(s) => s.geometry,
             Self::SolidColor(s) => s.geometry,
             Self::Border(b) => b.geometry,
+            Self::RoundedBox(r) => r.geometry,
         }
     }
 
@@ -548,6 +616,7 @@ impl RenderEl {
             }
             Self::SolidColor(s) => s.color_bt2020_nits[3] *= factor,
             Self::Border(b) => b.color_bt2020_nits[3] *= factor,
+            Self::RoundedBox(r) => r.color_bt2020_nits[3] *= factor,
         }
     }
 
@@ -582,6 +651,11 @@ impl RenderEl {
                 b.geometry = scaled(b.geometry, center, factor);
                 b.thickness = b.thickness.map(|t| t * factor);
             }
+            Self::RoundedBox(r) => {
+                r.geometry = scaled(r.geometry, center, factor);
+                r.radii = r.radii.map(|v| v * factor as f32);
+                r.inset = r.inset.map(|inset| inset.map(|v| v * factor));
+            }
         }
     }
 
@@ -595,6 +669,10 @@ impl RenderEl {
     ///   (`alpha == 1.0`); a translucent fill occludes nothing.
     /// - `Border`: nothing — a border is hollow stripes, so its bounding box is
     ///   mostly transparent and never a safe occluder.
+    /// - `RoundedBox`: a ring occludes nothing; a fully-opaque fill occludes
+    ///   the cross of two bands that excludes the corner squares (and an extra
+    ///   1-logical-px margin for the SDF's anti-aliased edge, which is
+    ///   translucent even on straight runs at fractional alignment).
     pub fn push_opaque_regions(&self, out: &mut Vec<Rectangle<f64, Logical>>) {
         match self {
             Self::Surface(s) => out.extend_from_slice(&s.opaque),
@@ -604,6 +682,36 @@ impl RenderEl {
                 }
             }
             Self::Border(_) => {}
+            Self::RoundedBox(r) => {
+                if r.inset.is_some() || r.color_bt2020_nits[3] < 1.0 {
+                    return;
+                }
+                let g = r.geometry;
+                let [tl, tr, br, bl] = r.radii.map(f64::from);
+                // One logical px covers the ≤ 1-physical-px AA band.
+                const AA: f64 = 1.0;
+                // Horizontal band: full width, between the corner rows.
+                let h_band = Rectangle::<f64, Logical>::new(
+                    Point::from((g.loc.x + AA, g.loc.y + tl.max(tr) + AA)),
+                    Size::from((
+                        g.size.w - 2.0 * AA,
+                        g.size.h - tl.max(tr) - bl.max(br) - 2.0 * AA,
+                    )),
+                );
+                // Vertical band: full height, between the corner columns.
+                let v_band = Rectangle::<f64, Logical>::new(
+                    Point::from((g.loc.x + tl.max(bl) + AA, g.loc.y + AA)),
+                    Size::from((
+                        g.size.w - tl.max(bl) - tr.max(br) - 2.0 * AA,
+                        g.size.h - 2.0 * AA,
+                    )),
+                );
+                for band in [h_band, v_band] {
+                    if band.size.w > 0.0 && band.size.h > 0.0 {
+                        out.push(band);
+                    }
+                }
+            }
         }
     }
 
@@ -621,6 +729,14 @@ impl RenderEl {
                     .iter()
                     .fold(c, |h, t| (h ^ t.to_bits()).wrapping_mul(FNV_PRIME))
             }
+            Self::RoundedBox(r) => {
+                let c = fnv_f32s(&r.color_bt2020_nits);
+                let c = fnv_f32s(&r.radii) ^ c;
+                r.inset
+                    .unwrap_or([-1.0; 4]) // distinct from any real (≥ 0) inset
+                    .iter()
+                    .fold(c, |h, t| (h ^ t.to_bits()).wrapping_mul(FNV_PRIME))
+            }
         }
     }
 
@@ -635,6 +751,7 @@ impl RenderEl {
             Self::Surface(s) => out.push(s.to_draw(project, output_peak_nits_rgb)),
             Self::SolidColor(s) => out.push(s.to_draw(project, white_view, output_peak_nits_rgb)),
             Self::Border(b) => b.push_draws(project, white_view, output_peak_nits_rgb, out),
+            Self::RoundedBox(r) => out.push(r.to_draw(project, white_view, output_peak_nits_rgb)),
         }
     }
 }
@@ -709,6 +826,16 @@ mod tests {
         })
     }
 
+    fn rounded(geo: Rectangle<f64, Logical>, inset: Option<[f64; 4]>, alpha: f32) -> RenderEl {
+        RenderEl::RoundedBox(RoundedBoxEl {
+            id: ElementId::alloc(),
+            geometry: geo,
+            radii: [20.0; 4],
+            inset,
+            color_bt2020_nits: [10.0, 10.0, 10.0, alpha],
+        })
+    }
+
     // Element vecs are back-to-front: index 0 paints behind the last.
 
     #[test]
@@ -766,6 +893,67 @@ mod tests {
             surface(rect(0.0, 0.0, 100.0, 100.0), vec![]),
         ];
         assert_eq!(cull_occluded(&els), vec![true, true]);
+    }
+
+    /// A filled opaque rounded box occludes its inner cross (between the
+    /// corner squares, minus the AA margin) but not its corner regions.
+    #[test]
+    fn rounded_fill_occludes_center_not_corners() {
+        let center = vec![
+            solid(rect(30.0, 30.0, 40.0, 40.0), 1.0),
+            rounded(rect(0.0, 0.0, 100.0, 100.0), None, 1.0),
+        ];
+        assert_eq!(cull_occluded(&center), vec![false, true]);
+
+        let corner = vec![
+            solid(rect(0.0, 0.0, 10.0, 10.0), 1.0),
+            rounded(rect(0.0, 0.0, 100.0, 100.0), None, 1.0),
+        ];
+        assert_eq!(cull_occluded(&corner), vec![true, true]);
+    }
+
+    #[test]
+    fn rounded_ring_never_occludes() {
+        let els = vec![
+            solid(rect(30.0, 30.0, 40.0, 40.0), 1.0),
+            rounded(rect(0.0, 0.0, 100.0, 100.0), Some([2.0; 4]), 1.0),
+        ];
+        assert_eq!(cull_occluded(&els), vec![true, true]);
+    }
+
+    #[test]
+    fn translucent_rounded_fill_occludes_nothing() {
+        let els = vec![
+            solid(rect(30.0, 30.0, 40.0, 40.0), 1.0),
+            rounded(rect(0.0, 0.0, 100.0, 100.0), None, 0.5),
+        ];
+        assert_eq!(cull_occluded(&els), vec![true, true]);
+    }
+
+    /// Field mapping of the SDF push constants: box rect in logical px,
+    /// fill vs ring mode, per-side inset.
+    #[test]
+    fn rounded_box_to_draw_push_fields() {
+        let project = make_projector(Size::from((200.0, 100.0)));
+
+        let RenderEl::RoundedBox(fill) = rounded(rect(10.0, 20.0, 80.0, 40.0), None, 1.0) else {
+            unreachable!()
+        };
+        let draw = fill.to_draw(&project, vk::ImageView::null(), [1000.0; 3]);
+        assert_eq!(draw.push.sdf_mode, 1);
+        assert_eq!(draw.push.sdf_box, [10.0, 20.0, 90.0, 60.0]);
+        assert_eq!(draw.push.sdf_radii, [20.0; 4]);
+
+        let RenderEl::RoundedBox(ring) = rounded(
+            rect(10.0, 20.0, 80.0, 40.0),
+            Some([1.0, 2.0, 3.0, 4.0]),
+            1.0,
+        ) else {
+            unreachable!()
+        };
+        let draw = ring.to_draw(&project, vk::ImageView::null(), [1000.0; 3]);
+        assert_eq!(draw.push.sdf_mode, 2);
+        assert_eq!(draw.push.sdf_inset, [1.0, 2.0, 3.0, 4.0]);
     }
 
     /// Two opaque halves sharing an exact edge tile the background; their union

@@ -67,9 +67,31 @@ layout(push_constant) uniform Push {
     //                       run on straight color) and re-premultiply at output.
     // Trailing scalar after the vec4, so no std430 padding is needed.
     int alpha_mode;
+    // Rounded-corner SDF coverage (see sdf_coverage below):
+    //   0 = off  — sdf_* fields ignored.
+    //   1 = fill — multiply alpha by the coverage of the rounded box
+    //              (sdf_box, sdf_radii). Filled rounded rects and, later,
+    //              window-surface corner clipping.
+    //   2 = ring — multiply alpha by (outer coverage − inner coverage):
+    //              a hollow border band of per-side thickness sdf_inset
+    //              inside sdf_box. Inner corner radii are derived as
+    //              max(outer − adjacent insets, 0), matching niri.
+    int sdf_mode;
+    // Logical size of the output view; lets the vertex shader recover the
+    // fragment's position in logical pixels from clip space (v_pos_log).
+    vec2 view_size_log;
+    // Rounded box in output-space logical pixels: x_min, y_min, x_max, y_max.
+    vec4 sdf_box;
+    // Per-corner radii in logical pixels: top-left, top-right, bottom-right,
+    // bottom-left (clockwise from top-left; matches prism-config CornerRadius).
+    vec4 sdf_radii;
+    // Ring mode only: per-side band thickness in logical pixels,
+    // top, right, bottom, left (CSS order; matches BorderEl::thickness).
+    vec4 sdf_inset;
 } push;
 
 layout(location = 0) in vec2 v_uv;
+layout(location = 1) in vec2 v_pos_log;
 layout(location = 0) out vec4 out_color;
 
 // sRGB inverse EOTF (encoded → linear), per IEC 61966-2-1.
@@ -98,6 +120,42 @@ vec3 pq_eotf(vec3 v) {
     vec3 den = c2 - c3 * vm;
     vec3 y = pow(num / den, vec3(1.0 / m1));
     return y * 10000.0;
+}
+
+// Signed distance to a rounded box centered at the origin. `p` is the sample
+// position relative to the box center, `b` the half-size, `r` the per-corner
+// radii (top-left, top-right, bottom-right, bottom-left). Quadrant-aware
+// radius selection, then the classic Inigo Quilez rounded-box SDF. The caller
+// clamps each radius to the half shorter side, so the field never degenerates.
+// (Ported from damascene's rounded_rect.wgsl.)
+float sdf_rounded_box(vec2 p, vec2 b, vec4 r) {
+    float r_top = p.x > 0.0 ? r.y : r.x; // tr : tl
+    float r_bot = p.x > 0.0 ? r.z : r.w; // br : bl
+    float rd = p.y < 0.0 ? r_top : r_bot;
+    vec2 q = abs(p) - b + vec2(rd);
+    return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0))) - rd;
+}
+
+// Pixel coverage of the rounded box `box` (logical px, min/max corners) with
+// per-corner radii `radii`, sampled at `pos` (logical px).
+//
+// Anti-aliasing: box-filter estimate `0.5 − d/aa` over the SDF, with `aa` the
+// L2 norm of the screen-space SDF gradient — NOT fwidth's L1 norm, which is
+// √2 wider at 45° and visibly fattens curved corners (damascene's lesson).
+// Since `d` is in logical px and derivatives are per *physical* pixel, the
+// gradient magnitude is exactly one physical pixel expressed in logical units,
+// so the AA band is one physical pixel at any output scale. The box-filter
+// form (rather than smoothstep) makes pixel-aligned straight edges resolve to
+// exact 0/1 coverage — a radius-0 box rasterizes crisp, identical to a plain
+// quad.
+float sdf_coverage(vec2 pos, vec4 box, vec4 radii) {
+    vec2 half_size = max((box.zw - box.xy) * 0.5, vec2(0.0));
+    vec2 center = (box.xy + box.zw) * 0.5;
+    float max_r = min(half_size.x, half_size.y);
+    vec4 r = clamp(radii, vec4(0.0), vec4(max_r));
+    float d = sdf_rounded_box(pos - center, half_size, r);
+    float aa = max(length(vec2(dFdx(d), dFdy(d))), 1e-4);
+    return clamp(0.5 - d / aa, 0.0, 1.0);
 }
 
 // Recover nonlinear R'G'B' from a limited-range Y'CbCr buffer. Luma is in
@@ -199,6 +257,36 @@ void main() {
     // hues through the white-texture path.
     bt2020 *= push.tint.rgb;
     float alpha = sampled.a * push.tint.a;
+
+    // Rounded-corner SDF coverage folds into alpha; the premultiplied output
+    // below then scales color by it, so the AA edge blends correctly in
+    // linear light. The branch is on a push constant — uniform across the
+    // draw — so the derivatives inside sdf_coverage are well-defined.
+    if (push.sdf_mode == 1) {
+        alpha *= sdf_coverage(v_pos_log, push.sdf_box, push.sdf_radii);
+    } else if (push.sdf_mode == 2) {
+        float outer = sdf_coverage(v_pos_log, push.sdf_box, push.sdf_radii);
+        // Inner box: outer inset per side (top, right, bottom, left).
+        vec4 inset = push.sdf_inset;
+        vec4 inner_box = vec4(
+            push.sdf_box.x + inset.w,
+            push.sdf_box.y + inset.x,
+            push.sdf_box.z - inset.y,
+            push.sdf_box.w - inset.z);
+        // Inner corner radius = outer minus the larger adjacent inset,
+        // floored at zero (niri: max(outer_radius - border_width, 0)).
+        vec4 inner_radii = max(
+            push.sdf_radii - vec4(
+                max(inset.x, inset.w),  // tl: top, left
+                max(inset.x, inset.y),  // tr: top, right
+                max(inset.z, inset.y),  // br: bottom, right
+                max(inset.z, inset.w)), // bl: bottom, left
+            vec4(0.0));
+        float inner = inner_box.z > inner_box.x && inner_box.w > inner_box.y
+            ? sdf_coverage(v_pos_log, inner_box, inner_radii)
+            : 0.0;
+        alpha *= clamp(outer - inner, 0.0, 1.0);
+    }
 
     // Display-referred clamp: the intermediate represents what the
     // panel can actually emit. Values authored beyond panel peak

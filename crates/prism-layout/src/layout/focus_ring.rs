@@ -1,22 +1,23 @@
 //! Focus / border ring around tiles.
 //!
-//! Heavily simplified from `niri/src/layout/focus_ring.rs`: niri's version
-//! uses a custom GLES `BorderRenderElement` shader to draw per-corner
-//! rounded gradient borders with optional urgent / active colour state and
-//! gradient fades. We don't have a Vulkan equivalent of that shader yet,
-//! so this port renders sharp-cornered, single-colour rings via
-//! [`prism_renderer::BorderEl`].
+//! Simplified from `niri/src/layout/focus_ring.rs`: niri's version uses a
+//! custom GLES `BorderRenderElement` shader (eight stripe/corner patches);
+//! this port renders single-colour rings — sharp rings via the cheap
+//! four-stripe [`prism_renderer::BorderEl`], rounded rings / fills via the
+//! SDF-backed [`prism_renderer::RoundedBoxEl`] (one quad, per-corner
+//! coverage in the decode shader). The split mirrors niri's
+//! `use_border_shader` heuristic: only pay the full-bounding-box quad when
+//! a corner radius actually asks for it.
 //!
-//! Visual deficit vs niri (revisit when the Vulkan border shader lands):
-//!   - no rounded corners (config `geometry-corner-radius` ignored here)
+//! Visual deficit vs niri (revisit later):
 //!   - no gradients (active_gradient / inactive_gradient / urgent_gradient
 //!     all collapse to the corresponding flat colour)
-//!   - no thicken-corners hack (we don't paint corners separately)
+//!   - no thicken-corners hack (the SDF has no corner-seam bleed to hide)
 //!
 //! API preserved so the layout port (`tile.rs`) compiles unchanged.
 
 use prism_frame::ElementId;
-use prism_renderer::{srgb_to_bt2020_nits, BorderEl, RenderEl};
+use prism_renderer::{srgb_to_bt2020_nits, BorderEl, RenderEl, RoundedBoxEl};
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::utils::round_logical_in_physical_max1;
@@ -54,10 +55,13 @@ struct CachedGeometry {
     /// used as a backdrop behind windows without SSDs). Niri's name; we
     /// keep it for porting fidelity.
     is_border: bool,
-    /// Per-side ring thickness in logical pixels. All four are `width`
-    /// for sharp-cornered, unrounded rings, but we keep them as four
-    /// fields so the future rounded-corner port can drop in cleanly.
+    /// Per-side ring thickness in logical pixels. All four are `width`;
+    /// kept as four fields to match `BorderEl::thickness` /
+    /// `RoundedBoxEl::inset`.
     thickness_logical: [f64; 4],
+    /// Per-corner radii of the ring's *outer* rect in logical pixels,
+    /// `[tl, tr, br, bl]`. All zero → sharp ring (stripe path).
+    radii: [f32; 4],
 }
 
 impl FocusRing {
@@ -96,9 +100,10 @@ impl FocusRing {
     /// Recompute the ring's geometry from the surrounding tile state.
     /// Called once per frame per tile.
     ///
-    /// `view_rect` and `radius` are accepted to match niri's signature
-    /// (for future rounded-corner / gradient support) but currently
-    /// ignored.
+    /// `radius` is the radius of the ring's *outer* corners — the caller
+    /// (tile.rs) has already expanded the window's `geometry-corner-radius`
+    /// by the border / ring widths, niri-style. `view_rect` is accepted to
+    /// match niri's signature (future gradient support) but ignored.
     #[allow(clippy::too_many_arguments)] // mirrors niri's signature
     pub fn update_render_elements(
         &mut self,
@@ -107,7 +112,7 @@ impl FocusRing {
         is_border: bool,
         is_urgent: bool,
         _view_rect: Rectangle<f64, Logical>,
-        _radius: prism_config::CornerRadius,
+        radius: prism_config::CornerRadius,
         scale: f64,
         alpha: f32,
     ) {
@@ -138,6 +143,16 @@ impl FocusRing {
             Size::from((win_size.w + 2. * w, win_size.h + 2. * w)),
         );
 
+        // Overlapping corner radii shrink CSS-style to fit the outer rect
+        // (niri does the same against its full_size).
+        let radius = radius.fit_to(outer.size.w as f32, outer.size.h as f32);
+        let radii = [
+            radius.top_left,
+            radius.top_right,
+            radius.bottom_right,
+            radius.bottom_left,
+        ];
+
         // Snap thickness to physical-pixel multiples so 1-px rings don't
         // disappear under fractional scaling.
         let snapped = round_logical_in_physical_max1(scale, w);
@@ -148,6 +163,7 @@ impl FocusRing {
             color_bt2020_nits,
             is_border,
             thickness_logical,
+            radii,
         });
     }
 
@@ -161,7 +177,20 @@ impl FocusRing {
 
         let outer_logical = Rectangle::new(cached.outer.loc + location, cached.outer.size);
 
-        if cached.is_border {
+        // Rounded rings/fills go through the SDF quad; sharp ones keep the
+        // cheaper stripe / plain-quad elements (which also rasterize only the
+        // painted area and, for the fill, occlude their full rect).
+        let rounded = cached.radii.iter().any(|r| *r > 0.0);
+
+        if rounded {
+            out.push(RenderEl::RoundedBox(RoundedBoxEl {
+                id: self.id,
+                geometry: outer_logical,
+                radii: cached.radii,
+                inset: cached.is_border.then_some(cached.thickness_logical),
+                color_bt2020_nits: cached.color_bt2020_nits,
+            }));
+        } else if cached.is_border {
             out.push(RenderEl::Border(BorderEl {
                 id: self.id,
                 geometry: outer_logical,

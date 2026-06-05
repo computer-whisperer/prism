@@ -22,9 +22,19 @@ layout(push_constant) uniform Push {
     int transfer;         // see decode.frag
     int yuv;              // see decode.frag (unused here)
     int yuv_matrix;       // see decode.frag (unused here)
+    vec4 output_peak_nits_rgba; // see decode.frag (unused here)
+    int alpha_mode;       // see decode.frag (unused here)
+    int sdf_mode;         // see decode.frag (unused here)
+    // Logical size of the output view. The projector maps logical → clip as
+    // clip = 2·log/view − 1, so the inverse below recovers the vertex (and
+    // thus, interpolated, the fragment) position in logical pixels for the
+    // rounded-corner SDF. Zero for draws with sdf_mode == 0; v_pos_log is
+    // then a constant 0 and the fragment shader ignores it.
+    vec2 view_size_log;
 } push;
 
 layout(location = 0) out vec2 v_uv;
+layout(location = 1) out vec2 v_pos_log;
 
 void main() {
     // Triangle strip: (0,0), (1,0), (0,1), (1,1).
@@ -33,4 +43,5 @@ void main() {
     vec2 src_uv = mix(push.src_rect_uv.xy, push.src_rect_uv.zw, corner);
     gl_Position = vec4(dst_xy, 0.0, 1.0);
     v_uv = src_uv;
+    v_pos_log = (dst_xy * 0.5 + 0.5) * push.view_size_log;
 }
