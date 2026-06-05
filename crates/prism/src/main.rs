@@ -8,6 +8,7 @@ use prism_renderer::vk;
 use tracing_subscriber::EnvFilter;
 
 mod ipc;
+mod watcher;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -65,6 +66,17 @@ fn main() -> Result<()> {
     result
 }
 
+/// Startup config load result: the config itself plus what the file
+/// watcher needs to keep watching it (resolved path + include files).
+struct LoadedConfig {
+    config: prism_config::Config,
+    /// The resolved config path — kept even when the file doesn't exist
+    /// yet, so the watcher picks it up if the user creates it later.
+    path: Option<std::path::PathBuf>,
+    /// Include files from a successful parse (watcher re-stats these too).
+    includes: Vec<std::path::PathBuf>,
+}
+
 /// Resolve the prism config to load:
 ///   1. `$PRISM_CONFIG` if set (full path)
 ///   2. `$XDG_CONFIG_HOME/prism/config.kdl` (XDG default)
@@ -73,7 +85,7 @@ fn main() -> Result<()> {
 /// On read / parse error: log loudly via `tracing::error!` AND a
 /// `breadcrumb` (TTY runs lose stderr; the breadcrumb survives), then
 /// fall back to `Config::default()` so the compositor still boots.
-fn load_config() -> prism_config::Config {
+fn load_config() -> LoadedConfig {
     use std::path::PathBuf;
 
     let candidate: Option<PathBuf> = std::env::var_os("PRISM_CONFIG")
@@ -89,7 +101,11 @@ fn load_config() -> prism_config::Config {
         tracing::warn!(
             "no config path resolvable (PRISM_CONFIG / XDG_CONFIG_HOME / HOME all unset); using defaults"
         );
-        return prism_config::Config::default();
+        return LoadedConfig {
+            config: prism_config::Config::default(),
+            path: None,
+            includes: Vec::new(),
+        };
     };
 
     if !path.exists() {
@@ -97,14 +113,18 @@ fn load_config() -> prism_config::Config {
             "no config file at {}; using defaults — set PRISM_CONFIG or create that file to customize",
             path.display()
         );
-        return prism_config::Config::default();
+        return LoadedConfig {
+            config: prism_config::Config::default(),
+            path: Some(path),
+            includes: Vec::new(),
+        };
     }
 
     let res = prism_config::Config::load(&path);
     if !res.includes.is_empty() {
         tracing::info!("config: loaded {} include(s)", res.includes.len());
     }
-    match res.config {
+    let config = match res.config {
         Ok(cfg) => {
             tracing::info!("loaded prism config from {}", path.display());
             cfg
@@ -113,7 +133,7 @@ fn load_config() -> prism_config::Config {
             let msg = format!("config parse failed for {}: {e:?}", path.display());
             breadcrumb(&msg);
             tracing::error!("{msg}");
-            tracing::error!("falling back to default config — fix the file and restart");
+            tracing::error!("falling back to default config — fix the file and save again");
             // The default config has no user binds, which used to mean
             // "user is now trapped on this VT with no way to quit
             // prism short of sshing in to pkill". Hard-coded escape
@@ -127,6 +147,11 @@ fn load_config() -> prism_config::Config {
             );
             prism_config::Config::default()
         }
+    };
+    LoadedConfig {
+        config,
+        path: Some(path),
+        includes: res.includes,
     }
 }
 
@@ -249,7 +274,7 @@ fn run_wayland_server() -> Result<()> {
     // No config file loaded in wayland-only mode — defaults give the
     // layout enough to bring up an empty workspace set.
     let mut state =
-        prism_protocols::PrismState::new(&display, load_config(), None, gpus, Some(key));
+        prism_protocols::PrismState::new(&display, load_config().config, None, gpus, Some(key));
 
     let mut event_loop: EventLoop<'static, prism_protocols::PrismState> =
         EventLoop::try_new().context("calloop EventLoop::try_new")?;
@@ -1024,8 +1049,13 @@ fn run_integrated(
     // load once and share. `load_config()` already falls back to defaults on
     // failure with a loud log line, so this is safe before anything else.
     // `mut` so the startup-spawn lists + environment can be taken out before
-    // the rest moves into PrismState (see below).
-    let mut config = load_config();
+    // the rest moves into PrismState (see below). The resolved path +
+    // include list seed the config file watcher once the event loop is up.
+    let LoadedConfig {
+        mut config,
+        path: config_path,
+        includes: config_includes,
+    } = load_config();
 
     // ── Open every card we want to drive ───────────────────────────────────
     // CARDS env var overrides the hard-coded list (comma-separated paths,
@@ -1507,6 +1537,65 @@ fn run_integrated(
             None
         }
     };
+    // Config file watcher → hot reload. A thread polls the config file (and
+    // its includes) and re-parses on change; the result lands here through a
+    // calloop channel and is applied via `PrismState::reload_config`. Parse
+    // failures keep the running config (the error is logged on the watcher
+    // thread). Must outlive the dispatch loop — dropping the handle stops
+    // the thread.
+    //
+    // Deliberate divergence from niri (which stores the watcher on its
+    // State): a local keeps prism-protocols free of the watcher type. Drop
+    // order is safe either way — on the normal path `drop(event_loop)`
+    // (receiver) precedes this binding's drop; on an early-`?` unwind the
+    // watcher drops first, and a watcher thread blocked in `send` unblocks
+    // with an error the moment the event loop (receiver) drops right after.
+    let _config_watcher = config_path.and_then(|path| {
+        let (tx, rx) = calloop::channel::sync_channel::<Result<prism_config::Config, ()>>(1);
+        let inserted = event_loop.handle().insert_source(rx, |event, _, state| {
+            match event {
+                calloop::channel::Event::Msg(Ok(mut config)) => {
+                    // Startup-only sections: the spawn lists never re-run on
+                    // reload; `environment {}` replaces the child-env table
+                    // (applies to children spawned from now on).
+                    config.spawn_at_startup = Vec::new();
+                    config.spawn_sh_at_startup = Vec::new();
+                    prism_input::set_child_env(
+                        std::mem::take(&mut config.environment)
+                            .0
+                            .into_iter()
+                            .map(|var| (var.name, var.value))
+                            .collect(),
+                    );
+                    state.reload_config(config);
+                }
+                // Parse error: already logged by the watcher thread; keep
+                // running on the previous config.
+                calloop::channel::Event::Msg(Err(())) => (),
+                calloop::channel::Event::Closed => (),
+            }
+        });
+        if let Err(e) = inserted {
+            tracing::warn!("config watcher bringup failed; hot reload disabled: {e:#}");
+            return None;
+        }
+        tracing::info!("watching {} for config changes", path.display());
+        Some(watcher::Watcher::new(
+            prism_config::ConfigPath::Explicit(path),
+            config_includes,
+            |config_path| {
+                config_path.load().map_config_res(|res| {
+                    res.map_err(|err| {
+                        tracing::error!("config reload: parse failed: {err:?}");
+                        tracing::error!(
+                            "keeping the previous config — fix the file and save again"
+                        );
+                    })
+                })
+            },
+            tx,
+        ))
+    });
     for output in state.outputs.values() {
         tracing::info!(
             "scanout target: {} {}×{} (crtc {:?})",

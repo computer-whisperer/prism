@@ -1488,6 +1488,137 @@ impl PrismState {
             queue_redraw_for_surface(self, surface.wl_surface());
         }
     }
+
+    /// Apply a freshly parsed config (file watcher / future IPC reload).
+    /// Mirrors niri's `State::reload_config` (niri.rs:1421), minus the
+    /// pieces prism doesn't have yet (layer rules, custom animation
+    /// shaders, libinput device settings, xwayland-satellite restart).
+    ///
+    /// The caller has already stripped startup-only sections (environment,
+    /// spawn-at-startup). Sections that only take effect at startup are
+    /// detected and logged as needing a restart rather than silently
+    /// half-applied: `output` blocks (mode/position/scale/HDR/LUT decisions
+    /// are baked into DRM + renderer state at bringup) and `debug`.
+    pub fn reload_config(&mut self, config: Config) {
+        tracing::info!("applying reloaded config");
+
+        // Named workspaces removed from the config lose their name (they
+        // become regular workspaces, cleaned up when emptied).
+        let removed_workspaces: Vec<String> = self
+            .config
+            .borrow()
+            .workspaces
+            .iter()
+            .filter(|ws| !config.workspaces.iter().any(|w| w.name == ws.name))
+            .map(|ws| ws.name.0.clone())
+            .collect();
+        for name in removed_workspaces {
+            self.layout.unname_workspace(&name);
+        }
+
+        // Layout options: gaps, struts, default widths, focus ring, border,
+        // shadow, animations — propagates down monitors → workspaces →
+        // tiles.
+        self.layout.update_config(&config);
+        for ws_config in &config.workspaces {
+            self.layout.ensure_named_workspace(ws_config);
+        }
+
+        self.clock
+            .set_rate(1.0 / config.animations.slowdown.max(0.001));
+        self.clock.set_complete_instantly(config.animations.off);
+
+        // Diff the sections that need explicit re-application, then swap
+        // the shared config in place. Everything that reads the config live
+        // per event (binds, mod-key, focus-follows-mouse, keyboard
+        // shortcuts) picks the swap up automatically.
+        let mut reload_xkb = None;
+        let mut reload_repeat = None;
+        let window_rules_changed;
+        {
+            let mut old_config = self.config.borrow_mut();
+
+            if config.cursor.xcursor_theme != old_config.cursor.xcursor_theme
+                || config.cursor.xcursor_size != old_config.cursor.xcursor_size
+            {
+                self.cursor_manager
+                    .reload(&config.cursor.xcursor_theme, config.cursor.xcursor_size);
+                self.cursor_texture_cache.clear();
+            }
+
+            let kb = &config.input.keyboard;
+            let old_kb = &old_config.input.keyboard;
+            if kb.xkb != old_kb.xkb {
+                // Pre-existing gap shared with the startup path: `xkb.file`
+                // is parsed but not honoured (no set_xkb_file machinery).
+                reload_xkb = Some(kb.xkb.clone());
+            }
+            if kb.repeat_rate != old_kb.repeat_rate || kb.repeat_delay != old_kb.repeat_delay {
+                reload_repeat = Some((i32::from(kb.repeat_rate), i32::from(kb.repeat_delay)));
+            }
+
+            window_rules_changed = config.window_rules != old_config.window_rules;
+
+            if config.outputs != old_config.outputs {
+                tracing::warn!(
+                    "`output` configuration changed: not hot-reloaded (modes, positions, \
+                     scale, HDR signaling and LUTs are resolved at bringup) — restart prism \
+                     to apply"
+                );
+            }
+            if config.debug != old_config.debug {
+                tracing::warn!("`debug` configuration changed: not hot-reloaded — restart prism");
+            }
+
+            *old_config = config;
+        }
+
+        if let Some(xkb) = reload_xkb {
+            if let Some(keyboard) = self.seat.get_keyboard() {
+                // Changing the keymap resets modifier state; carry num lock
+                // over (niri does the same — it's latched state the user
+                // doesn't expect a config reload to clear).
+                let num_lock = keyboard.modifier_state().num_lock;
+                if let Err(err) = keyboard.set_xkb_config(self, xkb.to_xkb_config()) {
+                    tracing::warn!("error updating xkb config: {err:?}");
+                } else {
+                    let mut mods = keyboard.modifier_state();
+                    if mods.num_lock != num_lock {
+                        mods.num_lock = num_lock;
+                        keyboard.set_modifier_state(mods);
+                    }
+                }
+            }
+        }
+        if let Some((rate, delay)) = reload_repeat {
+            if let Some(keyboard) = self.seat.get_keyboard() {
+                keyboard.change_repeat_info(rate, delay);
+            }
+        }
+
+        if window_rules_changed {
+            // Force-recompute every mapped window's resolved rules, and give
+            // the layout a chance to re-configure windows whose rules
+            // changed (sizing rules affect tile geometry). Unmapped windows
+            // are a known gap — prism doesn't resolve rules at
+            // initial-configure time yet.
+            let config = Rc::clone(&self.config);
+            let config = config.borrow();
+            let mut changed_windows = Vec::new();
+            self.layout.with_windows_mut(|mapped, _output| {
+                if mapped.recompute_window_rules(&config.window_rules, false) {
+                    changed_windows.push(mapped.window.clone());
+                }
+            });
+            for win in changed_windows {
+                self.layout.update_window(&win, None);
+            }
+        }
+
+        // Decoration/rule changes re-damage via element content tokens; a
+        // full redraw pass picks them all up on the next frame.
+        queue_redraw_all(self);
+    }
 }
 
 // ─── wl_output / xdg-output ─────────────────────────────────────────────────
