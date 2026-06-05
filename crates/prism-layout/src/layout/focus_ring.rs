@@ -202,6 +202,7 @@ impl FocusRing {
                 id: self.id,
                 geometry: outer_logical,
                 color_bt2020_nits: cached.color_bt2020_nits,
+                clip: None,
             }));
         }
     }

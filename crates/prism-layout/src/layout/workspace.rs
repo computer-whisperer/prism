@@ -1658,6 +1658,7 @@ impl<W: LayoutElement> Workspace<W> {
             id: self.background_id,
             geometry: rect,
             color_bt2020_nits,
+            clip: None,
         })
     }
 

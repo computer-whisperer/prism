@@ -291,6 +291,7 @@ pub fn push_surface_tree_elements(
                         rgba[3] as f32 / 255.0,
                         nits,
                     ),
+                    clip: None,
                 }));
                 return;
             }
@@ -350,6 +351,7 @@ pub fn push_surface_tree_elements(
                 color: ctx.color_for(states),
                 alpha_mode: ctx.alpha_mode_for(states),
                 alpha,
+                clip: None,
             }));
         },
         |_, _, _| true,

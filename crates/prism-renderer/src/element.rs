@@ -278,6 +278,70 @@ impl AlphaMode {
     }
 }
 
+/// Rounded-rect clip applied to an element at decode time — the
+/// `clip-to-geometry` window rule. The decode shader multiplies the
+/// element's alpha by the SDF coverage of this box (`sdf_mode = 1`), so
+/// pixels outside it (and outside its rounded corners) drop out with
+/// one physical pixel of anti-aliasing.
+#[derive(Clone, Copy, Debug)]
+pub struct SurfaceClip {
+    /// Clip box in output-space logical pixels — the window's visual
+    /// geometry, independent of this element's own rect (a subsurface can
+    /// hang outside it and gets clipped away entirely).
+    pub rect: Rectangle<f64, Logical>,
+    /// Per-corner radii in logical pixels, `[tl, tr, br, bl]`.
+    pub radii: [f32; 4],
+}
+
+impl SurfaceClip {
+    /// Whether the clip would actually remove pixels from an element with
+    /// this `geometry` — false when the element lies inside the clip box
+    /// and clear of all four corner squares (niri's
+    /// `ClippedSurfaceRenderElement::will_clip`). Callers skip clipping
+    /// such elements: same pixels, but their opaque regions stay intact
+    /// for occlusion culling and the shader skips the SDF.
+    pub fn would_clip(&self, geometry: Rectangle<f64, Logical>) -> bool {
+        if !self.rect.contains_rect(geometry) {
+            return true;
+        }
+        let [tl, tr, br, bl] = self.radii.map(f64::from);
+        let r = self.rect;
+        let corner = |x: f64, y: f64, s: f64| {
+            s > 0.0
+                && geometry.overlaps(Rectangle::<f64, Logical>::new((x, y).into(), (s, s).into()))
+        };
+        corner(r.loc.x, r.loc.y, tl)
+            || corner(r.loc.x + r.size.w - tr, r.loc.y, tr)
+            || corner(r.loc.x + r.size.w - br, r.loc.y + r.size.h - br, br)
+            || corner(r.loc.x, r.loc.y + r.size.h - bl, bl)
+    }
+
+    /// Fold this clip into a content fingerprint, relative to the element's
+    /// own origin — a moving window keeps the same token (geometry diffs
+    /// already re-damage moves), while a radius or relative-clip change
+    /// re-damages in place (e.g. the corner-radius animation).
+    fn mix_token(&self, token: u64, origin: Point<f64, Logical>) -> u64 {
+        let rel = [
+            (self.rect.loc.x - origin.x) as f32,
+            (self.rect.loc.y - origin.y) as f32,
+            self.rect.size.w as f32,
+            self.rect.size.h as f32,
+        ];
+        token ^ fnv_f32s(&rel) ^ fnv_f32s(&self.radii)
+    }
+
+    fn apply_to_push(&self, push: &mut DecodePush) {
+        push.sdf_mode = 1;
+        push.sdf_box = [
+            self.rect.loc.x as f32,
+            self.rect.loc.y as f32,
+            (self.rect.loc.x + self.rect.size.w) as f32,
+            (self.rect.loc.y + self.rect.size.h) as f32,
+        ];
+        push.sdf_radii = self.radii;
+    }
+}
+
 /// Sampled-texture surface element. Used for wl_surface content (xdg-shell
 /// toplevels, popups, layer-shell content, subsurfaces) and for the cursor.
 /// One per surface tree node; produced by walking the surface tree at
@@ -326,6 +390,11 @@ pub struct SurfaceEl {
     /// premultiplied pixel by `alpha` is the correct fade regardless of the
     /// buffer's own (premultiplied) alpha. `1.0` is a no-op.
     pub alpha: f32,
+    /// Rounded-rect clip (`clip-to-geometry`); `None` = unclipped. Set by
+    /// the tile render pass on the window's normal surface tree. The
+    /// reported opaque regions are shrunk accordingly at culling time
+    /// (see [`RenderEl::push_opaque_regions`]).
+    pub clip: Option<SurfaceClip>,
 }
 
 impl SurfaceEl {
@@ -349,6 +418,9 @@ impl SurfaceEl {
         // premultiplied pixel — the correct fade for both opaque and
         // already-premultiplied buffers. `identity_srgb` left `tint = [1; 4]`.
         push.tint[3] = self.alpha;
+        if let Some(clip) = &self.clip {
+            clip.apply_to_push(&mut push);
+        }
         ElementDraw {
             texture_view: self.texture_view,
             chroma_view: self.chroma_view,
@@ -381,6 +453,10 @@ pub struct SolidColorEl {
     /// Colour in BT.2020 linear nits, RGBA. Use [`srgb_to_bt2020_nits`] to
     /// convert from configured sRGB hex values.
     pub color_bt2020_nits: [f32; 4],
+    /// Rounded-rect clip (`clip-to-geometry`); `None` = unclipped. Reached
+    /// by single-pixel-buffer surfaces inside a clipped window's tree
+    /// (e.g. video letterbox bars), which the walk lowers to solids.
+    pub clip: Option<SurfaceClip>,
 }
 
 impl SolidColorEl {
@@ -390,12 +466,16 @@ impl SolidColorEl {
         white_view: vk::ImageView,
         output_peak_nits_rgb: [f32; 3],
     ) -> ElementDraw {
-        solid_color_draw(
+        let mut draw = solid_color_draw(
             project(self.geometry),
             self.color_bt2020_nits,
             white_view,
             output_peak_nits_rgb,
-        )
+        );
+        if let Some(clip) = &self.clip {
+            clip.apply_to_push(&mut draw.push);
+        }
+        draw
     }
 }
 
@@ -567,6 +647,42 @@ impl RoundedBoxEl {
     }
 }
 
+/// The fully-covered interior of a rounded box, as up to two overlapping
+/// bands (a horizontal one between the corner rows and a vertical one
+/// between the corner columns), each inset by 1 logical px to stay clear of
+/// the SDF's ≤ 1-physical-px anti-aliased edge — which is translucent even
+/// on straight runs at fractional alignment. Shared by the opaque-region
+/// reporting of filled [`RoundedBoxEl`]s and clip-shrunk surfaces/solids.
+fn push_rounded_box_bands(
+    g: Rectangle<f64, Logical>,
+    radii: [f32; 4],
+    out: &mut Vec<Rectangle<f64, Logical>>,
+) {
+    let [tl, tr, br, bl] = radii.map(f64::from);
+    const AA: f64 = 1.0;
+    // Horizontal band: full width, between the corner rows.
+    let h_band = Rectangle::<f64, Logical>::new(
+        Point::from((g.loc.x + AA, g.loc.y + tl.max(tr) + AA)),
+        Size::from((
+            g.size.w - 2.0 * AA,
+            g.size.h - tl.max(tr) - bl.max(br) - 2.0 * AA,
+        )),
+    );
+    // Vertical band: full height, between the corner columns.
+    let v_band = Rectangle::<f64, Logical>::new(
+        Point::from((g.loc.x + tl.max(bl) + AA, g.loc.y + AA)),
+        Size::from((
+            g.size.w - tl.max(bl) - tr.max(br) - 2.0 * AA,
+            g.size.h - 2.0 * AA,
+        )),
+    );
+    for band in [h_band, v_band] {
+        if band.size.w > 0.0 && band.size.h > 0.0 {
+            out.push(band);
+        }
+    }
+}
+
 /// Tagged dispatch over the element vocabulary. Callers build a
 /// `Vec<RenderEl>` from the layout walk; the render path calls
 /// [`RenderEl::lower`] on each to flatten into the [`ElementDraw`]
@@ -638,15 +754,27 @@ impl RenderEl {
             let size = Size::from((g.size.w * factor, g.size.h * factor));
             Rectangle::new(loc, size)
         }
+        fn scaled_clip(clip: SurfaceClip, center: Point<f64, Logical>, factor: f64) -> SurfaceClip {
+            SurfaceClip {
+                rect: scaled(clip.rect, center, factor),
+                radii: clip.radii.map(|r| r * factor as f32),
+            }
+        }
         match self {
             Self::Surface(s) => {
                 s.geometry = scaled(s.geometry, center, factor);
+                // The clip box follows the same transform so the rounded
+                // corners stay glued to the zoomed window.
+                s.clip = s.clip.map(|c| scaled_clip(c, center, factor));
                 // The opaque rects were computed against the un-scaled
                 // geometry; once moved they no longer describe where the
                 // surface is solid, so drop them rather than mis-cull.
                 s.opaque.clear();
             }
-            Self::SolidColor(s) => s.geometry = scaled(s.geometry, center, factor),
+            Self::SolidColor(s) => {
+                s.geometry = scaled(s.geometry, center, factor);
+                s.clip = s.clip.map(|c| scaled_clip(c, center, factor));
+            }
             Self::Border(b) => {
                 b.geometry = scaled(b.geometry, center, factor);
                 b.thickness = b.thickness.map(|t| t * factor);
@@ -659,26 +787,70 @@ impl RenderEl {
         }
     }
 
+    /// Apply a rounded-rect clip (`clip-to-geometry`) to this element, in
+    /// place. Skipped when the clip provably wouldn't remove any pixels
+    /// (element inside the box, clear of the corner squares — niri's
+    /// `will_clip` test), so unclipped elements keep their full opaque
+    /// regions and the cheap shader path. Surfaces and solids only; the
+    /// other variants are decorations that are never part of a window's
+    /// surface tree.
+    pub fn clip_to_rounded_box(&mut self, clip: SurfaceClip) {
+        match self {
+            Self::Surface(s) => {
+                if clip.would_clip(s.geometry) {
+                    s.clip = Some(clip);
+                }
+            }
+            Self::SolidColor(s) => {
+                if clip.would_clip(s.geometry) {
+                    s.clip = Some(clip);
+                }
+            }
+            Self::Border(_) | Self::RoundedBox(_) => {}
+        }
+    }
+
     /// Append this element's fully-opaque rects (absolute output-space logical)
     /// to `out`, for occlusion culling. An element drawn behind the union of
     /// these rects contributes nothing visible and can be skipped.
     ///
     /// - `Surface`: the buffer's opaque regions (already absolute; see
     ///   [`SurfaceEl::opaque`]). Empty for translucent / unknown-alpha buffers.
+    ///   Clipped surfaces intersect them with the clip's corner-free bands.
     /// - `SolidColor`: the whole geometry iff the colour is fully opaque
-    ///   (`alpha == 1.0`); a translucent fill occludes nothing.
+    ///   (`alpha == 1.0`); a translucent fill occludes nothing. Clipped solids
+    ///   intersect with the clip's bands like surfaces.
     /// - `Border`: nothing — a border is hollow stripes, so its bounding box is
     ///   mostly transparent and never a safe occluder.
     /// - `RoundedBox`: a ring occludes nothing; a fully-opaque fill occludes
-    ///   the cross of two bands that excludes the corner squares (and an extra
-    ///   1-logical-px margin for the SDF's anti-aliased edge, which is
-    ///   translucent even on straight runs at fractional alignment).
+    ///   the cross of two bands that excludes the corner squares (see
+    ///   [`push_rounded_box_bands`]).
     pub fn push_opaque_regions(&self, out: &mut Vec<Rectangle<f64, Logical>>) {
         match self {
-            Self::Surface(s) => out.extend_from_slice(&s.opaque),
+            Self::Surface(s) => match &s.clip {
+                None => out.extend_from_slice(&s.opaque),
+                // A clipped surface is only opaque where the buffer is opaque
+                // AND the clip keeps full coverage — intersect with the clip
+                // box's corner-free cross bands.
+                Some(clip) => {
+                    let mut bands = Vec::with_capacity(2);
+                    push_rounded_box_bands(clip.rect, clip.radii, &mut bands);
+                    for r in &s.opaque {
+                        out.extend(bands.iter().filter_map(|b| r.intersection(*b)));
+                    }
+                }
+            },
             Self::SolidColor(s) => {
-                if s.color_bt2020_nits[3] >= 1.0 {
-                    out.push(s.geometry);
+                if s.color_bt2020_nits[3] < 1.0 {
+                    return;
+                }
+                match &s.clip {
+                    None => out.push(s.geometry),
+                    Some(clip) => {
+                        let mut bands = Vec::with_capacity(2);
+                        push_rounded_box_bands(clip.rect, clip.radii, &mut bands);
+                        out.extend(bands.iter().filter_map(|b| s.geometry.intersection(*b)));
+                    }
                 }
             }
             Self::Border(_) => {}
@@ -686,31 +858,7 @@ impl RenderEl {
                 if r.inset.is_some() || r.color_bt2020_nits[3] < 1.0 {
                     return;
                 }
-                let g = r.geometry;
-                let [tl, tr, br, bl] = r.radii.map(f64::from);
-                // One logical px covers the ≤ 1-physical-px AA band.
-                const AA: f64 = 1.0;
-                // Horizontal band: full width, between the corner rows.
-                let h_band = Rectangle::<f64, Logical>::new(
-                    Point::from((g.loc.x + AA, g.loc.y + tl.max(tr) + AA)),
-                    Size::from((
-                        g.size.w - 2.0 * AA,
-                        g.size.h - tl.max(tr) - bl.max(br) - 2.0 * AA,
-                    )),
-                );
-                // Vertical band: full height, between the corner columns.
-                let v_band = Rectangle::<f64, Logical>::new(
-                    Point::from((g.loc.x + tl.max(bl) + AA, g.loc.y + AA)),
-                    Size::from((
-                        g.size.w - tl.max(bl) - tr.max(br) - 2.0 * AA,
-                        g.size.h - 2.0 * AA,
-                    )),
-                );
-                for band in [h_band, v_band] {
-                    if band.size.w > 0.0 && band.size.h > 0.0 {
-                        out.push(band);
-                    }
-                }
+                push_rounded_box_bands(r.geometry, r.radii, out);
             }
         }
     }
@@ -721,8 +869,20 @@ impl RenderEl {
     /// ring even though its geometry is unchanged.
     pub fn content_token(&self) -> u64 {
         match self {
-            Self::Surface(s) => s.content_commit,
-            Self::SolidColor(s) => fnv_f32s(&s.color_bt2020_nits),
+            // A clip folds into the token relative to the element origin, so
+            // a radius / relative-clip change re-damages in place while a
+            // plain move stays a pure geometry diff.
+            Self::Surface(s) => match &s.clip {
+                None => s.content_commit,
+                Some(clip) => clip.mix_token(s.content_commit, s.geometry.loc),
+            },
+            Self::SolidColor(s) => {
+                let c = fnv_f32s(&s.color_bt2020_nits);
+                match &s.clip {
+                    None => c,
+                    Some(clip) => clip.mix_token(c, s.geometry.loc),
+                }
+            }
             Self::Border(b) => {
                 let c = fnv_f32s(&b.color_bt2020_nits);
                 b.thickness
@@ -798,6 +958,7 @@ mod tests {
             id: ElementId::alloc(),
             geometry: geo,
             color_bt2020_nits: [10.0, 10.0, 10.0, alpha],
+            clip: None,
         })
     }
 
@@ -814,6 +975,7 @@ mod tests {
             color: SurfaceColorParams::default(),
             alpha_mode: AlphaMode::Opaque,
             alpha: 1.0,
+            clip: None,
         })
     }
 
@@ -954,6 +1116,91 @@ mod tests {
         let draw = ring.to_draw(&project, vk::ImageView::null(), [1000.0; 3]);
         assert_eq!(draw.push.sdf_mode, 2);
         assert_eq!(draw.push.sdf_inset, [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    fn clip(x: f64, y: f64, w: f64, h: f64, radius: f32) -> SurfaceClip {
+        SurfaceClip {
+            rect: rect(x, y, w, h),
+            radii: [radius; 4],
+        }
+    }
+
+    /// `would_clip` (niri's `will_clip`): false only for elements inside the
+    /// box and clear of every corner square.
+    #[test]
+    fn would_clip_semantics() {
+        let c = clip(0.0, 0.0, 100.0, 100.0, 12.0);
+        // Interior, clear of all corners.
+        assert!(!c.would_clip(rect(20.0, 20.0, 60.0, 60.0)));
+        // Inside the box but overlapping the top-left corner square.
+        assert!(c.would_clip(rect(5.0, 5.0, 20.0, 20.0)));
+        // Sticking out of the box.
+        assert!(c.would_clip(rect(50.0, 50.0, 60.0, 20.0)));
+        // Radius 0: anything inside the box is clear.
+        let sharp = clip(0.0, 0.0, 100.0, 100.0, 0.0);
+        assert!(!sharp.would_clip(rect(0.0, 0.0, 100.0, 100.0)));
+        assert!(sharp.would_clip(rect(-1.0, 0.0, 100.0, 100.0)));
+    }
+
+    /// `clip_to_rounded_box` skips elements the clip can't affect, keeping
+    /// their opaque regions intact; clipped elements shrink theirs to the
+    /// corner-free cross.
+    #[test]
+    fn clip_shrinks_opaque_regions() {
+        let full = rect(0.0, 0.0, 100.0, 100.0);
+        let c = clip(0.0, 0.0, 100.0, 100.0, 20.0);
+
+        let mut clipped = surface(full, vec![full]);
+        clipped.clip_to_rounded_box(c);
+        let mut regions = Vec::new();
+        clipped.push_opaque_regions(&mut regions);
+        // Corner square no longer claimed opaque…
+        assert!(regions
+            .iter()
+            .all(|r| r.intersection(rect(0.0, 0.0, 10.0, 10.0)).is_none()));
+        // …but the center still is.
+        assert!(regions
+            .iter()
+            .any(|r| r.contains_rect(rect(40.0, 40.0, 20.0, 20.0))));
+
+        let mut skipped = surface(
+            rect(30.0, 30.0, 40.0, 40.0),
+            vec![rect(30.0, 30.0, 40.0, 40.0)],
+        );
+        skipped.clip_to_rounded_box(c);
+        let mut regions = Vec::new();
+        skipped.push_opaque_regions(&mut regions);
+        assert_eq!(regions, vec![rect(30.0, 30.0, 40.0, 40.0)]);
+    }
+
+    /// Clipped surfaces lower with fill-mode SDF push constants.
+    #[test]
+    fn clipped_surface_to_draw_push_fields() {
+        let project = make_projector(Size::from((200.0, 100.0)));
+        let RenderEl::Surface(mut s) = surface(rect(10.0, 20.0, 80.0, 40.0), vec![]) else {
+            unreachable!()
+        };
+        s.clip = Some(clip(12.0, 22.0, 60.0, 30.0, 8.0));
+        let draw = s.to_draw(&project, [1000.0; 3]);
+        assert_eq!(draw.push.sdf_mode, 1);
+        assert_eq!(draw.push.sdf_box, [12.0, 22.0, 72.0, 52.0]);
+        assert_eq!(draw.push.sdf_radii, [8.0; 4]);
+    }
+
+    /// The clip folds into the content token relative to the element origin:
+    /// moving box+element together keeps the token; changing the radius (or
+    /// the clip relative to the element) changes it.
+    #[test]
+    fn clip_token_is_origin_relative() {
+        let mk = |loc: f64, radius: f32| {
+            let RenderEl::Surface(mut s) = surface(rect(loc, loc, 50.0, 50.0), vec![]) else {
+                unreachable!()
+            };
+            s.clip = Some(clip(loc, loc, 50.0, 50.0, radius));
+            RenderEl::Surface(s).content_token()
+        };
+        assert_eq!(mk(0.0, 8.0), mk(30.0, 8.0));
+        assert_ne!(mk(0.0, 8.0), mk(0.0, 12.0));
     }
 
     /// Two opaque halves sharing an exact edge tile the background; their union

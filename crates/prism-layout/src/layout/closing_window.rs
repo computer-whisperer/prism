@@ -122,6 +122,7 @@ impl ClosingWindow {
             color: SurfaceColorParams::passthrough(),
             alpha_mode: AlphaMode::Premultiplied,
             alpha: 1.0,
+            clip: None,
         });
 
         let center =

@@ -7,10 +7,11 @@
 //! element types into a `TileRenderElement`; prism's `render` produces a
 //! flat `Vec<RenderEl>` via the per-element `render` calls already in
 //! place on `FocusRing`/`Shadow` plus a single `Surface` push from the
-//! window. Snapshot-driven crossfades, offscreen-buffered alpha, the
-//! fullscreen black backdrop, clipped-surface rounded corners, and
-//! background blur are all dropped here and will be re-added once the
-//! corresponding Vulkan paths exist. See [`crate::layout::shadow`] and
+//! window. Snapshot crossfades, the fullscreen backdrop, and
+//! clipped-surface rounded corners (`clip-to-geometry`, via the decode
+//! pass's SDF coverage) have since been wired up; offscreen-buffered
+//! alpha and background blur remain dropped until the corresponding
+//! Vulkan paths exist. See [`crate::layout::shadow`] and
 //! [`crate::layout::focus_ring`] for the matching deficits.
 
 use core::f64;
@@ -1144,6 +1145,7 @@ impl<W: LayoutElement> Tile<W> {
                 id: self.backdrop_id,
                 geometry: backdrop,
                 color_bt2020_nits,
+                clip: None,
             }));
         }
 
@@ -1152,11 +1154,47 @@ impl<W: LayoutElement> Tile<W> {
             self.border.render(window_render_loc, &mut els);
         }
 
-        // Window content. Delegates to `LayoutElement::render` (popups
-        // emit on top of normal content; we leave that ordering to the
-        // trait impl).
+        // Window content, then popups on top (matching the order the trait's
+        // combined `render` would use). Split so the clip-to-geometry pass
+        // below applies to the window's own surface tree but never to popups
+        // — niri clips the same way in `render_inner`.
+        let window_els_start = els.len();
         self.window
-            .render(window_render_loc, scale, win_alpha, ctx, &mut els);
+            .render_normal(window_render_loc, scale, win_alpha, ctx, &mut els);
+
+        // Clip the window content to its geometry, with the window-rule
+        // corner radius (`clip-to-geometry`). Mirrors niri: keep clipping
+        // through the fullscreen *animation* (buggy clients submit
+        // full-sized buffers before acking the state — Firefox), drop it
+        // only at full fullscreen; scale the radius out with the expanded
+        // animation; fit overlapping radii to the window size. Elements the
+        // clip provably can't affect are left untouched
+        // (`clip_to_rounded_box` no-ops, keeping their opaque regions).
+        let clip_to_geometry =
+            fullscreen_progress < 1. && self.window.rules().clip_to_geometry == Some(true);
+        if clip_to_geometry {
+            let window_size = self.window_size();
+            let radius = self
+                .window
+                .geometry_corner_radius()
+                .scaled_by(1. - expanded_progress as f32)
+                .fit_to(window_size.w as f32, window_size.h as f32);
+            let clip = prism_renderer::SurfaceClip {
+                rect: Rectangle::new(window_render_loc, window_size),
+                radii: [
+                    radius.top_left,
+                    radius.top_right,
+                    radius.bottom_right,
+                    radius.bottom_left,
+                ],
+            };
+            for el in &mut els[window_els_start..] {
+                el.clip_to_rounded_box(clip);
+            }
+        }
+
+        self.window
+            .render_popups(window_render_loc, scale, win_alpha, ctx, &mut els);
 
         // Resize crossfade. The live content above is already drawn at the
         // animated size (inc1: `animated_tile_size`/`animated_window_size`
@@ -1191,6 +1229,7 @@ impl<W: LayoutElement> Tile<W> {
                         color: SurfaceColorParams::passthrough(),
                         alpha_mode: AlphaMode::Premultiplied,
                         alpha: fade,
+                        clip: None,
                     }));
                 }
             }
