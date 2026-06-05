@@ -303,9 +303,11 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
 
     let output_ctx = state.outputs.get_mut(&output_id).expect("just found above");
     // Track whether this mutation changed something the per-output 3D LUT
-    // depends on. CTM and response-curve obviously do; SdrReferenceNits +
-    // PanelPeakNits affect the encode pipeline elsewhere (target_peak +
-    // decode clamp) but not LUT *contents*, so they skip the re-synthesis.
+    // depends on. CTM and response-curve obviously do, and so does
+    // SdrReferenceNits on drive-domain (SDR) outputs — the synthesized
+    // fallback LUT bakes the nits → drive anchor in. PanelPeakNits
+    // affects the encode pipeline elsewhere (decode clamp) but not LUT
+    // *contents*, so it skips the re-synthesis.
     let mut lut_dirty = false;
     // Set when a mutation changes what color-management clients are told
     // (the advertised mastering peak) without touching the LUT or encode
@@ -317,6 +319,11 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             let v = (nits.clamp(1.0, 10_000.0)) as f32;
             output_ctx.color_override.sdr_reference_nits = Some(v);
             tracing::info!(connector = %name, sdr_reference_nits = v, "ipc: set sdr-reference-nits override");
+            // Decode-side policy, plus the anchor of the *synthesized*
+            // fallback LUT on drive-domain outputs. Measured LUTs
+            // (IPC/KDL precedence levels) are absolute and unaffected —
+            // resynthesize_color_lut re-uploads whichever source wins.
+            lut_dirty = true;
         }
         OutputAction::ResponseCurve {
             gain_r,
@@ -416,6 +423,19 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                     loaded.cube_edge, renderer_edge,
                 ));
             }
+            // Domain check: the chain's terminal OutputTransfer dictates
+            // what the LUT entries must mean (nits for PQ/linear, drive
+            // for sRGB). A mismatched file would render garbage — most
+            // insidiously, a pre-v5 nits-space file on an SDR output
+            // would re-create the silent dimming this reform removed.
+            let want = output_ctx.config.encode_config.lut_output_domain();
+            if loaded.out_space != want {
+                return Err(format!(
+                    "LUT file out_space={:?} doesn't match the output's encode chain ({want:?}); \
+                     rebake with the current prism-tune (SDR LUTs are drive-domain v5 now)",
+                    loaded.out_space,
+                ));
+            }
             let cube_edge = loaded.cube_edge;
             let bp = loaded.black_point_xyz;
             output_ctx.color_override.lut3d_entries = Some(loaded.entries);
@@ -445,7 +465,18 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                         .to_owned(),
                 );
             }
-            let entries = prism_renderer::identity_lut(cube_edge);
+            // Mode-appropriate "identity": nits passthrough for PQ/linear
+            // chains; for drive-domain (sRGB) chains the uncalibrated
+            // nits → drive mapping anchored at the effective reference
+            // white, so a calibration sweep's patch code values round-
+            // trip to the wire unchanged.
+            let entries = match output_ctx.config.encode_config.lut_output_domain() {
+                prism_renderer::LutOutputDomain::Nits => prism_renderer::identity_lut(cube_edge),
+                prism_renderer::LutOutputDomain::Drive => prism_renderer::drive_identity_lut(
+                    cube_edge,
+                    output_ctx.effective_sdr_reference_nits(),
+                ),
+            };
             output_ctx.color_override.lut3d_entries = Some(entries);
             tracing::info!(
                 connector = %name,
@@ -456,10 +487,10 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
         }
         OutputAction::EncodeDiagnose { r, g, b } => {
             // Build the encode push the live render path would use for
-            // this output — target_peak_nits + sdr_white_nits both
-            // influence the OutputTransfer stage, so the diagnose must
-            // mirror them or it'd test a different shader configuration
-            // than what the panel sees.
+            // this output — target_peak_nits influences the PQ/linear
+            // OutputTransfer stage, so the diagnose must mirror it or
+            // it'd test a different shader configuration than what the
+            // panel sees. (The sRGB transfer is parameter-free.)
             let mut p = match output_ctx.config.hdr {
                 Some(hdr) => {
                     let mut p = prism_renderer::EncodePushSynth::pq_identity();
@@ -468,7 +499,6 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                 }
                 None => prism_renderer::EncodePushSynth::sdr_identity(),
             };
-            p.sdr_white_nits = output_ctx.effective_sdr_reference_nits();
             // CTM + per-channel curve are no longer read by the
             // Lut3d-only encode chain, but mirror them anyway so any
             // legacy-chain output stays equivalent.

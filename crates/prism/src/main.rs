@@ -533,8 +533,9 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     // Source texture: 256×1 linear horizontal gradient, RGBA16_SFLOAT. Each
     // pixel = (x/255, x/255, x/255, 1.0). When fed through identity decode
     // (transfer=Linear) the intermediate holds linear values in [0,1] *
-    // sdr_white_nits. The encode pass (Srgb, sdr_white_nits=80) normalizes
-    // back to [0,1] and sRGB-encodes.
+    // sdr_white_nits. The encode pass samples the default drive-domain LUT
+    // (nits → drive anchored at the same 80-nit nominal white), then the
+    // parameter-free sRGB transfer clamps to [0,1] and sRGB-encodes.
     let texture = build_gradient_texture(device.clone(), width)?;
 
     // Headless self-test uses the renderer's default fp32 intermediate + the
@@ -1304,6 +1305,7 @@ fn run_integrated(
                         {
                             Ok(loaded) => {
                                 let renderer_edge = output.renderer.lut3d_cube_edge();
+                                let want_domain = output.config.encode_config.lut_output_domain();
                                 if loaded.cube_edge != renderer_edge {
                                     tracing::warn!(
                                         connector = %output.connector_name,
@@ -1311,6 +1313,23 @@ fn run_integrated(
                                         "LUT file cube_edge={} doesn't match renderer cube_edge={}; \
                                          falling back to synthesis",
                                         loaded.cube_edge, renderer_edge,
+                                    );
+                                } else if loaded.out_space != want_domain {
+                                    // Domain mismatch — e.g. a pre-v5
+                                    // nits-space SDR bake on a drive-domain
+                                    // sRGB chain. Loading it would re-create
+                                    // the silent reference-white dimming the
+                                    // drive-domain reform removed; fall back
+                                    // to synthesis and tell the user to
+                                    // rebake.
+                                    tracing::warn!(
+                                        connector = %output.connector_name,
+                                        path = %lut3d_cfg.path,
+                                        "LUT file out_space={:?} doesn't match the encode chain \
+                                         ({want_domain:?}); falling back to synthesis — rebake \
+                                         with the current prism-tune (SDR LUTs are drive-domain \
+                                         v5 now)",
+                                        loaded.out_space,
                                     );
                                 } else {
                                     let bp = loaded.black_point_xyz;
@@ -2648,7 +2667,9 @@ fn render_output_now(
 
     // Build the encode push from the output's config: PQ outputs clamp
     // at the panel's declared peak, and per-output response correction
-    // (if configured) gets its push-constant slots filled.
+    // (if configured) gets its push-constant slots filled. The sRGB
+    // transfer is parameter-free — SDR calibration meaning lives in the
+    // drive-domain LUT, immune to runtime reference-white policy.
     let encode_push = {
         let output = state
             .outputs
@@ -2662,7 +2683,6 @@ fn render_output_now(
             }
             None => EncodePush::sdr_identity(),
         };
-        p.sdr_white_nits = output.effective_sdr_reference_nits();
         if let Some((gain, gamma)) = output.effective_response_curve() {
             p.set_response_gain_gamma(gain, gamma);
         }

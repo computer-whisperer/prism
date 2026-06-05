@@ -2,10 +2,17 @@
 //!
 //! The encode pass is *the* per-output customization point. Different
 //! displays want different effects in different orders:
-//!   - Standard SDR: `[CalibrationMatrix, OutputTransferSrgb]`
-//!   - HDR PQ:       `[CalibrationMatrix, OutputTransferPq]`
-//!   - QD-OLED text: `[CalibrationMatrix, OutputTransferSrgb, SubpixelFir3Horizontal]`
+//!   - Standard SDR: `[Lut3d, OutputTransferSrgb]`
+//!   - HDR PQ:       `[Lut3d, OutputTransferPq]`
+//!   - QD-OLED text: `[Lut3d, OutputTransferSrgb, SubpixelFir3Horizontal]`
 //!   - 8-bit panel:  `[..., InterleavedGradientNoiseDither]`
+//!
+//! The LUT output domain is chain-dependent and absolute in both modes:
+//! PQ/linear chains expect linear nits, sRGB chains expect linear panel
+//! drive in `[0, 1]` (the wire value pre-OETF). Either way the terminal
+//! OutputTransfer fragment is a fixed function whose clamp exists only
+//! to keep invalid control values off the wire — calibration meaning
+//! lives entirely in the LUT and can't be re-scaled by runtime policy.
 //!
 //! Rather than a single mega-shader with runtime branches, we synthesize
 //! the fragment shader per output from an `EncodeConfig`. SPIR-V emission
@@ -33,7 +40,9 @@ pub struct EncodeConfig {
 pub enum EncodeFragment {
     /// `out = mat3(push.cal_matrix) * in`. Identity by default.
     CalibrationMatrix,
-    /// `out = srgb_oetf(clamp(in / sdr_white_nits, 0, 1))`.
+    /// `out = srgb_oetf(clamp(in, 0, 1))`. Input is linear panel drive
+    /// (the LUT's output domain for SDR chains); the clamp only guards
+    /// the wire against out-of-range control values.
     OutputTransferSrgb,
     /// `out = pq_oetf(clamp(in, 0, target_peak_nits))`.
     OutputTransferPq,
@@ -48,12 +57,13 @@ pub enum EncodeFragment {
     /// 3D color LUT lookup with a PQ shaper on input. The per-channel
     /// PQ OETF maps incoming linear BT.2020 nits into the LUT's `[0, 1]`
     /// coordinate space (allocating more precision near zero, where the
-    /// eye is sensitive), then a trilinear sample returns panel-native
-    /// commanded nits. Replaces the [`CalibrationMatrix`] +
+    /// eye is sensitive), then a trilinear sample returns the panel-
+    /// native command. Replaces the [`CalibrationMatrix`] +
     /// [`PerChannelResponseGainGamma`] pair: a single LUT captures both
     /// gamut correction AND per-channel response without assuming either
-    /// is a closed-form function. Output stays in linear-nits domain so
-    /// a downstream `OutputTransfer*` fragment encodes for scanout.
+    /// is a closed-form function. The output domain matches the chain's
+    /// terminal fragment: linear nits for PQ/linear chains, linear drive
+    /// `[0, 1]` for sRGB chains.
     Lut3d,
     /// Per-channel 3-tap horizontal FIR filter for non-stripe subpixel
     /// layouts (QD-OLED triangular). Requires multi-sample handling that
@@ -107,6 +117,36 @@ impl EncodeConfig {
             .iter()
             .any(|f| matches!(f, EncodeFragment::Lut3d))
     }
+
+    /// The output domain the chain's LUT must be baked/synthesized in,
+    /// derived from the terminal OutputTransfer fragment: sRGB chains
+    /// consume linear drive `[0, 1]`, PQ/linear chains consume linear
+    /// nits. Chains without an OutputTransfer default to nits (the IR
+    /// domain passes through untouched).
+    pub fn lut_output_domain(&self) -> LutOutputDomain {
+        for f in self.fragments.iter().rev() {
+            match f {
+                EncodeFragment::OutputTransferSrgb => return LutOutputDomain::Drive,
+                EncodeFragment::OutputTransferPq | EncodeFragment::OutputTransferLinear => {
+                    return LutOutputDomain::Nits
+                }
+                _ => {}
+            }
+        }
+        LutOutputDomain::Nits
+    }
+}
+
+/// Domain of the values a chain's 3D LUT outputs — what the terminal
+/// OutputTransfer fragment expects as input. See
+/// [`EncodeConfig::lut_output_domain`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LutOutputDomain {
+    /// Linear nits (absolute). PQ + linear-scanout chains.
+    Nits,
+    /// Linear panel drive in `[0, 1]` (the wire value pre-OETF). sRGB
+    /// chains.
+    Drive,
 }
 
 /// Synthesize a SPIR-V fragment shader for the given `EncodeConfig`.

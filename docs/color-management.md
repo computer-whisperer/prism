@@ -104,6 +104,23 @@ LUT binding).
   (exercised by the P010 video path). HLG, BT.1886, and parametric gamma are stubs.
 - **Encode**: `[Lut3d, OutputTransferSrgb|Pq|Linear]` per output. The LUT is
   identity until a calibration is loaded; `prism-tune` generates and pushes one.
+  The LUT output domain is **absolute and chain-determined** (the drive-domain
+  reform): PQ/linear chains consume linear nits; the sRGB chain consumes linear
+  panel drive `[0, 1]` and its OETF is parameter-free —
+  `srgb_oetf(clamp(in, 0, 1))`, the clamp being pure wire validity. SDR and HDR
+  are symmetric: the LUT carries the entire BT.2020→panel mapping, and no
+  runtime policy knob can re-scale a baked calibration. `sdr-reference-nits` is
+  decode-side policy only (what client reference white maps to in the
+  intermediate); it additionally anchors the *synthesized fallback* LUT on
+  uncalibrated SDR outputs, where round-trip identity is the only sane default.
+  `.lut` files are v5 with an `out_space` header tag (nits vs drive); pre-v5
+  files load as nits (every existing HDR calibration stays valid), and a
+  domain/chain mismatch is rejected at load with a "rebake" message instead of
+  rendering wrong. History: pre-reform, the SDR encode divided by the *runtime*
+  `sdr-reference-nits` while LUT cmd space was baked against the
+  *calibration-time* value — raising the config value from 74 → 200 on the
+  S24C230 silently capped the panel at ~0.64 drive (~69 cd/m² of a measured
+  182), which is the bug that motivated all of this.
 - **Output capability advertisement**: `wp_color_management_output_v1.get_output`
   returns the output's preferred PQ/BT.2020 description so HDR clients (Firefox)
   engage their HDR path.

@@ -131,11 +131,13 @@ impl EncodeDiagnoseProbe {
 
     /// Run the encode pipeline against a 1×1 scratch with `input_nits`
     /// as the (linear, BT.2020) intermediate value, read back the
-    /// scanout-format output, and decode it to linear nits.
+    /// scanout-format output, and decode it to the chain's LUT-output
+    /// domain — linear nits for HDR PQ scanout, linear drive `[0, 1]`
+    /// for SDR sRGB scanout.
     ///
     /// `encode_push` should match what the live render path uses for
-    /// this output — target_peak_nits + sdr_white_nits influence the
-    /// OutputTransfer stage and so the decoded result.
+    /// this output — target_peak_nits influences the OutputTransfer
+    /// stage and so the decoded result.
     ///
     /// `lut3d` is the per-output 3D LUT bound at descriptor set 0
     /// binding 1 when the encode chain includes `EncodeFragment::Lut3d`.
@@ -155,12 +157,7 @@ impl EncodeDiagnoseProbe {
         self.run_encode(encode, encode_push, lut3d)?;
 
         // 3) Copy the offscreen → readback buffer + read on CPU.
-        // SDR formats need `sdr_white_nits` for the scanout-to-nits
-        // inverse (sRGB EOTF returns [0,1] linear, then ×nits); HDR
-        // PQ formats decode straight to nits and ignore the param.
-        // Source it from the encode_push the live render path uses
-        // so the decode matches what the shader actually emitted.
-        self.readback_and_decode(encode_push.sdr_white_nits as f64)
+        self.readback_and_decode()
     }
 
     /// Push `input_nits` into the 1×1 intermediate image. The
@@ -393,9 +390,9 @@ impl EncodeDiagnoseProbe {
     }
 
     /// Copy the 1×1 offscreen to the readback buffer, read it on CPU,
-    /// decode the format back to linear cd/m². See
-    /// [`decode_scanout_texel`] for the `sdr_white_nits` semantics.
-    fn readback_and_decode(&mut self, sdr_white_nits: f64) -> Result<DiagnosedNits> {
+    /// decode the format back to the chain's LUT-output domain. See
+    /// [`decode_scanout_texel`] for the per-format semantics.
+    fn readback_and_decode(&mut self) -> Result<DiagnosedNits> {
         let offscreen_image = self.offscreen_image;
         let readback_buffer = self.readback_buffer;
         self.oneshot.record_and_submit(|raw, cb| unsafe {
@@ -425,9 +422,9 @@ impl EncodeDiagnoseProbe {
         // waited copy into it. Read texel and decode.
         let raw =
             unsafe { std::slice::from_raw_parts(self.readback_ptr, self.readback_size as usize) };
-        let nits = decode_scanout_texel(self.scanout_format, raw, sdr_white_nits)?;
+        let decoded = decode_scanout_texel(self.scanout_format, raw)?;
         let _ = self.readback_size;
-        Ok(nits)
+        Ok(decoded)
     }
 }
 
@@ -457,17 +454,16 @@ impl Drop for EncodeDiagnoseProbe {
 
 // ── Format decode ───────────────────────────────────────────────────────────
 
-/// CPU-side decode of one scanout texel back to absolute cd/m². The
-/// encode shader's `OutputTransfer*` fragment is the producer; this
-/// is its inverse, so what comes back is in the same "commanded
-/// nits" units as the LUT entries the verify path compares against.
+/// CPU-side decode of one scanout texel back to the encode chain's
+/// LUT-output domain. The encode shader's `OutputTransfer*` fragment
+/// is the producer; this is its inverse, so what comes back is in the
+/// same units as the LUT entries the verify path compares against.
 ///
-/// Mode-aware scaling: HDR PQ formats decode straight to linear nits
-/// (PQ EOTF is absolute by construction). SDR sRGB formats decode
-/// to linear `[0, 1]`, which then needs `× sdr_white_nits` to land
-/// in absolute cd/m². The caller passes `sdr_white_nits` from the
-/// EncodePush they handed to `diagnose`; for HDR formats the value
-/// is ignored.
+/// Per-format semantics: HDR PQ formats decode straight to linear
+/// nits (PQ EOTF is absolute by construction). SDR sRGB formats
+/// decode to linear drive `[0, 1]` — the sRGB transfer is parameter-
+/// free, so the drive value IS the LUT-output unit; no reference-
+/// white scaling applies anywhere on the encode side.
 ///
 /// Supported today:
 ///   - `R16G16B16A16_SFLOAT` — HDR PQ fp16 scanout (DP-4 HDR mode)
@@ -480,11 +476,7 @@ impl Drop for EncodeDiagnoseProbe {
 /// Add new arms as the renderer grows scanout formats; missing
 /// support manifests as a `MissingFeature` error on the first
 /// `EncodeDiagnose` IPC call for that output.
-pub fn decode_scanout_texel(
-    format: vk::Format,
-    bytes: &[u8],
-    sdr_white_nits: f64,
-) -> Result<DiagnosedNits> {
+pub fn decode_scanout_texel(format: vk::Format, bytes: &[u8]) -> Result<DiagnosedNits> {
     match format {
         vk::Format::R16G16B16A16_SFLOAT => {
             // PQ-encoded half-floats in [0, 1]. Inverse: f16 → f32 →
@@ -506,9 +498,9 @@ pub fn decode_scanout_texel(
                 ));
             }
             Ok([
-                srgb_eotf(bytes[0] as f64 / 255.0) * sdr_white_nits,
-                srgb_eotf(bytes[1] as f64 / 255.0) * sdr_white_nits,
-                srgb_eotf(bytes[2] as f64 / 255.0) * sdr_white_nits,
+                srgb_eotf(bytes[0] as f64 / 255.0),
+                srgb_eotf(bytes[1] as f64 / 255.0),
+                srgb_eotf(bytes[2] as f64 / 255.0),
             ])
         }
         vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => {
@@ -518,9 +510,9 @@ pub fn decode_scanout_texel(
                 ));
             }
             Ok([
-                srgb_eotf(bytes[2] as f64 / 255.0) * sdr_white_nits,
-                srgb_eotf(bytes[1] as f64 / 255.0) * sdr_white_nits,
-                srgb_eotf(bytes[0] as f64 / 255.0) * sdr_white_nits,
+                srgb_eotf(bytes[2] as f64 / 255.0),
+                srgb_eotf(bytes[1] as f64 / 255.0),
+                srgb_eotf(bytes[0] as f64 / 255.0),
             ])
         }
         vk::Format::A2R10G10B10_UNORM_PACK32 => {
@@ -538,9 +530,9 @@ pub fn decode_scanout_texel(
             let g10 = ((pack >> 10) & 0x3FF) as f64;
             let b10 = (pack & 0x3FF) as f64;
             Ok([
-                srgb_eotf(r10 / 1023.0) * sdr_white_nits,
-                srgb_eotf(g10 / 1023.0) * sdr_white_nits,
-                srgb_eotf(b10 / 1023.0) * sdr_white_nits,
+                srgb_eotf(r10 / 1023.0),
+                srgb_eotf(g10 / 1023.0),
+                srgb_eotf(b10 / 1023.0),
             ])
         }
         _ => Err(RendererError::MissingFeature(
@@ -549,9 +541,8 @@ pub fn decode_scanout_texel(
     }
 }
 
-/// sRGB encoded `[0, 1]` → linear `[0, 1]`. Standard IEC 61966-2-1
-/// piecewise inverse; caller multiplies by sdr_white_nits to get
-/// absolute cd/m² if needed.
+/// sRGB encoded `[0, 1]` → linear drive `[0, 1]`. Standard IEC
+/// 61966-2-1 piecewise inverse.
 fn srgb_eotf(c: f64) -> f64 {
     if c <= 0.04045 {
         c / 12.92
@@ -689,7 +680,7 @@ mod tests {
 
     /// PQ EOTF round-trip via decode_scanout_texel. Pack a known PQ-
     /// encoded f16 value (anchor: 0.5083 ≈ 100 nits) and verify we
-    /// decode back to ~100. sdr_white_nits is unused for HDR formats.
+    /// decode back to ~100 nits (HDR formats stay absolute-nits).
     #[test]
     fn decode_pq_anchor() {
         let v = half::f16::from_f32(0.5083);
@@ -698,37 +689,35 @@ mod tests {
         buf[0..2].copy_from_slice(&bytes_per);
         buf[2..4].copy_from_slice(&bytes_per);
         buf[4..6].copy_from_slice(&bytes_per);
-        let decoded = decode_scanout_texel(vk::Format::R16G16B16A16_SFLOAT, &buf, 80.0).unwrap();
+        let decoded = decode_scanout_texel(vk::Format::R16G16B16A16_SFLOAT, &buf).unwrap();
         for (c, &val) in decoded.iter().take(3).enumerate() {
             assert!((val - 100.0).abs() < 2.0, "ch {c} decoded {val} vs ~100");
         }
     }
 
-    /// sRGB white (255, 255, 255) at sdr_white_nits=80 should decode
-    /// to ~80 cd/m² per channel. Anchors the SDR nits-scaling path
-    /// (which was missing before — used to return [0, 1] linear).
+    /// sRGB white (255, 255, 255) decodes to drive 1.0 per channel —
+    /// SDR formats decode to the LUT's drive domain, with no
+    /// reference-white scaling anywhere on the encode side.
     #[test]
-    fn decode_srgb_white_at_80_nits() {
+    fn decode_srgb_white_is_full_drive() {
         let buf = [255u8, 255, 255, 255];
-        let decoded = decode_scanout_texel(vk::Format::R8G8B8A8_UNORM, &buf, 80.0).unwrap();
+        let decoded = decode_scanout_texel(vk::Format::R8G8B8A8_UNORM, &buf).unwrap();
         for (c, &val) in decoded.iter().take(3).enumerate() {
-            assert!((val - 80.0).abs() < 1e-6, "ch {c} decoded {val} vs ~80");
+            assert!((val - 1.0).abs() < 1e-6, "ch {c} decoded {val} vs 1.0");
         }
     }
 
-    /// A2R10G10B10 packed: full white (R=G=B=1023, A=3) at
-    /// sdr_white_nits=80 decodes to ~80 cd/m² per channel. Exercises
-    /// the packed-10-bit channel extraction that DP-8 SDR scanout
-    /// hits (depth=Bpc10 default whenever no `--depth` CLI flag is
-    /// given AND output isn't HDR).
+    /// A2R10G10B10 packed: full white (R=G=B=1023, A=3) decodes to
+    /// drive 1.0 per channel. Exercises the packed-10-bit channel
+    /// extraction that DP-8 SDR scanout hits (depth=Bpc10 default
+    /// whenever no `--depth` CLI flag is given AND output isn't HDR).
     #[test]
-    fn decode_a2r10g10b10_white_at_80_nits() {
+    fn decode_a2r10g10b10_white_is_full_drive() {
         let pack: u32 = (3 << 30) | (1023 << 20) | (1023 << 10) | 1023;
         let buf = pack.to_le_bytes();
-        let decoded =
-            decode_scanout_texel(vk::Format::A2R10G10B10_UNORM_PACK32, &buf, 80.0).unwrap();
+        let decoded = decode_scanout_texel(vk::Format::A2R10G10B10_UNORM_PACK32, &buf).unwrap();
         for (c, &val) in decoded.iter().take(3).enumerate() {
-            assert!((val - 80.0).abs() < 1e-6, "ch {c} decoded {val} vs ~80");
+            assert!((val - 1.0).abs() < 1e-6, "ch {c} decoded {val} vs 1.0");
         }
     }
 
@@ -740,8 +729,7 @@ mod tests {
     fn decode_a2r10g10b10_channel_order() {
         let pack: u32 = (512 << 20) | (256 << 10) | 128;
         let buf = pack.to_le_bytes();
-        let decoded =
-            decode_scanout_texel(vk::Format::A2R10G10B10_UNORM_PACK32, &buf, 100.0).unwrap();
+        let decoded = decode_scanout_texel(vk::Format::A2R10G10B10_UNORM_PACK32, &buf).unwrap();
         assert!(
             decoded[0] > decoded[1],
             "R={} should > G={}",

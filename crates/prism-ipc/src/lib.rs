@@ -345,13 +345,15 @@ impl GamutMesh {
     }
 }
 
-/// Per-channel decoded scanout nits returned by `OutputAction::EncodeDiagnose`.
+/// Per-channel decoded scanout value returned by `OutputAction::EncodeDiagnose`.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct EncodeDiagnoseResult {
     /// What the compositor's encode pipeline + LUT actually emitted
     /// for the requested input, decoded from the scanout format back
-    /// to linear cd/m².
+    /// to the encode chain's LUT-output domain: linear cd/m² for HDR
+    /// PQ scanout, linear panel drive `[0, 1]` for SDR sRGB scanout.
+    /// (Field name predates the drive-domain reform.)
     pub scanout_nits: [f64; 3],
 }
 

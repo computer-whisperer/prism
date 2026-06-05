@@ -410,7 +410,8 @@ impl RefineCtx<'_> {
 
 /// Configuration for the hardware gamut probe. `cmd_axis_max_nits` is
 /// the per-channel saturation peak discovered in the per-channel
-/// pre-probe; `cv = 1` on each axis maps to that nits value.
+/// pre-probe, in cmd units (cd/m² for HDR, linear drive `[0, 1]` for
+/// SDR); `cv = 1` on each axis maps to that cmd value.
 ///
 /// `fast_integration_ms` enables adaptive per-point integration: each
 /// vertex first burst-measures at the override integration time, and

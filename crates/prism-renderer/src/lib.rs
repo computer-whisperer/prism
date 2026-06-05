@@ -33,14 +33,15 @@ pub use element::{
     lower_elements, make_projector, srgb_to_bt2020_nits, AlphaMode, BorderEl, FrameElementMeta,
     LoweredFrame, RenderEl, SolidColorEl, SurfaceColorParams, SurfaceEl,
 };
-pub use encode_synth::{EncodeConfig, EncodeFragment, EncodePushSynth};
+pub use encode_synth::{EncodeConfig, EncodeFragment, EncodePushSynth, LutOutputDomain};
 pub use error::{RendererError, Result};
 pub use instance::Instance;
 pub use intermediate::{create_view, Intermediate, DEFAULT_INTERMEDIATE_FORMAT};
 pub use lut3d::{
-    identity_lut, load_lut3d_file, pq_eotf, save_lut3d_file, synthesize_lut_from_matrix_curve,
-    LoadedLut, Lut3dTexture, LutFileHeader, LUT_FILE_HEADER_BYTES, LUT_FILE_IN_TF_PQ,
-    LUT_FILE_MAGIC, LUT_FILE_TRIPLE_BYTES, LUT_FILE_VERSION, LUT_FORMAT,
+    drive_identity_lut, identity_lut, load_lut3d_file, pq_eotf, save_lut3d_file,
+    synthesize_lut_from_matrix_curve, LoadedLut, Lut3dTexture, LutFileHeader,
+    DEFAULT_DRIVE_WHITE_NITS, LUT_FILE_HEADER_BYTES, LUT_FILE_IN_TF_PQ, LUT_FILE_MAGIC,
+    LUT_FILE_TRIPLE_BYTES, LUT_FILE_VERSION, LUT_FORMAT,
 };
 pub use oneshot::OneshotPool;
 pub use pipeline::decode::{DecodePipeline, DecodePush};

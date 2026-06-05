@@ -237,12 +237,12 @@ fn report_neutral(samples: &[Sample], threshold: f64) {
     if has_cpu {
         println!(
             "{:>9}  {:>27}  {:>21}  {:>7}  {:>9}",
-            "input", "scanout R/G/B (cd/m²)", "balance R:G:B", "drift", "gpu-vs-lut"
+            "input", "scanout R/G/B (cmd)", "balance R:G:B", "drift", "gpu-vs-lut"
         );
     } else {
         println!(
             "{:>9}  {:>27}  {:>21}  {:>7}",
-            "input", "scanout R/G/B (cd/m²)", "balance R:G:B", "drift"
+            "input", "scanout R/G/B (cmd)", "balance R:G:B", "drift"
         );
     }
     for s in samples {

@@ -514,8 +514,23 @@ impl OutputContext {
         } else {
             None
         };
-        let entries =
-            synthesize_lut_from_matrix_curve(cube_edge, self.effective_ctm(), response_curve);
+        // Drive-domain chains (sRGB) bake the nits → drive normalization
+        // into the synthesized fallback, anchored at the output's
+        // effective reference white *at synthesis time*. This is the only
+        // place `sdr-reference-nits` touches the encode side, and only
+        // for uncalibrated outputs — a measured `.lut` (precedence 1/3
+        // above) carries its own absolute drive mapping that no runtime
+        // policy knob can re-scale.
+        let drive_white = match self.config.encode_config.lut_output_domain() {
+            prism_renderer::LutOutputDomain::Drive => Some(self.effective_sdr_reference_nits()),
+            prism_renderer::LutOutputDomain::Nits => None,
+        };
+        let entries = synthesize_lut_from_matrix_curve(
+            cube_edge,
+            self.effective_ctm(),
+            response_curve,
+            drive_white,
+        );
         self.renderer
             .upload_lut3d(&entries)
             .context("upload synthesized color LUT")

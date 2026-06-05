@@ -198,7 +198,10 @@ pub fn open_patch_surface(output: &str, baseline: &OutputBaseline) -> Result<Pat
 /// Encode a nits triple to the patch surface's `[0, 1]` code-value space
 /// for the current mode. HDR uses PQ OETF (10000-nit peak); SDR uses
 /// sRGB OETF anchored at `sdr_reference_nits`. The compositor decodes
-/// from this same convention.
+/// from this same convention. This is *content* space — use it for
+/// patches whose meaning is "render this luminance" (borders, verify
+/// targets, alignment aids). Sweep commands use
+/// [`code_values_for_cmd`] instead.
 pub fn code_values_for_nits(baseline: &OutputBaseline, nits_rgb: [f64; 3]) -> [f64; 3] {
     if baseline.hdr_active {
         [
@@ -212,6 +215,32 @@ pub fn code_values_for_nits(baseline: &OutputBaseline, nits_rgb: [f64; 3]) -> [f
             srgb_oetf((nits_rgb[0] / ref_nits).clamp(0.0, 1.0)),
             srgb_oetf((nits_rgb[1] / ref_nits).clamp(0.0, 1.0)),
             srgb_oetf((nits_rgb[2] / ref_nits).clamp(0.0, 1.0)),
+        ]
+    }
+}
+
+/// Encode a *sweep command* triple to patch code values. Cmd space is
+/// mode-absolute, mirroring the compositor's LUT output domain:
+///
+///   - **HDR**: commands are linear nits (PQ OETF, 10000-nit peak) —
+///     identical to content space.
+///   - **SDR**: commands are linear panel drive `[0, 1]` (sRGB OETF
+///     directly). With the calibration LUT forced to the drive
+///     identity, the wire receives exactly these code values, so a
+///     cmd IS the panel's pre-OETF drive — no `sdr_reference_nits`
+///     anywhere in the loop, matching the runtime encode contract.
+pub fn code_values_for_cmd(baseline: &OutputBaseline, cmd_rgb: [f64; 3]) -> [f64; 3] {
+    if baseline.hdr_active {
+        [
+            pq_oetf_f64(cmd_rgb[0].clamp(0.0, 10_000.0)),
+            pq_oetf_f64(cmd_rgb[1].clamp(0.0, 10_000.0)),
+            pq_oetf_f64(cmd_rgb[2].clamp(0.0, 10_000.0)),
+        ]
+    } else {
+        [
+            srgb_oetf(cmd_rgb[0].clamp(0.0, 1.0)),
+            srgb_oetf(cmd_rgb[1].clamp(0.0, 1.0)),
+            srgb_oetf(cmd_rgb[2].clamp(0.0, 1.0)),
         ]
     }
 }
@@ -274,23 +303,40 @@ pub fn set_channel_patch(
     })
 }
 
-/// Drive an arbitrary RGB patch in panel-native nits. The 3D-sweep
-/// calibration needs to command independent per-channel values
-/// (cmd_R, cmd_G, cmd_B) — encoded to the surface's code-value space
-/// via the same mode-aware helper as the single-channel and white
-/// setters so the conventions stay consistent.
+/// Drive an arbitrary RGB patch in *cmd space* (see
+/// [`code_values_for_cmd`]: nits for HDR, linear drive for SDR). The
+/// 3D-sweep calibration and the gamut probe command independent
+/// per-channel values (cmd_R, cmd_G, cmd_B).
 pub fn set_rgb_patch(
     patch: &mut PatchSurface,
     baseline: &OutputBaseline,
     cmd_rgb: [f64; 3],
 ) -> Result<()> {
-    let cv = code_values_for_nits(baseline, cmd_rgb);
+    let cv = code_values_for_cmd(baseline, cmd_rgb);
     patch.set_code_values(cv).with_context(|| {
         format!(
-            "set RGB patch ({:.2}, {:.2}, {:.2}) cd/m²",
+            "set RGB cmd patch ({:.4}, {:.4}, {:.4})",
             cmd_rgb[0], cmd_rgb[1], cmd_rgb[2],
         )
     })
+}
+
+/// Drive a single-channel patch in *cmd space* (see
+/// [`code_values_for_cmd`]) on the named channel, other channels at
+/// zero. The calibrate-lut3d per-channel sweep uses this; legacy
+/// content-space tools keep [`set_channel_patch`].
+pub fn set_channel_patch_cmd(
+    patch: &mut PatchSurface,
+    baseline: &OutputBaseline,
+    channel: Channel,
+    cmd: f64,
+) -> Result<()> {
+    let mut cmd_rgb = [0.0_f64; 3];
+    cmd_rgb[channel.idx()] = cmd;
+    let cv = code_values_for_cmd(baseline, cmd_rgb);
+    patch
+        .set_code_values(cv)
+        .with_context(|| format!("set {} channel cmd patch = {:.4}", channel.label(), cmd,))
 }
 
 /// Render BT.2020 D65 reference white at `target_nits` in the centred

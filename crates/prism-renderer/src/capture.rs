@@ -611,17 +611,27 @@ impl Drop for AsyncSlot {
     }
 }
 
-/// Build the capture encode push constants for a given reference-white level:
-/// the BT.2020 → BT.709 primaries matrix plus `sdr_white_nits` for the sRGB
-/// OETF's normalization. Shared by the SHM and dmabuf paths.
+/// Build the capture encode push constants for a given reference-white level.
+/// The sRGB output transfer is parameter-free (`srgb_oetf(clamp(in, 0, 1))`),
+/// so the nits → `[0, 1]` normalization folds into the calibration matrix:
+/// `srgb_oetf(clamp((M / white) × in, 0, 1))` is exactly the old
+/// `srgb_oetf(clamp((M × in) / white, 0, 1))`. Shared by the SHM and dmabuf
+/// paths.
 fn capture_push(sdr_white_nits: f32) -> EncodePush {
     let mut push = EncodePush::sdr_identity();
-    push.sdr_white_nits = sdr_white_nits;
     push.target_peak_nits = sdr_white_nits;
     // CalibrationMatrix does `out = mat3(cal_matrix) * in`; set it to the
-    // BT.2020 → BT.709 primaries conversion so the sRGB OETF that follows
-    // receives sRGB-primary light.
-    push.set_ctm(prism_frame::bt2020_to_srgb_matrix());
+    // BT.2020 → BT.709 primaries conversion (scaled by the reference-white
+    // normalization) so the sRGB OETF that follows receives sRGB-primary
+    // light in `[0, 1]`.
+    let inv_white = 1.0 / sdr_white_nits.max(1.0);
+    let mut m = prism_frame::bt2020_to_srgb_matrix();
+    for row in m.iter_mut() {
+        for v in row.iter_mut() {
+            *v *= inv_white;
+        }
+    }
+    push.set_ctm(m);
     push
 }
 

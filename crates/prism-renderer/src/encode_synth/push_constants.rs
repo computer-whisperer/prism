@@ -12,10 +12,10 @@
 //!     unused but reserved.)
 //!   - `vec4 response_gamma` at offset 80 (per-channel response gamma
 //!     exponent. `.w` unused but reserved.)
-//!   - `float sdr_white_nits` at offset 96
-//!   - `float target_peak_nits` at offset 100
-//!   - `float dither_strength` at offset 104
-//!   - `float _pad` at offset 108
+//!   - `float target_peak_nits` at offset 96
+//!   - `float dither_strength` at offset 100
+//!   - `float _pad` at offset 104
+//!   - `float _pad2` at offset 108
 //!
 //! Total 112 bytes — comfortably below the 128-byte Vulkan minimum
 //! push-constant size, so any conformant driver accepts this layout.
@@ -26,6 +26,15 @@
 //! shader no longer needs a pre-LUT axis-aligned box clamp. The PQ
 //! shaper still implicitly bounds inputs to `[0, 10000]` cd/m² via the
 //! sampler's clamp-to-edge addressing.
+//!
+//! A `float sdr_white_nits` used to sit at offset 96 as the SDR encode's
+//! normalization divisor. The drive-domain LUT reform removed it: SDR
+//! LUTs now output the panel's linear drive value directly and the sRGB
+//! output transfer is parameter-free (`srgb_oetf(clamp(in, 0, 1))`), so
+//! a runtime change to `sdr-reference-nits` can no longer silently
+//! re-scale a baked calibration. Reference-white policy lives entirely
+//! on the decode side (and in fallback-LUT synthesis for uncalibrated
+//! outputs).
 
 use bytemuck::{Pod, Zeroable};
 
@@ -47,27 +56,29 @@ pub struct EncodePushSynth {
     pub response_gain: [f32; 4],
     /// Per-channel response gamma — exponent. Identity = `[1.0, 1.0, 1.0, 0.0]`.
     pub response_gamma: [f32; 4],
-    /// For SDR encode: how many nits is the input value `1.0`.
-    pub sdr_white_nits: f32,
-    /// For PQ encode and linear scanout: clip / normalize ceiling.
+    /// For PQ encode and linear scanout: clip / normalize ceiling. Unused
+    /// by the (parameter-free) sRGB transfer.
     pub target_peak_nits: f32,
     /// Per-pixel dither magnitude (units: encoded code values). Set 0 to
     /// disable visually even if the dither fragment is in the chain.
     pub dither_strength: f32,
     pub _pad: f32,
+    pub _pad2: f32,
 }
 
 impl EncodePushSynth {
-    /// Identity calibration + 80-nit SDR white, no dither, identity response.
+    /// Identity calibration, no dither, identity response. The sRGB
+    /// output transfer takes no parameters — the LUT (drive-domain for
+    /// SDR chains) carries the entire nits→drive mapping.
     pub fn sdr_identity() -> Self {
         Self {
             cal_matrix: mat4_identity(),
             response_gain: identity_response_vec(),
             response_gamma: identity_response_vec(),
-            sdr_white_nits: 80.0,
             target_peak_nits: 80.0,
             dither_strength: 0.0,
             _pad: 0.0,
+            _pad2: 0.0,
         }
     }
 
@@ -77,10 +88,10 @@ impl EncodePushSynth {
             cal_matrix: mat4_identity(),
             response_gain: identity_response_vec(),
             response_gamma: identity_response_vec(),
-            sdr_white_nits: 80.0,
             target_peak_nits: 10000.0,
             dither_strength: 0.0,
             _pad: 0.0,
+            _pad2: 0.0,
         }
     }
 
@@ -127,18 +138,17 @@ pub const PUSH_CONSTANTS_SIZE: u32 = std::mem::size_of::<EncodePushSynth>() as u
 pub const OFFSET_CAL_MATRIX: u32 = 0;
 pub const OFFSET_RESPONSE_GAIN: u32 = 64;
 pub const OFFSET_RESPONSE_GAMMA: u32 = 80;
-pub const OFFSET_SDR_WHITE_NITS: u32 = 96;
-pub const OFFSET_TARGET_PEAK_NITS: u32 = 100;
-pub const OFFSET_DITHER_STRENGTH: u32 = 104;
-pub const OFFSET_PAD: u32 = 108;
+pub const OFFSET_TARGET_PEAK_NITS: u32 = 96;
+pub const OFFSET_DITHER_STRENGTH: u32 = 100;
+pub const OFFSET_PAD: u32 = 104;
+pub const OFFSET_PAD2: u32 = 108;
 
 // Member indices within the SPIR-V struct (same order as Rust struct).
 pub const MEMBER_CAL_MATRIX: u32 = 0;
 pub const MEMBER_RESPONSE_GAIN: u32 = 1;
 pub const MEMBER_RESPONSE_GAMMA: u32 = 2;
-pub const MEMBER_SDR_WHITE_NITS: u32 = 3;
-pub const MEMBER_TARGET_PEAK_NITS: u32 = 4;
-pub const MEMBER_DITHER_STRENGTH: u32 = 5;
+pub const MEMBER_TARGET_PEAK_NITS: u32 = 3;
+pub const MEMBER_DITHER_STRENGTH: u32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -168,16 +178,17 @@ mod tests {
             OFFSET_RESPONSE_GAMMA
         );
         assert_eq!(
-            (&zero.sdr_white_nits as *const _ as usize - base) as u32,
-            OFFSET_SDR_WHITE_NITS
-        );
-        assert_eq!(
             (&zero.target_peak_nits as *const _ as usize - base) as u32,
             OFFSET_TARGET_PEAK_NITS
         );
         assert_eq!(
             (&zero.dither_strength as *const _ as usize - base) as u32,
             OFFSET_DITHER_STRENGTH
+        );
+        assert_eq!((&zero._pad as *const _ as usize - base) as u32, OFFSET_PAD);
+        assert_eq!(
+            (&zero._pad2 as *const _ as usize - base) as u32,
+            OFFSET_PAD2
         );
     }
 }

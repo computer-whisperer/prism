@@ -121,46 +121,28 @@ pub fn emit_calibration_matrix(ctx: &mut ShaderCtx, in_rgb: spirv::Word) -> spir
         .expect("composite_construct output rgb")
 }
 
-/// sRGB output transfer: normalize by max(sdr_white_nits, 1.0), clamp to [0,1],
-/// apply sRGB OETF per channel.
+/// sRGB output transfer: clamp linear drive to [0, 1], apply sRGB OETF per
+/// channel. Parameter-free by design — the upstream LUT outputs the panel's
+/// linear drive value directly (the wire value pre-OETF), so the only job
+/// left here is refusing to send out-of-range control values to the panel.
+/// Mirrors how `OutputTransferPq` treats its input as absolute PQ nits: the
+/// LUT owns the BT.2020→panel mapping end-to-end in both modes, and no
+/// runtime policy knob (e.g. `sdr-reference-nits`) can silently re-scale a
+/// baked calibration.
 ///
 /// Today's encode path used piecewise sRGB OETF (12.92*c for small c, else
 /// 1.055*c^(1/2.4) - 0.055). We approximate with the pure-pow form over the
 /// whole range; the error is < 0.5/255 at any byte and the gradient anchor-
 /// point test still passes. Keeps the SPIR-V short and avoids per-component
 /// branch instructions.
-pub fn emit_output_transfer_srgb(ctx: &mut ShaderCtx, in_nits: spirv::Word) -> spirv::Word {
-    let f32_t = ctx.types.f32_t;
+pub fn emit_output_transfer_srgb(ctx: &mut ShaderCtx, in_drive: spirv::Word) -> spirv::Word {
     let vec3_t = ctx.types.vec3;
-    let glsl_ext = ctx.iface.glsl_ext;
     let f_zero = ctx.consts.f_zero;
     let f_one = ctx.consts.f_one;
 
-    let sdr_white = load_push_f32(ctx, MEMBER_SDR_WHITE_NITS);
-    let big = ctx.const_f32(1.0e30);
-    let sdr_white_clamped = ctx
-        .b
-        .ext_inst(
-            f32_t,
-            None,
-            glsl_ext,
-            GLSL_FCLAMP,
-            [
-                rspirv::dr::Operand::IdRef(sdr_white),
-                rspirv::dr::Operand::IdRef(f_one),
-                rspirv::dr::Operand::IdRef(big),
-            ],
-        )
-        .expect("clamp sdr_white");
-    let denom_vec = ctx.vec3_splat(sdr_white_clamped);
-    let normalized = ctx
-        .b
-        .f_div(vec3_t, None, in_nits, denom_vec)
-        .expect("normalize by sdr_white");
-
     let zero_vec = ctx.vec3_splat(f_zero);
     let one_vec = ctx.vec3_splat(f_one);
-    let clamped = ctx.glsl_call_vec3(GLSL_FCLAMP, [normalized, zero_vec, one_vec]);
+    let clamped = ctx.glsl_call_vec3(GLSL_FCLAMP, [in_drive, zero_vec, one_vec]);
 
     let inv_24 = ctx.const_f32(1.0 / 2.4);
     let inv_24_vec = ctx.vec3_splat(inv_24);

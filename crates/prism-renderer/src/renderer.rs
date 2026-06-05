@@ -187,12 +187,24 @@ impl Renderer {
         white_tex.upload_bytes(&[255, 255, 255, 255], 4, &[])?;
 
         // Per-output 3D LUT — only allocate when the configured encode
-        // chain actually samples it. Identity content at construction so
-        // an uncalibrated output renders pq_oetf → sample → pq_eotf as a
-        // visual no-op; calibration data arrives later via upload_lut3d.
+        // chain actually samples it. Default content at construction
+        // matches the chain's LUT-output domain: nits chains (PQ/linear)
+        // get the nits identity (pq_oetf → sample → pq_eotf is a visual
+        // no-op); drive chains (sRGB) get the nominal nits → drive
+        // mapping anchored at 80-nit reference white, so an uncalibrated
+        // output renders like a standard sRGB panel. Calibration data
+        // (or a per-output reference-white re-synthesis) arrives later
+        // via upload_lut3d.
         let lut3d = if encode.uses_lut3d {
             let mut tex = Lut3dTexture::new(device.clone(), DEFAULT_LUT_CUBE_EDGE)?;
-            tex.upload(&identity_lut(DEFAULT_LUT_CUBE_EDGE))?;
+            let entries = match encode_config.lut_output_domain() {
+                crate::encode_synth::LutOutputDomain::Nits => identity_lut(DEFAULT_LUT_CUBE_EDGE),
+                crate::encode_synth::LutOutputDomain::Drive => crate::lut3d::drive_identity_lut(
+                    DEFAULT_LUT_CUBE_EDGE,
+                    crate::lut3d::DEFAULT_DRIVE_WHITE_NITS,
+                ),
+            };
+            tex.upload(&entries)?;
             Some(tex)
         } else {
             None

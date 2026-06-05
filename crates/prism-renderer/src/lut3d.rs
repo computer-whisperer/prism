@@ -37,6 +37,7 @@ use std::sync::Arc;
 use ash::vk;
 
 use crate::device::Device;
+use crate::encode_synth::LutOutputDomain;
 use crate::error::{RendererError, Result, VkResultExt};
 use crate::oneshot::OneshotPool;
 
@@ -336,6 +337,13 @@ pub fn pq_eotf(v: f32) -> f32 {
     y * 10000.0
 }
 
+/// Nominal reference white (cd/m²) for the drive-domain fallback LUT a
+/// fresh Renderer uploads for sRGB chains before any output-specific
+/// synthesis or calibration arrives. 80 nits = the sRGB standard's
+/// diffuse white; outputs with a configured `sdr-reference-nits`
+/// re-synthesize at bringup with their own anchor.
+pub const DEFAULT_DRIVE_WHITE_NITS: f32 = 80.0;
+
 /// Generate an identity LUT (no calibration). Each grid point `(i, j, k)`
 /// gets the linear-nits value the shader's PQ shaper would decode the
 /// coord `(i, j, k) / (N-1)` to — so the round trip `pq_oetf(input) →
@@ -346,7 +354,18 @@ pub fn pq_eotf(v: f32) -> f32 {
 /// `cube_edge = 17` round-trip error peaks near a few percent at very
 /// low luminance; `cube_edge = 33` brings it down to sub-percent.
 pub fn identity_lut(cube_edge: u32) -> Vec<[f32; 3]> {
-    synthesize_lut_from_matrix_curve(cube_edge, None, None)
+    synthesize_lut_from_matrix_curve(cube_edge, None, None, None)
+}
+
+/// Generate the drive-domain "identity" for an uncalibrated SDR output:
+/// linear BT.2020 nits → linear panel drive, assuming a nominal sRGB
+/// panel whose full drive emits `ref_white_nits`. This is the fallback
+/// that makes uncalibrated SDR passthrough a round trip — a client
+/// pixel decoded at reference white `ref_white_nits` comes back out as
+/// the same code value on the wire. Measured calibrations replace this
+/// with the panel's true inverse, in the same drive output domain.
+pub fn drive_identity_lut(cube_edge: u32, ref_white_nits: f32) -> Vec<[f32; 3]> {
+    synthesize_lut_from_matrix_curve(cube_edge, None, None, Some(ref_white_nits))
 }
 
 /// Synthesize a 3D LUT that reproduces the legacy `(CTM, per-channel
@@ -364,15 +383,20 @@ pub fn identity_lut(cube_edge: u32) -> Vec<[f32; 3]> {
 ///    (identity when `response_curve` is `None`).
 /// 4. Store `commanded` as the LUT entry.
 ///
-/// `None` for both inputs degenerates exactly to [`identity_lut`].
-/// Calibrated LUTs stay in the same units throughout: the encode
-/// pipeline's OutputTransfer fragment is what eventually clamps + PQ-
-/// encodes for scanout, so the LUT output is "commanded nits" in
-/// linear space.
+/// `None` for all three inputs degenerates exactly to [`identity_lut`].
+///
+/// `drive_white_nits` selects the output domain: `None` leaves the
+/// entries in commanded linear nits (PQ/linear chains — the encode
+/// pipeline's OutputTransfer fragment clamps + PQ-encodes for scanout);
+/// `Some(ref)` divides every entry by `ref`, producing linear drive
+/// `[0, 1]`-domain entries for the parameter-free sRGB chain (values
+/// above full drive are left > 1 here — the shader's wire clamp
+/// handles them).
 pub fn synthesize_lut_from_matrix_curve(
     cube_edge: u32,
     ctm: Option<[[f32; 3]; 3]>,
     response_curve: Option<([f32; 3], [f32; 3])>,
+    drive_white_nits: Option<f32>,
 ) -> Vec<[f32; 3]> {
     let n = cube_edge as usize;
     let denom = (cube_edge - 1) as f32;
@@ -412,6 +436,14 @@ pub fn synthesize_lut_from_matrix_curve(
                     let p = panel[c].max(0.0);
                     panel[c] = (p / safe_gain[c]).powf(inv_gamma[c]);
                 }
+                // Drive-domain output: normalize so `drive_white_nits`
+                // commanded maps to full drive (1.0).
+                if let Some(white) = drive_white_nits {
+                    let inv = 1.0 / white.max(1e-6);
+                    for c in panel.iter_mut() {
+                        *c *= inv;
+                    }
+                }
                 out.push(panel);
             }
         }
@@ -436,13 +468,31 @@ pub const LUT_FILE_MAGIC: u32 = 0x54554C50;
 /// reachable surface and the table degrades gracefully — no shader-side
 /// per-channel pre-clamp needed beyond the loose fp-overflow guard at
 /// 10000 cd/m².
-pub const LUT_FILE_VERSION: u32 = 4;
+///
+/// v5 adds the `out_space` field, declaring the domain of the data
+/// payload: commanded linear nits (PQ/linear chains) or linear panel
+/// drive `[0, 1]` (the parameter-free sRGB chain). Pre-v5 files are
+/// nits-domain by construction (the only domain that existed) and load
+/// as such — existing HDR calibrations stay valid byte-for-byte. A
+/// nits-domain file can NOT serve an sRGB-chain output anymore; the
+/// load-time domain check rejects it loudly instead of letting a
+/// runtime policy value silently re-scale the table (the bug that
+/// motivated the drive-domain reform).
+pub const LUT_FILE_VERSION: u32 = 5;
 /// Old format version: v2 = no bt2020 input max field. Kept readable
 /// for existing calibrations.
 pub const LUT_FILE_VERSION_V2: u32 = 2;
 /// Old format version: v3 = with bt2020 input max field. Kept readable
 /// for existing calibrations; the cap value is ignored.
 pub const LUT_FILE_VERSION_V3: u32 = 3;
+/// Old format version: v4 = v5 minus the `out_space` field. Kept
+/// readable for existing (nits-domain / HDR) calibrations.
+pub const LUT_FILE_VERSION_V4: u32 = 4;
+
+/// `out_space` enum value: data payload is commanded linear nits.
+pub const LUT_FILE_OUT_SPACE_NITS: u32 = 1;
+/// `out_space` enum value: data payload is linear panel drive `[0, 1]`.
+pub const LUT_FILE_OUT_SPACE_DRIVE: u32 = 2;
 /// `in_tf` enum value for the PQ shaper. The compositor's encode shader
 /// always PQ-encodes its input before sampling the LUT, so files written
 /// for a different shaper would mis-index. Stored explicitly so a future
@@ -450,7 +500,7 @@ pub const LUT_FILE_VERSION_V3: u32 = 3;
 pub const LUT_FILE_IN_TF_PQ: u32 = 1;
 
 /// Binary header that precedes the data payload in a `.lut` file. All
-/// fields little-endian. v4 is 44 bytes total — the data payload
+/// fields little-endian. v5 is 48 bytes total — the data payload
 /// immediately follows.
 ///
 /// Field-by-field:
@@ -466,11 +516,12 @@ pub const LUT_FILE_IN_TF_PQ: u32 = 1;
 /// black_x   f32  panel black-point CIE X (cd/m²)
 /// black_y   f32  panel black-point CIE Y (cd/m²)  ← min luminance
 /// black_z   f32  panel black-point CIE Z (cd/m²)
+/// out_space u32  payload domain (v5+): 1 = nits, 2 = drive
 /// ```
 ///
 /// Data payload: `cube_edge³` RGB triples (3 × f32 each), X-fastest then
-/// Y then Z, in linear nits. Matches the iteration order
-/// [`Lut3dTexture::upload`] expects.
+/// Y then Z, in the domain `out_space` declares. Matches the iteration
+/// order [`Lut3dTexture::upload`] expects.
 ///
 /// The black-point fields capture what the colorimeter reads at
 /// (R=G=B=0) — i.e. panel emission below which no command can drive the
@@ -497,12 +548,14 @@ pub struct LutFileHeader {
     pub black_z: f32,
 }
 
-/// v4 header byte size — guaranteed by the file format and verified at load.
-pub const LUT_FILE_HEADER_BYTES: usize = 44;
-/// v2 header byte size — identical to v4 (no bt2020 input max field).
+/// v5 header byte size — guaranteed by the file format and verified at load.
+pub const LUT_FILE_HEADER_BYTES: usize = 48;
+/// v2 header byte size — v4 layout (no bt2020 input max field).
 pub const LUT_FILE_HEADER_BYTES_V2: usize = 44;
 /// v3 header byte size — v4 plus the dropped bt2020 input max triple.
 pub const LUT_FILE_HEADER_BYTES_V3: usize = 56;
+/// v4 header byte size — v5 minus the out_space field.
+pub const LUT_FILE_HEADER_BYTES_V4: usize = 44;
 
 /// Bytes per data triple (3 × f32, little-endian).
 pub const LUT_FILE_TRIPLE_BYTES: usize = 12;
@@ -518,6 +571,12 @@ pub struct LoadedLut {
     /// Measured panel black emission (X, Y, Z in cd/m²). All-zero if
     /// the calibration tool didn't have a meaningful measurement.
     pub black_point_xyz: [f32; 3],
+    /// Domain of `entries` — nits for PQ/linear chains, drive for the
+    /// sRGB chain. Pre-v5 files load as [`LutOutputDomain::Nits`].
+    /// Callers MUST validate this against the consuming chain's
+    /// [`EncodeConfig::lut_output_domain`](crate::encode_synth::EncodeConfig::lut_output_domain)
+    /// before uploading.
+    pub out_space: LutOutputDomain,
     pub entries: Vec<[f32; 3]>,
 }
 
@@ -544,6 +603,7 @@ pub fn load_lut3d_file(path: &Path) -> Result<LoadedLut> {
     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     let header_bytes = match version {
         LUT_FILE_VERSION => LUT_FILE_HEADER_BYTES,
+        LUT_FILE_VERSION_V4 => LUT_FILE_HEADER_BYTES_V4,
         LUT_FILE_VERSION_V3 => LUT_FILE_HEADER_BYTES_V3,
         LUT_FILE_VERSION_V2 => LUT_FILE_HEADER_BYTES_V2,
         _ => {
@@ -580,6 +640,23 @@ pub fn load_lut3d_file(path: &Path) -> Result<LoadedLut> {
     // v4 dropped it — the bake projects out-of-gamut requests onto the
     // measured reachable surface, so no shader-side pre-clamp is needed.
     // Older files load fine; the bytes are simply skipped.
+    //
+    // v5 added out_space at 44..48. Every pre-v5 file is nits-domain by
+    // construction — that was the only domain the format ever encoded —
+    // so existing (HDR) calibrations keep loading unchanged.
+    let out_space = if version == LUT_FILE_VERSION {
+        match u32::from_le_bytes(bytes[44..48].try_into().unwrap()) {
+            LUT_FILE_OUT_SPACE_NITS => LutOutputDomain::Nits,
+            LUT_FILE_OUT_SPACE_DRIVE => LutOutputDomain::Drive,
+            _ => {
+                return Err(RendererError::MissingFeature(
+                    "Lut3d: unrecognized out_space value",
+                ))
+            }
+        }
+    } else {
+        LutOutputDomain::Nits
+    };
 
     let n = cube_edge as usize;
     let expected_data = n * n * n * LUT_FILE_TRIPLE_BYTES;
@@ -601,14 +678,16 @@ pub fn load_lut3d_file(path: &Path) -> Result<LoadedLut> {
         cube_edge,
         peak_nits: [peak_r, peak_g, peak_b],
         black_point_xyz: [black_x, black_y, black_z],
+        out_space,
         entries,
     })
 }
 
-/// Write the entries + metadata as a binary LUT file. Header values
-/// other than `cube_edge`, `peak_nits`, and `black_point_xyz` are filled
-/// in from the canonical constants. `entries` must have length
-/// `cube_edge³` and be laid out X-fastest. Pass all-zero
+/// Write the entries + metadata as a binary LUT file (current = v5).
+/// Header values other than `cube_edge`, `peak_nits`,
+/// `black_point_xyz`, and `out_space` are filled in from the canonical
+/// constants. `entries` must have length `cube_edge³` and be laid out
+/// X-fastest, in the domain `out_space` declares. Pass all-zero
 /// `black_point_xyz` if the calibration tool didn't have a measurement;
 /// downstream consumers treat that as "unknown / assume zero floor".
 pub fn save_lut3d_file(
@@ -616,6 +695,7 @@ pub fn save_lut3d_file(
     cube_edge: u32,
     peak_nits: [f32; 3],
     black_point_xyz: [f32; 3],
+    out_space: LutOutputDomain,
     entries: &[[f32; 3]],
 ) -> std::io::Result<()> {
     let n = cube_edge as usize;
@@ -637,6 +717,11 @@ pub fn save_lut3d_file(
     out.extend_from_slice(&black_point_xyz[0].to_le_bytes());
     out.extend_from_slice(&black_point_xyz[1].to_le_bytes());
     out.extend_from_slice(&black_point_xyz[2].to_le_bytes());
+    let out_space_val = match out_space {
+        LutOutputDomain::Nits => LUT_FILE_OUT_SPACE_NITS,
+        LutOutputDomain::Drive => LUT_FILE_OUT_SPACE_DRIVE,
+    };
+    out.extend_from_slice(&out_space_val.to_le_bytes());
     for rgb in entries {
         out.extend_from_slice(&rgb[0].to_le_bytes());
         out.extend_from_slice(&rgb[1].to_le_bytes());
@@ -734,7 +819,7 @@ mod tests {
     #[test]
     fn synthesis_no_calibration_equals_identity() {
         let n = 9u32;
-        let synth = synthesize_lut_from_matrix_curve(n, None, None);
+        let synth = synthesize_lut_from_matrix_curve(n, None, None, None);
         let ident = identity_lut(n);
         assert_eq!(synth.len(), ident.len());
         for (i, (s, idn)) in synth.iter().zip(ident.iter()).enumerate() {
@@ -764,7 +849,7 @@ mod tests {
         ];
         let curve = ([0.0781f32, 0.1814, 0.0326], [1.0754f32, 1.0759, 1.0330]);
         let n = 9u32;
-        let lut = synthesize_lut_from_matrix_curve(n, Some(ctm), Some(curve));
+        let lut = synthesize_lut_from_matrix_curve(n, Some(ctm), Some(curve), None);
 
         // Spot-check the (4, 4, 4) grid point — well inside the cube so
         // all three channels see non-trivial CTM contributions.
@@ -814,10 +899,24 @@ mod tests {
                 [-0.001, -0.01, 0.95],
             ]),
             Some(([0.5, 0.7, 0.3], [1.05, 1.0, 1.02])),
+            None,
         );
-        save_lut3d_file(&path, cube_edge, peak_nits, black_point, &entries).expect("save");
+        save_lut3d_file(
+            &path,
+            cube_edge,
+            peak_nits,
+            black_point,
+            LutOutputDomain::Drive,
+            &entries,
+        )
+        .expect("save");
         let loaded = load_lut3d_file(&path).expect("load");
         assert_eq!(loaded.cube_edge, cube_edge);
+        assert_eq!(
+            loaded.out_space,
+            LutOutputDomain::Drive,
+            "out_space must round-trip"
+        );
         for c in 0..3 {
             assert!((loaded.peak_nits[c] - peak_nits[c]).abs() < 1e-6);
             assert!(
@@ -870,7 +969,71 @@ mod tests {
         std::fs::write(&path, &out).unwrap();
         let loaded = load_lut3d_file(&path).expect("load v2");
         assert_eq!(loaded.cube_edge, cube_edge);
+        assert_eq!(loaded.out_space, LutOutputDomain::Nits, "pre-v5 = nits");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// v4 LUT files — the format every existing HDR calibration on disk
+    /// uses — keep loading byte-for-byte, and come back as nits-domain.
+    /// This is the compatibility guarantee for the measured HDR LUTs
+    /// that aren't easy to recapture.
+    #[test]
+    fn lut_file_v4_loads_as_nits() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("prism-lut-v4-{}.lut", std::process::id()));
+        let cube_edge = 2u32;
+        let entries = identity_lut(cube_edge);
+        let peak_nits = [39.2f32, 127.1, 16.1];
+        let black = [0.2465f32, 0.2589, 0.6093];
+        let mut out =
+            Vec::with_capacity(LUT_FILE_HEADER_BYTES_V4 + entries.len() * LUT_FILE_TRIPLE_BYTES);
+        out.extend_from_slice(&LUT_FILE_MAGIC.to_le_bytes());
+        out.extend_from_slice(&LUT_FILE_VERSION_V4.to_le_bytes());
+        out.extend_from_slice(&cube_edge.to_le_bytes());
+        out.extend_from_slice(&LUT_FILE_IN_TF_PQ.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for v in peak_nits {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in black {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for rgb in &entries {
+            out.extend_from_slice(&rgb[0].to_le_bytes());
+            out.extend_from_slice(&rgb[1].to_le_bytes());
+            out.extend_from_slice(&rgb[2].to_le_bytes());
+        }
+        std::fs::write(&path, &out).unwrap();
+        let loaded = load_lut3d_file(&path).expect("load v4");
+        assert_eq!(loaded.cube_edge, cube_edge);
+        assert_eq!(loaded.out_space, LutOutputDomain::Nits, "v4 = nits");
+        for c in 0..3 {
+            assert!((loaded.peak_nits[c] - peak_nits[c]).abs() < 1e-6);
+            assert!((loaded.black_point_xyz[c] - black[c]).abs() < 1e-6);
+        }
+        assert_eq!(loaded.entries.len(), entries.len());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Drive-domain synthesis: entries are the nits synthesis divided
+    /// by the reference white, so full drive (1.0) lands exactly at
+    /// `ref_white_nits` commanded.
+    #[test]
+    fn drive_identity_scales_nits_identity() {
+        let n = 9u32;
+        let nits = identity_lut(n);
+        let drive = drive_identity_lut(n, 80.0);
+        assert_eq!(nits.len(), drive.len());
+        for (i, (a, b)) in nits.iter().zip(drive.iter()).enumerate() {
+            for c in 0..3 {
+                assert!(
+                    (a[c] / 80.0 - b[c]).abs() < 1e-4,
+                    "idx {i} ch {c}: nits/80={} drive={}",
+                    a[c] / 80.0,
+                    b[c],
+                );
+            }
+        }
     }
 
     /// v3 LUT files remain readable; the bt2020 cap triple they carried
@@ -907,6 +1070,7 @@ mod tests {
         let loaded = load_lut3d_file(&path).expect("load v3");
         assert_eq!(loaded.cube_edge, cube_edge);
         assert!((loaded.black_point_xyz[0] - 0.1).abs() < 1e-6);
+        assert_eq!(loaded.out_space, LutOutputDomain::Nits, "pre-v5 = nits");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -963,7 +1127,7 @@ mod tests {
         // CTM that maps positive R input to negative G and B (contrived).
         let ctm = Some([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]);
         let curve = Some(([0.5f32, 0.5, 0.5], [1.2f32, 1.2, 1.2]));
-        let lut = synthesize_lut_from_matrix_curve(9, ctm, curve);
+        let lut = synthesize_lut_from_matrix_curve(9, ctm, curve, None);
         // Grid point (4, 0, 0): R input > 0, so G/B CTM outputs are negative.
         let idx = 4; // (i=4, j=0, k=0) with X-fastest
                      // R should be positive (positive CTM diagonal, positive input).

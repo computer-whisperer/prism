@@ -42,7 +42,7 @@
 use anyhow::{Context, Result};
 use clap::Args;
 use prism_ipc::OutputAction;
-use prism_renderer::{pq_eotf, save_lut3d_file, LUT_FILE_IN_TF_PQ};
+use prism_renderer::{pq_eotf, save_lut3d_file, LutOutputDomain, LUT_FILE_IN_TF_PQ};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -52,8 +52,8 @@ use tristim_driver::{measurement::raw_to_xyz, AdaptiveTier, Colorimeter, Xyz};
 
 use crate::common::{
     apply_border, apply_panel_peaks, open_patch_surface, query_output_baseline,
-    sanitize_for_filename, send_action, send_action_for_reply, set_channel_patch, set_patch_off,
-    set_rgb_patch, set_white_patch, show_alignment_patch, Channel, OutputBaseline,
+    sanitize_for_filename, send_action, send_action_for_reply, set_channel_patch_cmd,
+    set_patch_off, set_rgb_patch, set_white_patch, show_alignment_patch, Channel, OutputBaseline,
 };
 use prism_ipc::Response;
 use tristim_display::PatchSurface;
@@ -83,16 +83,20 @@ pub struct CalibrateLut3dArgs {
     /// for cliff detection.
     #[arg(long, default_value_t = 9)]
     pub samples_per_channel: usize,
-    /// Lowest commanded value (cd/m²) in the per-channel sweep.
-    /// Defaults to 1.0 — below this the Spyder noise floor dominates
-    /// and the readings can't anchor the inversion at the dim end.
-    #[arg(long, default_value_t = 1.0)]
-    pub min_cmd: f64,
-    /// Highest commanded value (cd/m²) the sweep walks toward. We
-    /// stop early once Y plateaus (saturation), so this is just a
-    /// generous ceiling. Default 10000 = PQ peak.
-    #[arg(long, default_value_t = 10000.0)]
-    pub max_cmd: f64,
+    /// Lowest commanded value in the per-channel sweep, in cmd units
+    /// (cd/m² for HDR, linear drive `[0, 1]` for SDR). Default: 1.0
+    /// cd/m² (HDR) / 0.004 drive ≈ 1/255 (SDR) — below these the
+    /// Spyder noise floor dominates and the readings can't anchor the
+    /// inversion at the dim end.
+    #[arg(long)]
+    pub min_cmd: Option<f64>,
+    /// Highest commanded value the sweep walks toward, in cmd units.
+    /// We stop early once Y plateaus (saturation), so this is just a
+    /// generous ceiling. Default: 10000 cd/m² = PQ peak (HDR) / 1.0 =
+    /// full drive (SDR; values above 1.0 are clamped — the wire can't
+    /// carry them).
+    #[arg(long)]
+    pub max_cmd: Option<f64>,
     /// Colorimeter calibration index (0..=6). 0 = the "General" preset.
     #[arg(long, default_value_t = 0)]
     pub cal: u8,
@@ -158,13 +162,13 @@ pub struct CalibrateLut3dArgs {
 /// One (requested, diagnosed-scanout, XYZ) measurement from a per-channel sweep.
 #[derive(Clone, Copy, Debug)]
 struct ChannelSample {
-    /// Requested value handed to the patch surface (cd/m² for HDR PQ,
-    /// nits-equivalent for SDR sRGB encode at patch time).
+    /// Requested cmd handed to the patch surface (cd/m² for HDR PQ,
+    /// linear drive `[0, 1]` for SDR).
     requested: f64,
-    /// Actual scanout nits reported by `EncodeDiagnose`. In HDR this is
-    /// the coordinate used by the forward model; in SDR it equals
-    /// the requested value because `EncodeDiagnose` bypasses source-surface
-    /// decode.
+    /// Actual scanout coordinate reported by `EncodeDiagnose`, in the
+    /// same cmd units (nits for HDR, drive for SDR). This is the
+    /// coordinate the forward model is indexed by — it folds in the
+    /// live encode chain's LUT round-trip, clamps, and quantization.
     scanout: f64,
     xyz: Xyz,
 }
@@ -540,7 +544,7 @@ fn measure_channel_patch(
     tally: &mut TierTally,
     log: Option<&mut (PathBuf, BufWriter<File>)>,
 ) -> Result<ChannelSample> {
-    set_channel_patch(patch, baseline, channel, cmd)?;
+    set_channel_patch_cmd(patch, baseline, channel, cmd)?;
     let mut requested_rgb = [0.0_f64; 3];
     requested_rgb[channel.idx()] = cmd;
     let scanout_rgb = diagnose_scanout_cmd(&args.output, baseline, requested_rgb)?;
@@ -610,9 +614,9 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     }
 
     // Wipe any runtime overrides, then lift the IR clamp (HDR) so the
-    // panel sees raw commanded values during the sweep. SDR clamp stays
-    // at sdr_reference_nits — that's the user's policy and we shouldn't
-    // override it during measurement.
+    // panel sees raw commanded values during the sweep. SDR needs no
+    // equivalent: drive cmds [0, 1] span the wire exactly, and the
+    // parameter-free sRGB encode has nothing to lift.
     send_action(&args.output, OutputAction::ResetColor).context("initial ResetColor")?;
     if baseline.hdr_active {
         apply_panel_peaks(&args.output, [10_000.0, 10_000.0, 10_000.0])?;
@@ -622,7 +626,10 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     // gets re-synthesized from those values. That would silently
     // pre-transform every commanded value the sweep sends — measuring
     // panel response through the existing calibration instead of raw.
-    // IdentityLut3d forces the LUT to identity regardless of KDL.
+    // IdentityLut3d forces the LUT to the mode-appropriate identity
+    // regardless of KDL (nits passthrough for HDR; for SDR the
+    // nits → drive identity at the current reference white, which
+    // makes the patch's code values reach the wire unchanged).
     send_action(&args.output, OutputAction::IdentityLut3d)
         .context("force identity LUT for raw-cmd sweep")?;
 
@@ -715,21 +722,29 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     // these samples are NOT used as the per-channel additive model
     // any longer.
     //
-    // SDR sweep cap: SDR's encode pipeline clamps `cmd /
-    // sdr_reference_nits` to [0, 1] before sRGB-OETF encoding for
-    // scanout. Cmds above `sdr_reference_nits` all produce the same
-    // panel output (post-clip). Sampling that flat region would put
-    // degenerate data into the 3D grid — Newton could converge to
-    // phantom cmds the encode pipeline can't actually deliver. Cap
-    // the sweep at sdr_reference_nits so the request-space sweep bounds (and
-    // therefore the 3D sweep axis bounds) stay in the unclipped
-    // regime. HDR has no equivalent clamp; full args.max_cmd applies.
-    let effective_max_cmd = if baseline.hdr_active {
-        args.max_cmd
+    // Cmd-space bounds, per mode. HDR commands are absolute nits; the
+    // encode clamps at the configured PQ peak, so the generous default
+    // ceiling just lets saturation detection find the panel's real
+    // knee. SDR commands are linear drive [0, 1] — full scale IS the
+    // wire's ceiling, structurally; no policy value (and in particular
+    // not `sdr-reference-nits`) bounds the sweep anymore. The whole
+    // panel range is measurable in both modes.
+    let (effective_min_cmd, effective_max_cmd) = if baseline.hdr_active {
+        (
+            args.min_cmd.unwrap_or(1.0),
+            args.max_cmd.unwrap_or(10_000.0),
+        )
     } else {
-        args.max_cmd.min(baseline.sdr_reference_nits)
+        (
+            args.min_cmd.unwrap_or(1.0 / 255.0),
+            args.max_cmd.unwrap_or(1.0).min(1.0),
+        )
     };
-    let targets = log_spaced_targets(args.min_cmd, effective_max_cmd, args.samples_per_channel);
+    let targets = log_spaced_targets(
+        effective_min_cmd,
+        effective_max_cmd,
+        args.samples_per_channel,
+    );
     let mut responses: [Option<ChannelResponse>; 3] = [None, None, None];
     let mut phase1_tally = TierTally::default();
 
@@ -1087,11 +1102,21 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             .unwrap_or_else(|| sanitize_for_filename(&args.output));
         PathBuf::from(format!("prism-calibrate-lut3d-{stem}.lut"))
     });
+    // Output domain mirrors the panel's encode chain: drive for SDR
+    // sRGB scanout, nits for HDR PQ. The v5 header tag lets the
+    // compositor reject a mismatched file instead of rendering it
+    // wrong.
+    let out_space = if baseline.hdr_active {
+        LutOutputDomain::Nits
+    } else {
+        LutOutputDomain::Drive
+    };
     save_lut3d_file(
         &lut_path,
         args.cube_edge,
         peak_nits,
         black_point_f32,
+        out_space,
         &entries,
     )
     .with_context(|| format!("write LUT file {}", lut_path.display()))?;
@@ -1390,11 +1415,17 @@ fn sweep_3d_grid(
         start.elapsed().as_secs_f64(),
         tier_str,
     );
+    // Separability tolerance floor in cmd units: 0.05 nits for HDR;
+    // for SDR drive space, 0.0005 ≈ half a 10-bit wire LSB — the
+    // diagnose is deterministic GPU math, so same-index spread beyond
+    // quantization means the encode chain isn't per-axis separable.
+    let abs_tolerance_floor = if baseline.hdr_active { 0.05 } else { 5e-4 };
     let axis_cmds = diagnosed_axes_from_stats(
         axis_scanout_sum,
         axis_scanout_count,
         axis_scanout_min,
         axis_scanout_max,
+        abs_tolerance_floor,
     )?;
     eprintln!(
         "  diagnosed scanout ranges: R[{:.2}..{:.2}] G[{:.2}..{:.2}] B[{:.2}..{:.2}]",
@@ -1412,23 +1443,38 @@ fn sweep_3d_grid(
     })
 }
 
+/// Diagnose the actual scanout coordinate a cmd triple produces through
+/// the live encode chain. Cmd units per mode: HDR nits, SDR drive.
+///
+/// `EncodeDiagnose` takes a BT.2020 *intermediate* triple (linear nits)
+/// and returns the decoded scanout value in the chain's LUT-output
+/// domain — nits for HDR PQ scanout, drive for SDR sRGB scanout. For
+/// HDR the cmd already is the intermediate. For SDR the patch's decode
+/// maps `cv = srgb_oetf(d)` to `d × sdr_reference_nits` intermediate
+/// nits, so we feed that and get the true drive back — including the
+/// calibration LUT's trilinear round-trip error, which the old
+/// "return the request unchanged" shortcut couldn't see.
 fn diagnose_scanout_cmd(
     output: &str,
     baseline: &OutputBaseline,
     requested_rgb: [f64; 3],
 ) -> Result<[f64; 3]> {
-    if !baseline.hdr_active {
-        // SDR calibration patches start as source-surface sRGB and are decoded
-        // before entering BT.2020. EncodeDiagnose starts after that decode, so
-        // using it as the coordinate would silently change domains.
-        return Ok(requested_rgb);
-    }
+    let intermediate = if baseline.hdr_active {
+        requested_rgb
+    } else {
+        let ref_nits = baseline.sdr_reference_nits;
+        [
+            requested_rgb[0] * ref_nits,
+            requested_rgb[1] * ref_nits,
+            requested_rgb[2] * ref_nits,
+        ]
+    };
     let resp = send_action_for_reply(
         output,
         OutputAction::EncodeDiagnose {
-            r: requested_rgb[0],
-            g: requested_rgb[1],
-            b: requested_rgb[2],
+            r: intermediate[0],
+            g: intermediate[1],
+            b: intermediate[2],
         },
     )
     .context("EncodeDiagnose IPC during calibration sweep")?;
@@ -1443,6 +1489,7 @@ fn diagnosed_axes_from_stats(
     count: [Vec<usize>; 3],
     min: [Vec<f64>; 3],
     max: [Vec<f64>; 3],
+    abs_tolerance_floor: f64,
 ) -> Result<[Vec<f64>; 3]> {
     let out: [Vec<f64>; 3] = std::array::from_fn(|axis| {
         (0..sum[axis].len())
@@ -1459,7 +1506,7 @@ fn diagnosed_axes_from_stats(
                 anyhow::bail!("missing EncodeDiagnose samples for axis {axis} index {idx}");
             }
             let spread = max[axis][idx] - min[axis][idx];
-            let tolerance = (out[axis][idx].abs() * 0.002).max(0.05);
+            let tolerance = (out[axis][idx].abs() * 0.002).max(abs_tolerance_floor);
             if spread > tolerance {
                 anyhow::bail!(
                     "EncodeDiagnose scanout is not separable for axis {axis} index {idx}: \
@@ -1509,9 +1556,18 @@ fn verify_white_targets(hdr_active: bool, grid_white_y: f64, sdr_reference_nits:
             })
             .collect()
     } else {
+        // Fractions of the reference white (so reports stay comparable
+        // to `calibrate`'s verify phase), but anchored at most at the
+        // measured white peak. With the drive-domain pipeline the
+        // reference white is pure decode policy and may legitimately
+        // sit above what the panel can emit — content there projects
+        // onto the gamut surface BY DESIGN, and verifying absolute
+        // fidelity against an unreachable target would report a miss
+        // that isn't one. Mirror HDR's 0.9 surface margin.
+        let anchor = sdr_reference_nits.min(grid_white_y * 0.9 / 0.95);
         vec![0.10, 0.25, 0.50, 0.75, 0.95]
             .into_iter()
-            .map(|f| f * sdr_reference_nits)
+            .map(|f| f * anchor)
             .collect()
     }
 }
@@ -2374,11 +2430,17 @@ fn open_log(
     let file =
         File::create(&path).with_context(|| format!("create log file {}", path.display()))?;
     let mut w = BufWriter::new(file);
+    // `cmd_space` declares the units of every requested/scanout column:
+    // absolute nits (HDR) or linear drive [0, 1] (SDR, drive-domain
+    // reform). `rebake-lut3d` refuses SDR CSVs without the drive tag —
+    // those predate the reform and their cmd axis is in retired
+    // reference-white-relative nits.
     writeln!(
         w,
-        "# prism-tune calibrate-lut3d — output={} mode={} cube_edge={} cube_edge_cmd={} samples_per_channel={} settle_ms={} window={}",
+        "# prism-tune calibrate-lut3d — output={} mode={} cmd_space={} cube_edge={} cube_edge_cmd={} samples_per_channel={} settle_ms={} window={}",
         args.output,
         if baseline.hdr_active { "HDR" } else { "SDR" },
+        if baseline.hdr_active { "nits" } else { "drive" },
         args.cube_edge,
         args.cube_edge_cmd,
         args.samples_per_channel,
@@ -2390,7 +2452,7 @@ fn open_log(
     // block. Verify rows are tagged `verify,W,…`. All XYZ values are
     // black-subtracted (raw floor recoverable from the `# black_floor`
     // comment line below).
-    writeln!(w, "channel,sample_idx,requested_nits,scanout_nits,X,Y,Z")?;
+    writeln!(w, "channel,sample_idx,requested_cmd,scanout_cmd,X,Y,Z")?;
     eprintln!("Logging per-sample CSV to {}", path.display());
     Ok(Some((path, w)))
 }
@@ -2533,6 +2595,14 @@ struct ParsedCsvLog {
     /// Phase-2 grid edge from the header comments.
     cube_edge_cmd: usize,
     grid_rows: Vec<GridRow>,
+    /// `mode=HDR` in the header comment. Determines the LUT output
+    /// domain the rebake writes (nits vs drive).
+    hdr_active: bool,
+    /// `cmd_space=drive` in the header comment. SDR runs from the
+    /// drive-domain reform onward stamp this; its absence on an SDR
+    /// CSV means the cmd columns are in retired reference-white-
+    /// relative nits and the rebake must refuse them.
+    cmd_space_drive: bool,
 }
 
 /// Pull the unsigned integer following `key` out of a comment line
@@ -2544,6 +2614,13 @@ fn parse_kv_usize(line: &str, key: &str) -> Option<usize> {
         .take_while(|c| c.is_ascii_digit())
         .collect();
     digits.parse().ok()
+}
+
+/// Pull the whitespace-delimited token following `key` out of a comment
+/// line (e.g. `mode=HDR`, `cmd_space=drive`).
+fn parse_kv_token<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let start = line.find(key)? + key.len();
+    line[start..].split_whitespace().next()
 }
 
 /// Pull `X=… Y=… Z=…` floats out of a comment line.
@@ -2567,6 +2644,8 @@ fn parse_csv_log(text: &str) -> Result<ParsedCsvLog> {
     let mut cube_edge_cmd: Option<usize> = None;
     let mut channel_samples: [Vec<ChannelSample>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut grid_rows: Vec<GridRow> = Vec::new();
+    let mut mode: Option<String> = None;
+    let mut cmd_space: Option<String> = None;
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() {
@@ -2578,6 +2657,12 @@ fn parse_csv_log(text: &str) -> Result<ParsedCsvLog> {
             }
             if cube_edge_cmd.is_none() {
                 cube_edge_cmd = parse_kv_usize(comment, "cube_edge_cmd=");
+            }
+            if mode.is_none() {
+                mode = parse_kv_token(comment, "mode=").map(str::to_owned);
+            }
+            if cmd_space.is_none() {
+                cmd_space = parse_kv_token(comment, "cmd_space=").map(str::to_owned);
             }
             continue;
         }
@@ -2635,18 +2720,33 @@ fn parse_csv_log(text: &str) -> Result<ParsedCsvLog> {
     let cube_edge_cmd = cube_edge_cmd
         .ok_or_else(|| anyhow::anyhow!("CSV missing `cube_edge_cmd=` in its header comments"))?;
     anyhow::ensure!(!grid_rows.is_empty(), "CSV contains no `3D,…` grid rows");
+    let mode = mode.ok_or_else(|| anyhow::anyhow!("CSV missing `mode=` in its header comment"))?;
+    let hdr_active = match mode.as_str() {
+        "HDR" => true,
+        "SDR" => false,
+        other => anyhow::bail!("CSV header has unrecognized mode={other}"),
+    };
+    let cmd_space_drive = matches!(cmd_space.as_deref(), Some("drive"));
     Ok(ParsedCsvLog {
         black_floor_xyz,
         channel_samples,
         cube_edge_cmd,
         grid_rows,
+        hdr_active,
+        cmd_space_drive,
     })
 }
 
 /// Rebuild the [`ResponseGrid`] from parsed 3D rows: XYZ placed by
 /// (i, j, k), per-axis scanout coordinates re-derived through the same
 /// averaging + separability validation the live sweep uses.
-fn grid_from_rows(cube_edge_cmd: usize, rows: &[GridRow]) -> Result<ResponseGrid> {
+/// `abs_tolerance_floor` is the separability floor in cmd units (see
+/// the live sweep's mode-aware values).
+fn grid_from_rows(
+    cube_edge_cmd: usize,
+    rows: &[GridRow],
+    abs_tolerance_floor: f64,
+) -> Result<ResponseGrid> {
     let n = cube_edge_cmd;
     anyhow::ensure!(n >= 2, "cube_edge_cmd must be ≥ 2");
     let total = n * n * n;
@@ -2685,7 +2785,7 @@ fn grid_from_rows(cube_edge_cmd: usize, rows: &[GridRow]) -> Result<ResponseGrid
             max[axis][ai] = max[axis][ai].max(v);
         }
     }
-    let axis_cmds = diagnosed_axes_from_stats(sum, count, min, max)?;
+    let axis_cmds = diagnosed_axes_from_stats(sum, count, min, max, abs_tolerance_floor)?;
     Ok(ResponseGrid {
         cube_edge: n,
         axis_cmds,
@@ -2727,14 +2827,28 @@ pub fn run_rebake(args: RebakeLut3dArgs) -> Result<()> {
         .with_context(|| format!("read {}", args.csv.display()))?;
     let parsed = parse_csv_log(&text)?;
     eprintln!(
-        "Parsed {}: {}³ grid rows, channel sweeps R={} G={} B={}, black floor Y={:.4}",
+        "Parsed {}: mode={}, {}³ grid rows, channel sweeps R={} G={} B={}, black floor Y={:.4}",
         args.csv.display(),
+        if parsed.hdr_active { "HDR" } else { "SDR" },
         parsed.cube_edge_cmd,
         parsed.channel_samples[0].len(),
         parsed.channel_samples[1].len(),
         parsed.channel_samples[2].len(),
         parsed.black_floor_xyz[1],
     );
+    // SDR CSVs from before the drive-domain reform have cmd columns in
+    // reference-white-relative nits — a space the runtime encode no
+    // longer has any notion of. There's no reliable in-band record of
+    // the reference white they were swept against, so refuse rather
+    // than guess; the panel needs one fresh calibrate-lut3d run.
+    if !parsed.hdr_active && !parsed.cmd_space_drive {
+        anyhow::bail!(
+            "{} is a legacy nits-space SDR measurement (no `cmd_space=drive` header tag); \
+             the drive-domain pipeline can't rebake it — re-run `prism-tune calibrate-lut3d` \
+             on the panel",
+            args.csv.display(),
+        );
+    }
 
     // Rebuild the per-channel responses just enough for the Newton seed
     // gain + the header peaks. The grid axes come from the 3D rows
@@ -2767,7 +2881,8 @@ pub fn run_rebake(args: RebakeLut3dArgs) -> Result<()> {
         responses[1].approx_gain_y_per_cmd(),
         responses[2].approx_gain_y_per_cmd(),
     ];
-    let grid = grid_from_rows(parsed.cube_edge_cmd, &parsed.grid_rows)?;
+    let abs_tolerance_floor = if parsed.hdr_active { 0.05 } else { 5e-4 };
+    let grid = grid_from_rows(parsed.cube_edge_cmd, &parsed.grid_rows, abs_tolerance_floor)?;
 
     // White/black anchors from the sidecar mesh when present; fall back
     // to the grid's max-cmd corner + the CSV's raw floor.
@@ -2823,11 +2938,17 @@ pub fn run_rebake(args: RebakeLut3dArgs) -> Result<()> {
         .lut_path
         .clone()
         .unwrap_or_else(|| args.csv.with_extension("lut"));
+    let out_space = if parsed.hdr_active {
+        LutOutputDomain::Nits
+    } else {
+        LutOutputDomain::Drive
+    };
     save_lut3d_file(
         &lut_path,
         args.cube_edge,
         peak_nits,
         black_point_f32,
+        out_space,
         &entries,
     )
     .with_context(|| format!("write LUT file {}", lut_path.display()))?;
@@ -3213,9 +3334,20 @@ mod tests {
             t.iter().any(|&v| (150.0..330.0).contains(&v)),
             "verify sweep must cover the mid-range whites: {t:?}",
         );
-        // SDR branch unchanged: fractions of the reference white.
+        // SDR with reference white inside the measured range: plain
+        // fractions of the reference white.
         let sdr = verify_white_targets(false, 457.0, 200.0);
         assert_eq!(sdr, vec![20.0, 50.0, 100.0, 150.0, 190.0]);
+        // SDR with reference white ABOVE the panel's measured white
+        // (decode policy can exceed the gamut now): targets anchor at
+        // the reachable range so verify doesn't flag by-design
+        // projection as a miss. Top target = 0.9 × grid white.
+        let sdr_over = verify_white_targets(false, 182.5, 200.0);
+        let top = *sdr_over.last().unwrap();
+        assert!(
+            (top - 182.5 * 0.9).abs() < 1e-9,
+            "top SDR verify target {top} should be 0.9 × measured white",
+        );
     }
 
     /// CSV log → ParsedCsvLog → ResponseGrid round-trip on a minimal
@@ -3254,7 +3386,7 @@ verify,W,1,1.4394,1.4082,1.4885,1.6542
         }
         assert_eq!(parsed.grid_rows.len(), 8);
 
-        let grid = grid_from_rows(parsed.cube_edge_cmd, &parsed.grid_rows).unwrap();
+        let grid = grid_from_rows(parsed.cube_edge_cmd, &parsed.grid_rows, 0.05).unwrap();
         for axis in 0..3 {
             assert_eq!(grid.axis_cmds[axis], vec![1.0, 10.0], "axis {axis}");
         }
@@ -3264,7 +3396,7 @@ verify,W,1,1.4394,1.4082,1.4885,1.6542
         assert!((v.y - 3.8980).abs() < 1e-9);
         assert!((v.z - 10.6381).abs() < 1e-9);
         // Missing/duplicate coverage is rejected.
-        assert!(grid_from_rows(3, &parsed.grid_rows).is_err());
+        assert!(grid_from_rows(3, &parsed.grid_rows, 0.05).is_err());
     }
 
     /// Trilinear interp at the midpoint between two grid points

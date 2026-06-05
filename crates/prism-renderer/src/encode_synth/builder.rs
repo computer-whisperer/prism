@@ -164,10 +164,10 @@ impl ShaderCtx {
             mat4,  // 0: cal_matrix
             vec4,  // 1: response_gain (rgb + reserved)
             vec4,  // 2: response_gamma (rgb + reserved)
-            f32_t, // 3: sdr_white_nits
-            f32_t, // 4: target_peak_nits
-            f32_t, // 5: dither_strength
-            f32_t, // 6: _pad
+            f32_t, // 3: target_peak_nits
+            f32_t, // 4: dither_strength
+            f32_t, // 5: _pad
+            f32_t, // 6: _pad2
         ]);
         // Block decoration so SPIR-V treats it as a push-constant block.
         b.decorate(push_struct, spirv::Decoration::Block, []);
@@ -193,7 +193,6 @@ impl ShaderCtx {
         for (member, offset) in [
             (MEMBER_RESPONSE_GAIN, OFFSET_RESPONSE_GAIN),
             (MEMBER_RESPONSE_GAMMA, OFFSET_RESPONSE_GAMMA),
-            (MEMBER_SDR_WHITE_NITS, OFFSET_SDR_WHITE_NITS),
             (MEMBER_TARGET_PEAK_NITS, OFFSET_TARGET_PEAK_NITS),
             (MEMBER_DITHER_STRENGTH, OFFSET_DITHER_STRENGTH),
         ] {
@@ -204,14 +203,20 @@ impl ShaderCtx {
                 [rspirv::dr::Operand::LiteralBit32(offset)],
             );
         }
-        // Padding member (no offset decoration needed since it isn't read,
-        // but emitting one keeps the struct layout valid). Member index
-        // is one past the live members (i.e. 6 after dropping the cap).
+        // Padding members (no offset decoration needed since they aren't
+        // read, but emitting one keeps the struct layout valid). Member
+        // indices are one past the live members.
+        b.member_decorate(
+            push_struct,
+            5,
+            spirv::Decoration::Offset,
+            [rspirv::dr::Operand::LiteralBit32(OFFSET_PAD)],
+        );
         b.member_decorate(
             push_struct,
             6,
             spirv::Decoration::Offset,
-            [rspirv::dr::Operand::LiteralBit32(OFFSET_PAD)],
+            [rspirv::dr::Operand::LiteralBit32(OFFSET_PAD2)],
         );
 
         // ── Pointer types ──────────────────────────────────────────────────
