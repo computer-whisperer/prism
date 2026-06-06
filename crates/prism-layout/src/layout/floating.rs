@@ -287,7 +287,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.tiles.iter_mut()
     }
 
-    pub fn tiles_with_offsets(&self) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>)> + '_ {
+    pub fn tiles_with_offsets(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (&Tile<W>, Point<f64, Logical>)> + '_ {
         let offsets = self.data.iter().map(|d| d.logical_pos);
         zip(&self.tiles, offsets)
     }
@@ -301,7 +303,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 
     pub fn tiles_with_render_positions(
         &self,
-    ) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>)> {
+    ) -> impl DoubleEndedIterator<Item = (&Tile<W>, Point<f64, Logical>)> {
         let scale = self.scale;
         self.tiles_with_offsets().map(move |(tile, offset)| {
             let pos = offset + tile.render_offset();
@@ -1105,8 +1107,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
             closing.render(closing.geometry().loc, scale, out);
         }
 
+        // `tiles` is stored top-to-bottom; `out` is back-to-front
+        // (prism's painter order), so draw bottommost first.
         let active = self.active_window_id.clone();
-        for (tile, tile_pos) in self.tiles_with_render_positions() {
+        for (tile, tile_pos) in self.tiles_with_render_positions().rev() {
             let focus_ring = focus_ring && Some(tile.window().id()) == active.as_ref();
             tile.render(tile_pos, scale, focus_ring, ctx, out);
         }

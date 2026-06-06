@@ -1688,8 +1688,11 @@ impl<W: LayoutElement> Monitor<W> {
             .insert_hint_render_loc
             .filter(|_| !self.options.layout.insert_hint.off);
 
+        // `out` is back-to-front (prism's painter order, inverse of
+        // niri's front-to-back element lists): scrolling first, then
+        // the insert hint, then floating on top.
         for (ws, _geo) in self.workspaces_with_render_geo() {
-            ws.render_floating(focus_ring, ctx, out);
+            ws.render_scrolling(focus_ring, ctx, out);
 
             if let Some(loc) = insert_hint_render_loc {
                 if loc.workspace == InsertWorkspace::Existing(ws.id()) {
@@ -1697,7 +1700,7 @@ impl<W: LayoutElement> Monitor<W> {
                 }
             }
 
-            ws.render_scrolling(focus_ring, ctx, out);
+            ws.render_floating(focus_ring, ctx, out);
         }
     }
 
