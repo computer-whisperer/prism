@@ -1148,7 +1148,13 @@ fn run_integrated(
     // ── Pick connectors + bring up OutputContexts on every card ────────────
     // If OUTPUT specifies a connector name, search every card for it and
     // bring up only that one. Otherwise pick_all_connected on each card.
+    // Non-desktop connectors (VR headsets) found by the scan are collected
+    // per card and advertised for DRM leasing once PrismState is up.
     let mut outputs: Vec<prism_drm::OutputContext> = Vec::new();
+    let mut non_desktop_by_card: std::collections::HashMap<
+        prism_renderer::DrmDevId,
+        Vec<prism_drm::NonDesktopConnector>,
+    > = std::collections::HashMap::new();
     for card in &mut cards {
         breadcrumb(&format!("bringup loop: entering card {}", card.path));
         let Some(device) = gpus.get(&card.drm_dev_id).cloned() else {
@@ -1167,8 +1173,14 @@ fn run_integrated(
                     Err(_) => Vec::new(), // OUTPUT might be on a different card
                 }
             }
-            None => prism_drm::pick_all_connected_with_config(&card.drm, &config.outputs.0)
-                .unwrap_or_default(),
+            None => {
+                let scan = prism_drm::pick_all_connected_with_config(&card.drm, &config.outputs.0)
+                    .unwrap_or_default();
+                if !scan.non_desktop.is_empty() {
+                    non_desktop_by_card.insert(card.drm_dev_id, scan.non_desktop);
+                }
+                scan.picks
+            }
         };
         breadcrumb(&format!(
             "bringup loop: {} got {} pick(s)",
@@ -1509,6 +1521,11 @@ fn run_integrated(
     // attached. Skipped silently if kernel lacks `syncobj_eventfd`
     // or the primary GPU's card isn't registered.
     state.init_drm_syncobj();
+    // Bring up wp_drm_lease_device_v1 (one global per card) and advertise
+    // the non-desktop connectors (VR headsets) found at bringup so a VR
+    // runtime can lease them for direct scanout. OUTPUT= debug runs skip
+    // the scan, so nothing is advertised there.
+    state.init_drm_lease(non_desktop_by_card);
     let socket = prism_protocols::insert_wayland_sources(&event_loop.handle(), display)?;
     // Bring up xwayland-satellite integration (binds X11 sockets, exports
     // $DISPLAY for children, spawns the satellite on-demand). Single-threaded
@@ -1736,6 +1753,13 @@ fn run_integrated(
                         for card in state.cards.values_mut() {
                             card.drm.pause();
                         }
+                        // Withdraw the advertised DRM lease connectors while
+                        // away: new leases can't be created without master.
+                        // Active leases stay alive (the lessee holds its own
+                        // fd), and the globals themselves stay bound.
+                        for lease in state.drm_lease.values_mut() {
+                            lease.lease_state.suspend();
+                        }
                     }
                     SessionEvent::ActivateSession => {
                         breadcrumb("session ACTIVATE");
@@ -1751,6 +1775,11 @@ fn run_integrated(
                                 tracing::error!("drm.activate after VT switch failed: {e}");
                                 breadcrumb(&format!("session ACTIVATE drm.activate ERROR: {e}"));
                             }
+                        }
+                        // Re-advertise the DRM lease connectors withdrawn on
+                        // pause.
+                        for lease in state.drm_lease.values_mut() {
+                            lease.lease_state.resume::<prism_protocols::PrismState>();
                         }
                         state.session_active = true;
                         // Per-output resume fixups. `activate(true)` reset both

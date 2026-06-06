@@ -435,6 +435,13 @@ pub struct PrismState {
     /// `surface.clear()`, which needs DRM master. Must drop before
     /// `session` releases libseat (else EACCES on clear).
     pub outputs: HashMap<OutputId, prism_drm::OutputContext>,
+    /// Per-card DRM lease state (`wp_drm_lease_device_v1`): VR headset
+    /// connectors reserved at bringup + the leases handed out. Keyed
+    /// like `cards`. Declared before `cards` so active leases revoke
+    /// first on teardown (not strictly required — each `DrmLease`
+    /// holds its own fd clone — but it keeps revoke-before-close
+    /// ordering obvious).
+    pub drm_lease: HashMap<DrmDevId, crate::drm_lease::CardLeaseState>,
     /// Open DRM cards, keyed by their primary-node major/minor. One per
     /// `/dev/dri/cardN` we're driving. Drops after outputs so their
     /// `DrmDevice` is still valid during surface teardown.
@@ -832,6 +839,7 @@ impl PrismState {
             layer_shell_state,
             session,
             session_active: true,
+            drm_lease: HashMap::new(),
             cards: HashMap::new(),
             mirror_copiers: build_mirror_copiers(&gpus),
             gpus,
@@ -1043,6 +1051,16 @@ impl PrismState {
         };
         let device_fd = card.drm.device_fd().clone();
         self.drm_syncobj_state = crate::drm_syncobj::try_init(&self.display_handle, device_fd);
+    }
+
+    /// Bring up the `wp_drm_lease_device_v1` globals (one per attached
+    /// card) and advertise the non-desktop (VR headset) connectors found
+    /// at bringup. Call after cards are attached.
+    pub fn init_drm_lease(
+        &mut self,
+        non_desktop_by_card: HashMap<DrmDevId, Vec<prism_drm::NonDesktopConnector>>,
+    ) {
+        crate::drm_lease::init(self, non_desktop_by_card);
     }
 
     /// Insert a built output. Returns the previous entry for that

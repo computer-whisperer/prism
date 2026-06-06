@@ -67,6 +67,32 @@ pub struct OutputPick {
     pub connector_name: String,
 }
 
+/// A connected connector the kernel flags `non-desktop` (VR headsets and
+/// other head-mounted displays, matched against an EDID quirk list).
+/// Never brought up as a desktop output; instead advertised on
+/// `wp_drm_lease_device_v1` so a VR runtime (SteamVR, Monado) can lease
+/// it for direct scanout. The CRTC is reserved at scan time so desktop
+/// picks in the same pass can't take it.
+#[derive(Debug)]
+pub struct NonDesktopConnector {
+    pub connector: connector::Handle,
+    /// CRTC reserved for a future lease of this connector.
+    pub crtc: crtc::Handle,
+    /// Kernel connector name (e.g. `DP-5`).
+    pub connector_name: String,
+    /// Human-readable description for the lease advertisement
+    /// (EDID make + model, falling back to the connector name).
+    pub description: String,
+}
+
+/// Result of a full connector scan: desktop outputs to bring up, plus
+/// non-desktop connectors set aside for DRM leasing.
+#[derive(Debug, Default)]
+pub struct ConnectorScan {
+    pub picks: Vec<OutputPick>,
+    pub non_desktop: Vec<NonDesktopConnector>,
+}
+
 /// Pick a connected output: first connected connector with a preferred mode
 /// and a compatible (currently-unused) CRTC. Good enough for the single-screen
 /// scanout smoke test; the real compositor will allow user-driven assignments.
@@ -139,6 +165,10 @@ where
         if !matches(&name) {
             continue;
         }
+        if connector_is_non_desktop(drm, conn_h) {
+            tracing::info!("{name}: non-desktop connector (VR headset); not a desktop output");
+            continue;
+        }
         let edid = crate::EdidInfo::read(drm, conn_h);
         let cfg = match_config_for_connector(&name, &edid, outputs_cfg);
         let Some((mode, fallback)) = pick_mode(&info, cfg) else {
@@ -163,13 +193,16 @@ where
 }
 
 /// Pick every connected connector with a usable mode + free CRTC.
-/// No config consulted — used by the headless tracer paths.
+/// No config consulted — used by the headless tracer paths. Non-desktop
+/// connectors are excluded (and their lease reservation discarded).
 pub fn pick_all_connected(drm: &DrmDevice) -> Result<Vec<OutputPick>> {
-    pick_all_connected_with_config(drm, &[])
+    pick_all_connected_with_config(drm, &[]).map(|scan| scan.picks)
 }
 
 /// Same as [`pick_all_connected`] but honors per-output `off` and
-/// `mode`/`modeline` from the KDL config.
+/// `mode`/`modeline` from the KDL config, and returns the full
+/// [`ConnectorScan`] including non-desktop connectors reserved for
+/// DRM leasing.
 ///
 /// Each successful pick reserves its CRTC against subsequent picks in the
 /// same call, so two of our outputs can't accidentally collide on the same
@@ -187,9 +220,15 @@ pub fn pick_all_connected(drm: &DrmDevice) -> Result<Vec<OutputPick>> {
 pub fn pick_all_connected_with_config(
     drm: &DrmDevice,
     outputs_cfg: &[OutputCfg],
-) -> Result<Vec<OutputPick>> {
+) -> Result<ConnectorScan> {
     let resources = drm.resource_handles().context("resource_handles")?;
     let occupied_by_other = collect_other_session_crtcs(drm, &resources);
+
+    // Non-desktop connectors (VR headsets) first: they never become
+    // desktop outputs, and reserving their CRTCs up front means the
+    // desktop picks below can't steal the only CRTC able to drive a
+    // headset.
+    let non_desktop = scan_non_desktop(drm, &resources, &occupied_by_other);
 
     let mut picks: Vec<OutputPick> = Vec::new();
     for &conn_h in resources.connectors() {
@@ -202,6 +241,9 @@ pub fn pick_all_connected_with_config(
         };
         if info.state() != connector::State::Connected {
             continue;
+        }
+        if non_desktop.iter().any(|n| n.connector == conn_h) {
+            continue; // reserved for DRM leasing, logged in scan_non_desktop
         }
         let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
 
@@ -220,7 +262,8 @@ pub fn pick_all_connected_with_config(
             tracing::warn!("{name}: configured mode not available; falling back to preferred",);
         }
 
-        let used_by_us: Vec<crtc::Handle> = picks.iter().map(|p| p.crtc).collect();
+        let mut used_by_us: Vec<crtc::Handle> = picks.iter().map(|p| p.crtc).collect();
+        used_by_us.extend(non_desktop.iter().map(|n| n.crtc));
         match resolve_pick(
             drm,
             &resources,
@@ -246,7 +289,75 @@ pub fn pick_all_connected_with_config(
             }
         }
     }
-    Ok(picks)
+    Ok(ConnectorScan { picks, non_desktop })
+}
+
+/// Find every connected `non-desktop` connector and reserve a free CRTC
+/// for each, so it can be offered for DRM leasing. Connectors with no
+/// reservable CRTC are skipped with a warning (they won't be leasable).
+fn scan_non_desktop(
+    drm: &DrmDevice,
+    resources: &smithay::reexports::drm::control::ResourceHandles,
+    occupied_by_other: &[crtc::Handle],
+) -> Vec<NonDesktopConnector> {
+    let mut found: Vec<NonDesktopConnector> = Vec::new();
+    for &conn_h in resources.connectors() {
+        let Ok(info) = drm.get_connector(conn_h, false) else {
+            continue;
+        };
+        if info.state() != connector::State::Connected || !connector_is_non_desktop(drm, conn_h) {
+            continue;
+        }
+        let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
+        let reserved: Vec<crtc::Handle> = found.iter().map(|n| n.crtc).collect();
+        let crtc = match find_free_crtc(drm, resources, &info, occupied_by_other, &reserved) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "{name}: non-desktop connector, but no CRTC to reserve for leasing: {e:#}"
+                );
+                continue;
+            }
+        };
+        let edid = crate::EdidInfo::read(drm, conn_h);
+        let description = match (&edid.make, &edid.model) {
+            (Some(make), Some(model)) => format!("{make} {model}"),
+            (Some(one), None) | (None, Some(one)) => one.clone(),
+            (None, None) => name.clone(),
+        };
+        tracing::info!(
+            "{name}: non-desktop connector ({description}); reserving crtc {crtc:?} for DRM leasing"
+        );
+        found.push(NonDesktopConnector {
+            connector: conn_h,
+            crtc,
+            connector_name: name,
+            description,
+        });
+    }
+    found
+}
+
+/// Whether the kernel flags this connector `non-desktop` (set from an
+/// EDID quirk list — VR headsets and other head-mounted displays).
+/// Missing property or any read failure → `false`.
+pub fn connector_is_non_desktop(drm: &DrmDevice, conn_h: connector::Handle) -> bool {
+    let Ok(props) = drm.get_properties(conn_h) else {
+        return false;
+    };
+    for (prop_h, value) in props {
+        let Ok(info) = drm.get_property(prop_h) else {
+            continue;
+        };
+        if info.name().to_string_lossy() == "non-desktop" {
+            return info
+                .value_type()
+                .convert_value(value)
+                .as_boolean()
+                .unwrap_or(false);
+        }
+    }
+    false
 }
 
 /// CRTCs currently bound to *other* sessions' connectors (a prior desktop
@@ -410,6 +521,25 @@ fn resolve_pick(
     occupied_by_other: &[crtc::Handle],
     also_excluded: &[crtc::Handle],
 ) -> Result<OutputPick> {
+    let crtc = find_free_crtc(drm, resources, info, occupied_by_other, also_excluded)
+        .with_context(|| format!("no free CRTC available for {name}"))?;
+    Ok(OutputPick {
+        connector: conn_h,
+        mode,
+        crtc,
+        connector_name: name.to_string(),
+    })
+}
+
+/// Find a free CRTC reachable from one of the connector's encoders,
+/// honoring the same exclusion sets as [`resolve_pick`].
+fn find_free_crtc(
+    drm: &DrmDevice,
+    resources: &smithay::reexports::drm::control::ResourceHandles,
+    info: &connector::Info,
+    occupied_by_other: &[crtc::Handle],
+    also_excluded: &[crtc::Handle],
+) -> Result<crtc::Handle> {
     let own_crtc: Option<crtc::Handle> = info
         .current_encoder()
         .and_then(|enc_h| drm.get_encoder(enc_h).ok())
@@ -426,17 +556,12 @@ fn resolve_pick(
             let blocked_by_other =
                 occupied_by_other.contains(&candidate) && Some(candidate) != own_crtc;
             if !blocked_by_other {
-                return Ok(OutputPick {
-                    connector: conn_h,
-                    mode,
-                    crtc: candidate,
-                    connector_name: name.to_string(),
-                });
+                return Ok(candidate);
             }
         }
     }
     Err(anyhow!(
-        "no free CRTC available for {name} (all compatible CRTCs are bound to other connectors or already picked in this pass)"
+        "all compatible CRTCs are bound to other connectors or already picked in this pass"
     ))
 }
 

@@ -35,8 +35,8 @@ pub use hdr::{HdrEotf, HdrProps, HdrSignaling};
 pub use modifiers::pick_scanout_modifiers;
 pub use output_ctx::{ColorOverride, OutputContext, PresentOutcome};
 pub use scanout::{
-    add_framebuffer_for_bo, find_property, pick_all_connected, pick_all_connected_with_config,
-    pick_by_name, pick_by_name_with_config, pick_first_connected, set_connector_max_bpc,
-    OutputPick, ScanoutDepth,
+    add_framebuffer_for_bo, connector_is_non_desktop, find_property, pick_all_connected,
+    pick_all_connected_with_config, pick_by_name, pick_by_name_with_config, pick_first_connected,
+    set_connector_max_bpc, ConnectorScan, NonDesktopConnector, OutputPick, ScanoutDepth,
 };
 pub use session::SeatSession;

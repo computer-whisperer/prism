@@ -9,6 +9,7 @@
 pub mod client;
 pub mod color_management;
 pub mod dmabuf_sync;
+pub mod drm_lease;
 pub mod drm_syncobj;
 pub mod ext_workspace;
 pub mod foreign_toplevel;

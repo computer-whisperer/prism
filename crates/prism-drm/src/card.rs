@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result};
 use prism_renderer::{vk, DrmDevId, EncodeConfig};
-use smithay::backend::drm::{DrmDevice, DrmDeviceNotifier};
+use smithay::backend::drm::{DrmDevice, DrmDeviceNotifier, DrmNode};
 
 use crate::{GbmDevice, ScanoutDepth, SeatSession};
 
@@ -36,6 +36,9 @@ pub struct DrmCardContext {
     /// DRM primary-node major/minor (extracted from the device fd). Used
     /// to match this card to its Vulkan device (`Device::physical.drm_primary`).
     pub drm_dev_id: DrmDevId,
+    /// The same identity as smithay's [`DrmNode`], for protocols that key
+    /// their per-device state by node (`wp_drm_lease_device_v1`).
+    pub node: DrmNode,
 }
 
 impl DrmCardContext {
@@ -56,6 +59,8 @@ impl DrmCardContext {
             major: libc::major(dev_id_raw) as i64,
             minor: libc::minor(dev_id_raw) as i64,
         };
+        let node = DrmNode::from_dev_id(dev_id_raw)
+            .with_context(|| format!("DrmNode::from_dev_id for {path}"))?;
 
         tracing::info!(
             path = %path,
@@ -70,6 +75,7 @@ impl DrmCardContext {
                 drm,
                 gbm,
                 drm_dev_id,
+                node,
             },
             drm_notifier,
         ))
