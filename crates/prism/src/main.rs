@@ -1777,9 +1777,15 @@ fn run_integrated(
                             }
                         }
                         // Re-advertise the DRM lease connectors withdrawn on
-                        // pause.
+                        // pause, then reconcile against a fresh scan: udev
+                        // events were dropped while away, so a headset may
+                        // have been plugged or unplugged in the meantime.
                         for lease in state.drm_lease.values_mut() {
                             lease.lease_state.resume::<prism_protocols::PrismState>();
+                        }
+                        let card_ids: Vec<_> = state.cards.keys().copied().collect();
+                        for dev_id in card_ids {
+                            prism_protocols::drm_lease::rescan_card(state, dev_id);
                         }
                         state.session_active = true;
                         // Per-output resume fixups. `activate(true)` reset both
@@ -1826,6 +1832,50 @@ fn run_integrated(
                 prism_input::process_input_event(state, event);
             })
             .map_err(|e| anyhow!("insert libinput source: {e}"))?;
+    }
+
+    // DRM udev `change` events → re-scan non-desktop connectors and
+    // reconcile the DRM lease advertisements (drm_lease::rescan_card).
+    // The kernel emits this uevent for connector hotplug (HOTPLUG=1)
+    // and when a lessee closes its lease fd (LEASE=1); smithay folds
+    // both into UdevEvent::Changed, and the rescan is idempotent, so no
+    // property sniffing is needed. This is *leasing-only* hotplug — a
+    // VR headset can now be plugged/unplugged after launch. Desktop
+    // outputs remain fixed at bringup (restart to apply). Events while
+    // the session is paused are dropped; the ActivateSession handler
+    // above runs a catch-up rescan.
+    {
+        use smithay::backend::udev::{UdevBackend, UdevEvent};
+        let seat_name = state
+            .session
+            .as_ref()
+            .expect("integrated mode always has a session")
+            .seat();
+        match UdevBackend::new(&seat_name) {
+            Ok(udev) => {
+                event_loop
+                    .handle()
+                    .insert_source(udev, |event, _, state| {
+                        let UdevEvent::Changed { device_id } = event else {
+                            return; // GPU add/remove is out of scope
+                        };
+                        if !state.session_active {
+                            return;
+                        }
+                        let dev_id = prism_renderer::DrmDevId {
+                            major: libc::major(device_id) as i64,
+                            minor: libc::minor(device_id) as i64,
+                        };
+                        if state.cards.contains_key(&dev_id) {
+                            prism_protocols::drm_lease::rescan_card(state, dev_id);
+                        }
+                    })
+                    .map_err(|e| anyhow!("insert udev source: {e}"))?;
+            }
+            Err(e) => {
+                tracing::warn!("udev monitor unavailable ({e}); VR headset hotplug disabled");
+            }
+        }
     }
 
     // SIGINT / SIGTERM → clean shutdown.

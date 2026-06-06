@@ -16,15 +16,19 @@
 //! that from the libseat session events, mirroring the `card.drm`
 //! pause/activate calls.
 //!
-//! Connector hotplug is not handled (prism has no connector hotplug at
-//! all yet): the headset must be plugged in before compositor launch,
-//! and stays advertised if unplugged after.
+//! Connector hotplug is handled by [`rescan_card`]: `main.rs` listens
+//! for DRM udev `change` events and reconciles the advertised set
+//! against a fresh scan. The kernel emits that uevent both for physical
+//! hotplug (`HOTPLUG=1`) and when a lessee closes its lease fd
+//! (`LEASE=1`), so plugging a headset after launch, unplugging it, and
+//! SteamVR exiting all converge through the same idempotent path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use prism_renderer::DrmDevId;
 use smithay::backend::drm::DrmNode;
 use smithay::delegate_drm_lease;
+use smithay::reexports::drm::control::{connector, crtc};
 use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseHandler, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
 };
@@ -35,8 +39,10 @@ use crate::state::PrismState;
 /// advertises and the leases currently handed out.
 pub struct CardLeaseState {
     pub lease_state: DrmLeaseState,
-    /// Non-desktop connectors advertised on this card's global, each
-    /// with its CRTC reserved at bringup.
+    /// Non-desktop connectors known on this card, each with a reserved
+    /// CRTC — populated at bringup and reconciled by [`rescan_card`] on
+    /// hotplug. Entries persist while their connector is leased out
+    /// (the advertisement is withdrawn, but the reservation holds).
     pub non_desktop: Vec<prism_drm::NonDesktopConnector>,
     /// Currently-active leases. Holding the [`DrmLease`] keeps the
     /// kernel lease alive; dropping one revokes it.
@@ -93,6 +99,93 @@ pub fn init(
             },
         );
     }
+}
+
+/// Re-scan one card's non-desktop connectors and reconcile the lease
+/// advertisements: newly plugged headsets get a CRTC reserved and are
+/// advertised, unplugged ones are withdrawn (releasing the reservation).
+/// Idempotent — safe to run on every DRM udev `change` event. Also
+/// invoked from [`DrmLeaseHandler::lease_destroyed`] (a compositor-side
+/// revoke emits no uevent) and on VT re-activation (events while away
+/// were dropped).
+pub fn rescan_card(state: &mut PrismState, dev_id: DrmDevId) {
+    let Some(card) = state.cards.get(&dev_id) else {
+        return;
+    };
+    let Some(lease) = state.drm_lease.get_mut(&dev_id) else {
+        return;
+    };
+
+    // Connectors currently leased out. The kernel does NOT hide leased
+    // resources from the lessor — they still enumerate with their real
+    // connection state — but their advertisement lifecycle belongs to
+    // smithay while the lease lives: withdrawn at grant, re-advertised
+    // when the lease object dies. We must neither re-advertise nor
+    // withdraw them here; `withdraw_connector` on a leased connector
+    // drops smithay's lease bookkeeping and `lease_destroyed` would
+    // never fire for it.
+    let leased: HashSet<connector::Handle> = lease
+        .active_leases
+        .iter()
+        .flat_map(|l| l.connectors().copied())
+        .collect();
+
+    // CRTCs a fresh reservation must avoid: this card's desktop outputs
+    // plus anything leased out right now (visible to us, but the
+    // lessee's to drive).
+    let mut occupied: Vec<crtc::Handle> = state
+        .outputs
+        .values()
+        .filter(|o| o.gpu_id == dev_id)
+        .map(|o| o.crtc)
+        .collect();
+    occupied.extend(lease.active_leases.iter().flat_map(|l| l.crtcs().copied()));
+
+    let mut next = match prism_drm::rescan_non_desktop(&card.drm, &occupied, &lease.non_desktop) {
+        Ok(scan) => scan,
+        Err(e) => {
+            tracing::warn!("card {}: non-desktop rescan failed: {e:#}", card.path);
+            return;
+        }
+    };
+
+    let prev = std::mem::take(&mut lease.non_desktop);
+    for old in &prev {
+        if next.iter().any(|c| c.connector == old.connector) {
+            continue;
+        }
+        if leased.contains(&old.connector) {
+            // Unplugged while leased out: the lease (and its CRTC) is
+            // still the lessee's. Keep the entry; the rescan triggered
+            // by `lease_destroyed` retires it for real.
+            next.push(old.clone());
+            continue;
+        }
+        tracing::info!(
+            "card {}: {} ({}) gone; withdrawing from DRM leasing",
+            card.path,
+            old.connector_name,
+            old.description
+        );
+        lease.lease_state.withdraw_connector(old.connector);
+    }
+    for new in &next {
+        if leased.contains(&new.connector) || prev.iter().any(|o| o.connector == new.connector) {
+            continue;
+        }
+        tracing::info!(
+            "card {}: advertising {} ({}) for DRM leasing",
+            card.path,
+            new.connector_name,
+            new.description
+        );
+        lease.lease_state.add_connector::<PrismState>(
+            new.connector,
+            new.connector_name.clone(),
+            new.description.clone(),
+        );
+    }
+    lease.non_desktop = next;
 }
 
 impl DrmLeaseHandler for PrismState {
@@ -161,9 +254,17 @@ impl DrmLeaseHandler for PrismState {
 
     fn lease_destroyed(&mut self, node: DrmNode, lease_id: u32) {
         tracing::info!("DRM lease {lease_id} destroyed");
-        if let Some(cls) = self.drm_lease.get_mut(&dev_id_of(node)) {
+        let dev_id = dev_id_of(node);
+        if let Some(cls) = self.drm_lease.get_mut(&dev_id) {
+            // Dropping the DrmLease revokes the kernel lease; smithay
+            // has already re-advertised the connectors (`remove_lease`
+            // resumes them before calling us).
             cls.active_leases.retain(|l| l.id() != lease_id);
         }
+        // Reconcile: a headset unplugged mid-lease was kept advertised
+        // (see `rescan_card`) and must be withdrawn now; and the revoke
+        // path emits no uevent, so we can't count on udev waking us.
+        rescan_card(self, dev_id);
     }
 }
 

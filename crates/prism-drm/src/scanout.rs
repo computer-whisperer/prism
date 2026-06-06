@@ -73,7 +73,7 @@ pub struct OutputPick {
 /// `wp_drm_lease_device_v1` so a VR runtime (SteamVR, Monado) can lease
 /// it for direct scanout. The CRTC is reserved at scan time so desktop
 /// picks in the same pass can't take it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NonDesktopConnector {
     pub connector: connector::Handle,
     /// CRTC reserved for a future lease of this connector.
@@ -228,7 +228,7 @@ pub fn pick_all_connected_with_config(
     // desktop outputs, and reserving their CRTCs up front means the
     // desktop picks below can't steal the only CRTC able to drive a
     // headset.
-    let non_desktop = scan_non_desktop(drm, &resources, &occupied_by_other);
+    let non_desktop = scan_non_desktop(drm, &resources, &occupied_by_other, &[]);
 
     let mut picks: Vec<OutputPick> = Vec::new();
     for &conn_h in resources.connectors() {
@@ -292,13 +292,31 @@ pub fn pick_all_connected_with_config(
     Ok(ConnectorScan { picks, non_desktop })
 }
 
+/// Re-scan a card's connected `non-desktop` connectors at runtime (after
+/// a hotplug uevent). `existing` entries keep their reserved CRTC if the
+/// connector is still connected; newly appeared connectors get a fresh
+/// reservation avoiding `occupied` (the card's desktop-output CRTCs plus
+/// any actively-leased CRTCs). Returns the full current list — diffing
+/// against the previous list is the caller's job.
+pub fn rescan_non_desktop(
+    drm: &DrmDevice,
+    occupied: &[crtc::Handle],
+    existing: &[NonDesktopConnector],
+) -> Result<Vec<NonDesktopConnector>> {
+    let resources = drm.resource_handles().context("resource_handles")?;
+    Ok(scan_non_desktop(drm, &resources, occupied, existing))
+}
+
 /// Find every connected `non-desktop` connector and reserve a free CRTC
 /// for each, so it can be offered for DRM leasing. Connectors with no
 /// reservable CRTC are skipped with a warning (they won't be leasable).
+/// Connectors present in `existing` keep their entry (and reservation)
+/// instead of being re-assigned.
 fn scan_non_desktop(
     drm: &DrmDevice,
     resources: &smithay::reexports::drm::control::ResourceHandles,
     occupied_by_other: &[crtc::Handle],
+    existing: &[NonDesktopConnector],
 ) -> Vec<NonDesktopConnector> {
     let mut found: Vec<NonDesktopConnector> = Vec::new();
     for &conn_h in resources.connectors() {
@@ -308,8 +326,20 @@ fn scan_non_desktop(
         if info.state() != connector::State::Connected || !connector_is_non_desktop(drm, conn_h) {
             continue;
         }
+        if let Some(prev) = existing.iter().find(|n| n.connector == conn_h) {
+            found.push(prev.clone());
+            continue;
+        }
         let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
-        let reserved: Vec<crtc::Handle> = found.iter().map(|n| n.crtc).collect();
+        // Exclude reservations made so far this scan AND all existing
+        // reservations: an existing entry enumerated later in the loop
+        // keeps its CRTC, which must not be handed to a new connector
+        // enumerated before it.
+        let reserved: Vec<crtc::Handle> = found
+            .iter()
+            .chain(existing.iter())
+            .map(|n| n.crtc)
+            .collect();
         let crtc = match find_free_crtc(drm, resources, &info, occupied_by_other, &reserved) {
             Ok(c) => c,
             Err(e) => {
