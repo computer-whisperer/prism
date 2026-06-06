@@ -127,11 +127,17 @@ impl Watcher {
         Self { load_config }
     }
 
-    /// Force an immediate reload, optionally retargeting the watcher to a
-    /// new explicit path (future IPC `config reload` hook).
-    #[allow(dead_code)]
-    pub fn load_config(&self, path: Option<String>) {
-        let _ = self.load_config.send(path);
+    /// A detached force-reload trigger, for wiring into
+    /// [`PrismState::config_load_request`] (the `load-config-file`
+    /// action). Owns a clone of the trigger channel; calling it after
+    /// the watcher thread exits is a silent no-op.
+    ///
+    /// [`PrismState::config_load_request`]: prism_protocols::PrismState
+    pub fn loader(&self) -> Box<dyn Fn(Option<String>)> {
+        let tx = self.load_config.clone();
+        Box::new(move |path| {
+            let _ = tx.send(path);
+        })
     }
 }
 

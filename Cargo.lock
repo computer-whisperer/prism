@@ -2985,6 +2985,7 @@ dependencies = [
  "input",
  "libc",
  "prism-config",
+ "prism-ipc",
  "prism-layout",
  "prism-protocols",
  "smithay",

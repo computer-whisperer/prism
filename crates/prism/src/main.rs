@@ -1550,7 +1550,7 @@ fn run_integrated(
     // (receiver) precedes this binding's drop; on an early-`?` unwind the
     // watcher drops first, and a watcher thread blocked in `send` unblocks
     // with an error the moment the event loop (receiver) drops right after.
-    let _config_watcher = config_path.and_then(|path| {
+    let config_watcher = config_path.and_then(|path| {
         let (tx, rx) = calloop::channel::sync_channel::<Result<prism_config::Config, ()>>(1);
         let inserted = event_loop.handle().insert_source(rx, |event, _, state| {
             match event {
@@ -1596,6 +1596,11 @@ fn run_integrated(
             tx,
         ))
     });
+    // Let the `load-config-file` bind/action force a reload through the
+    // watcher's trigger channel.
+    if let Some(watcher) = &config_watcher {
+        state.config_load_request = Some(watcher.loader());
+    }
     for output in state.outputs.values() {
         tracing::info!(
             "scanout target: {} {}×{} (crtc {:?})",

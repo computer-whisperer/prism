@@ -12,6 +12,7 @@ calloop.workspace = true
 input = { version = "0.10", features = ["libinput_1_19"] }
 libc.workspace = true
 prism-config.workspace = true
+prism-ipc.workspace = true
 prism-layout.workspace = true
 prism-protocols.workspace = true
 smithay.workspace = true

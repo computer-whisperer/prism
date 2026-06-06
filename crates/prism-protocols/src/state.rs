@@ -26,10 +26,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use prism_animation::Clock;
-use prism_config::{Config, PresetSize};
+use prism_config::{Config, PresetSize, WorkspaceReference};
 use prism_frame::{DrmFourcc, DrmModifier};
 use prism_layout::cursor::{CursorManager, CursorTextureCache, RenderCursor};
-use prism_layout::layout::{ActivateWindow, AddWindowTarget, Layout, LayoutElement as _};
+use prism_layout::layout::{
+    ActivateWindow, AddWindowTarget, Layout, LayoutElement as _, WorkspaceId,
+};
 use prism_layout::utils::{output_matches_name, update_tiled_state};
 use prism_layout::window::{
     InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef,
@@ -177,6 +179,15 @@ pub struct PrismState {
     /// `Rc<RefCell>` to mirror niri's pattern — the layout, input
     /// dispatch, and IPC handlers all need read access.
     pub config: Rc<RefCell<Config>>,
+
+    /// Hook for the `load-config-file` action: asks the config file
+    /// watcher for an immediate (re)load, optionally from an explicit
+    /// path. `None` until `main` wires the watcher up — or forever, when
+    /// the watcher failed to start. A boxed closure rather than the
+    /// watcher handle itself so prism-protocols stays free of the
+    /// watcher type (deliberate divergence from niri, which stores the
+    /// watcher on its `State`).
+    pub config_load_request: Option<Box<dyn Fn(Option<String>)>>,
 
     /// Animation/event clock. Lazy: caches the monotonic time across a
     /// single event-loop turn and is cleared once per turn. The layout
@@ -784,6 +795,7 @@ impl PrismState {
 
         Self {
             config,
+            config_load_request: None,
             clock,
             layout,
             display_handle: dh,
@@ -1346,6 +1358,38 @@ impl PrismState {
             (i + sorted.len() - 1) % sorted.len()
         };
         Some(sorted[next].clone())
+    }
+
+    /// First output matching `target` by name — connector ("DP-2") or
+    /// make/model/serial, case-insensitive. Niri's `output_by_name_match`;
+    /// backs the `focus-monitor "name"` family of binds.
+    pub fn output_by_name_match(&self, target: &str) -> Option<Output> {
+        self.wl_outputs
+            .values()
+            .find(|o| output_matches_name(o, target))
+            .cloned()
+    }
+
+    /// Resolve a `WorkspaceReference` from a bind or IPC request to
+    /// `(owning output, workspace index on that output)`. `None` output
+    /// means "the active output" — always the case for plain `Index`
+    /// references, which are 1-based in config and clamp to 0-based here.
+    /// Name/Id references fail (`None`) if no such workspace exists.
+    /// Ported from niri's `find_output_and_workspace_index`.
+    pub fn find_output_and_workspace_index(
+        &self,
+        reference: WorkspaceReference,
+    ) -> Option<(Option<Output>, usize)> {
+        let (index, workspace) = match reference {
+            WorkspaceReference::Index(index) => {
+                return Some((None, usize::from(index.saturating_sub(1))));
+            }
+            WorkspaceReference::Name(name) => self.layout.find_workspace_by_name(&name)?,
+            WorkspaceReference::Id(id) => self
+                .layout
+                .find_workspace_by_id(WorkspaceId::specific(id))?,
+        };
+        Some((workspace.current_output().cloned(), index))
     }
 
     /// Look up the config-specified scale + transform for a connector.
