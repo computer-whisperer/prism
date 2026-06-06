@@ -20,18 +20,30 @@
 //! clicked; a `None` surface (bars, wallpapers) never receives keyboard
 //! input. See that method for the priority order.
 //!
+//! **Popups** (`zwlr_layer_surface_v1.get_popup`, e.g. a bar's tray menus)
+//! ride the ordinary xdg_popup machinery: the popup is created parent-less
+//! (`XdgShellHandler::new_popup` stashes it in `PopupManager`'s unmapped
+//! set), `get_popup` assigns the layer surface as parent (smithay), and
+//! `PopupManager::commit` maps it on the first commit. Our
+//! [`WlrLayerShellHandler::new_popup`] only has to unconstrain the pending
+//! geometry against the hosting output ([`PrismState::unconstrain_layer_popup`]);
+//! rendering, input hit-testing, frame callbacks, and texture
+//! materialization all resolve popups through their parent chain already.
+//!
 //! **Scope (deliberate gaps):** all four layers render + arrange, and
 //! exclusive zones shrink the tiling work area (via
 //! `LayerMap::non_exclusive_zone`, consumed by `compute_working_area` in
-//! prism-layout). Not yet: layer *popups* and layer *shadows*. Exclusive
-//! grab is scoped to the *focused* output (a surface on a non-focused
-//! monitor waits until that monitor is focused).
+//! prism-layout). Not yet: layer *shadows*. Exclusive grab is scoped to the
+//! *focused* output (a surface on a non-focused monitor waits until that
+//! monitor is focused).
 
-use smithay::desktop::{layer_map_for_output, LayerSurface, WindowSurfaceType};
+use smithay::desktop::{
+    get_popup_toplevel_coords, layer_map_for_output, LayerSurface, PopupKind, WindowSurfaceType,
+};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::{wl_output::WlOutput, wl_surface::WlSurface};
 use smithay::reexports::wayland_server::Resource as _;
-use smithay::utils::{IsAlive, SERIAL_COUNTER};
+use smithay::utils::{IsAlive, Rectangle, SERIAL_COUNTER};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::wlr_layer::{
     KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData,
@@ -291,6 +303,55 @@ impl PrismState {
         self.update_keyboard_focus();
     }
 
+    /// Unconstrain a popup whose root is a layer surface: reposition its
+    /// pending geometry so it stays on the hosting output, honoring the
+    /// positioner's constraint_adjustment. The layer analogue of the window
+    /// branch in [`Self::unconstrain_popup`]; ported from niri's
+    /// `unconstrain_layer_shell_popup` (xdg_shell.rs:1263). No-op when `root`
+    /// isn't a mapped layer surface.
+    ///
+    /// Two deliberate divergences from the window branch, both niri-parity:
+    /// no cosmetic 8px padding (a bar popover anchors flush against the
+    /// screen edge; insetting it is unexpected), and Background/Bottom
+    /// popups unconstrain against the *non-exclusive zone* rather than the
+    /// full output — they composite below Top/Overlay chrome, so sliding
+    /// them under a bar would hide them.
+    pub(crate) fn unconstrain_layer_popup(&self, popup: &PopupKind, root: &WlSurface) {
+        let Some((layer, output)) = self.wl_outputs.values().find_map(|output| {
+            let ls = layer_map_for_output(output)
+                .layer_for_surface(root, WindowSurfaceType::TOPLEVEL)?
+                .clone();
+            Some((ls, output.clone()))
+        }) else {
+            return;
+        };
+
+        let map = layer_map_for_output(&output);
+        let Some(layer_geo) = map.layer_geometry(&layer) else {
+            return;
+        };
+        let Some((lw, lh)) = crate::state::output_logical_size(&output) else {
+            return;
+        };
+
+        // Target rect in the popup's own coordinate space: the positioner
+        // anchors against the parent layer surface, so shift the output rect
+        // by the layer's placement and the popup's parent-chain offset.
+        let mut target = Rectangle::from_size((lw, lh).into());
+        if matches!(layer.layer(), Layer::Background | Layer::Bottom) {
+            target = map.non_exclusive_zone();
+        }
+        target.loc -= layer_geo.loc;
+        target.loc -= get_popup_toplevel_coords(popup);
+
+        let PopupKind::Xdg(popup) = popup else {
+            return;
+        };
+        popup.with_pending_state(|state| {
+            state.geometry = state.positioner.get_unconstrained_geometry(target);
+        });
+    }
+
     /// Unmap a destroyed layer surface from whichever output's `LayerMap`
     /// holds it (`unmap_layer` re-arranges + sends `wl_surface.leave`).
     pub fn layer_shell_destroyed(&mut self, surface: WlrLayerSurface) {
@@ -336,6 +397,21 @@ impl WlrLayerShellHandler for PrismState {
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
         self.layer_shell_destroyed(surface);
+    }
+
+    fn new_popup(
+        &mut self,
+        _parent: WlrLayerSurface,
+        popup: smithay::wayland::shell::xdg::PopupSurface,
+    ) {
+        // `zwlr_layer_surface_v1.get_popup`: smithay has just set the layer
+        // surface as the popup's parent (the xdg_popup was created with a
+        // null parent, so `XdgShellHandler::new_popup`'s unconstrain was a
+        // no-op and `track_popup` stashed it as unmapped — the parent now
+        // exists, so `PopupManager::commit` maps it on first commit).
+        // Unconstrain against the layer's output now that the root is known.
+        // Mirrors niri's `WlrLayerShellHandler::new_popup`.
+        self.unconstrain_popup(&PopupKind::Xdg(popup));
     }
 }
 

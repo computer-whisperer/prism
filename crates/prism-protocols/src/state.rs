@@ -2521,11 +2521,11 @@ impl PrismState {
     /// Reposition `popup`'s pending geometry so it stays within its parent's
     /// on-screen working area, honoring the client's positioner
     /// constraint_adjustment (flip / slide / resize). Mirrors niri's
-    /// `unconstrain_popup` for the window-popup case.
-    ///
-    /// Window popups only for now: layer-shell popups keep their requested
-    /// geometry (their working-area math differs and isn't ported yet).
-    fn unconstrain_popup(&self, popup: &PopupKind) {
+    /// `unconstrain_popup`, dispatching on the popup's root: layout windows
+    /// here, layer-shell surfaces (popups bound via
+    /// `zwlr_layer_surface_v1.get_popup`) in
+    /// [`Self::unconstrain_layer_popup`].
+    pub(crate) fn unconstrain_popup(&self, popup: &PopupKind) {
         let Ok(root) = find_popup_root_surface(popup) else {
             return;
         };
@@ -2534,6 +2534,9 @@ impl PrismState {
             .find_window_and_output(&root)
             .map(|(mapped, _)| mapped.window.clone())
         else {
+            // Not a window popup — the root may be a layer surface (a bar's
+            // tray popover). No-op if it's neither.
+            self.unconstrain_layer_popup(popup, &root);
             return;
         };
 

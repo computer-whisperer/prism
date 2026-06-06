@@ -2684,6 +2684,27 @@ fn render_output_now(
                     &ctx,
                     out,
                 );
+                // xdg_popups bound to this layer surface via
+                // zwlr_layer_surface_v1.get_popup (a bar's tray menus).
+                // Pushed after the parent tree so they draw on top. Same
+                // math as `Mapped::render_popups` minus the window-geometry
+                // inset (layer surfaces have none): `popup_offset` is the
+                // positioner placement relative to the layer surface origin,
+                // and the popup's own geometry inset is subtracted to land
+                // its buffer top-left — matching the hit-test offset in
+                // smithay's `LayerSurface::surface_under`.
+                for (popup, popup_offset) in
+                    smithay::desktop::PopupManager::popups_for_surface(ls.wl_surface())
+                {
+                    let popup_buf_origin = (geo.loc + popup_offset - popup.geometry().loc).to_f64();
+                    prism_layout::layout::element::push_surface_tree_elements(
+                        popup.wl_surface(),
+                        popup_buf_origin,
+                        1.0,
+                        &ctx,
+                        out,
+                    );
+                }
             }
         }
     };
@@ -2917,7 +2938,8 @@ fn render_output_now(
     }
     // Same harvest for every layer-shell surface we just rendered (all four
     // layers now composite). harvest_surface_feedback descends each surface's
-    // subsurface tree itself, so the layer roots are all we pass in.
+    // subsurface tree itself, so the layer roots are all we pass in — plus
+    // each root's popup trees, which (as above) are not subsurfaces.
     {
         let map = smithay::desktop::layer_map_for_output(&smithay_output);
         for ls in map.layers() {
@@ -2927,6 +2949,14 @@ fn render_output_now(
                 &mut presentation_cbs,
                 &mut release_trackers,
             );
+            for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(ls.wl_surface()) {
+                prism_protocols::redraw::harvest_surface_feedback(
+                    popup.wl_surface(),
+                    None,
+                    &mut presentation_cbs,
+                    &mut release_trackers,
+                );
+            }
         }
     }
 
@@ -3043,7 +3073,9 @@ fn send_frame_callbacks(
         }
     }
 
-    // Layer-shell surfaces composited on this output.
+    // Layer-shell surfaces composited on this output, plus their popup trees
+    // (popups are separate surface trees, not subsurfaces — same as the
+    // toplevel loop above).
     let map = smithay::desktop::layer_map_for_output(&smithay_output);
     for ls in map.layers() {
         send_frames_surface_tree(
@@ -3053,6 +3085,15 @@ fn send_frame_callbacks(
             None,
             &mut should_send,
         );
+        for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(ls.wl_surface()) {
+            send_frames_surface_tree(
+                popup.wl_surface(),
+                &smithay_output,
+                time,
+                None,
+                &mut should_send,
+            );
+        }
     }
 }
 
