@@ -18,13 +18,16 @@
 //!
 //! Actions whose subsystems don't exist yet fall through to the
 //! catch-all at the bottom and log: screenshot UI, MRU switcher UI,
-//! hotkey overlay, screencast targets, screen transitions, the
-//! overview (the *layout* tracks overview state, but prism's render
-//! and input paths don't support it — wiring the binds before that
-//! would leave the screen not matching the layout's idea of itself),
+//! hotkey overlay, screencast targets, screen transitions,
 //! `Suspend` (needs logind), keyboard-shortcuts-inhibit (protocol not
 //! implemented), debug render toggles, and the `*UnderMouse` variants
 //! (nothing in prism's input paths generates them).
+//!
+//! The overview toggle actions are wired (render path scales the
+//! workspace cards); overview *pointer* interaction (click-to-activate,
+//! workspace click) and the touchpad gesture are separate increments —
+//! until then, clicks in the overview resolve no window (`HitType::
+//! Activate` hits are filtered by pointer focus), which is safe.
 
 use std::process::Command;
 use std::sync::RwLock;
@@ -920,6 +923,21 @@ pub fn handle_action(state: &mut PrismState, action: Action) {
         A::PowerOnMonitors => {
             tracing::info!("action: PowerOnMonitors");
             state.set_all_monitors_powered(true);
+        }
+
+        A::ToggleOverview => {
+            state.layout.toggle_overview();
+            queue_redraw_active_output(state);
+        }
+        A::OpenOverview => {
+            if state.layout.open_overview() {
+                queue_redraw_active_output(state);
+            }
+        }
+        A::CloseOverview => {
+            if state.layout.close_overview() {
+                queue_redraw_active_output(state);
+            }
         }
 
         // Stubs for actions whose subsystems aren't ported yet — see

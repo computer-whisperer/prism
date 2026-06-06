@@ -848,6 +848,87 @@ impl RenderEl {
         }
     }
 
+    /// Translate this element's geometry by `offset`, in place — the
+    /// overview's workspace-card placement (and the workspace-switch
+    /// slide). Companion to [`Self::scale_about`]; unlike scaling, a pure
+    /// translation keeps the opaque rects valid (they're absolute
+    /// output-space), so they shift along instead of being cleared.
+    pub fn translate(&mut self, offset: Point<f64, Logical>) {
+        match self {
+            Self::Surface(s) => {
+                s.geometry.loc += offset;
+                if let Some(c) = &mut s.clip {
+                    c.rect.loc += offset;
+                }
+                for r in &mut s.opaque {
+                    r.loc += offset;
+                }
+            }
+            Self::SolidColor(s) => {
+                s.geometry.loc += offset;
+                if let Some(c) = &mut s.clip {
+                    c.rect.loc += offset;
+                }
+            }
+            Self::Border(b) => b.geometry.loc += offset,
+            Self::RoundedBox(r) => r.geometry.loc += offset,
+            Self::Shadow(s) => {
+                s.geometry.loc += offset;
+                s.shadow_box.loc += offset;
+                if let Some(c) = &mut s.cutout {
+                    c.rect.loc += offset;
+                }
+            }
+        }
+    }
+
+    /// Restrict this element to `bounds` (output-space logical), in place —
+    /// the overview's workspace-card crop (niri's `CropRenderElement`).
+    /// Returns `false` when the element lies fully outside `bounds` and
+    /// should be dropped. Surfaces and solids get their clip box
+    /// intersected with `bounds` (an existing rounded clip keeps its radii;
+    /// a corner cut by the card edge keeps its rounding — a sub-pixel
+    /// divergence from niri's exact crop at overview zoom). The decoration
+    /// variants (border / rounded box / shadow) carry only their own SDF
+    /// box, so ones straddling the card edge are kept un-cropped.
+    pub fn crop_to_rect(&mut self, bounds: Rectangle<f64, Logical>) -> bool {
+        let geometry = self.geometry();
+        if geometry.intersection(bounds).is_none() {
+            return false;
+        }
+        if bounds.contains_rect(geometry) {
+            return true;
+        }
+        match self {
+            Self::Surface(s) => match &mut s.clip {
+                Some(c) => match c.rect.intersection(bounds) {
+                    Some(r) => c.rect = r,
+                    None => return false,
+                },
+                None => {
+                    s.clip = Some(SurfaceClip {
+                        rect: bounds,
+                        radii: [0.0; 4],
+                    });
+                }
+            },
+            Self::SolidColor(s) => match &mut s.clip {
+                Some(c) => match c.rect.intersection(bounds) {
+                    Some(r) => c.rect = r,
+                    None => return false,
+                },
+                None => {
+                    s.clip = Some(SurfaceClip {
+                        rect: bounds,
+                        radii: [0.0; 4],
+                    });
+                }
+            },
+            Self::Border(_) | Self::RoundedBox(_) | Self::Shadow(_) => {}
+        }
+        true
+    }
+
     /// Apply a rounded-rect clip (`clip-to-geometry`) to this element, in
     /// place. Skipped when the clip provably wouldn't remove any pixels
     /// (element inside the box, clear of the corner squares — niri's

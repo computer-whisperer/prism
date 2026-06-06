@@ -4686,8 +4686,17 @@ impl<W: LayoutElement> Layout<W> {
         let scale = Scale::from(move_.output.current_scale().fractional_scale());
         let zoom = self.overview_zoom();
         let pos_in_backdrop = move_.tile_render_location(zoom);
-        let _ = zoom;
+        // In the overview, the moved tile shrinks to match the zoomed
+        // workspace cards: `tile_render_location` already returns the
+        // zoom-adjusted position, so scale the tile's elements about it
+        // (niri's `RescaleRenderElement(elem, pos_in_backdrop, zoom)`).
+        let start = out.len();
         move_.tile.render(pos_in_backdrop, scale, true, ctx, out);
+        if zoom != 1.0 {
+            for el in &mut out[start..] {
+                el.scale_about(pos_in_backdrop, zoom);
+            }
+        }
     }
 
     pub fn refresh(&mut self, is_active: bool) {

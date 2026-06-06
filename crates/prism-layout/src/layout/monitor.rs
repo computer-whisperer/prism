@@ -1688,31 +1688,105 @@ impl<W: LayoutElement> Monitor<W> {
             .insert_hint_render_loc
             .filter(|_| !self.options.layout.insert_hint.off);
 
-        // `out` is back-to-front (prism's painter order, inverse of
-        // niri's front-to-back element lists): scrolling first, then
-        // the insert hint, then floating on top.
-        for (ws, _geo) in self.workspaces_with_render_geo() {
-            ws.render_scrolling(focus_ring, ctx, out);
+        let zoom = self.overview_zoom();
+        let progress = self.overview_progress.as_ref().map(|p| p.clamped_value());
+        let origin = Point::from((0., 0.));
+
+        // `ws_els` is back-to-front (prism's painter order, inverse of
+        // niri's front-to-back element lists): background card first,
+        // then scrolling, the insert hint, and floating on top.
+        let mut ws_els: Vec<RenderEl> = Vec::new();
+        for (ws, geo) in self.workspaces_with_render_geo() {
+            // In the overview, each workspace gets an opaque background
+            // card (fading in with the zoom) so its windows read as a
+            // group over the backdrop. Normal mode skips the card — the
+            // wallpaper (Background/Bottom layers) shows through instead.
+            // Deliberate divergence from niri: prism keeps the wallpaper
+            // unscaled on the backdrop (niri's `place-within-backdrop`
+            // look) rather than duplicating it into every card, which
+            // would need per-workspace element namespacing in the damage
+            // tracker.
+            if let Some(p) = progress {
+                let mut bg = ws.render_background();
+                bg.mul_alpha(p.clamp(0., 1.) as f32);
+                ws_els.push(bg);
+            }
+
+            ws.render_scrolling(focus_ring, ctx, &mut ws_els);
 
             if let Some(loc) = insert_hint_render_loc {
                 if loc.workspace == InsertWorkspace::Existing(ws.id()) {
-                    self.insert_hint_element.render(loc.location, out);
+                    self.insert_hint_element.render(loc.location, &mut ws_els);
                 }
             }
 
-            ws.render_floating(focus_ring, ctx, out);
+            ws.render_floating(focus_ring, ctx, &mut ws_els);
+
+            // Place the workspace's elements onto its card: scale about
+            // the origin, move to the card position, and crop to the
+            // card's *vertical band* — horizontally unbounded, matching
+            // niri's crop_bounds HACK (a tight horizontal crop would cut
+            // columns that legitimately spill past the card's sides in
+            // the overview). The crop only exists while cards can
+            // overlap each other's space (switch in flight or overview);
+            // a static frame is identity-transformed and un-cropped,
+            // exactly as before.
+            let band =
+                (self.workspace_switch.is_some() || self.overview_progress.is_some()).then(|| {
+                    const INF: f64 = 1e9;
+                    Rectangle::new(
+                        Point::from((-INF / 2., geo.loc.y)),
+                        Size::from((INF, geo.size.h)),
+                    )
+                });
+            out.reserve(ws_els.len());
+            for mut el in ws_els.drain(..) {
+                if zoom != 1.0 {
+                    el.scale_about(origin, zoom);
+                }
+                if geo.loc != origin {
+                    el.translate(geo.loc);
+                }
+                match band {
+                    Some(band) => {
+                        if el.crop_to_rect(band) {
+                            out.push(el);
+                        }
+                    }
+                    None => out.push(el),
+                }
+            }
         }
     }
 
-    /// Render the overview-mode shadow under each workspace card.
+    /// Render the overview-mode shadow under each workspace card, faded
+    /// in with the overview progress and placed like the card itself
+    /// (niri's `render_workspace_shadows`).
     pub fn render_workspace_shadows(&self, out: &mut Vec<RenderEl>) {
-        let Some(_progress) = self.overview_progress.as_ref().map(|p| p.clamped_value()) else {
+        let Some(progress) = self.overview_progress.as_ref().map(|p| p.clamped_value()) else {
             return;
         };
+        let alpha = progress.clamp(0., 1.) as f32;
+        let zoom = self.overview_zoom();
+        let origin = Point::from((0., 0.));
 
-        for (ws, _geo) in self.workspaces_with_render_geo() {
-            ws.render_shadow(out);
+        let mut shadow_els: Vec<RenderEl> = Vec::new();
+        for (ws, geo) in self.workspaces_with_render_geo() {
+            ws.render_shadow(&mut shadow_els);
+            for mut el in shadow_els.drain(..) {
+                el.mul_alpha(alpha);
+                el.scale_about(origin, zoom);
+                el.translate(geo.loc);
+                out.push(el);
+            }
         }
+    }
+
+    /// Whether the overview backdrop behind the workspace cards can be
+    /// visible this frame: any overview zoom in effect, or a workspace
+    /// switch in flight (cards are spaced with a gap that exposes it).
+    pub fn backdrop_visible(&self) -> bool {
+        self.overview_progress.is_some() || self.workspace_switch.is_some()
     }
 
     pub fn workspace_switch_gesture_begin(&mut self, is_touchpad: bool) {

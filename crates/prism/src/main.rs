@@ -2792,9 +2792,40 @@ fn render_output_now(
             }
         }
     };
+    // Overview backdrop: a solid color at the very back, below the
+    // wallpaper layers. Prism renders the wallpaper unscaled on the
+    // backdrop (niri's `place-within-backdrop` look), so the color only
+    // shows where no Background/Bottom layer covers — and it's emitted
+    // at all only when workspace cards can actually expose it (overview
+    // zoom, or the gap during a workspace switch), keeping the static
+    // frame free of a permanent fullscreen quad.
+    if let Some(monitor) = state.layout.monitor_for_output(&smithay_output) {
+        if monitor.backdrop_visible() {
+            static BACKDROP_ID: std::sync::OnceLock<prism_frame::ElementId> =
+                std::sync::OnceLock::new();
+            let rgba = state
+                .config
+                .borrow()
+                .overview
+                .backdrop_color
+                .to_array_unpremul();
+            let color_bt2020_nits =
+                prism_renderer::srgb_to_bt2020_nits(rgba[0], rgba[1], rgba[2], rgba[3], 80.0);
+            render_els.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
+                id: *BACKDROP_ID.get_or_init(prism_frame::ElementId::alloc),
+                geometry: smithay::utils::Rectangle::from_size(view_size),
+                color_bt2020_nits,
+                clip: None,
+            }));
+        }
+    }
+
     push_layers(&[Layer::Background, Layer::Bottom], &mut render_els);
 
     let monitor_found = if let Some(monitor) = state.layout.monitor_for_output(&smithay_output) {
+        // Overview workspace-card shadows go under the cards, over the
+        // backdrop/wallpaper. No-op outside the overview.
+        monitor.render_workspace_shadows(&mut render_els);
         // focus_ring: this is the focused monitor's render — for
         // single-monitor configs it always is; multi-monitor focus
         // tracking lands when input dispatch does.
