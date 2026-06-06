@@ -104,6 +104,12 @@ enum TopCommand {
         /// Directory to write artifacts into.
         #[arg(long, default_value = "prism-tune-gui-bundle")]
         out: std::path::PathBuf,
+        /// Viewport width (logical px) to lay the panel out at.
+        #[arg(long, default_value_t = 900.0)]
+        width: f32,
+        /// Viewport height (logical px) to lay the panel out at.
+        #[arg(long, default_value_t = 760.0)]
+        height: f32,
     },
 }
 
@@ -138,7 +144,7 @@ fn main() -> Result<()> {
         TopCommand::Characterize(args) => characterize::run(args),
         TopCommand::ValidateLut3d(args) => validate_lut3d::run(args),
         TopCommand::Gui => gui::run(),
-        TopCommand::GuiBundle { out } => gui::dump_bundle(&out),
+        TopCommand::GuiBundle { out, width, height } => gui::dump_bundle(&out, width, height),
     }
 }
 

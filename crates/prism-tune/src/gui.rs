@@ -38,6 +38,45 @@ const CLOUD_MAX_SIDE: usize = 256;
 /// Preview-image decimation cap (per axis) — keeps the preview texture
 /// light while staying crisp enough to read.
 const PREVIEW_MAX_SIDE: usize = 960;
+/// Viewport width (logical px) at which the detail area switches from
+/// the tabbed single-pane layout to the controls-rail + visualization
+/// split. Below this there isn't room for the sidebar, a usable
+/// controls column, and a chart side by side.
+const WIDE_BREAKPOINT: f32 = 1280.0;
+/// Width of the controls rail in the wide layout — enough for an R/G/B
+/// triple of numeric inputs (each with its −/+ spinner buttons and a
+/// 4-decimal value) inside a card without truncating.
+const CONTROLS_PANE_WIDTH: f32 = 560.0;
+
+/// Which detail pane is visible in the narrow (tabbed) layout. The
+/// wide layout shows all three at once and ignores this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pane {
+    Controls,
+    Preview,
+    Gamut,
+}
+
+impl Pane {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "controls" => Some(Pane::Controls),
+            "preview" => Some(Pane::Preview),
+            "gamut" => Some(Pane::Gamut),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Pane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Pane::Controls => "controls",
+            Pane::Preview => "preview",
+            Pane::Gamut => "gamut",
+        })
+    }
+}
 
 /// Query every connected output, sorted by connector name.
 fn query_outputs() -> Result<Vec<Output>> {
@@ -154,6 +193,8 @@ struct TuneGui {
     gamut_mesh: Option<GamutMesh>,
     /// Whether the measured-gamut lattice shell is drawn.
     show_shell: bool,
+    /// Active detail tab in the narrow layout.
+    pane: Pane,
     selection: Selection,
 }
 
@@ -171,6 +212,7 @@ impl TuneGui {
             enabled_gamuts: [true; REF_GAMUTS.len()],
             gamut_mesh: None,
             show_shell: false,
+            pane: Pane::Controls,
             selection: Selection::default(),
         };
         gui.reload(None);
@@ -205,21 +247,43 @@ impl TuneGui {
                 advertised_peak_nits: Some(1000.0),
             },
         };
+        // Synthetic frame stand-ins so the preview and gamut cards lay
+        // out at their real (populated) sizes rather than collapsing to
+        // their empty placeholders: a hue-sweep preview image and a
+        // matching grid of BT.2020 absolute-nits samples.
+        let (pw, ph) = (320u32, 180u32);
+        let mut pixels = Vec::with_capacity((pw * ph * 4) as usize);
+        let mut samples = Vec::with_capacity((pw * ph) as usize);
+        for y in 0..ph {
+            for x in 0..pw {
+                let (fx, fy) = (x as f32 / pw as f32, y as f32 / ph as f32);
+                let nits = 600.0 * (1.0 - fy);
+                samples.push([nits * fx, nits * (1.0 - fx), nits * fy]);
+                pixels.extend_from_slice(&[
+                    (fx * 255.0) as u8,
+                    ((1.0 - fx) * 255.0) as u8,
+                    (fy * 255.0) as u8,
+                    255,
+                ]);
+            }
+        }
         let mut gui = TuneGui {
             outputs: vec![output],
             selected: Some(0),
             fields: Fields::default(),
             status: "Mock state — no prism connection.".to_string(),
-            preview: None,
-            frame_samples: None,
+            preview: Some(Image::from_rgba8(pw, ph, pixels)),
+            frame_samples: Some(samples),
             gamut: None,
             gamut_space: GamutSpace::Cielab,
             enabled_gamuts: [true; REF_GAMUTS.len()],
             gamut_mesh: None,
             show_shell: false,
+            pane: Pane::Controls,
             selection: Selection::default(),
         };
         gui.sync_fields();
+        gui.rebuild_gamut();
         gui
     }
 
@@ -466,64 +530,76 @@ impl TuneGui {
     }
 }
 
-/// Read-only summary of the live color state.
-fn color_state_card(color: &ColorState) -> El {
-    let mode = if color.hdr_active {
+/// A titled card whose content column stretches: the card takes the
+/// height its parent assigns (the caller sets a `Fill` weight on the
+/// returned El) and the body's last child absorbs the slack. Used for
+/// the chart cards so the preview / 3D plot grow with the window
+/// instead of sitting at a fixed height inside a scroll column.
+fn fill_card<I, E>(title: &str, body: I) -> El
+where
+    I: IntoIterator<Item = E>,
+    E: Into<El>,
+{
+    card([
+        card_header([card_title(title)]),
+        card_content([body_column(body).height(Size::Fill(1.0))]).height(Size::Fill(1.0)),
+    ])
+}
+
+/// A card-body column with an explicit gap: `card_content` stacks its
+/// children with no gap at all, which butts focusable rows against
+/// each other — their expanded hit targets overlap and each row's
+/// focus ring is painted over by the next (both lint findings).
+fn body_column<I, E>(body: I) -> El
+where
+    I: IntoIterator<Item = E>,
+    E: Into<El>,
+{
+    column(body.into_iter().map(Into::into).collect::<Vec<_>>())
+        .gap(tokens::SPACE_3)
+        .width(Size::Fill(1.0))
+}
+
+/// [`titled_card`] with a gapped body — see [`body_column`].
+fn gapped_card<I, E>(title: &str, body: I) -> El
+where
+    I: IntoIterator<Item = E>,
+    E: Into<El>,
+{
+    titled_card(title, [body_column(body)])
+}
+
+/// Compact header for the selected output: connector name + status
+/// badges on one line, make/model under it. The badges carry what the
+/// old read-only state card reported that isn't already visible in an
+/// editable field (mode, and whether a CTM / response correction is
+/// live).
+fn output_header(output: &Output) -> El {
+    let color = &output.color;
+    let mut title_row: Vec<El> = vec![h2(output.name.clone())];
+    title_row.push(if color.hdr_active {
         badge("HDR").success()
     } else {
         badge("SDR").muted()
-    };
-    // The exact gain/gamma values live in the editable Response curve
-    // card below; the live-state row only reports whether a correction
-    // is active, so it stays short enough to fit the row.
-    let response = match color.response_curve {
-        Some(_) => "custom",
-        None => "identity",
-    };
-    let ctm = match color.ctm {
-        Some(_) => "custom",
-        None => "identity",
-    };
-    titled_card(
-        "Live color state",
-        [
-            row([text("Mode"), mode])
-                .align(Align::Center)
-                .justify(Justify::SpaceBetween),
-            info_row(
-                "Panel peak nits",
-                &format!(
-                    "{:.1}, {:.1}, {:.1}",
-                    color.panel_peak_nits[0], color.panel_peak_nits[1], color.panel_peak_nits[2]
-                ),
-            ),
-            info_row(
-                "SDR reference nits",
-                &format!("{:.1}", color.sdr_reference_nits),
-            ),
-            info_row(
-                "Advertised peak nits",
-                &match color.advertised_peak_nits {
-                    Some(v) => format!("{v:.1}"),
-                    None => "—".to_string(),
-                },
-            ),
-            info_row("Response curve", response),
-            info_row("Gamut matrix (CTM)", ctm),
-        ],
-    )
+    });
+    if color.response_curve.is_some() {
+        title_row.push(badge("response curve").muted());
+    }
+    if color.ctm.is_some() {
+        title_row.push(badge("CTM").muted());
+    }
+    column([
+        row(title_row).gap(tokens::SPACE_2).align(Align::Center),
+        text(format!("{} — {}", output.make, output.model))
+            .muted()
+            .small(),
+    ])
+    .gap(tokens::SPACE_1)
 }
 
-fn info_row(label: &str, value: &str) -> El {
-    row([text(label).muted(), text(value.to_string()).mono()])
-        .align(Align::Center)
-        .justify(Justify::SpaceBetween)
-        .gap(tokens::SPACE_3)
-}
-
-impl App for TuneGui {
-    fn build(&self, _cx: &BuildCx) -> El {
-        // Sidebar: output picker + refresh.
+impl TuneGui {
+    /// Sidebar: output picker + refresh.
+    fn sidebar(&self) -> El {
         let mut picker: Vec<El> = vec![text("Outputs").bold()];
         for (i, output) in self.outputs.iter().enumerate() {
             let mut btn = button(output.name.clone()).key(format!("out:{}", output.name));
@@ -541,269 +617,332 @@ impl App for TuneGui {
                 .secondary()
                 .width(Size::Fill(1.0)),
         );
-        let sidebar = column(picker)
+        column(picker)
             .gap(tokens::SPACE_2)
             .padding(tokens::SPACE_4)
-            .width(Size::Fixed(220.0));
+            .width(Size::Fixed(220.0))
+    }
 
-        // Detail pane for the selected output.
-        let detail: El = match self.current() {
-            Some(output) => {
-                let header = column([
-                    h2(output.name.clone()),
-                    text(format!("{} — {}", output.make, output.model))
-                        .muted()
-                        .small(),
-                ])
-                .gap(tokens::SPACE_1);
-
-                let sdr_card = titled_card(
-                    "SDR reference",
-                    [row([
-                        text("Nits").muted(),
-                        numeric_input(&self.fields.sdr_nits, &self.selection, "sdr", nits_opts())
-                            .width(Size::Fill(1.0)),
-                        button("Apply").key("apply:sdr").primary(),
-                    ])
-                    .gap(tokens::SPACE_2)
-                    .align(Align::Center)],
-                );
-
-                // Color-management advertised mastering peak. HDR-only —
-                // it sets the mastering_luminance max in the preferred
-                // image description, independent of the panel-facing
-                // max-luminance (infoframe + encode clamp).
-                let advertised_card = titled_card(
-                    "Advertised peak · color management",
-                    [
-                        row([
-                            text("Nits").muted(),
-                            numeric_input(
-                                &self.fields.advertised_peak,
-                                &self.selection,
-                                "advertised",
-                                nits_opts(),
-                            )
-                            .width(Size::Fill(1.0)),
-                            button("Apply").key("apply:advertised").primary(),
-                        ])
-                        .gap(tokens::SPACE_2)
-                        .align(Align::Center),
-                        text(
-                            "What color-managed clients tone-map against; \
-                              separate from the panel's max-luminance.",
-                        )
-                        .muted()
-                        .small(),
-                    ],
-                );
-
-                let response_card = titled_card(
-                    "Response curve",
-                    [
-                        triple_row(
-                            "Gain",
-                            &self.fields.gain,
-                            &self.selection,
-                            ["gain_r", "gain_g", "gain_b"],
-                            curve_opts(),
-                        ),
-                        triple_row(
-                            "Gamma",
-                            &self.fields.gamma,
-                            &self.selection,
-                            ["gamma_r", "gamma_g", "gamma_b"],
-                            curve_opts(),
-                        ),
-                        row([button("Apply").key("apply:response").primary()])
-                            .justify(Justify::End),
-                    ],
-                );
-
-                let peak_card = titled_card(
-                    "Panel peak nits",
-                    [
-                        triple_row(
-                            "RGB",
-                            &self.fields.peak,
-                            &self.selection,
-                            ["peak_r", "peak_g", "peak_b"],
-                            nits_opts(),
-                        ),
-                        row([button("Apply").key("apply:peak").primary()]).justify(Justify::End),
-                    ],
-                );
-
-                let reset = row([button("Reset all color overrides")
-                    .key("apply:reset")
-                    .destructive()])
-                .justify(Justify::End);
-
-                let preview_body: El = match &self.preview {
-                    Some(img) => image(img.clone())
-                        .image_fit(ImageFit::Contain)
-                        .width(Size::Fill(1.0))
-                        .height(Size::Fixed(360.0)),
-                    None => column([text("No frame captured yet.").muted().small()])
-                        .height(Size::Fixed(48.0))
-                        .justify(Justify::Center),
-                };
-                let preview_card = titled_card(
-                    "Recent frame · BT.2020 intermediate",
-                    [
-                        row([button("Fetch new frame").key("fetch").primary()])
-                            .justify(Justify::End),
-                        preview_body,
-                    ],
-                );
-
-                let space_toggle = row([
-                    toggle_button(
-                        "CIELAB",
-                        "space:lab",
-                        self.gamut_space == GamutSpace::Cielab,
-                    ),
-                    toggle_button(
-                        "BT.2020 RGB (nits)",
-                        "space:rgb",
-                        self.gamut_space == GamutSpace::Bt2020Rgb,
-                    ),
-                ])
-                .gap(tokens::SPACE_2);
-
-                // Per-gamut cage on/off, in REF_GAMUTS order. Each cage is
-                // named in-plot at its green primary (see GamutScene).
-                let mut cage_btns: Vec<El> = Vec::with_capacity(REF_GAMUTS.len());
-                for (i, g) in REF_GAMUTS.iter().enumerate() {
-                    cage_btns.push(toggle_button(
-                        g.name,
-                        &format!("cage:{}", g.key),
-                        self.enabled_gamuts[i],
-                    ));
-                }
-                let cage_toggle = column([
-                    text("Reference gamuts").small().muted(),
-                    row(cage_btns).gap(tokens::SPACE_2),
-                ])
-                .gap(tokens::SPACE_1);
-
-                // Measured-gamut shell: a button to pull the mesh from the
-                // compositor, and (once loaded) a show/hide toggle.
-                let mut shell_row: Vec<El> =
-                    vec![button("Load measured gamut").key("fetch:gamut").secondary()];
-                if self.gamut_mesh.is_some() {
-                    shell_row.push(toggle_button("Show shell", "shell", self.show_shell));
-                }
-                let shell_controls = column([
-                    text("Measured gamut").small().muted(),
-                    row(shell_row).gap(tokens::SPACE_2),
-                ])
-                .gap(tokens::SPACE_1);
-
-                let has_geometry = self.gamut.as_ref().is_some_and(|g| {
-                    g.point_count > 0
-                        || g.cage_segments > 0
-                        || g.shell_segments > 0
-                        || g.cage_label_count > 0
-                });
-                let gamut_body: El = match self.gamut.as_ref().filter(|_| has_geometry) {
-                    Some(g) => {
-                        // Axes are unclipped: both spaces are absolute, so
-                        // content brighter than reference white sits above
-                        // the cage whites instead of being clamped.
-                        let (tx, ty, tz) = match self.gamut_space {
-                            GamutSpace::Cielab => ("a*", "L*", "b*"),
-                            GamutSpace::Bt2020Rgb => ("R (nits)", "G (nits)", "B (nits)"),
-                        };
-                        // The damascene wgpu backend rejects empty geometry
-                        // buffers, so add each mark only when it has data —
-                        // the cloud (no frame yet), the cages (all toggled
-                        // off), the shell (no mesh), and the labels can each
-                        // be empty independently.
-                        let mut scene = SceneSpec::new();
-                        if g.point_count > 0 {
-                            scene = scene.points_styled(
-                                g.points.clone(),
-                                PointStyle {
-                                    size: 5.0,
-                                    shape: PointShape::Circle,
-                                    size_mode: SizeMode::ScreenSpace,
-                                },
-                            );
-                        }
-                        if g.cage_segments > 0 {
-                            scene = scene.lines(g.cages.clone());
-                        }
-                        if g.shell_segments > 0 {
-                            scene = scene.lines(g.shell.clone());
-                        }
-                        if g.cage_label_count > 0 {
-                            // A small square marker + persistent name at each
-                            // enabled cage's green primary.
-                            scene = scene.points_labeled(
-                                g.cage_label_geo.clone(),
-                                PointStyle {
-                                    size: 5.0,
-                                    shape: PointShape::Square,
-                                    size_mode: SizeMode::ScreenSpace,
-                                },
-                                g.cage_labels.clone(),
-                            );
-                        }
-                        scene = scene.axis_titles(tx, ty, tz);
-                        chart3d(scene)
-                            .width(Size::Fill(1.0))
-                            .height(Size::Fixed(480.0))
-                    }
-                    None => column([text("Fetch a frame or load the measured gamut to plot.")
-                        .muted()
-                        .small()])
-                    .height(Size::Fixed(48.0))
-                    .justify(Justify::Center),
-                };
-                let gamut_card = titled_card(
-                    "Gamut cloud — drag to orbit, wheel to zoom",
-                    [space_toggle, cage_toggle, shell_controls, gamut_body],
-                );
-
-                let mut cards = vec![
-                    header,
-                    preview_card,
-                    gamut_card,
-                    color_state_card(&output.color),
-                    sdr_card,
-                ];
-                // The advertised mastering peak only applies to HDR
-                // outputs — skip the card entirely on SDR.
-                if output.color.hdr_active {
-                    cards.push(advertised_card);
-                }
-                cards.push(response_card);
-                cards.push(peak_card);
-                cards.push(reset);
-                column(cards).gap(tokens::SPACE_4)
-            }
-            None => column([text("No output selected.").muted()]).padding(tokens::SPACE_4),
-        };
-
-        let mut detail_children = Vec::new();
-        if !self.status.is_empty() {
-            detail_children.push(
-                column([text(self.status.clone()).small()])
-                    .padding(tokens::SPACE_3)
-                    .surface_role(SurfaceRole::Sunken),
+    /// Luminance anchors in one card: the SDR reference, plus (HDR
+    /// only) the color-management advertised mastering peak — the
+    /// mastering_luminance max in the preferred image description,
+    /// independent of the panel-facing max-luminance (infoframe +
+    /// encode clamp).
+    fn luminance_card(&self, hdr: bool) -> El {
+        let mut rows = vec![nits_row(
+            "SDR reference",
+            &self.fields.sdr_nits,
+            &self.selection,
+            "sdr",
+            "apply:sdr",
+        )];
+        if hdr {
+            rows.push(nits_row(
+                "Advertised peak",
+                &self.fields.advertised_peak,
+                &self.selection,
+                "advertised",
+                "apply:advertised",
+            ));
+            rows.push(
+                text(
+                    "Advertised peak is what color-managed clients tone-map \
+                     against; separate from the panel's max-luminance.",
+                )
+                .muted()
+                .small()
+                .wrap_text(),
             );
         }
-        detail_children.push(detail);
-        let detail_pane = scroll([column(detail_children)
+        gapped_card("Luminance", rows)
+    }
+
+    fn response_card(&self) -> El {
+        gapped_card(
+            "Response curve",
+            [
+                triple_row(
+                    "Gain",
+                    &self.fields.gain,
+                    &self.selection,
+                    ["gain_r", "gain_g", "gain_b"],
+                    curve_opts(),
+                ),
+                triple_row(
+                    "Gamma",
+                    &self.fields.gamma,
+                    &self.selection,
+                    ["gamma_r", "gamma_g", "gamma_b"],
+                    curve_opts(),
+                ),
+                row([button("Apply").key("apply:response").primary()]).justify(Justify::End),
+            ],
+        )
+    }
+
+    fn peak_card(&self) -> El {
+        gapped_card(
+            "Panel peak nits",
+            [
+                triple_row(
+                    "RGB",
+                    &self.fields.peak,
+                    &self.selection,
+                    ["peak_r", "peak_g", "peak_b"],
+                    nits_opts(),
+                ),
+                row([button("Apply").key("apply:peak").primary()]).justify(Justify::End),
+            ],
+        )
+    }
+
+    /// The editable control cards, in the order they stack in the
+    /// controls rail / Controls tab.
+    fn control_cards(&self, output: &Output) -> Vec<El> {
+        vec![
+            self.luminance_card(output.color.hdr_active),
+            self.response_card(),
+            self.peak_card(),
+            row([button("Reset all color overrides")
+                .key("apply:reset")
+                .destructive()])
+            .justify(Justify::End),
+        ]
+    }
+
+    /// Frame-preview card. The image absorbs whatever height the card
+    /// is assigned, so the preview scales with the window.
+    fn preview_card(&self) -> El {
+        let body: El = match &self.preview {
+            Some(img) => image(img.clone())
+                .image_fit(ImageFit::Contain)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+            None => column([text("No frame captured yet.").muted().small()])
+                .height(Size::Fill(1.0))
+                .justify(Justify::Center),
+        };
+        fill_card(
+            "Recent frame · BT.2020 intermediate",
+            [
+                row([button("Fetch new frame").key("fetch").primary()]).justify(Justify::End),
+                body,
+            ],
+        )
+    }
+
+    /// Gamut-cloud card: space + cage + shell toggles, then the 3D
+    /// chart filling the remaining height.
+    fn gamut_card(&self) -> El {
+        let space_toggle = row([
+            toggle_button(
+                "CIELAB",
+                "space:lab",
+                self.gamut_space == GamutSpace::Cielab,
+            ),
+            toggle_button(
+                "BT.2020 RGB (nits)",
+                "space:rgb",
+                self.gamut_space == GamutSpace::Bt2020Rgb,
+            ),
+        ])
+        .gap(tokens::SPACE_2);
+
+        // Per-gamut cage on/off, in REF_GAMUTS order. Each cage is
+        // named in-plot at its green primary (see GamutScene).
+        let mut cage_btns: Vec<El> = Vec::with_capacity(REF_GAMUTS.len());
+        for (i, g) in REF_GAMUTS.iter().enumerate() {
+            cage_btns.push(toggle_button(
+                g.name,
+                &format!("cage:{}", g.key),
+                self.enabled_gamuts[i],
+            ));
+        }
+        let cage_toggle = column([
+            text("Reference gamuts").small().muted(),
+            row(cage_btns).gap(tokens::SPACE_2),
+        ])
+        .gap(tokens::SPACE_1);
+
+        // Measured-gamut shell: a button to pull the mesh from the
+        // compositor, and (once loaded) a show/hide toggle.
+        let mut shell_row: Vec<El> =
+            vec![button("Load measured gamut").key("fetch:gamut").secondary()];
+        if self.gamut_mesh.is_some() {
+            shell_row.push(toggle_button("Show shell", "shell", self.show_shell));
+        }
+        let shell_controls = column([
+            text("Measured gamut").small().muted(),
+            row(shell_row).gap(tokens::SPACE_2),
+        ])
+        .gap(tokens::SPACE_1);
+
+        let has_geometry = self.gamut.as_ref().is_some_and(|g| {
+            g.point_count > 0
+                || g.cage_segments > 0
+                || g.shell_segments > 0
+                || g.cage_label_count > 0
+        });
+        let gamut_body: El = match self.gamut.as_ref().filter(|_| has_geometry) {
+            Some(g) => {
+                // Axes are unclipped: both spaces are absolute, so
+                // content brighter than reference white sits above
+                // the cage whites instead of being clamped.
+                let (tx, ty, tz) = match self.gamut_space {
+                    GamutSpace::Cielab => ("a*", "L*", "b*"),
+                    GamutSpace::Bt2020Rgb => ("R (nits)", "G (nits)", "B (nits)"),
+                };
+                // The damascene wgpu backend rejects empty geometry
+                // buffers, so add each mark only when it has data —
+                // the cloud (no frame yet), the cages (all toggled
+                // off), the shell (no mesh), and the labels can each
+                // be empty independently.
+                let mut scene = SceneSpec::new();
+                if g.point_count > 0 {
+                    scene = scene.points_styled(
+                        g.points.clone(),
+                        PointStyle {
+                            size: 5.0,
+                            shape: PointShape::Circle,
+                            size_mode: SizeMode::ScreenSpace,
+                        },
+                    );
+                }
+                if g.cage_segments > 0 {
+                    scene = scene.lines(g.cages.clone());
+                }
+                if g.shell_segments > 0 {
+                    scene = scene.lines(g.shell.clone());
+                }
+                if g.cage_label_count > 0 {
+                    // A small square marker + persistent name at each
+                    // enabled cage's green primary.
+                    scene = scene.points_labeled(
+                        g.cage_label_geo.clone(),
+                        PointStyle {
+                            size: 5.0,
+                            shape: PointShape::Square,
+                            size_mode: SizeMode::ScreenSpace,
+                        },
+                        g.cage_labels.clone(),
+                    );
+                }
+                scene = scene.axis_titles(tx, ty, tz);
+                chart3d(scene)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fill(1.0))
+            }
+            None => column([text("Fetch a frame or load the measured gamut to plot.")
+                .muted()
+                .small()])
+            .height(Size::Fill(1.0))
+            .justify(Justify::Center),
+        };
+        fill_card(
+            "Gamut cloud — drag to orbit, wheel to zoom",
+            [space_toggle, cage_toggle, shell_controls, gamut_body],
+        )
+    }
+
+    /// Last action / error, as a sunken banner.
+    fn status_banner(&self) -> El {
+        column([text(self.status.clone()).small().wrap_text()])
+            .padding(tokens::SPACE_3)
+            .surface_role(SurfaceRole::Sunken)
+    }
+
+    /// Wide (≥ [`WIDE_BREAKPOINT`]) detail: a fixed-width controls
+    /// rail next to a visualization column with the preview and gamut
+    /// plot stacked — everything visible at once, charts sized by the
+    /// window.
+    fn wide_detail(&self, output: &Output) -> El {
+        let mut controls: Vec<El> = Vec::new();
+        if !self.status.is_empty() {
+            controls.push(self.status_banner());
+        }
+        controls.push(output_header(output));
+        controls.extend(self.control_cards(output));
+        let controls_pane = scroll([column(controls)
             .gap(tokens::SPACE_4)
             .padding(tokens::SPACE_5)])
-        .width(Size::Fill(1.0));
+        .width(Size::Fixed(CONTROLS_PANE_WIDTH));
+        // The gamut plot gets the larger share — it carries its own
+        // toggle rows.
+        let viz = column([
+            self.preview_card().height(Size::Fill(2.0)),
+            self.gamut_card().height(Size::Fill(3.0)),
+        ])
+        .gap(tokens::SPACE_4)
+        .padding(tokens::SPACE_5)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0));
+        row([controls_pane, vertical_separator(), viz])
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
+    }
 
-        row([sidebar, vertical_separator(), detail_pane]).height(Size::Fill(1.0))
+    /// Narrow detail: header + tab strip, one pane at a time filling
+    /// the window — no scrolling past charts to reach the controls.
+    fn narrow_detail(&self, output: &Output) -> El {
+        let mut children: Vec<El> = Vec::new();
+        if !self.status.is_empty() {
+            children.push(self.status_banner());
+        }
+        children.push(output_header(output));
+        children.push(tabs_list(
+            "pane",
+            &self.pane,
+            [
+                (Pane::Controls, "Controls"),
+                (Pane::Preview, "Preview"),
+                (Pane::Gamut, "Gamut"),
+            ],
+        ));
+        children.push(match self.pane {
+            Pane::Controls => scroll([column(self.control_cards(output))
+                .gap(tokens::SPACE_4)
+                // Ring-width padding so focus rings at the column's
+                // edges aren't clipped by the scroll scissor.
+                .padding(tokens::RING_WIDTH)])
+            .height(Size::Fill(1.0)),
+            Pane::Preview => self.preview_card().height(Size::Fill(1.0)),
+            Pane::Gamut => self.gamut_card().height(Size::Fill(1.0)),
+        });
+        column(children)
+            .gap(tokens::SPACE_4)
+            .padding(tokens::SPACE_5)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0))
+    }
+}
+
+impl App for TuneGui {
+    fn build(&self, cx: &BuildCx) -> El {
+        // Tabbed below WIDE_BREAKPOINT (and when the host reports no
+        // viewport), three-pane split above it.
+        let wide = cx.viewport_width().is_some_and(|w| w >= WIDE_BREAKPOINT);
+        let detail: El = match self.current() {
+            Some(output) if wide => self.wide_detail(output),
+            Some(output) => self.narrow_detail(output),
+            None => {
+                let mut children: Vec<El> = Vec::new();
+                if !self.status.is_empty() {
+                    children.push(self.status_banner());
+                }
+                children.push(text("No output selected.").muted());
+                column(children)
+                    .gap(tokens::SPACE_4)
+                    .padding(tokens::SPACE_5)
+                    .width(Size::Fill(1.0))
+            }
+        };
+        row([self.sidebar(), vertical_separator(), detail]).height(Size::Fill(1.0))
     }
 
     fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
+        if tabs::apply_event(&mut self.pane, &event, "pane", Pane::parse) {
+            return;
+        }
         if let Some(route) = event
             .route()
             .filter(|_| matches!(event.kind, UiEventKind::Click | UiEventKind::Activate))
@@ -897,6 +1036,18 @@ fn toggle_button(label: &str, key: &str, active: bool) -> El {
     } else {
         btn.ghost()
     }
+}
+
+/// A labelled single-value nits input with its own Apply button. The
+/// fixed label width keeps stacked rows' inputs aligned.
+fn nits_row(label: &str, value: &str, selection: &Selection, key: &str, apply_key: &str) -> El {
+    row([
+        text(label).muted().width(Size::Fixed(130.0)),
+        numeric_input(value, selection, key, nits_opts()).width(Size::Fill(1.0)),
+        button("Apply").key(apply_key).primary(),
+    ])
+    .gap(tokens::SPACE_2)
+    .align(Align::Center)
 }
 
 /// A labelled group of three numeric inputs (R/G/B-style triples): the
@@ -1046,12 +1197,9 @@ fn enc(linear: f64) -> u8 {
         .clamp(0.0, 255.0) as u8
 }
 
-fn viewport() -> Rect {
-    Rect::new(0.0, 0.0, 900.0, 760.0)
-}
-
 pub fn run() -> Result<()> {
-    damascene_winit_wgpu::run("prism-tune", viewport(), TuneGui::new())
+    let viewport = Rect::new(0.0, 0.0, 900.0, 760.0);
+    damascene_winit_wgpu::run("prism-tune", viewport, TuneGui::new())
         .map_err(|e| anyhow::anyhow!("damascene host error: {e}"))
 }
 
@@ -1059,12 +1207,15 @@ pub fn run() -> Result<()> {
 /// pipeline and write the standard artifact set — `.svg`, `.tree.txt`,
 /// `.draw_ops.txt`, `.shader_manifest.txt`, `.lint.txt` — to `dir`, then
 /// echo the layout lint report to stderr. Headless: no prism, no GPU.
-pub fn dump_bundle(dir: &std::path::Path) -> Result<()> {
+/// `width`×`height` is the logical-px viewport to lay out at, so the
+/// panel can be checked at different window sizes.
+pub fn dump_bundle(dir: &std::path::Path, width: f32, height: f32) -> Result<()> {
+    let viewport = Rect::new(0.0, 0.0, width, height);
     let app = TuneGui::mock();
     let theme = Theme::default();
-    let cx = BuildCx::new(&theme);
+    let cx = BuildCx::new(&theme).with_viewport(width, height);
     let mut root = app.build(&cx);
-    let bundle = render_bundle(&mut root, viewport());
+    let bundle = render_bundle(&mut root, viewport);
 
     let written = write_bundle(&bundle, dir, "prism-tune-gui").context("write bundle artifacts")?;
     eprintln!("Wrote {} artifact(s) to {}:", written.len(), dir.display());
