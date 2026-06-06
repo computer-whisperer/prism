@@ -838,10 +838,27 @@ impl TuneGui {
             .height(Size::Fill(1.0))
             .justify(Justify::Center),
         };
-        fill_card(
-            "Gamut cloud — drag to orbit, wheel to zoom",
-            [space_toggle, cage_toggle, shell_controls, gamut_body],
-        )
+        // Floating legend: the toggle cluster paints over the plot's
+        // top-left corner on a translucent panel, so the 3D render
+        // surface gets the card's whole content area. Painted after
+        // the chart ⇒ hit-tested first, so the buttons win clicks;
+        // drag / wheel anywhere else still orbits / zooms the scene.
+        let legend =
+            card([column([space_toggle, cage_toggle, shell_controls]).gap(tokens::SPACE_3)])
+                .padding(tokens::SPACE_3)
+                .fill(tokens::CARD.with_alpha(0.85))
+                .radius(tokens::RADIUS_MD);
+        let body = stack([
+            gamut_body,
+            // Transparent spacer wrapper: inset the legend from the
+            // plot's corner (and keep its focus rings unclipped).
+            column([legend]).padding(tokens::SPACE_2),
+        ])
+        .align(Align::Start)
+        .justify(Justify::Start)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0));
+        fill_card("Gamut cloud — drag to orbit, wheel to zoom", [body])
     }
 
     /// Last action / error, as a sunken banner.
