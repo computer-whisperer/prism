@@ -44,9 +44,9 @@ bitflags = "2.11.1"
 bytemuck = { version = "1.20", features = ["derive"] }
 calloop = { version = "0.14.4", features = ["executor", "signals"] }
 clap = { version = "4.6.1", features = ["derive"] }
-# damascene: GPU UI library (the prism-tune GUI host). crates.io 0.4.0.
-damascene-core = "0.4.0"
-damascene-winit-wgpu = "0.4.0"
+# damascene: GPU UI library (the prism-tune GUI host). crates.io 0.4.1.
+damascene-core = "0.4.1"
+damascene-winit-wgpu = "0.4.1"
 drm-fourcc = "2.2.0"
 gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
 glam = "0.30"

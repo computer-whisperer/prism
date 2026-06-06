@@ -803,7 +803,7 @@ impl App for TuneGui {
         row([sidebar, vertical_separator(), detail_pane]).height(Size::Fill(1.0))
     }
 
-    fn on_event(&mut self, event: UiEvent) {
+    fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         if let Some(route) = event
             .route()
             .filter(|_| matches!(event.kind, UiEventKind::Click | UiEventKind::Activate))
