@@ -1,0 +1,27 @@
+pkgbase = prism
+	pkgdesc = Vulkan-native, HDR-native Wayland compositor
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/computer-whisperer/prism
+	arch = x86_64
+	license = GPL-3.0-or-later
+	makedepends = cargo
+	makedepends = glslang
+	makedepends = pkgconf
+	depends = gcc-libs
+	depends = glibc
+	depends = libdisplay-info
+	depends = libinput
+	depends = libusb
+	depends = libxkbcommon
+	depends = mesa
+	depends = seatd
+	depends = systemd-libs
+	depends = vulkan-icd-loader
+	depends = wayland
+	optdepends = xwayland-satellite: X11 application support (spawned on demand)
+	options = !lto
+	source = prism-0.1.0.tar.gz::https://github.com/computer-whisperer/prism/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = e6e030259291d691cf68569b0573f3a015602292d5810771a292eed15ba3b139
+
+pkgname = prism

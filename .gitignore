@@ -43,3 +43,9 @@ prism-layer-win.log
 
 # Scratch screen captures
 /mpv-shot*.jpg
+
+# makepkg build artifacts (PKGBUILD/.SRCINFO themselves are tracked)
+/prism-*.tar.gz
+/src/
+/pkg/
+/*.pkg.tar.zst
