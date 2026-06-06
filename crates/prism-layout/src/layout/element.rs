@@ -28,6 +28,7 @@ use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource as _;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
+use smithay::wayland::alpha_modifier::AlphaModifierSurfaceCachedState;
 use smithay::wayland::compositor::{with_surface_tree_downward, SurfaceData, TraversalAction};
 use tracing::trace;
 
@@ -265,6 +266,21 @@ pub fn push_surface_tree_elements(
                     }
                 }
             };
+            // wp_alpha_modifier_v1: fold the surface's committed opacity
+            // multiplier into the tree-wide fade. Per-surface (subsurfaces
+            // carry their own), [0, 1] by construction (u32 / u32::MAX),
+            // None when no modifier object was ever attached. Read at
+            // emit time from the committed cached state, so it follows
+            // wl_surface.commit semantics; the damage diff picks up
+            // multiplier-only commits because `alpha` folds into the
+            // surface's content token.
+            let alpha = alpha
+                * states
+                    .cached_state
+                    .get::<AlphaModifierSurfaceCachedState>()
+                    .current()
+                    .multiplier_f32()
+                    .unwrap_or(1.0);
             // Single-pixel (wp_single_pixel_buffer) solid color: no texture —
             // lower to a color-managed SolidColorEl over the surface's dst.
             // The sRGB→BT.2020-nits conversion uses the surface's reference
@@ -276,21 +292,25 @@ pub fn push_surface_tree_elements(
                 let pos = surf_loc + view.offset.to_f64();
                 let dst = Rectangle::new(pos, view.dst.to_f64());
                 let nits = ctx.color_for(states).sdr_white_nits;
-                // NOTE: `alpha` (per-element fade) is not yet applied to the
-                // single-pixel-buffer solid path — `SolidColorEl` has no
-                // opacity field until the open/close work adds one. A toplevel
-                // whose content is a single-pixel buffer won't fade; rare
-                // (single-pixel buffers are almost always opaque backgrounds).
+                // Effective opacity (fade × wp_alpha_modifier) lands in the
+                // colour's alpha channel — the same premultiplied fade as
+                // `SurfaceEl::alpha`, both lower into the decode push's
+                // `tint.a` (see `RenderEl::mul_alpha`). A non-opaque alpha
+                // also stops the solid occluding (`push_opaque_regions`
+                // requires `alpha == 1.0`), and the colour fingerprint in
+                // `content_token` re-damages alpha-only commits.
+                let mut color_bt2020_nits = srgb_to_bt2020_nits(
+                    rgba[0] as f32 / 255.0,
+                    rgba[1] as f32 / 255.0,
+                    rgba[2] as f32 / 255.0,
+                    rgba[3] as f32 / 255.0,
+                    nits,
+                );
+                color_bt2020_nits[3] *= alpha;
                 surf_els.push(RenderEl::SolidColor(SolidColorEl {
                     id: surface_element_id(states),
                     geometry: dst,
-                    color_bt2020_nits: srgb_to_bt2020_nits(
-                        rgba[0] as f32 / 255.0,
-                        rgba[1] as f32 / 255.0,
-                        rgba[2] as f32 / 255.0,
-                        rgba[3] as f32 / 255.0,
-                        nits,
-                    ),
+                    color_bt2020_nits,
                     clip: None,
                 }));
                 return;

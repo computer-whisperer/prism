@@ -40,6 +40,7 @@ use smithay::backend::allocator::Format as DrmFormat;
 use smithay::backend::renderer::utils::{
     on_commit_buffer_handler, CommitCounter, RendererSurfaceStateUserData,
 };
+use smithay::delegate_alpha_modifier;
 use smithay::delegate_compositor;
 use smithay::delegate_content_type;
 use smithay::delegate_cursor_shape;
@@ -80,6 +81,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::{Display, DisplayHandle, Resource};
 use smithay::utils::{IsAlive, Logical, Rectangle, Serial, Transform};
+use smithay::wayland::alpha_modifier::AlphaModifierState;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     add_pre_commit_hook, get_parent, get_role, with_states, with_surface_tree_downward,
@@ -772,6 +774,13 @@ impl PrismState {
         // client refuses the wayland display. See crate::selection.
         let data_device_state = DataDeviceState::new::<PrismState>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<PrismState>(&dh);
+
+        // wp_alpha_modifier_v1 — a per-surface opacity multiplier, committed
+        // as double-buffered surface state (smithay caches it in
+        // `AlphaModifierSurfaceCachedState`). Consumed by the render walk
+        // (`push_surface_tree_elements`), which folds the multiplier into the
+        // element's `alpha` fade. Global kept alive by the display.
+        let _alpha_modifier = AlphaModifierState::new::<PrismState>(&dh);
 
         Self {
             config,
@@ -3055,6 +3064,7 @@ impl FractionalScaleHandler for PrismState {}
 delegate_fractional_scale!(PrismState);
 delegate_single_pixel_buffer!(PrismState);
 delegate_content_type!(PrismState);
+delegate_alpha_modifier!(PrismState);
 
 // ─── linux_drm_syncobj_v1 ───────────────────────────────────────────────────
 // Real handler lives in [`crate::drm_syncobj`] — release tracking,

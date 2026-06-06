@@ -934,11 +934,17 @@ impl RenderEl {
         match self {
             // A clip folds into the token relative to the element origin, so
             // a radius / relative-clip change re-damages in place while a
-            // plain move stays a pure geometry diff.
-            Self::Surface(s) => match &s.clip {
-                None => s.content_commit,
-                Some(clip) => clip.mix_token(s.content_commit, s.geometry.loc),
-            },
+            // plain move stays a pure geometry diff. The element opacity folds
+            // in too: a fade / wp_alpha_modifier change repaints in place even
+            // though the buffer commit count is unchanged (a multiplier-only
+            // commit attaches no buffer, so `content_commit` doesn't advance).
+            Self::Surface(s) => {
+                let c = (s.content_commit ^ s.alpha.to_bits() as u64).wrapping_mul(FNV_PRIME);
+                match &s.clip {
+                    None => c,
+                    Some(clip) => clip.mix_token(c, s.geometry.loc),
+                }
+            }
             Self::SolidColor(s) => {
                 let c = fnv_f32s(&s.color_bt2020_nits);
                 match &s.clip {
@@ -1354,6 +1360,21 @@ mod tests {
         };
         assert_eq!(mk(0.0, 8.0), mk(30.0, 8.0));
         assert_ne!(mk(0.0, 8.0), mk(0.0, 12.0));
+    }
+
+    /// Element opacity folds into the surface content token: an alpha-only
+    /// change (fade frame, wp_alpha_modifier commit) re-damages in place.
+    #[test]
+    fn surface_token_alpha_sensitive() {
+        let mk = |alpha: f32| {
+            let RenderEl::Surface(mut s) = surface(rect(0.0, 0.0, 50.0, 50.0), vec![]) else {
+                unreachable!()
+            };
+            s.alpha = alpha;
+            RenderEl::Surface(s).content_token()
+        };
+        assert_eq!(mk(1.0), mk(1.0));
+        assert_ne!(mk(1.0), mk(0.5));
     }
 
     /// Two opaque halves sharing an exact edge tile the background; their union
