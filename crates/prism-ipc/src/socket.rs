@@ -153,6 +153,19 @@ impl Socket {
     }
 }
 
+/// Create a memfd holding `bytes`, for attaching to a reply
+/// via [`write_reply_with_fd`] — the server side of a bulk-data response
+/// (e.g. `Response::Lut3d`). The receiver reads it with `pread(2)` from
+/// offset 0, so the write cursor's final position doesn't matter.
+pub fn memfd_from_bytes(name: &str, bytes: &[u8]) -> io::Result<OwnedFd> {
+    let memfd =
+        rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC).map_err(io::Error::from)?;
+    let file = std::fs::File::from(memfd);
+    let mut writer = &file;
+    writer.write_all(bytes)?;
+    Ok(file.into())
+}
+
 /// Write one JSON [`Reply`] line to `stream`, optionally attaching `fd`
 /// as out-of-band ancillary data (`SCM_RIGHTS`). The server side of
 /// [`Socket::send_recv_fd`]: when `fd` is `Some`, the reply is sent with

@@ -145,6 +145,21 @@ pub enum Request {
         /// Output connector name (e.g. `DisplayPort-4`).
         output: String,
     },
+    /// Fetch the calibration 3D LUT this output's encode pass is
+    /// *currently running* — the effective LUT after the compositor's
+    /// override precedence (IPC-pushed measurement → CTM/curve override
+    /// synthesis → KDL `.lut` file → KDL synthesis), which may never have
+    /// existed on disk. The compositor replies with
+    /// `Response::Lut3d(meta)` **plus a memfd passed as an out-of-band
+    /// file descriptor** (`SCM_RIGHTS`), received via
+    /// [`socket::Socket::send_recv_fd`]. The fd's first
+    /// [`byte_len`](Lut3dMeta::byte_len) bytes are `cube_edge³` RGB
+    /// entries laid out per [`Lut3dMeta`]. Intended for the prism-tune
+    /// LUT inspector.
+    Lut3d {
+        /// Output connector name (e.g. `DisplayPort-4`).
+        output: String,
+    },
 }
 
 /// Reply from niri to client.
@@ -206,6 +221,10 @@ pub enum Response {
     /// `None` when the output has no `color.gamut` file configured (or it
     /// failed to load). Small enough to travel inline as JSON.
     GamutMesh(Option<GamutMesh>),
+    /// Layout + provenance for a `Request::Lut3d`. The entry data itself
+    /// travels out-of-band as a memfd file descriptor (see
+    /// [`socket::Socket::send_recv_fd`]); this describes how to read it.
+    Lut3d(Lut3dMeta),
 }
 
 /// Describes the memfd payload of a `Response::FrameCaptured`. The fd's
@@ -234,6 +253,55 @@ pub enum FrameFormat {
     /// Four little-endian `f32` channels per texel: R, G, B, A (16
     /// bytes). RGB are BT.2020 absolute-nits linear; A is unused.
     Rgba32Float,
+}
+
+/// Describes the memfd payload of a `Response::Lut3d`. The fd's first
+/// `byte_len` bytes are `cube_edge³` LUT entries of three little-endian
+/// `f32`s each (R, G, B — 12 bytes per entry), X-fastest then Y then Z —
+/// the same layout as the `.lut` file's data section. Entry `(i, j, k)`
+/// is the panel command the encode shader emits for the PQ-shaped
+/// BT.2020 input coordinate `(i, j, k) / (cube_edge − 1)`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct Lut3dMeta {
+    /// Grid points per axis (typically 33); the payload holds
+    /// `cube_edge³` entries.
+    pub cube_edge: u32,
+    /// Total payload length in the memfd, in bytes
+    /// (`cube_edge³ × 12`).
+    pub byte_len: u64,
+    /// What the entry values mean — the output's encode-chain domain
+    /// (mirrors the `.lut` v5 `out_space` header field).
+    pub out_space: Lut3dDomain,
+    /// Which precedence level produced the effective LUT.
+    pub source: Lut3dSource,
+}
+
+/// Output domain of a 3D LUT's entries — what the numbers mean.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum Lut3dDomain {
+    /// Per-channel commanded panel luminance in cd/m² (PQ/linear HDR
+    /// chains — the OutputTransfer stage clamps + encodes for the wire).
+    Nits,
+    /// Linear panel drive in `[0, 1]` (the parameter-free sRGB chain;
+    /// values above 1 are wire-clamped by the shader).
+    Drive,
+}
+
+/// Which level of the compositor's LUT precedence chain produced the
+/// effective LUT (see `Request::Lut3d`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum Lut3dSource {
+    /// Pushed live over IPC (`LoadLut3dFromFile` / `IdentityLut3d`) —
+    /// measurement-derived data from a calibration tool.
+    IpcOverride,
+    /// Loaded from the KDL-configured `color.lut3d` file at startup.
+    KdlFile,
+    /// Synthesized from the effective CTM + response curve (no measured
+    /// LUT in effect).
+    Synthesized,
 }
 
 /// Schema tag the `.gamut.json` sidecar is written with (and the only

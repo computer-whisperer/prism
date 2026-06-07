@@ -148,6 +148,7 @@ fn dispatch(state: &mut PrismState, req: Request) -> (Reply, Option<OwnedFd>) {
         Request::Output { output, action } => (handle_output_action(state, &output, action), None),
         Request::CaptureFrame { output } => handle_capture_frame(state, &output),
         Request::GamutMesh { output } => (handle_gamut_mesh(state, &output), None),
+        Request::Lut3d { output } => handle_lut3d(state, &output),
         other => (
             Err(format!(
                 "request {other:?} is not implemented in this build"
@@ -187,6 +188,53 @@ fn handle_capture_frame(state: &mut PrismState, name: &str) -> (Reply, Option<Ow
         }
         Err(e) => (Err(format!("capture-frame: {e:#}")), None),
     }
+}
+
+/// Serve the effective 3D LUT for `name` — the exact entries
+/// `resynthesize_color_lut` would upload (same precedence chain), so the
+/// inspector sees what the GPU is running even when it was synthesized
+/// and never written to disk. Entries travel out-of-band in a memfd
+/// (three LE `f32`s each, X-fastest) alongside [`Response::Lut3d`].
+fn handle_lut3d(state: &mut PrismState, name: &str) -> (Reply, Option<OwnedFd>) {
+    let Some(ctx) = state
+        .outputs
+        .values()
+        .find(|ctx| ctx.connector_name == name)
+    else {
+        return (Err(format!("lut3d: output {name:?} not found")), None);
+    };
+    let Some((entries, source)) = ctx.effective_lut3d_entries() else {
+        return (
+            Err(format!(
+                "lut3d: output {name:?} has no LUT slot in its encode chain"
+            )),
+            None,
+        );
+    };
+    let mut bytes = Vec::with_capacity(entries.len() * 12);
+    for entry in &entries {
+        for channel in entry {
+            bytes.extend_from_slice(&channel.to_le_bytes());
+        }
+    }
+    let fd = match prism_ipc::socket::memfd_from_bytes("prism-lut3d", &bytes) {
+        Ok(fd) => fd,
+        Err(e) => return (Err(format!("lut3d: memfd: {e}")), None),
+    };
+    let meta = prism_ipc::Lut3dMeta {
+        cube_edge: ctx.renderer.lut3d_cube_edge(),
+        byte_len: bytes.len() as u64,
+        out_space: match ctx.config.encode_config.lut_output_domain() {
+            prism_renderer::LutOutputDomain::Nits => prism_ipc::Lut3dDomain::Nits,
+            prism_renderer::LutOutputDomain::Drive => prism_ipc::Lut3dDomain::Drive,
+        },
+        source: match source {
+            prism_drm::LutSource::IpcOverride => prism_ipc::Lut3dSource::IpcOverride,
+            prism_drm::LutSource::KdlFile => prism_ipc::Lut3dSource::KdlFile,
+            prism_drm::LutSource::Synthesized => prism_ipc::Lut3dSource::Synthesized,
+        },
+    };
+    (Ok(Response::Lut3d(meta)), Some(fd))
 }
 
 /// Load + return the measured gamut-surface mesh configured for `name`

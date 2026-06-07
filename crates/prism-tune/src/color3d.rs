@@ -25,6 +25,8 @@ use damascene_core::scene::glam::Vec3;
 use damascene_core::scene::{LabelPlacement, PointLabels};
 use damascene_core::scene::{LineData, LinesHandle};
 use damascene_core::scene::{LineSegment, PointData, PointsHandle, ScenePoint};
+use prism_ipc::Lut3dDomain;
+use prism_renderer::pq_eotf;
 
 use crate::common::srgb_oetf;
 
@@ -90,6 +92,14 @@ pub struct GamutScene {
     /// The measured gamut-surface lattice shell (patch quad-edges), empty
     /// when no mesh is supplied. Folded patches drawn hot.
     pub shell: LinesHandle,
+    /// The calibration LUT's warped lattice: grid points at their *output*
+    /// positions, colored by their *input* color. Empty when no LUT is
+    /// supplied (or it can't be placed in this space — see
+    /// [`Self::lut_modeled`]).
+    pub lut_points: PointsHandle,
+    /// Subsampled wireframe connecting lattice neighbors, so warping /
+    /// fold-overs read as structure rather than a dust cloud.
+    pub lut_lines: LinesHandle,
     /// One marker point per enabled cage, at its green primary — the
     /// vertex that differs most between gamuts, so labels don't pile up at
     /// the shared white.
@@ -106,6 +116,15 @@ pub struct GamutScene {
     pub shell_segments: usize,
     /// Cage-label marker count (== enabled cages; see [`Self::cage_segments`]).
     pub cage_label_count: usize,
+    /// LUT-lattice marker count (see [`Self::cage_segments`]).
+    pub lut_point_count: usize,
+    /// LUT-lattice wireframe segment count (see [`Self::cage_segments`]).
+    pub lut_segment_count: usize,
+    /// Whether the LUT lattice was placed colorimetrically through the
+    /// mesh-derived panel model (`true`), or fell back to raw command
+    /// coordinates (`false` — drawn in the BT.2020 RGB view only, since
+    /// raw commands have no Lab position).
+    pub lut_modeled: bool,
 }
 
 /// The measured gamut shell's normal patch-edge color (a distinct magenta,
@@ -168,6 +187,233 @@ pub const REF_GAMUTS: [RefGamut; N_REF_GAMUTS] = [
     },
 ];
 
+/// The effective calibration 3D LUT fetched over IPC, as the lattice
+/// layer consumes it. Entries are panel commands (`Request::Lut3d`
+/// layout: X-fastest), `domain` says what the numbers mean.
+pub struct LutLatticeInput<'a> {
+    /// `cube_edge³` output triples, X-fastest then Y then Z.
+    pub entries: &'a [[f32; 3]],
+    /// Grid points per axis.
+    pub cube_edge: u32,
+    /// Output domain of the entries (cmd nits vs drive `[0, 1]`).
+    pub domain: Lut3dDomain,
+}
+
+/// Grid-index stride between lattice points drawn as marks (every 2nd ⇒
+/// 17³ ≈ 5k points at cube_edge 33 — dense enough that folds read, light
+/// enough to orbit).
+const LUT_POINT_STRIDE: usize = 2;
+/// Grid-index stride between wireframe planes (every 8th ⇒ a 5×5 comb of
+/// polylines per axis at cube_edge 33, ~2.4k segments).
+const LUT_LINE_STRIDE: usize = 8;
+/// Wireframe alpha — dimmer than the marks so the lattice reads as
+/// structure under them.
+const LUT_LINE_ALPHA: f32 = 0.55;
+
+/// Additive panel forward model derived from a measured gamut mesh's
+/// primary-axis vertices: per-channel piecewise-linear command → XYZ
+/// ramps, summed across channels and black-corrected. Additivity is the
+/// same assumption the calibration bake itself rests on, so the lattice
+/// is placed by the panel model the LUT was built against.
+struct PanelModel {
+    /// Per channel: `(abscissa, xyz)` knots sorted ascending. The
+    /// abscissa is in the LUT's output domain — per-channel cmd nits for
+    /// nits LUTs, drive code `[0, 1]` for drive LUTs — so LUT entries
+    /// index the ramps directly.
+    ramps: [Vec<(f64, [f64; 3])>; 3],
+    /// Measured black corner (code `(0,0,0)`), absolute XYZ.
+    black: [f64; 3],
+}
+
+impl PanelModel {
+    /// Extract the model from a mesh's on-axis vertices (code values with
+    /// at most one nonzero channel — the cube edges incident at black).
+    /// `None` when the mesh lacks a black corner or a usable ramp for
+    /// some channel; callers then fall back to raw command coordinates.
+    fn from_mesh(mesh: &prism_ipc::GamutMesh, domain: Lut3dDomain) -> Option<PanelModel> {
+        const EPS: f64 = 1e-6;
+        let black = mesh
+            .vertices
+            .iter()
+            .find(|v| v.code_value.iter().all(|c| *c < EPS))
+            .map(|v| v.xyz)?;
+        let mut ramps: [Vec<(f64, [f64; 3])>; 3] = Default::default();
+        for v in &mesh.vertices {
+            let mut on_axis = (0..3).filter(|&c| v.code_value[c] >= EPS);
+            let (Some(c), None) = (on_axis.next(), on_axis.next()) else {
+                continue;
+            };
+            let x = match domain {
+                Lut3dDomain::Nits => v.cmd_nits[c],
+                Lut3dDomain::Drive => v.code_value[c],
+            };
+            // The black corner is the authoritative knot at abscissa 0;
+            // skip on-axis vertices that collide with it (a near-black
+            // cmd_nits sample) so the dedup below can't nondeterministically
+            // pick the wrong one.
+            if x < EPS {
+                continue;
+            }
+            ramps[c].push((x, v.xyz));
+        }
+        for ramp in ramps.iter_mut() {
+            ramp.push((0.0, black));
+            ramp.sort_by(|a, b| a.0.total_cmp(&b.0));
+            ramp.dedup_by(|a, b| (a.0 - b.0).abs() < EPS);
+            if ramp.len() < 2 {
+                return None;
+            }
+        }
+        Some(PanelModel { ramps, black })
+    }
+
+    /// Predicted absolute XYZ for a LUT output triple:
+    /// `XYZ(r, g, b) = R(r) + G(g) + B(b) − 2·black` (each per-channel
+    /// ramp includes the black floor once; two copies are subtracted so
+    /// it's counted once total). Commands beyond a ramp's measured range
+    /// clamp to its ends — mirroring the encode shader's wire clamp.
+    fn xyz(&self, cmd: [f64; 3]) -> [f64; 3] {
+        let mut out = [
+            -2.0 * self.black[0],
+            -2.0 * self.black[1],
+            -2.0 * self.black[2],
+        ];
+        for (c, ramp) in self.ramps.iter().enumerate() {
+            let xyz = sample_ramp(ramp, cmd[c]);
+            for (o, v) in out.iter_mut().zip(xyz) {
+                *o += v;
+            }
+        }
+        // Tiny negatives can appear from black subtraction; Lab's cube
+        // root doesn't want them.
+        out.map(|v| v.max(0.0))
+    }
+}
+
+/// Piecewise-linear interpolation over sorted `(x, xyz)` knots, clamped
+/// to the end knots outside the measured range.
+fn sample_ramp(ramp: &[(f64, [f64; 3])], x: f64) -> [f64; 3] {
+    let first = ramp.first().expect("ramps have ≥ 2 knots");
+    let last = ramp.last().expect("ramps have ≥ 2 knots");
+    if x <= first.0 {
+        return first.1;
+    }
+    if x >= last.0 {
+        return last.1;
+    }
+    let i = ramp.partition_point(|(kx, _)| *kx <= x);
+    let (x0, a) = ramp[i - 1];
+    let (x1, b) = ramp[i];
+    let t = (x - x0) / (x1 - x0);
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    ]
+}
+
+/// Grid indices `0, stride, 2·stride, …` with the last index always
+/// included, so the lattice reaches the cube faces whatever the edge.
+fn axis_indices(n: usize, stride: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..n).step_by(stride).collect();
+    if *idx.last().expect("n ≥ 1") != n - 1 {
+        idx.push(n - 1);
+    }
+    idx
+}
+
+/// Build the warped-lattice geometry for a fetched LUT: marks at the
+/// outputs of a subsampled grid, plus wireframe polylines along each
+/// axis on a coarser comb of planes — both colored by the *input* (PQ
+/// grid coordinate decoded to BT.2020 nits), so the mapping reads
+/// directly: "this input color lands here".
+///
+/// Placement: through the mesh-derived [`PanelModel`] when available
+/// (colorimetric — same frame as the shell and cages); otherwise raw
+/// command coordinates, which only the BT.2020 RGB view can host (Lab
+/// has no meaning for raw commands — `None` there).
+///
+/// Returns `(points, segments, modeled)`.
+#[allow(clippy::type_complexity)]
+fn lut_lattice(
+    lut: &LutLatticeInput<'_>,
+    mesh: Option<&prism_ipc::GamutMesh>,
+    space: GamutSpace,
+) -> Option<(Vec<ScenePoint>, Vec<LineSegment>, bool)> {
+    let n = lut.cube_edge as usize;
+    if n < 2 || lut.entries.len() != n * n * n {
+        return None;
+    }
+    let model = mesh.and_then(|m| PanelModel::from_mesh(m, lut.domain));
+    if model.is_none() && space == GamutSpace::Cielab {
+        return None;
+    }
+
+    let world = |i: usize, j: usize, k: usize| -> Vec3 {
+        let e = lut.entries[(k * n + j) * n + i];
+        match &model {
+            Some(m) => {
+                let xyz = m.xyz([e[0] as f64, e[1] as f64, e[2] as f64]);
+                mesh_vertex_world(xyz, space)
+            }
+            None => Vec3::new(e[0], e[1], e[2]),
+        }
+    };
+    // Input swatch: the PQ-shaped grid coordinate decoded to BT.2020
+    // nits, tonemapped like the sample cloud so "input color" means the
+    // same thing in both layers.
+    let denom = (n - 1) as f32;
+    let swatch = |i: usize, j: usize, k: usize, alpha: f32| -> [f32; 4] {
+        let rel = [
+            pq_eotf(i as f32 / denom) as f64 / REFERENCE_WHITE_NITS,
+            pq_eotf(j as f32 / denom) as f64 / REFERENCE_WHITE_NITS,
+            pq_eotf(k as f32 / denom) as f64 / REFERENCE_WHITE_NITS,
+        ];
+        let mut color = point_color(rel);
+        color[3] = alpha;
+        color
+    };
+
+    let marks = axis_indices(n, LUT_POINT_STRIDE);
+    let mut points = Vec::with_capacity(marks.len().pow(3));
+    for &k in &marks {
+        for &j in &marks {
+            for &i in &marks {
+                points.push(ScenePoint {
+                    position: world(i, j, k),
+                    color: swatch(i, j, k, 1.0),
+                });
+            }
+        }
+    }
+
+    // Wireframe: polylines along each axis, on a comb of planes in the
+    // other two — every grid step is its own segment so the warp curves.
+    let planes = axis_indices(n, LUT_LINE_STRIDE);
+    let mut segments = Vec::new();
+    for &p in &planes {
+        for &q in &planes {
+            for t in 0..n - 1 {
+                // (axis, start-point, end-point) per lattice direction.
+                let runs = [
+                    ((t, p, q), (t + 1, p, q)),
+                    ((p, t, q), (p, t + 1, q)),
+                    ((p, q, t), (p, q, t + 1)),
+                ];
+                for ((ai, aj, ak), (bi, bj, bk)) in runs {
+                    segments.push(LineSegment {
+                        start: world(ai, aj, ak),
+                        end: world(bi, bj, bk),
+                        color: swatch(ai, aj, ak, LUT_LINE_ALPHA),
+                    });
+                }
+            }
+        }
+    }
+
+    Some((points, segments, model.is_some()))
+}
+
 fn mat_mul(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
     [
         m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
@@ -214,11 +460,17 @@ fn point_color(bt2020: [f64; 3]) -> [f32; 4] {
 /// collapse to one mark instead of thousands. Point swatch colors are the
 /// same in both spaces (tonemapped relative to reference white so a mark
 /// looks like its pixel); only the *positions* differ.
+///
+/// `mesh` is the measured gamut mesh when fetched — it positions the LUT
+/// lattice (panel forward model) whether or not the shell itself is
+/// drawn; `show_shell` gates only the shell's quad-edge geometry.
 pub fn build_gamut_scene(
     samples: &[[f32; 3]],
     space: GamutSpace,
     refs: RefSet,
-    shell: Option<&prism_ipc::GamutMesh>,
+    mesh: Option<&prism_ipc::GamutMesh>,
+    show_shell: bool,
+    lut: Option<&LutLatticeInput<'_>>,
 ) -> GamutScene {
     let inv_ref = 1.0 / REFERENCE_WHITE_NITS;
     let mut seen: HashSet<(i32, i32, i32)> = HashSet::new();
@@ -288,18 +540,29 @@ pub fn build_gamut_scene(
         anchor_txt.push(g.name.to_string());
     }
 
-    let shell_segs = shell.map(|m| shell_segments(m, space)).unwrap_or_default();
+    let shell_segs = mesh
+        .filter(|_| show_shell)
+        .map(|m| shell_segments(m, space))
+        .unwrap_or_default();
+
+    let (lut_pts, lut_segs, lut_modeled) = lut
+        .and_then(|l| lut_lattice(l, mesh, space))
+        .unwrap_or((Vec::new(), Vec::new(), false));
 
     let point_count = points.len();
     let cage_segments = cages.len();
     let shell_segments = shell_segs.len();
     let cage_label_count = anchor_pts.len();
+    let lut_point_count = lut_pts.len();
+    let lut_segment_count = lut_segs.len();
     GamutScene {
         points: PointsHandle::new(PointData { points }),
         cages: LinesHandle::new(LineData { segments: cages }),
         shell: LinesHandle::new(LineData {
             segments: shell_segs,
         }),
+        lut_points: PointsHandle::new(PointData { points: lut_pts }),
+        lut_lines: LinesHandle::new(LineData { segments: lut_segs }),
         cage_label_geo: PointsHandle::new(PointData { points: anchor_pts }),
         cage_labels: PointLabels::new(anchor_txt)
             .always()
@@ -308,6 +571,9 @@ pub fn build_gamut_scene(
         cage_segments,
         shell_segments,
         cage_label_count,
+        lut_point_count,
+        lut_segment_count,
+        lut_modeled,
     }
 }
 
@@ -498,7 +764,14 @@ mod tests {
         // A BT.2020 sample at exactly REFERENCE_WHITE_NITS is L*≈100,
         // independent of any per-output white.
         let w = REFERENCE_WHITE_NITS as f32;
-        let scene = build_gamut_scene(&[[w, w, w]], GamutSpace::Cielab, [true; N_REF_GAMUTS], None);
+        let scene = build_gamut_scene(
+            &[[w, w, w]],
+            GamutSpace::Cielab,
+            [true; N_REF_GAMUTS],
+            None,
+            false,
+            None,
+        );
         let (data, _rev) = scene.points.snapshot();
         assert_eq!(scene.point_count, 1);
         assert!(approx(data.points[0].position.y as f64, 100.0, 0.1));
@@ -508,7 +781,7 @@ mod tests {
     fn cloud_dedups_identical_samples() {
         let samples = vec![[100.0f32, 50.0, 25.0]; 1000];
         for space in [GamutSpace::Cielab, GamutSpace::Bt2020Rgb] {
-            let scene = build_gamut_scene(&samples, space, [true; N_REF_GAMUTS], None);
+            let scene = build_gamut_scene(&samples, space, [true; N_REF_GAMUTS], None, false, None);
             assert_eq!(
                 scene.point_count, 1,
                 "identical samples collapse, {space:?}"
@@ -524,6 +797,8 @@ mod tests {
             GamutSpace::Bt2020Rgb,
             [true; N_REF_GAMUTS],
             None,
+            false,
+            None,
         );
         let (data, _rev) = scene.points.snapshot();
         let p = data.points[0].position;
@@ -536,7 +811,14 @@ mod tests {
     fn enabled_set_selects_cages_and_labels() {
         let sample = [[100.0f32, 50.0, 25.0]];
         // All three on: three labelled anchors, named in REF_GAMUTS order.
-        let all = build_gamut_scene(&sample, GamutSpace::Cielab, [true; N_REF_GAMUTS], None);
+        let all = build_gamut_scene(
+            &sample,
+            GamutSpace::Cielab,
+            [true; N_REF_GAMUTS],
+            None,
+            false,
+            None,
+        );
         assert_eq!(all.cage_label_geo.snapshot().0.points.len(), 3);
         assert_eq!(all.cage_labels.get(0), Some("sRGB"));
         assert_eq!(all.cage_labels.get(1), Some("Display P3"));
@@ -544,13 +826,27 @@ mod tests {
         let all_segs = all.cages.snapshot().0.segments.len();
 
         // Only Rec.2020 on: one anchor labelled "Rec.2020", a third of the cages.
-        let one = build_gamut_scene(&sample, GamutSpace::Cielab, [false, false, true], None);
+        let one = build_gamut_scene(
+            &sample,
+            GamutSpace::Cielab,
+            [false, false, true],
+            None,
+            false,
+            None,
+        );
         assert_eq!(one.cage_label_geo.snapshot().0.points.len(), 1);
         assert_eq!(one.cage_labels.get(0), Some("Rec.2020"));
         assert_eq!(one.cages.snapshot().0.segments.len(), all_segs / 3);
 
         // None on: no cages, no labels (the cloud still stands on its own).
-        let none = build_gamut_scene(&sample, GamutSpace::Cielab, [false; N_REF_GAMUTS], None);
+        let none = build_gamut_scene(
+            &sample,
+            GamutSpace::Cielab,
+            [false; N_REF_GAMUTS],
+            None,
+            false,
+            None,
+        );
         assert_eq!(none.cage_label_geo.snapshot().0.points.len(), 0);
         assert_eq!(none.cages.snapshot().0.segments.len(), 0);
     }
@@ -561,7 +857,14 @@ mod tests {
         // the green primaries land at different absolute nits. Rec.2020's
         // green is the on-axis (0, 203, 0); sRGB's is dimmer (80-white) and
         // off-axis. The anchors are the green corners, in REF_GAMUTS order.
-        let scene = build_gamut_scene(&[], GamutSpace::Bt2020Rgb, [true; N_REF_GAMUTS], None);
+        let scene = build_gamut_scene(
+            &[],
+            GamutSpace::Bt2020Rgb,
+            [true; N_REF_GAMUTS],
+            None,
+            false,
+            None,
+        );
         let (data, _rev) = scene.cage_label_geo.snapshot();
         let anchors = &data.points;
         assert_eq!(anchors.len(), 3);
@@ -623,7 +926,8 @@ mod tests {
         };
 
         for space in [GamutSpace::Cielab, GamutSpace::Bt2020Rgb] {
-            let scene = build_gamut_scene(&[], space, [false; N_REF_GAMUTS], Some(&mesh));
+            let scene =
+                build_gamut_scene(&[], space, [false; N_REF_GAMUTS], Some(&mesh), true, None);
             let (lines, _) = scene.shell.snapshot();
             assert_eq!(lines.segments.len(), 8, "two quads → 8 edges, {space:?}");
             let folded = lines
@@ -638,7 +942,189 @@ mod tests {
         }
 
         // No mesh ⇒ empty shell.
-        let bare = build_gamut_scene(&[], GamutSpace::Cielab, [false; N_REF_GAMUTS], None);
+        let bare = build_gamut_scene(
+            &[],
+            GamutSpace::Cielab,
+            [false; N_REF_GAMUTS],
+            None,
+            false,
+            None,
+        );
         assert_eq!(bare.shell.snapshot().0.segments.len(), 0);
+    }
+
+    /// A minimal measured mesh with linear per-channel ramps: black at
+    /// the origin and one knot per primary axis. R/G/B axis ends emit
+    /// distinct XYZ so additivity sums are easy to verify by hand.
+    fn axis_mesh() -> prism_ipc::GamutMesh {
+        use prism_ipc::{GamutMesh, GamutVertex};
+        let vert = |code: [f64; 3], cmd: [f64; 3], xyz: [f64; 3]| GamutVertex {
+            code_value: code,
+            cmd_nits: cmd,
+            xyz,
+            lab: [0.0; 3],
+            trustworthy: true,
+        };
+        GamutMesh {
+            white_xyz: [95.0, 103.0, 95.0],
+            cmd_axis_max_nits: [100.0, 100.0, 100.0],
+            vertices: vec![
+                vert([0.0, 0.0, 0.0], [0.0; 3], [0.0; 3]),
+                vert([1.0, 0.0, 0.0], [100.0, 0.0, 0.0], [50.0, 25.0, 0.0]),
+                vert([0.0, 1.0, 0.0], [0.0, 100.0, 0.0], [30.0, 70.0, 5.0]),
+                vert([0.0, 0.0, 1.0], [0.0, 0.0, 100.0], [15.0, 8.0, 90.0]),
+            ],
+            patches: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn panel_model_interpolates_and_clamps() {
+        let mesh = axis_mesh();
+        let m = PanelModel::from_mesh(&mesh, Lut3dDomain::Nits).expect("axis mesh builds a model");
+
+        // Black command reproduces the black corner.
+        assert_eq!(m.xyz([0.0; 3]), [0.0; 3]);
+        // Half-ramp R interpolates linearly.
+        let half_r = m.xyz([50.0, 0.0, 0.0]);
+        assert!(approx(half_r[0], 25.0, 1e-9) && approx(half_r[1], 12.5, 1e-9));
+        // Full white sums the three primaries (additivity).
+        let white = m.xyz([100.0, 100.0, 100.0]);
+        assert!(approx(white[0], 95.0, 1e-9));
+        assert!(approx(white[1], 103.0, 1e-9));
+        assert!(approx(white[2], 95.0, 1e-9));
+        // Out-of-range commands clamp to the measured ramp end (the
+        // shader's wire clamp).
+        assert_eq!(m.xyz([500.0, 0.0, 0.0]), m.xyz([100.0, 0.0, 0.0]));
+
+        // Drive domain indexes the ramps by code value instead.
+        let md =
+            PanelModel::from_mesh(&mesh, Lut3dDomain::Drive).expect("drive model from same mesh");
+        let half = md.xyz([0.5, 0.0, 0.0]);
+        assert!(approx(half[0], 25.0, 1e-9));
+
+        // A mesh without on-axis vertices yields no model.
+        let mut bare = mesh.clone();
+        bare.vertices.truncate(1); // black corner only
+        assert!(PanelModel::from_mesh(&bare, Lut3dDomain::Nits).is_none());
+    }
+
+    #[test]
+    fn lut_lattice_modeled_places_colorimetrically() {
+        let mesh = axis_mesh();
+        // cube_edge 2: entries indexed X-fastest; commands span the
+        // measured range so positions are interior.
+        let entries: Vec<[f32; 3]> = (0..8)
+            .map(|idx| {
+                [
+                    100.0 * (idx & 1) as f32,
+                    100.0 * ((idx >> 1) & 1) as f32,
+                    100.0 * ((idx >> 2) & 1) as f32,
+                ]
+            })
+            .collect();
+        let lut = LutLatticeInput {
+            entries: &entries,
+            cube_edge: 2,
+            domain: Lut3dDomain::Nits,
+        };
+
+        for space in [GamutSpace::Cielab, GamutSpace::Bt2020Rgb] {
+            let scene = build_gamut_scene(
+                &[],
+                space,
+                [false; N_REF_GAMUTS],
+                Some(&mesh),
+                false,
+                Some(&lut),
+            );
+            assert!(scene.lut_modeled, "{space:?}");
+            // axis_indices(2, stride) = [0, 1] ⇒ full 2³ lattice of
+            // marks and 12 cube-edge segments.
+            assert_eq!(scene.lut_point_count, 8, "{space:?}");
+            assert_eq!(scene.lut_segment_count, 12, "{space:?}");
+            let (pts, _) = scene.lut_points.snapshot();
+            for p in &pts.points {
+                assert!(p.position.is_finite(), "{space:?}");
+            }
+        }
+
+        // The black entry lands on the black corner: XYZ (0,0,0) →
+        // BT.2020 (0,0,0) in the RGB view.
+        let scene = build_gamut_scene(
+            &[],
+            GamutSpace::Bt2020Rgb,
+            [false; N_REF_GAMUTS],
+            Some(&mesh),
+            false,
+            Some(&lut),
+        );
+        let (pts, _) = scene.lut_points.snapshot();
+        let origin = pts.points[0].position;
+        assert!(origin.length() < 1e-4, "{origin:?}");
+    }
+
+    #[test]
+    fn lut_lattice_raw_fallback_is_rgb_view_only() {
+        let entries: Vec<[f32; 3]> = (0..8).map(|i| [i as f32 * 10.0, 5.0, 1.0]).collect();
+        let lut = LutLatticeInput {
+            entries: &entries,
+            cube_edge: 2,
+            domain: Lut3dDomain::Nits,
+        };
+
+        // No mesh + Lab: raw commands have no Lab position ⇒ no lattice.
+        let lab = build_gamut_scene(
+            &[],
+            GamutSpace::Cielab,
+            [false; N_REF_GAMUTS],
+            None,
+            false,
+            Some(&lut),
+        );
+        assert!(!lab.lut_modeled);
+        assert_eq!(lab.lut_point_count, 0);
+        assert_eq!(lab.lut_segment_count, 0);
+
+        // No mesh + RGB: raw command coordinates pass straight through.
+        let rgb = build_gamut_scene(
+            &[],
+            GamutSpace::Bt2020Rgb,
+            [false; N_REF_GAMUTS],
+            None,
+            false,
+            Some(&lut),
+        );
+        assert!(!rgb.lut_modeled);
+        assert_eq!(rgb.lut_point_count, 8);
+        let (pts, _) = rgb.lut_points.snapshot();
+        // Point order is X-fastest: points[1] is grid (1,0,0) = entry 1.
+        let p = pts.points[1].position;
+        assert!(approx(p.x as f64, 10.0, 1e-6));
+        assert!(approx(p.y as f64, 5.0, 1e-6));
+        assert!(approx(p.z as f64, 1.0, 1e-6));
+    }
+
+    #[test]
+    fn lut_lattice_subsamples_a_33_cube() {
+        // Realistic size: marks every 2nd index (17³), wireframe on a
+        // 5-plane comb per axis (3 × 5×5 × 32 segments).
+        let n = 33usize;
+        let entries = vec![[1.0f32; 3]; n * n * n];
+        let lut = LutLatticeInput {
+            entries: &entries,
+            cube_edge: 33,
+            domain: Lut3dDomain::Nits,
+        };
+        let scene = build_gamut_scene(
+            &[],
+            GamutSpace::Bt2020Rgb,
+            [false; N_REF_GAMUTS],
+            None,
+            false,
+            Some(&lut),
+        );
+        assert_eq!(scene.lut_point_count, 17 * 17 * 17);
+        assert_eq!(scene.lut_segment_count, 3 * 5 * 5 * 32);
     }
 }

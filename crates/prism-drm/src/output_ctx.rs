@@ -464,23 +464,43 @@ impl OutputContext {
     /// `(CTM, curve)` pair as before — that path is what the LUT
     /// pipeline was designed around.
     pub fn resynthesize_color_lut(&mut self) -> Result<()> {
+        let Some((entries, source)) = self.effective_lut3d_entries() else {
+            return Ok(());
+        };
+        let what = match source {
+            LutSource::IpcOverride => "upload IPC-pushed color LUT",
+            LutSource::KdlFile => "upload KDL-loaded color LUT",
+            LutSource::Synthesized => "upload synthesized color LUT",
+        };
+        self.renderer.upload_lut3d(&entries).context(what)
+    }
+
+    /// The 3D LUT entries the encode pass should be running right now,
+    /// plus which precedence level produced them. This is the single
+    /// source of truth [`Self::resynthesize_color_lut`] uploads from; the
+    /// IPC `Lut3d` inspector request reads it directly so clients see
+    /// exactly what the GPU sees (which may never have existed on disk).
+    ///
+    /// Returns `None` when the renderer's encode chain has no LUT slot
+    /// (`lut3d_cube_edge() == 0`). Always returns owned entries — the
+    /// stored-override branches clone (~0.4 MB at cube_edge 33, dwarfed
+    /// by the GPU upload that typically follows).
+    ///
+    /// Precedence (highest to lowest):
+    ///   1. IPC LUT override (LoadLut3dFromFile) — measurement-derived
+    ///      data pushed live by a calibration tool.
+    ///   2. IPC override on CTM or response-curve → synthesize from
+    ///      effective values (override-wins).
+    ///   3. KDL-loaded LUT file (`color.lut3d "…"`).
+    ///   4. KDL CTM + response-curve synthesis.
+    pub fn effective_lut3d_entries(&self) -> Option<(Vec<[f32; 3]>, LutSource)> {
         let cube_edge = self.renderer.lut3d_cube_edge();
         if cube_edge == 0 {
-            return Ok(());
+            return None;
         }
-        // Precedence (highest to lowest):
-        //   1. IPC LUT override (LoadLut3dFromFile) — measurement-derived
-        //      data pushed live by a calibration tool.
-        //   2. IPC override on CTM or response-curve → synthesize from
-        //      effective values (override-wins).
-        //   3. KDL-loaded LUT file (`color.lut3d "…"`).
-        //   4. KDL CTM + response-curve synthesis.
         if let Some(entries) = self.color_override.lut3d_entries.as_ref() {
             if entries.len() == (cube_edge as usize).pow(3) {
-                return self
-                    .renderer
-                    .upload_lut3d(entries)
-                    .context("upload IPC-pushed color LUT");
+                return Some((entries.clone(), LutSource::IpcOverride));
             }
             tracing::warn!(
                 connector = %self.connector_name,
@@ -495,10 +515,7 @@ impl OutputContext {
         if !ipc_curve_override_active {
             if let Some(entries) = self.kdl_lut3d_entries.as_ref() {
                 if entries.len() == (cube_edge as usize).pow(3) {
-                    return self
-                        .renderer
-                        .upload_lut3d(entries)
-                        .context("upload KDL-loaded color LUT");
+                    return Some((entries.clone(), LutSource::KdlFile));
                 }
                 tracing::warn!(
                     connector = %self.connector_name,
@@ -531,9 +548,7 @@ impl OutputContext {
             response_curve,
             drive_white,
         );
-        self.renderer
-            .upload_lut3d(&entries)
-            .context("upload synthesized color LUT")
+        Some((entries, LutSource::Synthesized))
     }
 
     /// Effective per-channel panel-NATIVE peak nits (i.e. the peak
@@ -638,6 +653,18 @@ impl OutputContext {
         }
         Ok(())
     }
+}
+
+/// Which precedence level of [`OutputContext::effective_lut3d_entries`]
+/// produced the effective LUT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LutSource {
+    /// IPC-pushed override (`LoadLut3dFromFile` / `IdentityLut3d`).
+    IpcOverride,
+    /// KDL-configured `color.lut3d` file.
+    KdlFile,
+    /// Synthesized from the effective CTM + response curve.
+    Synthesized,
 }
 
 /// Runtime color overrides — see [`OutputContext::color_override`].

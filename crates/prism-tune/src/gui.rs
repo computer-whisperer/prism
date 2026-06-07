@@ -24,11 +24,11 @@ use damascene_core::prelude::*;
 use damascene_core::scene::{PointShape, PointStyle, SceneSpec, SizeMode};
 use prism_ipc::socket::Socket;
 use prism_ipc::{
-    ColorState, FrameFormat, FrameMeta, GamutMesh, Output, OutputAction, Request, Response,
-    ResponseCurveState,
+    ColorState, FrameFormat, FrameMeta, GamutMesh, Lut3dDomain, Lut3dMeta, Lut3dSource, Output,
+    OutputAction, Request, Response, ResponseCurveState,
 };
 
-use crate::color3d::{self, GamutScene, GamutSpace, RefSet, REF_GAMUTS};
+use crate::color3d::{self, GamutScene, GamutSpace, LutLatticeInput, RefSet, REF_GAMUTS};
 use crate::common::{send_action, srgb_oetf};
 
 /// Cloud-sample decimation cap (per axis). The cloud is deduped in Lab
@@ -47,6 +47,31 @@ const WIDE_BREAKPOINT: f32 = 1280.0;
 /// triple of numeric inputs (each with its −/+ spinner buttons and a
 /// 4-decimal value) inside a card without truncating.
 const CONTROLS_PANE_WIDTH: f32 = 560.0;
+
+/// The effective calibration 3D LUT fetched from the compositor: wire
+/// metadata plus the decoded entries (panel commands, X-fastest — see
+/// [`Lut3dMeta`]).
+struct FetchedLut {
+    meta: Lut3dMeta,
+    entries: Vec<[f32; 3]>,
+}
+
+impl FetchedLut {
+    /// One-line provenance + domain for the status line, e.g.
+    /// `33³, measured (IPC-pushed), nits domain`.
+    fn describe(&self) -> String {
+        let source = match self.meta.source {
+            Lut3dSource::IpcOverride => "measured (IPC-pushed)",
+            Lut3dSource::KdlFile => "measured (KDL file)",
+            Lut3dSource::Synthesized => "synthesized from CTM + curve",
+        };
+        let domain = match self.meta.out_space {
+            Lut3dDomain::Nits => "nits",
+            Lut3dDomain::Drive => "drive",
+        };
+        format!("{}³, {source}, {domain} domain", self.meta.cube_edge)
+    }
+}
 
 /// Which detail pane is visible in the narrow (tabbed) layout. The
 /// wide layout shows all three at once and ignores this.
@@ -193,6 +218,12 @@ struct TuneGui {
     gamut_mesh: Option<GamutMesh>,
     /// Whether the measured-gamut lattice shell is drawn.
     show_shell: bool,
+    /// The selected output's effective calibration 3D LUT, pulled from
+    /// the compositor over IPC (memfd). Retained for space toggles, like
+    /// `gamut_mesh`; per-output, dropped on output switch.
+    lut: Option<FetchedLut>,
+    /// Whether the LUT's warped lattice is drawn.
+    show_lut: bool,
     /// Active detail tab in the narrow layout.
     pane: Pane,
     selection: Selection,
@@ -212,6 +243,8 @@ impl TuneGui {
             enabled_gamuts: [true; REF_GAMUTS.len()],
             gamut_mesh: None,
             show_shell: false,
+            lut: None,
+            show_lut: false,
             pane: Pane::Controls,
             selection: Selection::default(),
         };
@@ -279,6 +312,8 @@ impl TuneGui {
             enabled_gamuts: [true; REF_GAMUTS.len()],
             gamut_mesh: None,
             show_shell: false,
+            lut: None,
+            show_lut: false,
             pane: Pane::Controls,
             selection: Selection::default(),
         };
@@ -371,21 +406,31 @@ impl TuneGui {
         }
     }
 
-    /// Rebuild the gamut scene from the retained frame samples and/or the
-    /// measured-gamut shell in the current coordinate space. Cheap (dedup
-    /// over a decimated grid), so it runs on every space / cage / shell
-    /// toggle without re-fetching. Builds a scene whenever there's either a
-    /// cloud or a visible shell to show.
+    /// Rebuild the gamut scene from the retained frame samples, the
+    /// measured-gamut shell, and/or the fetched LUT lattice in the current
+    /// coordinate space. Cheap (dedup over a decimated grid + lattice
+    /// walk), so it runs on every space / cage / shell / lattice toggle
+    /// without re-fetching. Builds a scene whenever any layer has data.
     fn rebuild_gamut(&mut self) {
-        let shell = self
-            .show_shell
-            .then_some(self.gamut_mesh.as_ref())
-            .flatten();
         let have_cloud = self.frame_samples.is_some();
-        self.gamut = (have_cloud || shell.is_some()).then(|| {
+        let show_shell = self.show_shell && self.gamut_mesh.is_some();
+        let lut = self.show_lut.then_some(self.lut.as_ref()).flatten();
+        self.gamut = (have_cloud || show_shell || lut.is_some()).then(|| {
             let empty: Vec<[f32; 3]> = Vec::new();
             let samples = self.frame_samples.as_deref().unwrap_or(&empty);
-            color3d::build_gamut_scene(samples, self.gamut_space, self.enabled_gamuts, shell)
+            let lattice = lut.map(|l| LutLatticeInput {
+                entries: &l.entries,
+                cube_edge: l.meta.cube_edge,
+                domain: l.meta.out_space,
+            });
+            color3d::build_gamut_scene(
+                samples,
+                self.gamut_space,
+                self.enabled_gamuts,
+                self.gamut_mesh.as_ref(),
+                show_shell,
+                lattice.as_ref(),
+            )
         });
     }
 
@@ -414,6 +459,38 @@ impl TuneGui {
                 self.status = format!("No measured gamut (color.gamut) configured for {output}.");
             }
             Err(e) => self.status = format!("Gamut fetch failed: {e:#}"),
+        }
+    }
+
+    /// Pull the selected output's *effective* calibration 3D LUT from the
+    /// compositor — exactly what the encode pass is running, whether it
+    /// came from a measured file, an IPC push, or live synthesis. One IPC
+    /// round-trip + a memfd read; retained so space toggles rebuild
+    /// without re-fetching.
+    fn fetch_lut(&mut self) {
+        let Some(output) = self.current().map(|o| o.name.clone()) else {
+            self.status = "No output selected.".into();
+            return;
+        };
+        match fetch_lut3d(&output) {
+            Ok(lut) => {
+                let desc = lut.describe();
+                self.lut = Some(lut);
+                self.show_lut = true;
+                self.rebuild_gamut();
+                let placement = match self.gamut.as_ref() {
+                    Some(g) if g.lut_modeled => "placed via measured gamut",
+                    _ if self.gamut_mesh.is_some() => {
+                        "mesh lacks axis data — raw command view (RGB mode)"
+                    }
+                    _ => {
+                        "load measured gamut to place colorimetrically; \
+                          raw command view (RGB mode) until then"
+                    }
+                };
+                self.status = format!("Fetched LUT from {output} · {desc} · {placement}.");
+            }
+            Err(e) => self.status = format!("LUT fetch failed: {e:#}"),
         }
     }
 
@@ -777,11 +854,26 @@ impl TuneGui {
         ])
         .gap(tokens::SPACE_1);
 
+        // Effective calibration LUT: a button to pull it from the
+        // compositor, and (once fetched) a show/hide toggle for the
+        // warped lattice.
+        let mut lut_row: Vec<El> = vec![button("Fetch LUT").key("fetch:lut").secondary()];
+        if self.lut.is_some() {
+            lut_row.push(toggle_button("Show lattice", "lut", self.show_lut));
+        }
+        let lut_controls = column([
+            text("Calibration LUT").small().muted(),
+            row(lut_row).gap(tokens::SPACE_2),
+        ])
+        .gap(tokens::SPACE_1);
+
         let has_geometry = self.gamut.as_ref().is_some_and(|g| {
             g.point_count > 0
                 || g.cage_segments > 0
                 || g.shell_segments > 0
                 || g.cage_label_count > 0
+                || g.lut_point_count > 0
+                || g.lut_segment_count > 0
         });
         let gamut_body: El = match self.gamut.as_ref().filter(|_| has_geometry) {
             Some(g) => {
@@ -814,6 +906,21 @@ impl TuneGui {
                 if g.shell_segments > 0 {
                     scene = scene.lines(g.shell.clone());
                 }
+                if g.lut_segment_count > 0 {
+                    scene = scene.lines(g.lut_lines.clone());
+                }
+                if g.lut_point_count > 0 {
+                    // Smaller than the sample cloud's marks so the two
+                    // layers stay distinguishable when interleaved.
+                    scene = scene.points_styled(
+                        g.lut_points.clone(),
+                        PointStyle {
+                            size: 3.5,
+                            shape: PointShape::Circle,
+                            size_mode: SizeMode::ScreenSpace,
+                        },
+                    );
+                }
                 if g.cage_label_count > 0 {
                     // A small square marker + persistent name at each
                     // enabled cage's green primary.
@@ -843,11 +950,12 @@ impl TuneGui {
         // surface gets the card's whole content area. Painted after
         // the chart ⇒ hit-tested first, so the buttons win clicks;
         // drag / wheel anywhere else still orbits / zooms the scene.
-        let legend =
-            card([column([space_toggle, cage_toggle, shell_controls]).gap(tokens::SPACE_3)])
-                .padding(tokens::SPACE_3)
-                .fill(tokens::CARD.with_alpha(0.85))
-                .radius(tokens::RADIUS_MD);
+        let legend = card([
+            column([space_toggle, cage_toggle, shell_controls, lut_controls]).gap(tokens::SPACE_3),
+        ])
+        .padding(tokens::SPACE_3)
+        .fill(tokens::CARD.with_alpha(0.85))
+        .radius(tokens::RADIUS_MD);
         let body = stack([
             gamut_body,
             // Transparent spacer wrapper: inset the legend from the
@@ -977,8 +1085,17 @@ impl App for TuneGui {
                     self.fetch_gamut_mesh();
                     return;
                 }
+                "fetch:lut" => {
+                    self.fetch_lut();
+                    return;
+                }
                 "shell" => {
                     self.show_shell = !self.show_shell;
+                    self.rebuild_gamut();
+                    return;
+                }
+                "lut" => {
+                    self.show_lut = !self.show_lut;
                     self.rebuild_gamut();
                     return;
                 }
@@ -1018,10 +1135,12 @@ impl App for TuneGui {
                             self.selected = Some(i);
                             self.sync_fields();
                             self.status.clear();
-                            // The measured gamut is per-output; drop it so a
-                            // stale shell doesn't carry over to the new one.
+                            // The measured gamut and LUT are per-output; drop
+                            // them so stale layers don't carry over.
                             self.gamut_mesh = None;
                             self.show_shell = false;
+                            self.lut = None;
+                            self.show_lut = false;
                             self.rebuild_gamut();
                         }
                         return;
@@ -1115,6 +1234,50 @@ fn capture_frame(output: &str, white_nits: f64) -> Result<(Image, Vec<[f32; 3]>,
     let fd = fd.ok_or_else(|| anyhow::anyhow!("server replied FrameCaptured without an fd"))?;
     let (image, samples) = process_frame(File::from(fd), &meta, white_nits)?;
     Ok((image, samples, meta.width, meta.height))
+}
+
+/// Request the effective 3D LUT for `output`, receive the memfd, and
+/// decode it into entries. Fresh one-shot connection for the same
+/// `recvmsg` reason as [`capture_frame`].
+fn fetch_lut3d(output: &str) -> Result<FetchedLut> {
+    let mut socket = Socket::connect()
+        .context("connect to PRISM_SOCKET (is prism running, and are you in its env?)")?;
+    let (reply, fd) = socket
+        .send_recv_fd(Request::Lut3d {
+            output: output.to_string(),
+        })
+        .context("send Lut3d request")?;
+    let meta = match reply {
+        Ok(Response::Lut3d(meta)) => meta,
+        Ok(other) => bail!("unexpected reply to Lut3d: {other:?}"),
+        Err(e) => bail!("prism returned an error: {e}"),
+    };
+    let fd = fd.ok_or_else(|| anyhow::anyhow!("server replied Lut3d without an fd"))?;
+
+    let n = meta.cube_edge as usize;
+    let want = n * n * n * 12;
+    if meta.byte_len as usize != want {
+        bail!(
+            "LUT payload length {} doesn't match cube_edge {} (want {want})",
+            meta.byte_len,
+            meta.cube_edge,
+        );
+    }
+    let mut data = vec![0u8; want];
+    File::from(fd)
+        .read_exact_at(&mut data, 0)
+        .context("read LUT entries from memfd")?;
+    let entries = data
+        .chunks_exact(12)
+        .map(|c| {
+            [
+                f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                f32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+                f32::from_le_bytes([c[8], c[9], c[10], c[11]]),
+            ]
+        })
+        .collect();
+    Ok(FetchedLut { meta, entries })
 }
 
 /// Read a captured BT.2020 intermediate frame once and derive two views:
