@@ -8,10 +8,13 @@
 //! handled in `on_pointer_motion`; activation/teardown lives in
 //! [`prism_protocols::PrismState::maybe_activate_pointer_constraint`].
 //!
+//! Carries the hot-corner trigger, the overview's pointer bindings
+//! (LMB click/drag, wheel, finger scroll), the move/resize/spatial
+//! grab triggers, and the DnD → layout feed.
+//!
 //! What's intentionally not here (yet):
-//!   - Hot corners
 //!   - Tablet integration
-//!   - Move/resize/spatial/pick_window/pick_color grabs (niri's 7 grab files)
+//!   - pick_window / pick_color grabs (niri's screenshot-UI helpers)
 //!   - Cursor auto-hide / pointer-inactivity timer
 //!
 //! These can all bolt onto this file as their backing state lands.
@@ -163,6 +166,7 @@ pub fn on_pointer_motion<I: PrismInputBackend>(
     pointer.frame(state);
     maybe_focus_follows_mouse(state);
     maybe_trigger_hot_corner(state, was_inside_hot_corner);
+    maybe_dnd_update(state, &pointer);
     // Walk the cursor plane on every output: show on the output the
     // pointer is in, hide on the rest, queue redraws on changes.
     prism_protocols::state::update_output_cursors(state);
@@ -211,6 +215,7 @@ pub fn on_pointer_motion_absolute<I: PrismInputBackend>(
     pointer.frame(state);
     maybe_focus_follows_mouse(state);
     maybe_trigger_hot_corner(state, was_inside_hot_corner);
+    maybe_dnd_update(state, &pointer);
     prism_protocols::state::update_output_cursors(state);
     // Absolute motion doesn't enforce locks (no meaningful raw delta), but it
     // can still settle focus onto a surface that wants to activate a
@@ -244,6 +249,15 @@ pub fn on_pointer_button<I: PrismInputBackend>(
     // somewhere else. niri runs the same `focus_output` from its
     // input handlers.
     if state_pressed && !pointer.is_grabbed() {
+        // Spatial-movement drags run before click-to-focus: RMB in the
+        // overview pans the workspace view; Mod+MMB pans / switches
+        // workspaces anywhere. niri deliberately does NOT activate the
+        // window under the cursor for these (avoids surprise scrolling
+        // when Mod+MMB-clicking a partially off-screen window).
+        if spatial_movement_press(state, button, serial) {
+            return;
+        }
+
         if let Some((surface, _)) = surface_under_pointer(state) {
             // Click-to-focus is for switching between WINDOWS. Clicking a
             // popup (menu item) must NOT move keyboard focus onto the popup:
@@ -269,8 +283,8 @@ pub fn on_pointer_button<I: PrismInputBackend>(
         // threshold) then activates the window and zooms to its
         // workspace, handled in `MoveGrab::end`; a drag interactively
         // moves it. On a workspace card's background it zooms straight
-        // to that workspace. RMB/MMB spatial-movement grabs need niri's
-        // `SpatialMovementGrab`, which prism doesn't carry yet.
+        // to that workspace. (RMB/MMB drags were handled above by
+        // `spatial_movement_press`.)
         if state.layout.is_overview_open()
             && button == BTN_LEFT
             && overview_lmb_press(state, serial)
@@ -307,6 +321,94 @@ pub fn on_pointer_button<I: PrismInputBackend>(
 /// Match niri's hardcoded constants in `input/mod.rs::on_pointer_button`.
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
+
+/// Try to start a spatial-movement grab (niri input/mod.rs:2825-2889):
+/// RMB in the overview pans the workspace view under the cursor (the
+/// view-offset gesture begins immediately); Mod+MMB starts the
+/// recognizing variant whose first 8px of travel picks view-pan
+/// (horizontal) or workspace-switch (vertical). Returns `true` if a
+/// grab consumed the press.
+fn spatial_movement_press(
+    state: &mut PrismState,
+    button: u32,
+    serial: smithay::utils::Serial,
+) -> bool {
+    use smithay::input::pointer::{CursorIcon, CursorImageStatus, Focus};
+
+    let overview_open = state.layout.is_overview_open();
+
+    let is_rmb_overview = button == BTN_RIGHT && overview_open;
+    let is_mod_mmb = button == BTN_MIDDLE && {
+        use prism_config::ModKey;
+        let mod_key = state.config.borrow().input.mod_key.unwrap_or(ModKey::Super);
+        state
+            .seat
+            .get_keyboard()
+            .map(|kb| {
+                crate::dispatch::modifiers_from_state(kb.modifier_state())
+                    .contains(mod_key.to_modifiers())
+            })
+            .unwrap_or(false)
+    };
+    if !is_rmb_overview && !is_mod_mmb {
+        return false;
+    }
+
+    let Some((out, pos_within_output)) = output_under_pointer(state) else {
+        return false;
+    };
+
+    // RMB-in-overview targets the workspace under the cursor (extended,
+    // full-width bounds); Mod+MMB does too in the overview, but outside
+    // it uses the active workspace — hit-testing during animations
+    // could catch the wrong one (niri's comment).
+    let ws_id = if overview_open {
+        state
+            .layout
+            .monitor_for_output(&out)
+            .and_then(|mon| mon.workspace_under(pos_within_output))
+            .map(|(ws, _geo)| ws.id())
+    } else {
+        state
+            .layout
+            .monitor_for_output(&out)
+            .map(|mon| mon.active_workspace_ref().id())
+    };
+    let Some(ws_id) = ws_id else {
+        return false;
+    };
+
+    state.layout.focus_output(&out);
+
+    if is_rmb_overview {
+        let Some((ws_idx, _)) = state.layout.find_workspace_by_id(ws_id) else {
+            return false;
+        };
+        state
+            .layout
+            .view_offset_gesture_begin(&out, Some(ws_idx), false);
+    }
+
+    let Some(pointer) = state.seat.get_pointer() else {
+        return false;
+    };
+    let start_data = smithay::input::pointer::GrabStartData {
+        focus: None,
+        button,
+        location: state.pointer_pos,
+    };
+    let grab = crate::SpatialMovementGrab::new(start_data, out, ws_id, is_rmb_overview);
+    pointer.set_grab(state, grab, serial, Focus::Clear);
+
+    state
+        .cursor_manager
+        .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
+    state.cursor_dirty = true;
+    prism_protocols::state::update_output_cursors(state);
+    crate::move_grab::queue_redraw_all(state);
+    true
+}
 
 /// Handle an unmodified LeftClick press while the overview is open.
 /// On a window (the zoom-aware `window_under` resolves hits on the
@@ -714,6 +816,37 @@ fn maybe_trigger_hot_corner(state: &mut PrismState, was_inside: bool) {
         crate::move_grab::queue_redraw_all(state);
     }
     state.pointer_inside_hot_corner = true;
+}
+
+/// Inform the layout of an ongoing data-device DnD drag (niri
+/// input/mod.rs:2644): it drives the DnD edge view-scroll and, in the
+/// overview, hovering a workspace card edge-switches to it. The layout
+/// state is cleared from the drop/cancel handlers (`Layout::dnd_end`).
+fn maybe_dnd_update(
+    state: &mut PrismState,
+    pointer: &smithay::input::pointer::PointerHandle<PrismState>,
+) {
+    use smithay::input::dnd::DnDGrab;
+    use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
+
+    let is_dnd = pointer
+        .with_grab(|_, grab| {
+            let grab = grab.as_any();
+            // Normal DnD, plus null-source DnD (weston-dnd --self-only).
+            grab.is::<DnDGrab<PrismState, WlDataSource, WlSurface>>()
+                || grab.is::<DnDGrab<PrismState, WlSurface, WlSurface>>()
+        })
+        .unwrap_or(false);
+    if !is_dnd {
+        return;
+    }
+
+    if let Some((out, pos_within_output)) = output_under_pointer(state) {
+        state.layout.dnd_update(out, pos_within_output);
+        // The DnD scroll/switch gestures animate; one queued redraw
+        // starts the cycle, are_animations_ongoing keeps it running.
+        crate::move_grab::queue_redraw_all(state);
+    }
 }
 
 /// The output under the pointer, and the pointer position within it

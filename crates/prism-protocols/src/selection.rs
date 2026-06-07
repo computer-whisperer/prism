@@ -208,12 +208,27 @@ impl DndGrabHandler for PrismState {
     ) {
         // TODO: niri activates the drop-target output/window here so
         // that drag-tab-into-new-window lands focus on the target.
-        // We just clear the icon today.
-        self.dnd_icon = None;
+        self.on_dnd_ended();
     }
 
     fn cancelled(&mut self, _seat: Seat<Self>, _location: Point<f64, Logical>) {
+        self.on_dnd_ended();
+    }
+}
+
+impl PrismState {
+    /// A data-device drag finished (drop or cancel): clear the layout's
+    /// DnD state — it was fed by the pointer-motion handlers via
+    /// `Layout::dnd_update` to drive edge scrolling and the overview's
+    /// hover-to-switch — and drop the icon. Mirrors niri's
+    /// `on_maybe_dnd_ended` (handlers/mod.rs:396).
+    fn on_dnd_ended(&mut self) {
+        self.layout.dnd_end();
         self.dnd_icon = None;
+        let ids: Vec<_> = self.outputs.keys().cloned().collect();
+        for id in ids {
+            self.output_redraw.entry(id).or_default().queue_redraw();
+        }
     }
 }
 

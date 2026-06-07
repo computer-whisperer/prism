@@ -21,9 +21,11 @@ pub mod gestures;
 pub mod move_grab;
 pub mod pointer;
 pub mod resize_grab;
+pub mod spatial_movement_grab;
 
 pub use actions::{set_child_env, spawn, spawn_sh};
 pub use backend_ext::{PrismInputBackend, PrismInputDevice};
 pub use dispatch::process_input_event;
 pub use move_grab::MoveGrab;
 pub use resize_grab::ResizeGrab;
+pub use spatial_movement_grab::SpatialMovementGrab;
