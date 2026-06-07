@@ -44,11 +44,11 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 use tristim_display::PatchSurface;
-use tristim_driver::{measurement::raw_to_xyz, Calibration, Colorimeter, Setup, Xyz};
+use tristim_driver::{Colorimeter, Xyz};
 
 use crate::common::{
-    apply_border, apply_panel_peaks, open_patch_surface, query_output_baseline, send_action,
-    set_channel_patch, set_patch_off, set_white_patch, show_alignment_patch, Channel,
+    apply_border, apply_panel_peaks, open_colorimeter, open_patch_surface, query_output_baseline,
+    send_action, set_channel_patch, set_patch_off, set_white_patch, show_alignment_patch, Channel,
     OutputBaseline,
 };
 use prism_ipc::OutputAction;
@@ -196,16 +196,7 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
     // Open hardware. Probe colorimeter first — if the puck isn't
     // plugged in / udev rule missing we want to fail before the user
     // has held it for 30 seconds.
-    let mut device = Colorimeter::open_any().context("open colorimeter")?;
-    let info = device.get_info().context("read colorimeter info")?;
-    eprintln!(
-        "Colorimeter: Spyder SN {} HW {}.{:02}",
-        info.serial, info.hw_version.0, info.hw_version.1
-    );
-    let cal = device
-        .get_calibration(args.cal)
-        .context("download cal matrix")?;
-    let setup = device.get_setup(&cal).context("download setup")?;
+    let mut device = open_colorimeter(args.cal)?;
 
     // Patch surface. Mode picks the constructor.
     let mut patch = open_patch_surface(&args.output, &baseline)?;
@@ -254,15 +245,7 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
 
     // ─── Phase 1: per-channel saturation discovery ────────────────────
     let (discovered_peaks, probe_peak_y, measured_primaries, probe_cabl_count) =
-        discover_per_channel_peaks(
-            &args,
-            &baseline,
-            &mut device,
-            &mut patch,
-            &setup,
-            &cal,
-            log.as_mut(),
-        )?;
+        discover_per_channel_peaks(&args, &baseline, &mut *device, &mut patch, log.as_mut())?;
     eprintln!(
         "\nDiscovered per-channel commanded peaks (cd/m²): R={:.1}  G={:.1}  B={:.1}",
         discovered_peaks[0], discovered_peaks[1], discovered_peaks[2]
@@ -331,10 +314,8 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
         settle,
         &PerChannelCurve::IDENTITY,
         &baseline,
-        &mut device,
+        &mut *device,
         &mut patch,
-        &setup,
-        &cal,
         log.as_mut(),
     )?;
 
@@ -350,10 +331,8 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
         &discovered_peaks,
         &probe_peak_y,
         &measured_primaries,
-        &mut device,
+        &mut *device,
         &mut patch,
-        &setup,
-        &cal,
         log.as_mut(),
     )?;
 
@@ -401,10 +380,8 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
         settle,
         &curve,
         &baseline,
-        &mut device,
+        &mut *device,
         &mut patch,
-        &setup,
-        &cal,
         log.as_mut(),
     )?;
 
@@ -420,10 +397,8 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
         &args,
         &baseline,
         &probe_peak_y,
-        &mut device,
+        &mut *device,
         &mut patch,
-        &setup,
-        &cal,
         log.as_mut(),
     )?;
 
@@ -531,10 +506,8 @@ pub fn run(args: CalibrateArgs) -> Result<()> {
 fn discover_per_channel_peaks(
     args: &CalibrateArgs,
     baseline: &OutputBaseline,
-    device: &mut Colorimeter,
+    device: &mut dyn Colorimeter,
     patch: &mut PatchSurface,
-    setup: &Setup,
-    cal: &Calibration,
     mut log: Option<&mut (PathBuf, BufWriter<File>)>,
 ) -> Result<([f64; 3], [f64; 3], [(f64, f64); 3], usize)> {
     // HDR mode: lift the compositor clamp temporarily so the buffer's
@@ -566,7 +539,7 @@ fn discover_per_channel_peaks(
 
     for c in Channel::ALL {
         eprintln!("\n--- phase 1 probe: {} channel ---", c.label());
-        // measure_raw() resets per-call — Argyll's auto-zero behaviour.
+        // measure() re-zeros per reading — Argyll's auto-zero behaviour.
         // Skipping it (the earlier --no-reset optimisation) made dim
         // single-channel reads unreliable on real LCDs; honest dark-
         // current refresh per measurement is the only safe default.
@@ -574,8 +547,7 @@ fn discover_per_channel_peaks(
         for (patch_idx, &target_nits) in probe_targets.iter().enumerate() {
             set_channel_patch(patch, baseline, c, target_nits)?;
             thread::sleep(settle);
-            let raw = device.measure_raw(setup).context("measure")?;
-            let xyz = raw_to_xyz(&raw, setup, cal);
+            let xyz = device.measure(1).context("measure")?.xyz[0];
             let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
             let cabl = is_backlight_off(target_nits, &xyz);
             eprintln!(
@@ -702,8 +674,7 @@ fn discover_per_channel_peaks(
                     let mid_t = (left_t * right_t).sqrt();
                     set_channel_patch(patch, baseline, c, mid_t)?;
                     thread::sleep(settle);
-                    let raw = device.measure_raw(setup).context("measure (bisect)")?;
-                    let xyz = raw_to_xyz(&raw, setup, cal);
+                    let xyz = device.measure(1).context("measure (bisect)")?.xyz[0];
                     let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
                     let mid_y = xyz.y;
                     if is_backlight_off(mid_t, &xyz) {
@@ -863,10 +834,8 @@ fn refine_per_channel_curve(
     discovered_peaks: &[f64; 3],
     probe_peak_y: &[f64; 3],
     initial_primaries: &[(f64, f64); 3],
-    device: &mut Colorimeter,
+    device: &mut dyn Colorimeter,
     patch: &mut PatchSurface,
-    setup: &Setup,
-    cal: &Calibration,
     mut log: Option<&mut (PathBuf, BufWriter<File>)>,
 ) -> Result<(PerChannelCurve, [[f64; 3]; 3], [(f64, f64); 3], usize)> {
     /// Lowest commanded value to sample. 50 cd/m² is well above the
@@ -994,8 +963,7 @@ fn refine_per_channel_curve(
                 let bt2020_send = t / ctm_diag;
                 set_channel_patch(patch, baseline, c, bt2020_send)?;
                 thread::sleep(settle);
-                let raw = device.measure_raw(setup).context("measure")?;
-                let xyz = raw_to_xyz(&raw, setup, cal);
+                let xyz = device.measure(1).context("measure")?.xyz[0];
                 let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
                 let cabl = is_backlight_off(t, &xyz);
                 if cabl {
@@ -1239,8 +1207,6 @@ fn refine_per_channel_curve(
             baseline,
             device,
             patch,
-            setup,
-            cal,
             log.as_deref_mut(),
         )?;
 
@@ -1356,10 +1322,8 @@ fn verify_white_point(
     args: &CalibrateArgs,
     baseline: &OutputBaseline,
     probe_peak_y: &[f64; 3],
-    device: &mut Colorimeter,
+    device: &mut dyn Colorimeter,
     patch: &mut PatchSurface,
-    setup: &Setup,
-    cal: &Calibration,
     mut log: Option<&mut (PathBuf, BufWriter<File>)>,
 ) -> Result<VerifyResult> {
     const D65: (f64, f64) = (0.3127, 0.3290);
@@ -1401,8 +1365,7 @@ fn verify_white_point(
     for (patch_idx, &t) in targets.iter().enumerate() {
         set_white_patch(patch, baseline, t)?;
         thread::sleep(settle);
-        let raw = device.measure_raw(setup).context("measure (verify)")?;
-        let xyz = raw_to_xyz(&raw, setup, cal);
+        let xyz = device.measure(1).context("measure (verify)")?.xyz[0];
         let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
         let (up, vp) = xy_to_uv_prime((cx, cy));
         let duv = ((up - d65_up).powi(2) + (vp - d65_vp).powi(2)).sqrt();
@@ -1493,10 +1456,8 @@ fn white_check_d65(
     settle: Duration,
     curve: &PerChannelCurve,
     baseline: &OutputBaseline,
-    device: &mut Colorimeter,
+    device: &mut dyn Colorimeter,
     patch: &mut PatchSurface,
-    setup: &Setup,
-    cal: &Calibration,
     log: Option<&mut (PathBuf, BufWriter<File>)>,
 ) -> Result<f64> {
     const D65: (f64, f64) = (0.3127, 0.3290);
@@ -1504,8 +1465,7 @@ fn white_check_d65(
 
     set_white_patch(patch, baseline, target_nits)?;
     thread::sleep(settle);
-    let raw = device.measure_raw(setup).context("measure (white_check)")?;
-    let xyz = raw_to_xyz(&raw, setup, cal);
+    let xyz = device.measure(1).context("measure (white_check)")?.xyz[0];
     let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
     let (up, vp) = xy_to_uv_prime((cx, cy));
     let duv = ((up - d65_up).powi(2) + (vp - d65_vp).powi(2)).sqrt();

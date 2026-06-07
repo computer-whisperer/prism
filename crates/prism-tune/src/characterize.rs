@@ -18,6 +18,11 @@
 //! clamp to 10000 nits per channel so the buffer's nits aren't
 //! pre-clipped before reaching the panel.
 
+use crate::common::{
+    apply_border, apply_panel_peaks, open_colorimeter, open_patch_surface, query_output_baseline,
+    send_action, set_channel_patch, set_patch_off, set_white_patch, show_alignment_patch, Channel,
+    OutputBaseline,
+};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use prism_ipc::OutputAction;
@@ -26,13 +31,6 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
-use tristim_driver::{measurement::raw_to_xyz, Colorimeter};
-
-use crate::common::{
-    apply_border, apply_panel_peaks, open_patch_surface, query_output_baseline, send_action,
-    set_channel_patch, set_patch_off, set_white_patch, show_alignment_patch, Channel,
-    OutputBaseline,
-};
 
 #[derive(Args)]
 pub struct CharacterizeArgs {
@@ -171,16 +169,7 @@ fn run_single_channel(args: SingleChannelArgs) -> Result<()> {
     }
 
     // Hardware setup.
-    let mut device = Colorimeter::open_any().context("open colorimeter")?;
-    let info = device.get_info().context("read colorimeter info")?;
-    eprintln!(
-        "Colorimeter: Spyder SN {} HW {}.{:02}",
-        info.serial, info.hw_version.0, info.hw_version.1
-    );
-    let cal = device
-        .get_calibration(args.cal)
-        .context("download cal matrix")?;
-    let setup = device.get_setup(&cal).context("download setup")?;
+    let mut device = open_colorimeter(args.cal)?;
 
     let mut patch = open_patch_surface(&args.output, &baseline)?;
     patch
@@ -234,8 +223,7 @@ fn run_single_channel(args: SingleChannelArgs) -> Result<()> {
         for (idx, &cmd) in targets.iter().enumerate() {
             set_channel_patch(&mut patch, &baseline, channel, cmd)?;
             thread::sleep(settle);
-            let raw = device.measure_raw(&setup).context("measure")?;
-            let xyz = raw_to_xyz(&raw, &setup, &cal);
+            let xyz = device.measure(1).context("measure")?.xyz[0];
             let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
             eprintln!(
                 "  {} cmd {:>8.2} cd/m² → X={:>8.3}  Y={:>8.3}  Z={:>8.3}  xy=({:.4}, {:.4})",
@@ -360,16 +348,7 @@ fn run_white_sweep(args: WhiteSweepArgs) -> Result<()> {
         apply_panel_peaks(&args.output, [10_000.0, 10_000.0, 10_000.0])?;
     }
 
-    let mut device = Colorimeter::open_any().context("open colorimeter")?;
-    let info = device.get_info().context("read colorimeter info")?;
-    eprintln!(
-        "Colorimeter: Spyder SN {} HW {}.{:02}",
-        info.serial, info.hw_version.0, info.hw_version.1
-    );
-    let cal = device
-        .get_calibration(args.cal)
-        .context("download cal matrix")?;
-    let setup = device.get_setup(&cal).context("download setup")?;
+    let mut device = open_colorimeter(args.cal)?;
 
     let mut patch = open_patch_surface(&args.output, &baseline)?;
     patch
@@ -420,8 +399,7 @@ fn run_white_sweep(args: WhiteSweepArgs) -> Result<()> {
     for (idx, &target) in targets.iter().enumerate() {
         set_white_patch(&mut patch, &baseline, target)?;
         thread::sleep(settle);
-        let raw = device.measure_raw(&setup).context("measure")?;
-        let xyz = raw_to_xyz(&raw, &setup, &cal);
+        let xyz = device.measure(1).context("measure")?.xyz[0];
         let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
         let (up, vp) = xy_to_uv_prime((cx, cy));
         let duv = ((up - d65_up).powi(2) + (vp - d65_vp).powi(2)).sqrt();

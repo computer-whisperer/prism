@@ -48,16 +48,15 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
-use tristim_driver::{measurement::raw_to_xyz, AdaptiveTier, Colorimeter, Xyz};
+use tristim_driver::{AdaptiveTier, Colorimeter, Xyz};
 
 use crate::common::{
-    apply_border, apply_panel_peaks, open_patch_surface, query_output_baseline,
+    apply_border, apply_panel_peaks, open_colorimeter, open_patch_surface, query_output_baseline,
     sanitize_for_filename, send_action, send_action_for_reply, set_channel_patch_cmd,
     set_patch_off, set_rgb_patch, set_white_patch, show_alignment_patch, Channel, OutputBaseline,
 };
 use prism_ipc::Response;
 use tristim_display::PatchSurface;
-use tristim_driver::{Calibration, Setup};
 
 #[derive(Args)]
 pub struct CalibrateLut3dArgs {
@@ -446,25 +445,23 @@ fn sub_xyz_scaled(a: Xyz, b: Xyz, scale: f64) -> Xyz {
 /// probe is the only site that consumes confidence). `fast_ms = None`
 /// degrades to `SingleFull` (a plain default-integration measurement).
 fn measure_single_adaptive(
-    device: &mut Colorimeter,
-    setup: &Setup,
-    cal: &Calibration,
+    device: &mut dyn Colorimeter,
     fast_ms: Option<u16>,
 ) -> Result<(Xyz, AdaptiveTier)> {
     let m = device
-        .measure_adaptive(setup, cal, 1, fast_ms)
+        .measure_adaptive(1, fast_ms)
         .context("measure_adaptive")?;
-    let xyz = raw_to_xyz(&m.raws[0], &m.setup, &m.cal);
-    Ok((xyz, m.tier))
+    Ok((m.sample.xyz[0], m.tier))
 }
 
 /// Compact tier suffix for per-measurement log lines. Empty string for
-/// `SingleFull` so non-adaptive runs keep the legacy log shape.
+/// `SingleFull` (and any tier this build doesn't know — the enum is
+/// non-exhaustive) so non-adaptive runs keep the legacy log shape.
 fn tier_suffix(tier: AdaptiveTier) -> &'static str {
     match tier {
         AdaptiveTier::Fast => " [fast]",
         AdaptiveTier::EscalatedFull => " [esc]",
-        AdaptiveTier::SingleFull => "",
+        _ => "",
     }
 }
 
@@ -483,7 +480,9 @@ impl TierTally {
         match tier {
             AdaptiveTier::Fast => self.fast += 1,
             AdaptiveTier::EscalatedFull => self.escalated += 1,
-            AdaptiveTier::SingleFull => self.single += 1,
+            // Unknown tiers (non-exhaustive upstream) count as single:
+            // "valid measurement, no adaptive shortcut we recognize".
+            _ => self.single += 1,
         }
     }
 
@@ -537,10 +536,8 @@ fn measure_channel_patch(
     baseline: &OutputBaseline,
     settle: Duration,
     black_xyz: &Xyz,
-    device: &mut Colorimeter,
+    device: &mut dyn Colorimeter,
     patch: &mut PatchSurface,
-    setup: &Setup,
-    cal: &Calibration,
     tally: &mut TierTally,
     log: Option<&mut (PathBuf, BufWriter<File>)>,
 ) -> Result<ChannelSample> {
@@ -550,8 +547,8 @@ fn measure_channel_patch(
     let scanout_rgb = diagnose_scanout_cmd(&args.output, baseline, requested_rgb)?;
     let scanout_cmd = scanout_rgb[channel.idx()];
     thread::sleep(settle);
-    let (raw_xyz, tier) = measure_single_adaptive(device, setup, cal, args.fast_integration_ms)
-        .context("phase 1 measure")?;
+    let (raw_xyz, tier) =
+        measure_single_adaptive(device, args.fast_integration_ms).context("phase 1 measure")?;
     tally.record(tier);
     // True emission above the black floor. Clamp to zero so the
     // toe can't go negative from measurement noise — the inverter
@@ -633,16 +630,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     send_action(&args.output, OutputAction::IdentityLut3d)
         .context("force identity LUT for raw-cmd sweep")?;
 
-    let mut device = Colorimeter::open_any().context("open colorimeter")?;
-    let info = device.get_info().context("read colorimeter info")?;
-    eprintln!(
-        "Colorimeter: Spyder SN {} HW {}.{:02}",
-        info.serial, info.hw_version.0, info.hw_version.1
-    );
-    let cal = device
-        .get_calibration(args.cal)
-        .context("download cal matrix")?;
-    let setup = device.get_setup(&cal).context("download setup")?;
+    let mut device = open_colorimeter(args.cal)?;
 
     let mut patch = open_patch_surface(&args.output, &baseline)?;
     patch
@@ -693,9 +681,8 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
     // Patch was already driven off by the prep-countdown setup above —
     // just give the panel the extra settle window before measuring.
     thread::sleep(settle_black);
-    let (black_xyz, black_tier) =
-        measure_single_adaptive(&mut device, &setup, &cal, args.fast_integration_ms)
-            .context("measure black floor")?;
+    let (black_xyz, black_tier) = measure_single_adaptive(&mut *device, args.fast_integration_ms)
+        .context("measure black floor")?;
     eprintln!(
         "  black floor: X={:.4}  Y={:.4}  Z={:.4} cd/m²{}",
         black_xyz.x,
@@ -769,10 +756,8 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
                 &baseline,
                 settle,
                 &black_xyz,
-                &mut device,
+                &mut *device,
                 &mut patch,
-                &setup,
-                &cal,
                 &mut phase1_tally,
                 log.as_mut(),
             )?;
@@ -843,10 +828,8 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
                             &baseline,
                             settle,
                             &black_xyz,
-                            &mut device,
+                            &mut *device,
                             &mut patch,
-                            &setup,
-                            &cal,
                             &mut phase1_tally,
                             log.as_mut(),
                         )?;
@@ -959,10 +942,8 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         &probe_config,
         &probe_params,
         &baseline,
-        &mut device,
+        &mut *device,
         &mut patch,
-        &setup,
-        &cal,
         |evt| {
             let crate::gamut::GamutProbeEvent::Measured {
                 index,
@@ -981,6 +962,9 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
                         tristim_driver::TrustFlag::Floor => "FLOOR",
                         tristim_driver::TrustFlag::Noisy => "NOISY",
                         tristim_driver::TrustFlag::Chroma => "DUV",
+                        // Non-exhaustive upstream: an unfamiliar flag
+                        // still means "less trustworthy".
+                        _ => "UNKNOWN",
                     })
                     .collect::<Vec<_>>()
                     .join(",")
@@ -990,7 +974,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             let tier_str = match tier {
                 tristim_driver::AdaptiveTier::Fast => " [fast]",
                 tristim_driver::AdaptiveTier::EscalatedFull => " [esc]",
-                tristim_driver::AdaptiveTier::SingleFull => "",
+                _ => "",
             };
             eprintln!(
                 "  vertex {index:>3} cv=({:.2},{:.2},{:.2}) cmd=({:>6.1},{:>6.1},{:>6.1}) → \
@@ -1040,12 +1024,10 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         args.cube_edge_cmd,
         phase2_request_axes,
         settle,
-        &mut device,
+        &mut *device,
         &mut patch,
         &args.output,
         &baseline,
-        &setup,
-        &cal,
         args.fast_integration_ms,
         log.as_mut(),
     )?;
@@ -1181,10 +1163,8 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
             &baseline,
             &entries,
             &grid,
-            &mut device,
+            &mut *device,
             &mut patch,
-            &setup,
-            &cal,
             log.as_mut(),
         )?)
     } else {
@@ -1291,12 +1271,10 @@ fn sweep_3d_grid(
     cube_edge: usize,
     requested_axis_cmds: [Vec<f64>; 3],
     settle: Duration,
-    device: &mut Colorimeter,
+    device: &mut dyn Colorimeter,
     patch: &mut PatchSurface,
     output: &str,
     baseline: &OutputBaseline,
-    setup: &Setup,
-    cal: &Calibration,
     fast_ms: Option<u16>,
     mut log: Option<&mut (PathBuf, BufWriter<File>)>,
 ) -> Result<ResponseGrid> {
@@ -1360,8 +1338,8 @@ fn sweep_3d_grid(
                     axis_scanout_max[axis][idx] = axis_scanout_max[axis][idx].max(v);
                 }
                 thread::sleep(settle);
-                let (raw_xyz, tier) = measure_single_adaptive(device, setup, cal, fast_ms)
-                    .context("3D-sweep measure")?;
+                let (raw_xyz, tier) =
+                    measure_single_adaptive(device, fast_ms).context("3D-sweep measure")?;
                 tally.record(tier);
                 // Absolute emission — the reformed bake works in
                 // absolute XYZ and projects sub-floor requests onto
@@ -1587,10 +1565,8 @@ fn verify_white_point(
     baseline: &OutputBaseline,
     lut_entries: &[[f32; 3]],
     grid: &ResponseGrid,
-    device: &mut tristim_driver::Colorimeter,
+    device: &mut dyn Colorimeter,
     patch: &mut PatchSurface,
-    setup: &Setup,
-    cal: &Calibration,
     mut log: Option<&mut (PathBuf, BufWriter<File>)>,
 ) -> Result<VerifyResult> {
     const D65: (f64, f64) = (0.3127, 0.3290);
@@ -1617,8 +1593,8 @@ fn verify_white_point(
     for (patch_idx, &t) in targets.iter().enumerate() {
         set_white_patch(patch, baseline, t)?;
         thread::sleep(settle);
-        let (xyz, _tier) = measure_single_adaptive(device, setup, cal, args.fast_integration_ms)
-            .context("verify measure")?;
+        let (xyz, _tier) =
+            measure_single_adaptive(device, args.fast_integration_ms).context("verify measure")?;
         let (cx, cy) = xyz.chromaticity().unwrap_or((0.0, 0.0));
         let (up, vp) = xy_to_uv_prime((cx, cy));
         let duv = ((up - d65_up).powi(2) + (vp - d65_vp).powi(2)).sqrt();

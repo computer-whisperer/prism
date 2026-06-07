@@ -4302,8 +4302,9 @@ dependencies = [
 
 [[package]]
 name = "tristim-display"
-version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/tristim.git?rev=89ffdc1#89ffdc14d52b9d5a5600b9e6cb7c75aabfd3d9d2"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc90e132f03c42277504f2c7998e2abe0ae7c3b8a93fad8df88eef12c8bc8a1"
 dependencies = [
  "half",
  "libc",
@@ -4315,8 +4316,9 @@ dependencies = [
 
 [[package]]
 name = "tristim-driver"
-version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/tristim.git?rev=89ffdc1#89ffdc14d52b9d5a5600b9e6cb7c75aabfd3d9d2"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f7b663f65cb9d4352fe9937856d8b576e7a0ff5dcc62ad078aabf40f157367c"
 dependencies = [
  "rand 0.8.6",
  "rusb",

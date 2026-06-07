@@ -12,7 +12,11 @@ use anyhow::{Context, Result};
 use prism_ipc::socket::Socket;
 use prism_ipc::{ColorState, OutputAction, Request, Response};
 use std::collections::HashMap;
-use tristim_display::{BufferFormat, DescriptionRequest, Luminances, Mastering, PatchSurface};
+use tristim_display::{
+    BufferFormat, DescriptionRequest, Luminances, Mastering, ParametricDescription, PatchSurface,
+    PrimariesChoice, TransferChoice,
+};
+use tristim_driver::{CalibrationId, Colorimeter};
 
 // ─── Channel ──────────────────────────────────────────────────────────────────
 
@@ -143,6 +147,27 @@ pub fn query_output_baseline(name: &str) -> Result<OutputBaseline> {
     })
 }
 
+// ─── Colorimeter ──────────────────────────────────────────────────────────────
+
+/// Open the first supported colorimeter on the bus, select the
+/// requested on-board calibration slot, and announce the instrument.
+/// Shared by every measuring subcommand so the open/select/banner
+/// sequence stays identical across them.
+pub fn open_colorimeter(cal: u8) -> Result<Box<dyn Colorimeter>> {
+    let mut device = tristim_driver::open_any().context("open colorimeter")?;
+    {
+        let info = device.info();
+        eprintln!(
+            "Colorimeter: {} {} SN {} FW {}.{:02}",
+            info.vendor, info.model, info.serial, info.firmware.0, info.firmware.1
+        );
+    }
+    device
+        .select_calibration(CalibrationId(cal))
+        .with_context(|| format!("select calibration slot {cal}"))?;
+    Ok(device)
+}
+
 // ─── Patch surface lifecycle ──────────────────────────────────────────────────
 
 /// Open an HDR or SDR patch surface on the chosen output, mode-aware.
@@ -165,31 +190,31 @@ pub fn query_output_baseline(name: &str) -> Result<OutputBaseline> {
 pub fn open_patch_surface(output: &str, baseline: &OutputBaseline) -> Result<PatchSurface> {
     if baseline.hdr_active {
         let probe_peak = 10_000.0;
-        let desc = DescriptionRequest {
-            transfer_function: "st2084_pq".into(),
-            primaries: "bt2020".into(),
+        let desc = DescriptionRequest::parametric(ParametricDescription {
+            transfer_function: TransferChoice::Named("st2084_pq".into()),
+            primaries: PrimariesChoice::Named("bt2020".into()),
             luminances: None,
             mastering: Some(Mastering {
-                min_nits: 0.0005,
-                max_nits: probe_peak,
-                max_cll_nits: probe_peak,
-                max_fall_nits: probe_peak / 2.0,
+                luminance_nits: Some((0.0005, probe_peak)),
+                primaries: None,
+                max_cll_nits: Some(probe_peak),
+                max_fall_nits: Some(probe_peak / 2.0),
             }),
-        };
+        });
         PatchSurface::open(output, BufferFormat::Xbgr16161616f, Some(desc))
             .with_context(|| format!("open HDR patch on {output}"))
     } else {
         let ref_nits = baseline.sdr_reference_nits;
-        let desc = DescriptionRequest {
-            transfer_function: "srgb".into(),
-            primaries: "bt2020".into(),
+        let desc = DescriptionRequest::parametric(ParametricDescription {
+            transfer_function: TransferChoice::Named("srgb".into()),
+            primaries: PrimariesChoice::Named("bt2020".into()),
             luminances: Some(Luminances {
                 min_nits: 0.0,
                 max_nits: ref_nits,
                 reference_nits: ref_nits,
             }),
             mastering: None,
-        };
+        });
         PatchSurface::open(output, BufferFormat::Xrgb8888, Some(desc))
             .with_context(|| format!("open SDR patch (BT.2020-described) on {output}"))
     }

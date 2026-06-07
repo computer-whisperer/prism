@@ -28,9 +28,7 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 use tristim_display::PatchSurface;
-use tristim_driver::{
-    AdaptiveTier, Calibration, Colorimeter, MeasurementConfidence, Setup, TrustFlag, Xyz,
-};
+use tristim_driver::{AdaptiveTier, Colorimeter, MeasurementConfidence, TrustFlag, Xyz};
 
 /// The 14 coarse cube-surface probe points: 8 corners (black, three
 /// primaries, three secondaries, white) + 6 face centres. Each entry
@@ -441,10 +439,8 @@ pub fn probe_gamut_refined(
     config: &ProbeConfig,
     params: &RefineParams,
     baseline: &OutputBaseline,
-    device: &mut Colorimeter,
+    device: &mut dyn Colorimeter,
     patch: &mut PatchSurface,
-    setup: &Setup,
-    cal: &Calibration,
     mut on_event: impl FnMut(GamutProbeEvent),
 ) -> Result<GamutMesh> {
     let mut index = 0usize;
@@ -466,13 +462,13 @@ pub fn probe_gamut_refined(
         });
         // Adaptive integration: bright vertices clear trust at the short
         // tier and skip the long integration entirely. Dim/saturated
-        // vertices auto-escalate to the calibration default. `setup`/`cal`
-        // come back paired with the actual raws (the fast tier uses a
-        // scaled cal matrix), so they go straight into `from_repeats`.
+        // vertices auto-escalate to the calibration default. The sample
+        // comes back already converted with whichever setup/cal pair
+        // actually produced it, so it goes straight into `from_sample`.
         let m = device
-            .measure_adaptive(setup, cal, config.repeats, config.fast_integration_ms)
+            .measure_adaptive(config.repeats, config.fast_integration_ms)
             .context("gamut probe measure_adaptive")?;
-        let confidence = MeasurementConfidence::from_repeats(&m.raws, &m.setup, &m.cal);
+        let confidence = MeasurementConfidence::from_sample(&m.sample);
         let sample = ProbeSample {
             measured: confidence.mean,
             trustworthy: confidence.is_trustworthy(),

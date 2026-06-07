@@ -16,8 +16,6 @@ path = "src/main.rs"
 # Phase 2 (in progress) adds the `calibrate` subcommand, which drives
 # the tristim USB colorimeter against the tristim Wayland patch surface
 # and iterates the panel response correction live via the prism IPC.
-# tristim is pinned to a git rev (not crates.io yet) — bump the rev when
-# the driver or patch-surface API changes shape.
 
 [dependencies]
 anyhow.workspace = true
@@ -27,8 +25,8 @@ damascene-winit-wgpu.workspace = true
 prism-ipc = { workspace = true, features = ["clap"] }
 prism-renderer.workspace = true
 serde_json.workspace = true
-tristim-driver = { git = "https://github.com/computer-whisperer/tristim.git", rev = "89ffdc1" }
-tristim-display = { git = "https://github.com/computer-whisperer/tristim.git", rev = "89ffdc1" }
+tristim-driver = "0.2.1"
+tristim-display = "0.2"
 
 # prism-tune is numerical calibration code. Matrix and 3D-LUT-cube loops
 # read clearer with explicit indices, and the calibration entry points

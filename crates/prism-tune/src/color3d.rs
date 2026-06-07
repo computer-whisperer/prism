@@ -1,7 +1,7 @@
 //! Local color science for the 3D gamut view: BT.2020/sRGB/P3 → XYZ →
 //! CIELAB, and gamut-cage wireframes. Reimplemented here (rather than
-//! pulling `tristim-color`, which would force a bump of the pinned
-//! tristim git rev) — the needed subset is small and standard.
+//! pulling `tristim-color`, which isn't on crates.io) — the needed
+//! subset is small and standard.
 //!
 //! Two plot spaces ([`GamutSpace`]):
 //!
