@@ -2667,6 +2667,22 @@ impl PrismState {
             state.geometry = unconstrain_with_padding(state.positioner, target);
         });
     }
+
+    /// Resolve a (sub)surface to its root shell surface: subsurfaces walk
+    /// up the parent chain; popups follow the xdg_popup parent chain to
+    /// their toplevel (or layer) surface. Mirrors niri's
+    /// `find_root_shell_surface` (niri.rs:6125) — the layout only knows
+    /// toplevel root surfaces, so resolve before querying it.
+    pub(crate) fn find_root_shell_surface(&self, surface: &WlSurface) -> WlSurface {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        if let Some(popup) = self.popups.find_popup(&root) {
+            return find_popup_root_surface(&popup).unwrap_or(root);
+        }
+        root
+    }
 }
 
 /// Unconstrain `positioner` against `target`, preferring an 8px inset (nicer

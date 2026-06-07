@@ -48,10 +48,6 @@
 //!     protocols used by tools like `cliphist`, `wl-paste --watch`,
 //!     and `clipman`. The core clipboard works without them; add when
 //!     a clipboard manager workflow is desired.
-//!   - **Cross-monitor drop activation.** niri's `dropped` handler
-//!     activates the target output + window so that "drag a Firefox
-//!     tab to another monitor" lands focus correctly. Skipped pending
-//!     a concrete use case in the prism layout.
 //!   - **Compositor-set selections.** [`SelectionHandler`] requires
 //!     us to declare a `SelectionUserData` type for clipboard data
 //!     the *compositor* writes (e.g. after a screenshot). We use
@@ -201,14 +197,44 @@ impl WaylandDndGrabHandler for PrismState {
 impl DndGrabHandler for PrismState {
     fn dropped(
         &mut self,
-        _target: Option<DndTarget<'_, Self>>,
-        _validated: bool,
+        target: Option<DndTarget<'_, Self>>,
+        validated: bool,
         _seat: Seat<Self>,
-        _location: Point<f64, Logical>,
+        location: Point<f64, Logical>,
     ) {
-        // TODO: niri activates the drop-target output/window here so
-        // that drag-tab-into-new-window lands focus on the target.
+        let target: Option<&WlSurface> = target.map(DndTarget::into_inner);
+        tracing::trace!("dnd dropped, target: {target:?}, validated: {validated}");
+
+        // End DnD before activating a specific window below so that the
+        // activation takes precedence (niri handlers/mod.rs:363).
         self.on_dnd_ended();
+
+        // Activate the target output — that's how Firefox's
+        // drag-tab-into-new-window works, for example. On a successful
+        // drop, additionally activate the target window.
+        let mut activate_output = true;
+        if let Some(target) = validated.then_some(target).flatten() {
+            let root = self.find_root_shell_surface(target);
+            let window = self
+                .layout
+                .find_window_and_output(&root)
+                .map(|(mapped, _)| mapped.window.clone());
+            if let Some(window) = window {
+                self.layout.activate_window(&window);
+                // Drop any transient on-demand layer focus so the
+                // keyboard reconcile hands focus to the layout window.
+                self.on_demand_layer_focus = None;
+                activate_output = false;
+            }
+        }
+
+        if activate_output {
+            // Find the output from the drop coordinates.
+            let id = self.output_containing((location.x as i32, location.y as i32));
+            if let Some(output) = id.and_then(|id| self.wl_outputs.get(&id)).cloned() {
+                self.layout.focus_output(&output);
+            }
+        }
     }
 
     fn cancelled(&mut self, _seat: Seat<Self>, _location: Point<f64, Logical>) {
