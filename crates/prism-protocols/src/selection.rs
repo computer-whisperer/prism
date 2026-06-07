@@ -68,8 +68,6 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::thread;
 
-use smithay::delegate_data_device;
-use smithay::delegate_primary_selection;
 use smithay::input::dnd::{self, DnDGrab, DndGrabHandler, DndTarget};
 use smithay::input::pointer::Focus;
 use smithay::input::Seat;
@@ -269,8 +267,6 @@ impl PrismState {
     }
 }
 
-delegate_data_device!(PrismState);
-
 // ─── PrimarySelectionHandler ────────────────────────────────────────────────
 
 impl PrimarySelectionHandler for PrismState {
@@ -278,5 +274,3 @@ impl PrimarySelectionHandler for PrismState {
         &mut self.primary_selection_state
     }
 }
-
-delegate_primary_selection!(PrismState);

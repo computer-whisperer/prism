@@ -16,7 +16,11 @@ what we need at the protocol/utils/drm level, we depend on it and work around. I
 *can't* do what we need at the renderer level — that's exactly the layer we're
 replacing.
 
-The pinned smithay rev is `ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef`.
+The pinned smithay rev is `85f83ab6` (upstream master). We carry one local
+patch on top of it — a Cargo `[patch]` onto the `prism/dnd-no-data-device-cancel`
+branch of the computer-whisperer/smithay fork — fixing a DnD bug where a drop on
+a client with no `wl_data_device` reports `dnd_drop_performed` instead of
+`cancelled`. Drop the patch when it lands upstream.
 
 ## The cut line, in one sentence
 

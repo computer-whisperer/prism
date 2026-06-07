@@ -435,6 +435,3 @@ impl WlrLayerShellHandler for PrismState {
         self.unconstrain_popup(&PopupKind::Xdg(popup));
     }
 }
-
-// Re-export so state.rs can wire the delegate macro.
-pub use smithay::delegate_layer_shell;

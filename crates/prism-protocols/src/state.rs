@@ -2,8 +2,11 @@
 //!
 //! Smithay's protocol dispatch model: one application-owned struct
 //! (`PrismState` here) implements every protocol's `*Handler` trait that the
-//! compositor wants to participate in, and `delegate_*!` macros wire the
-//! protocol message dispatch into those traits.
+//! compositor wants to participate in, and a single `delegate_dispatch2!`
+//! invocation (below) blanket-implements `Dispatch`/`GlobalDispatch` for
+//! `PrismState` by deferring to the per-user-data `Dispatch2` /
+//! `GlobalDispatch2` impls (smithay's own for its built-in protocols, ours
+//! for the hand-rolled ones).
 //!
 //! Scope of this scaffolding (task #46):
 //!   - wl_compositor (surface lifecycle, basic commits)
@@ -42,27 +45,6 @@ use smithay::backend::allocator::Format as DrmFormat;
 use smithay::backend::renderer::utils::{
     on_commit_buffer_handler, CommitCounter, RendererSurfaceStateUserData,
 };
-use smithay::delegate_alpha_modifier;
-use smithay::delegate_compositor;
-use smithay::delegate_content_type;
-use smithay::delegate_cursor_shape;
-use smithay::delegate_dmabuf;
-use smithay::delegate_drm_syncobj;
-use smithay::delegate_fractional_scale;
-use smithay::delegate_idle_inhibit;
-use smithay::delegate_idle_notify;
-use smithay::delegate_output;
-use smithay::delegate_pointer_constraints;
-use smithay::delegate_presentation;
-use smithay::delegate_relative_pointer;
-use smithay::delegate_seat;
-use smithay::delegate_shm;
-use smithay::delegate_single_pixel_buffer;
-use smithay::delegate_viewporter;
-use smithay::delegate_xdg_activation;
-use smithay::delegate_xdg_decoration;
-use smithay::delegate_xdg_dialog;
-use smithay::delegate_xdg_shell;
 use smithay::desktop::{
     find_popup_root_surface, get_popup_toplevel_coords, PopupKeyboardGrab, PopupKind, PopupManager,
     PopupPointerGrab, PopupUngrabStrategy, Window,
@@ -125,6 +107,11 @@ use crate::input_state::{KeyboardFocus, PointerVisibility};
 use crate::surface_tex::{
     GpuTex, MirrorChroma, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture, TexSource,
 };
+
+// The one dispatch wiring for everything: `Dispatch`/`GlobalDispatch` for
+// `PrismState` defer to `Dispatch2`/`GlobalDispatch2` on the user-data type.
+// This replaced the per-protocol `delegate_*!` macro zoo (smithay 0d14cd65).
+smithay::delegate_dispatch2!(PrismState);
 
 /// Stable per-output id. Today we key by the connector name (e.g. `"DP-4"`,
 /// `"HDMI-A-1"`). amdgpu's connector names are globally unique across cards
@@ -2203,8 +2190,6 @@ impl OutputHandler for PrismState {
     }
 }
 
-delegate_output!(PrismState);
-
 // ─── wl_seat ────────────────────────────────────────────────────────────────
 
 impl SeatHandler for PrismState {
@@ -2249,23 +2234,17 @@ impl SeatHandler for PrismState {
     // led_state_changed defaults to a no-op.
 }
 
-delegate_seat!(PrismState);
-
 // wp_cursor_shape attaches shape devices to both pointers and tablet tools,
 // so its delegate requires TabletSeatHandler even though we have no tablet
 // support yet. The default `tablet_tool_image` (a no-op) is all we need; a
 // tool's cursor will wire through here if/when tablet support lands.
 impl smithay::wayland::tablet_manager::TabletSeatHandler for PrismState {}
 
-delegate_cursor_shape!(PrismState);
-
 // ─── zwp_relative_pointer / zwp_pointer_constraints ──────────────────────────
 
 // Relative pointer needs no handler trait — the manager just gates the global,
 // and the per-motion deltas are pushed from the input layer via
 // `PointerHandle::relative_motion`.
-delegate_relative_pointer!(PrismState);
-smithay::delegate_pointer_gestures!(PrismState);
 
 impl PointerConstraintsHandler for PrismState {
     fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {
@@ -2275,6 +2254,18 @@ impl PointerConstraintsHandler for PrismState {
         // so a constraint created while the pointer is already inside (the
         // normal case for click-to-lock games) activates immediately.
         self.maybe_activate_pointer_constraint();
+    }
+
+    fn remove_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {
+        // smithay added this hook (df73da71) so the compositor can apply a
+        // pending cursor-position hint at the moment the lock/confinement is
+        // torn down — that's what anvil now does, having moved hint handling
+        // out of `cursor_position_hint`. prism keeps the *eager* model
+        // instead: `cursor_position_hint` repositions the pointer the instant
+        // the client commits the hint (load-bearing for the captured-game
+        // escape fix, 8f204d6 — see the clamp comment below), so by the time
+        // the constraint is removed the pointer is already where it should be.
+        // Nothing to defer here.
     }
 
     fn cursor_position_hint(
@@ -2326,7 +2317,6 @@ impl PointerConstraintsHandler for PrismState {
         update_output_cursors(self);
     }
 }
-delegate_pointer_constraints!(PrismState);
 
 // ─── ext-idle-notify-v1 / zwp_idle_inhibit ───────────────────────────────────
 
@@ -2339,8 +2329,6 @@ impl IdleNotifierHandler for PrismState {
             .expect("idle notifier built in set_loop_handle before clients connect")
     }
 }
-
-delegate_idle_notify!(PrismState);
 
 impl IdleInhibitHandler for PrismState {
     fn inhibit(&mut self, surface: WlSurface) {
@@ -2356,18 +2344,13 @@ impl IdleInhibitHandler for PrismState {
     }
 }
 
-delegate_idle_inhibit!(PrismState);
-
 // ─── wp_viewporter ──────────────────────────────────────────────────────────
 
 // No handler trait required — smithay stores per-surface viewport
 // state in SurfaceData::cached_state; we'd read it via with_states +
 // ViewportCachedState if/when we honor it in the render path.
-delegate_viewporter!(PrismState);
 
 // ─── wp_presentation_time ───────────────────────────────────────────────────
-
-delegate_presentation!(PrismState);
 
 // ─── wl_compositor ──────────────────────────────────────────────────────────
 
@@ -2651,8 +2634,6 @@ impl BufferHandler for PrismState {
     }
 }
 
-delegate_compositor!(PrismState);
-
 // ─── wl_shm ─────────────────────────────────────────────────────────────────
 
 impl ShmHandler for PrismState {
@@ -2660,8 +2641,6 @@ impl ShmHandler for PrismState {
         &self.shm
     }
 }
-
-delegate_shm!(PrismState);
 
 // ─── xdg-shell ──────────────────────────────────────────────────────────────
 
@@ -3021,8 +3000,6 @@ impl XdgShellHandler for PrismState {
     }
 }
 
-delegate_xdg_shell!(PrismState);
-
 // ─── xdg-decoration v1 ──────────────────────────────────────────────────────
 //
 // Clients that opt into negotiation get told "server-side" iff
@@ -3071,8 +3048,6 @@ impl XdgDecorationHandler for PrismState {
         toplevel.send_configure();
     }
 }
-
-delegate_xdg_decoration!(PrismState);
 
 // ─── linux-dmabuf ───────────────────────────────────────────────────────────
 
@@ -3199,15 +3174,11 @@ impl DmabufHandler for PrismState {
     }
 }
 
-delegate_dmabuf!(PrismState);
-
 // ─── wlr_layer_shell ────────────────────────────────────────────────────────
 // Handler impl lives in `crate::layer_shell`; this just hooks the
 // smithay delegate macro so dispatch routes here. The macro generates
 // GlobalDispatch + Dispatch impls for the manager + per-surface
 // interfaces.
-
-smithay::delegate_layer_shell!(PrismState);
 
 // ─── fractional_scale / single_pixel_buffer / content_type ──────────────────
 // Advertise-only today. The handlers are no-op shims so smithay's
@@ -3216,10 +3187,6 @@ smithay::delegate_layer_shell!(PrismState);
 // follow-up wiring each needs.
 
 impl FractionalScaleHandler for PrismState {}
-delegate_fractional_scale!(PrismState);
-delegate_single_pixel_buffer!(PrismState);
-delegate_content_type!(PrismState);
-delegate_alpha_modifier!(PrismState);
 
 // ─── linux_drm_syncobj_v1 ───────────────────────────────────────────────────
 // Real handler lives in [`crate::drm_syncobj`] — release tracking,
@@ -3232,7 +3199,6 @@ impl DrmSyncobjHandler for PrismState {
         self.drm_syncobj_state.as_mut()
     }
 }
-delegate_drm_syncobj!(PrismState);
 
 // ─── xdg_activation_v1 ──────────────────────────────────────────────────────
 // Activation tokens carry a seat + serial that the requesting client
@@ -3325,14 +3291,12 @@ impl XdgActivationHandler for PrismState {
         self.xdg_activation.remove_token(&token);
     }
 }
-delegate_xdg_activation!(PrismState);
 
 // xdg-dialog: we only need the global advertised and the hint tracked (smithay
 // stores it on the toplevel role). The dialog/modal hint is consumed at window
 // open time in `compute_open_floating`, so the `dialog_hint_changed` default
 // no-op is all we need here.
 impl XdgDialogHandler for PrismState {}
-delegate_xdg_dialog!(PrismState);
 
 /// Build the per-output `DmabufFeedback` published to clients whose
 /// surfaces map onto this output.

@@ -27,7 +27,6 @@ use std::collections::{HashMap, HashSet};
 
 use prism_renderer::DrmDevId;
 use smithay::backend::drm::DrmNode;
-use smithay::delegate_drm_lease;
 use smithay::reexports::drm::control::{connector, crtc};
 use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseHandler, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
@@ -267,5 +266,3 @@ impl DrmLeaseHandler for PrismState {
         rescan_card(self, dev_id);
     }
 }
-
-delegate_drm_lease!(PrismState);

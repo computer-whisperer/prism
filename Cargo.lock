@@ -3868,7 +3868,7 @@ dependencies = [
 [[package]]
 name = "smithay-drm-extras"
 version = "0.1.0"
-source = "git+https://github.com/Smithay/smithay.git?rev=ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef#ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+source = "git+https://github.com/Smithay/smithay.git?rev=85f83ab6#85f83ab61711e725aa1f3481df4f4dc5370e925b"
 dependencies = [
  "drm",
  "libdisplay-info",

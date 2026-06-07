@@ -61,11 +61,14 @@ thiserror = "2.0"
 tracing = { version = "0.1.44", features = ["max_level_trace", "release_max_level_debug"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-# smithay: pinned to the same revision niri uses (known-good for the protocol/drm/utils
-# pieces we depend on). Migrate to crates.io once a release catches up to what we use.
+# smithay: tracking upstream master (ahead of niri's pin). The Dispatch2/
+# GlobalDispatch2 rework (0d14cd65) replaced every `delegate_*!` macro with a
+# single `delegate_dispatch2!`, and `PointerConstraintsHandler` gained
+# `remove_constraint` (df73da71); prism is adapted for both. Migrate to
+# crates.io once a release catches up to what we use.
 [workspace.dependencies.smithay]
 git = "https://github.com/Smithay/smithay.git"
-rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+rev = "85f83ab6"
 default-features = false
 features = [
     "backend_drm",
@@ -79,7 +82,7 @@ features = [
 
 [workspace.dependencies.smithay-drm-extras]
 git = "https://github.com/Smithay/smithay.git"
-rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+rev = "85f83ab6"
 
 [profile.dev]
 opt-level = 1
@@ -92,12 +95,12 @@ opt-level = 3
 debug = "limited"
 lto = "thin"
 
-# Carry a local smithay fix on top of the niri-aligned pin: drops onto
-# clients that never bound wl_data_device must cancel the drag, not
-# report dnd_drop_performed (frozen Firefox tab tear-off over prism-bg;
-# upstream smithay bug, present through at least 2026-06 master). The
-# worktree is a one-commit branch (prism/dnd-no-data-device-cancel) on
-# top of the exact pinned rev in the computer-whisperer/smithay fork.
-# Drop this section when the fix lands upstream and niri re-pins.
+# Carry a local smithay fix on top of upstream master: drops onto clients
+# that never bound wl_data_device must cancel the drag, not report
+# dnd_drop_performed (frozen Firefox tab tear-off over prism-bg; upstream
+# smithay bug, present through at least 2026-06 master). The worktree is a
+# one-commit branch (prism/dnd-no-data-device-cancel) rebased onto the
+# pinned master rev in the computer-whisperer/smithay fork.
+# Drop this section when the fix lands upstream.
 [patch."https://github.com/Smithay/smithay.git"]
 smithay = { path = "../../compositor/smithay-prism-pin" }
