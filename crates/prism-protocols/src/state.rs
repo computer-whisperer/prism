@@ -2460,6 +2460,41 @@ impl CompositorHandler for PrismState {
             update_output_cursors(self);
         }
 
+        // DnD icon surface (or one of its subsurfaces). The icon isn't a
+        // layout window or layer surface, so the placement-driven
+        // `queue_redraw_for_surface` at the bottom can't resolve it to an
+        // output — queue the repaint here, on the output under the pointer
+        // (the only place the render walk draws it). A commit on the icon
+        // surface itself may also carry a wl_surface.offset delta that
+        // moves the icon relative to the cursor; accumulate it. Mirrors
+        // niri handlers/compositor.rs:438.
+        {
+            let mut icon_root = surface.clone();
+            while let Some(parent) = get_parent(&icon_root) {
+                icon_root = parent;
+            }
+            if matches!(&self.dnd_icon, Some(icon) if icon.surface == icon_root) {
+                let icon = self.dnd_icon.as_mut().unwrap();
+                if surface == &icon.surface {
+                    with_states(surface, |states| {
+                        let buffer_delta = states
+                            .cached_state
+                            .get::<smithay::wayland::compositor::SurfaceAttributes>()
+                            .current()
+                            .buffer_delta
+                            .take()
+                            .unwrap_or_default();
+                        icon.offset += buffer_delta;
+                    });
+                }
+                if let Some(id) =
+                    self.output_containing((self.pointer_pos.x as i32, self.pointer_pos.y as i32))
+                {
+                    self.output_redraw.entry(id).or_default().queue_redraw();
+                }
+            }
+        }
+
         // xdg-shell toplevel lifecycle. A toplevel lives in
         // `unmapped_windows` from `new_toplevel` until its first buffer
         // commit. The first (buffer-less) commit triggers the initial
@@ -4196,11 +4231,24 @@ fn consumer_gpus_for_surface(state: &PrismState, surface: &WlSurface) -> Vec<Drm
     // the popup's texture on re-commit (so menu hover/press frames never
     // update). Follow the xdg_popup parent chain to the real root and resolve
     // that, mirroring `queue_redraw_for_surface`.
-    let output_name = resolve(state, &root).or_else(|| {
-        let popup = state.popups.find_popup(&root)?;
-        let popup_root = find_popup_root_surface(&popup).ok()?;
-        resolve(state, &popup_root)
-    });
+    let output_name = resolve(state, &root)
+        .or_else(|| {
+            let popup = state.popups.find_popup(&root)?;
+            let popup_root = find_popup_root_surface(&popup).ok()?;
+            resolve(state, &popup_root)
+        })
+        // The DnD icon isn't a layout window or layer surface — it rides
+        // the pointer, so its pixels are consumed by the GPU driving the
+        // output under the pointer. Without this, same-buffer shm damage
+        // on an animated icon never re-uploads (refresh_shm_uploads only
+        // writes to consumer GPUs).
+        .or_else(|| {
+            let icon = state.dnd_icon.as_ref()?;
+            if icon.surface != root {
+                return None;
+            }
+            state.output_containing((state.pointer_pos.x as i32, state.pointer_pos.y as i32))
+        });
     let Some(name) = output_name else {
         return Vec::new();
     };

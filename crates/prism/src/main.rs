@@ -2853,6 +2853,31 @@ fn render_output_now(
     // frame is caught + retried exactly like a window.
     push_layers(&[Layer::Top, Layer::Overlay], &mut render_els);
 
+    // DnD drag icon: topmost, riding the cursor position, drawn only on
+    // the output under the pointer (niri renders it alongside the pointer
+    // sprite, niri.rs:3752 — prism's cursor is on a HW plane, so the icon
+    // composites alone). `offset` accumulates the icon's wl_surface.offset
+    // deltas from commits. Not a layout window — if its texture hasn't
+    // materialized on this GPU yet, the demand pass below catches it.
+    if let Some(icon) = state.dnd_icon.as_ref() {
+        let under =
+            state.output_containing((state.pointer_pos.x as i32, state.pointer_pos.y as i32));
+        if under.as_deref() == Some(output_id) {
+            let origin = smithay_output.current_location();
+            let pos = smithay::utils::Point::<f64, smithay::utils::Logical>::from((
+                state.pointer_pos.x - origin.x as f64 + icon.offset.x as f64,
+                state.pointer_pos.y - origin.y as f64 + icon.offset.y as f64,
+            ));
+            prism_layout::layout::element::push_surface_tree_elements(
+                &icon.surface,
+                pos,
+                1.0,
+                &ctx,
+                &mut render_els,
+            );
+        }
+    }
+
     // Render-demand safety net: materialize any surfaces the walk drew on
     // this output but had no texture for its GPU (spanning windows,
     // surfaces committed before placement, layer surfaces). They render
@@ -3208,6 +3233,18 @@ fn send_frame_callbacks(
                 None,
                 &mut should_send,
             );
+        }
+    }
+
+    // DnD drag icon: not a layout window or layer surface — drive its
+    // frame callbacks from the output under the pointer, where the render
+    // walk draws it (niri.rs:4768). Starving it stalls GTK's icon
+    // animation throttling during the drag.
+    if let Some(icon_surface) = state.dnd_icon.as_ref().map(|i| &i.surface) {
+        let under =
+            state.output_containing((state.pointer_pos.x as i32, state.pointer_pos.y as i32));
+        if under.as_deref() == Some(output_id) {
+            send_frames_surface_tree(icon_surface, &smithay_output, time, None, &mut should_send);
         }
     }
 }

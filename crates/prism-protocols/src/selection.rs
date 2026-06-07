@@ -32,18 +32,21 @@
 //! `wl_data_device.start_drag`, [`WaylandDndGrabHandler::dnd_requested`]
 //! fires, we stash the icon surface for the render path, and
 //! construct + install a pointer (or touch) grab that drives
-//! enter/leave/motion/drop events to potential drop targets. When
-//! the grab ends, [`DndGrabHandler::dropped`] or `cancelled` clears
-//! the icon and queues a redraw.
+//! enter/leave/motion/drop events to potential drop targets. While the
+//! grab is live, the render walk draws the icon surface at the cursor
+//! position on the output under the pointer (`render_output_now`), the
+//! commit handler accumulates the icon's `wl_surface.offset` deltas and
+//! queues repaints, and `send_frame_callbacks` keeps the icon's frame
+//! callbacks fed. When the grab ends, [`DndGrabHandler::dropped`]
+//! activates the drop-target window (or the output under the drop) and
+//! clears the icon; `cancelled` just clears.
 //!
 //! ## Deferred — see TODO comments for details
 //!
-//!   - **DnD icon rendering.** We *store* the icon surface in
-//!     [`PrismState::dnd_icon`] but the render path doesn't draw it
-//!     yet. Drag operations work functionally; the cursor just has no
-//!     visual drag preview attached. Wiring needs render-path access
-//!     to (a) the icon's WlSurface texture, (b) the current cursor
-//!     position, (c) per-frame redraw on cursor motion.
+//!   - **Icon `wl_surface.enter`/`leave`.** The icon surface is never
+//!     sent output enter/leave, so fractional-scale clients can't pick
+//!     a preferred scale for it (niri dispatches these from its
+//!     render-walk visibility tracking).
 //!   - **wlr_data_control / ext_data_control.** Clipboard *manager*
 //!     protocols used by tools like `cliphist`, `wl-paste --watch`,
 //!     and `clipman`. The core clipboard works without them; add when
@@ -87,18 +90,18 @@ use crate::state::PrismState;
 /// [`PrismState::dnd_icon`] from [`WaylandDndGrabHandler::dnd_requested`]
 /// (drag start) until [`DndGrabHandler::dropped`] or `cancelled`.
 ///
-/// Currently unread by the render path — see the module-level TODO.
-/// When wired, the icon surface should be drawn at
-/// `cursor_position + offset` on top of the cursor sprite.
+/// The render walk draws the icon surface tree at
+/// `pointer_pos + offset`, topmost, on the output under the pointer.
 #[derive(Debug)]
 pub struct DndIcon {
     /// The wl_surface the client wants drawn under the cursor while
     /// the drag is active. May have its own subsurfaces and damage
     /// events like any other surface.
     pub surface: WlSurface,
-    /// Hot-spot offset relative to the cursor position. Today this
-    /// is always zero — wl_data_device's start_drag doesn't carry
-    /// an explicit offset and we don't yet apply any.
+    /// Offset of the icon's buffer top-left relative to the cursor
+    /// position. Starts at zero and accumulates the dnd_icon role's
+    /// `wl_surface.offset` deltas as the client commits (the commit
+    /// handler in `state.rs` applies them), matching niri.
     pub offset: Point<i32, Logical>,
 }
 
@@ -161,6 +164,7 @@ impl WaylandDndGrabHandler for PrismState {
             surface,
             offset: Point::from((0, 0)),
         });
+        let icon_present = self.dnd_icon.is_some();
 
         // The seat is guaranteed to have the corresponding device — smithay
         // validates this before reaching the handler.
@@ -187,10 +191,17 @@ impl WaylandDndGrabHandler for PrismState {
             }
         }
 
-        // TODO: per-frame redraw while dragging. Today the cursor
-        // doesn't move with the drag from the compositor's POV
-        // because we don't render the icon, so this is a no-op
-        // worth doing as part of the icon-rendering follow-up.
+        // Show the icon right away — if it committed its buffer before
+        // start_drag, no commit will queue the repaint for us. After
+        // this, redraws are sustained by pointer motion
+        // (`maybe_dnd_update`) and by icon commits (the dnd-icon branch
+        // in the commit handler), whichever happens.
+        if icon_present {
+            let ids: Vec<_> = self.outputs.keys().cloned().collect();
+            for id in ids {
+                self.output_redraw.entry(id).or_default().queue_redraw();
+            }
+        }
     }
 }
 
