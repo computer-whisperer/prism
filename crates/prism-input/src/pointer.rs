@@ -32,6 +32,11 @@ pub fn on_pointer_motion<I: PrismInputBackend>(
     state: &mut PrismState,
     event: I::PointerMotionEvent,
 ) {
+    // Any early return below means the pointer is not inside the hot
+    // corner (niri does the same reset-first dance).
+    let was_inside_hot_corner = state.pointer_inside_hot_corner;
+    state.pointer_inside_hot_corner = false;
+
     let serial = SERIAL_COUNTER.next_serial();
     let time = smithay::backend::input::Event::time_msec(&event);
 
@@ -157,6 +162,7 @@ pub fn on_pointer_motion<I: PrismInputBackend>(
     );
     pointer.frame(state);
     maybe_focus_follows_mouse(state);
+    maybe_trigger_hot_corner(state, was_inside_hot_corner);
     // Walk the cursor plane on every output: show on the output the
     // pointer is in, hide on the rest, queue redraws on changes.
     prism_protocols::state::update_output_cursors(state);
@@ -168,6 +174,10 @@ pub fn on_pointer_motion_absolute<I: PrismInputBackend>(
     state: &mut PrismState,
     event: I::PointerMotionAbsoluteEvent,
 ) {
+    // See on_pointer_motion: reset-first, edge-triggered.
+    let was_inside_hot_corner = state.pointer_inside_hot_corner;
+    state.pointer_inside_hot_corner = false;
+
     let serial = SERIAL_COUNTER.next_serial();
     let time = smithay::backend::input::Event::time_msec(&event);
 
@@ -200,6 +210,7 @@ pub fn on_pointer_motion_absolute<I: PrismInputBackend>(
     );
     pointer.frame(state);
     maybe_focus_follows_mouse(state);
+    maybe_trigger_hot_corner(state, was_inside_hot_corner);
     prism_protocols::state::update_output_cursors(state);
     // Absolute motion doesn't enforce locks (no meaningful raw delta), but it
     // can still settle focus onto a surface that wants to activate a
@@ -668,6 +679,41 @@ fn overview_finger_scroll<I: PrismInputBackend>(
         }
     }
     false
+}
+
+/// Hot-corner trigger, run after a motion event delivered its focus.
+/// Toggles the overview when the pointer *enters* a configured hot
+/// corner (edge-triggered via `pointer_inside_hot_corner`, which the
+/// caller captured-and-reset at the top of the handler).
+///
+/// Conditions, mirroring niri (input/mod.rs:2628):
+///   - the corner pixel must not be focus-owned (`contents_under`
+///     makes it dead, so normally focus is None there; an implicit
+///     click grab keeps focus on its window, correctly blocking the
+///     trigger mid-click);
+///   - an active grab must allow it — resize is blocklisted; the move
+///     grab is allowed so dragging a window into the corner opens the
+///     overview; DnD likewise (drag across workspaces).
+fn maybe_trigger_hot_corner(state: &mut PrismState, was_inside: bool) {
+    let Some(pointer) = state.seat.get_pointer() else {
+        return;
+    };
+    let Some((out, pos_within_output)) = output_under_pointer(state) else {
+        return;
+    };
+    if !state.is_inside_hot_corner(&out, pos_within_output) || pointer.current_focus().is_some() {
+        return;
+    }
+
+    if !was_inside
+        && pointer
+            .with_grab(|_, grab| !grab.as_any().is::<crate::ResizeGrab>())
+            .unwrap_or(true)
+    {
+        state.layout.toggle_overview();
+        crate::move_grab::queue_redraw_all(state);
+    }
+    state.pointer_inside_hot_corner = true;
 }
 
 /// The output under the pointer, and the pointer position within it

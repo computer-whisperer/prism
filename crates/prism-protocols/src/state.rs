@@ -528,6 +528,10 @@ pub struct PrismState {
     /// workspace-switch / view-offset gestures continuously — libinput
     /// only reports swipe gestures for 3+ fingers.
     pub overview_scroll_swipe_gesture: prism_layout::input::ScrollSwipeGesture,
+    /// Whether the pointer was inside a hot corner on the last motion
+    /// event — the trigger is edge-sensitive (fires once on entry, not
+    /// continuously while parked in the corner).
+    pub pointer_inside_hot_corner: bool,
 
     /// The surface (and its global origin) last reported under the pointer,
     /// as resolved by [`PrismState::contents_under`]. Tracked so that focus
@@ -898,6 +902,7 @@ impl PrismState {
             overview_wheel_last_switch: None,
             gesture_swipe_3f_cumulative: None,
             overview_scroll_swipe_gesture: prism_layout::input::ScrollSwipeGesture::new(),
+            pointer_inside_hot_corner: false,
             pointer_contents: None,
             cursor_manager,
             cursor_texture_cache: CursorTextureCache::default(),

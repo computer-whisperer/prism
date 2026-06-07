@@ -2,11 +2,11 @@
 //! point in global logical space.
 //!
 //! Ported from niri's `Niri::contents_under` (src/niri.rs:3283), reduced to
-//! the subsystems prism has today: layout windows and `wlr_layer_shell`
-//! surfaces. niri additionally consults the session-lock surface, the
-//! exit-confirm / screenshot / window-MRU UIs, hot corners, and the overview;
-//! prism has none of those yet, so they're omitted (add them here, in render
-//! order, as they land).
+//! the subsystems prism has today: layout windows, `wlr_layer_shell`
+//! surfaces, and the hot corner. niri additionally consults the session-lock
+//! surface and the exit-confirm / screenshot / window-MRU UIs; prism has
+//! none of those yet, so they're omitted (add them here, in render order,
+//! as they land).
 //!
 //! The returned origin is in *global* logical coordinates — exactly the focus
 //! tuple smithay's `PointerHandle::motion` wants, so the deepest surface and
@@ -79,8 +79,20 @@ impl PrismState {
                 .map(|(surface, surface_pos)| (surface, surface_pos.to_f64() + win_pos))
         };
 
-        let within_output = self
-            .layer_under(&output_id, pos_within_output, Layer::Overlay)
+        let overlay = self.layer_under(&output_id, pos_within_output, Layer::Overlay);
+
+        // The hot-corner trigger pixel is dead to everything below the
+        // Overlay layer (niri checks it between Overlay and Top,
+        // niri.rs:3420): a bar anchored into the corner doesn't swallow
+        // the trigger, and clients never see hover or clicks there. The
+        // motion handlers re-check the geometry to do the actual toggle
+        // (prism returns a plain surface tuple, not niri's
+        // `PointContents` with a `hot_corner` flag).
+        if overlay.is_none() && self.is_inside_hot_corner(output, pos_within_output) {
+            return None;
+        }
+
+        let within_output = overlay
             .or_else(|| self.layer_under(&output_id, pos_within_output, Layer::Top))
             .or_else(|| {
                 self.layout
@@ -97,6 +109,64 @@ impl PrismState {
 
         // Lift the output-local origin into global space.
         Some((within_output.0, within_output.1 + output_loc))
+    }
+
+    /// Whether `pos_within_output` lies inside a configured hot corner of
+    /// `output` — a 1×1 logical pixel at each enabled corner. Per-output
+    /// `hot-corners` config overrides the global `gestures` section; when
+    /// the user set no corner explicitly, top-left is the default. Ported
+    /// from niri's `is_inside_hot_corner` (niri.rs:3057).
+    pub fn is_inside_hot_corner(
+        &self,
+        output: &smithay::output::Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> bool {
+        let config = self.config.borrow();
+        let hot_corners = output
+            .user_data()
+            .get::<prism_config::output::OutputName>()
+            .and_then(|name| config.outputs.find(name))
+            .and_then(|c| c.hot_corners)
+            .unwrap_or(config.gestures.hot_corners);
+
+        if hot_corners.off {
+            return false;
+        }
+
+        // Logical output size, same math as `output_containing` /
+        // the pointer clamp (physical mode / fractional scale, rounded)
+        // so the corner pixels are exactly reachable.
+        let Some(mode) = output.current_mode() else {
+            return false;
+        };
+        let scale = output.current_scale().fractional_scale().max(0.01);
+        let w = (mode.size.w as f64 / scale).round();
+        let h = (mode.size.h as f64 / scale).round();
+
+        let contains = |corner: Point<f64, Logical>| {
+            smithay::utils::Rectangle::new(corner, smithay::utils::Size::from((1., 1.)))
+                .contains(pos_within_output)
+        };
+
+        if hot_corners.top_right && contains(Point::from((w - 1., 0.))) {
+            return true;
+        }
+        if hot_corners.bottom_left && contains(Point::from((0., h - 1.))) {
+            return true;
+        }
+        if hot_corners.bottom_right && contains(Point::from((w - 1., h - 1.))) {
+            return true;
+        }
+
+        // If the user didn't explicitly set any corners, default to top-left.
+        if (hot_corners.top_left
+            || !(hot_corners.top_right || hot_corners.bottom_right || hot_corners.bottom_left))
+            && contains(Point::from((0., 0.)))
+        {
+            return true;
+        }
+
+        false
     }
 
     /// Activate the pointer constraint on the surface under the pointer, if
