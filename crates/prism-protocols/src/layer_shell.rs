@@ -157,37 +157,58 @@ impl PrismState {
     ///
     /// `None`-interactivity surfaces (bars, wallpapers) are never candidates,
     /// so they never steal the keyboard — even when clicked. Idempotent:
-    /// no-ops (no enter/leave round-trip) when the effective surface is
+    /// no-ops (no enter/leave round-trip) when the effective focus is
     /// unchanged, so it is cheap to call every frame.
+    ///
+    /// While the overview is open it takes priority over the layout's
+    /// window (keys drive the hardcoded overview binds, not the focused
+    /// window) and over `OnDemand` Bottom/Background layer surfaces;
+    /// `Exclusive` surfaces and Top/Overlay `OnDemand` focus stay above
+    /// it, mirroring niri's priority order (niri.rs:1210-1240).
     pub fn update_keyboard_focus(&mut self) {
-        let target = self
-            .exclusive_layer_focus()
-            .or_else(|| self.active_on_demand_layer_focus())
-            .or_else(|| {
-                self.layout
+        let overview_open = self.layout.is_overview_open();
+
+        let layer_target = self.exclusive_layer_focus().or_else(|| {
+            self.active_on_demand_layer_focus().filter(|s| {
+                !overview_open
+                    || self
+                        .layer_surface_for(s)
+                        .is_some_and(|ls| matches!(ls.layer(), Layer::Top | Layer::Overlay))
+            })
+        });
+
+        let new_focus = if let Some(surface) = layer_target {
+            KeyboardFocus::LayerShell { surface }
+        } else if overview_open {
+            KeyboardFocus::Overview
+        } else {
+            KeyboardFocus::Layout {
+                surface: self
+                    .layout
                     .focus()
                     .map(|win| win.toplevel().wl_surface().clone())
-                    .filter(IsAlive::alive)
-            });
+                    .filter(IsAlive::alive),
+            }
+        };
 
-        let same = match (self.keyboard_focus.surface(), &target) {
-            (Some(a), Some(b)) => a.id() == b.id(),
-            (None, None) => true,
-            _ => false,
+        // Same effective focus → no-op. Overview compares by variant: it
+        // has no surface, but so does an empty Layout focus, and the two
+        // route keys differently.
+        let same = if self.keyboard_focus.is_overview() || new_focus.is_overview() {
+            self.keyboard_focus.is_overview() == new_focus.is_overview()
+        } else {
+            match (self.keyboard_focus.surface(), new_focus.surface()) {
+                (Some(a), Some(b)) => a.id() == b.id(),
+                (None, None) => true,
+                _ => false,
+            }
         };
         if same {
             return;
         }
 
-        let from_layer = target
-            .as_ref()
-            .is_some_and(|s| self.layer_surface_for(s).is_some());
-        self.keyboard_focus = match (&target, from_layer) {
-            (Some(s), true) => KeyboardFocus::LayerShell { surface: s.clone() },
-            _ => KeyboardFocus::Layout {
-                surface: target.clone(),
-            },
-        };
+        let target = new_focus.surface().cloned();
+        self.keyboard_focus = new_focus;
 
         if let Some(kb) = self.seat.get_keyboard() {
             let serial = SERIAL_COUNTER.next_serial();

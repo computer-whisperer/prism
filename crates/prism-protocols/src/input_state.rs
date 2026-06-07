@@ -32,11 +32,14 @@ pub enum KeyboardFocus {
     /// clicked an `OnDemand` surface. `surface` is the layer surface's
     /// role wl_surface.
     LayerShell { surface: WlSurface },
+    /// The overview owns focus: no client surface receives keys; the
+    /// input path routes unmodified Esc/Return/arrows to the hardcoded
+    /// overview binds (niri's `hardcoded_overview_bind`).
+    Overview,
     // Variants to re-add as the corresponding subsystems land:
     //   LockScreen { surface: Option<WlSurface> } — ext-session-lock
     //   ScreenshotUi                            — niri-style overlay
     //   ExitConfirmDialog                       — niri-style overlay
-    //   Overview                                — niri-style overlay
     //   Mru                                     — alt-tab style switcher
 }
 
@@ -51,6 +54,7 @@ impl KeyboardFocus {
         match self {
             KeyboardFocus::Layout { surface } => surface.as_ref(),
             KeyboardFocus::LayerShell { surface } => Some(surface),
+            KeyboardFocus::Overview => None,
         }
     }
 
@@ -58,6 +62,7 @@ impl KeyboardFocus {
         match self {
             KeyboardFocus::Layout { surface } => surface,
             KeyboardFocus::LayerShell { surface } => Some(surface),
+            KeyboardFocus::Overview => None,
         }
     }
 
@@ -67,6 +72,10 @@ impl KeyboardFocus {
 
     pub fn is_layer_shell(&self) -> bool {
         matches!(self, KeyboardFocus::LayerShell { .. })
+    }
+
+    pub fn is_overview(&self) -> bool {
+        matches!(self, KeyboardFocus::Overview)
     }
 }
 

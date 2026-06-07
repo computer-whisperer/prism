@@ -235,7 +235,20 @@ fn on_keyboard<I: PrismInputBackend>(state: &mut PrismState, event: I::KeyboardK
                     this.suppressed_keys.insert(key_code);
                     FilterResult::Intercept(Some(bind))
                 }
-                None => FilterResult::Forward,
+                None => {
+                    // No configured bind: while the overview owns the
+                    // keyboard, unmodified Esc/Return/arrows drive it
+                    // (niri's `hardcoded_overview_bind`). Unmatched keys
+                    // still Forward, but land on the overview's None
+                    // focus — no client surface receives them.
+                    if this.keyboard_focus.is_overview() {
+                        if let Some(bind) = hardcoded_overview_bind(raw, *mods) {
+                            this.suppressed_keys.insert(key_code);
+                            return FilterResult::Intercept(Some(bind));
+                        }
+                    }
+                    FilterResult::Forward
+                }
             }
         },
     );
@@ -252,6 +265,49 @@ fn on_keyboard<I: PrismInputBackend>(state: &mut PrismState, event: I::KeyboardK
     if pressed {
         state.hide_pointer_for_typing();
     }
+}
+
+/// Hardcoded keys while the overview owns the keyboard (niri
+/// input/mod.rs `hardcoded_overview_bind`): unmodified Esc/Return
+/// close it, arrows navigate columns / windows / workspaces. Only
+/// consulted after the user's bind table found no match, so a
+/// configured bind still wins.
+fn hardcoded_overview_bind(
+    raw: smithay::input::keyboard::Keysym,
+    mods: ModifiersState,
+) -> Option<Bind> {
+    use prism_config::{Action, Key};
+    use smithay::input::keyboard::Keysym;
+
+    if !modifiers_from_state(mods).is_empty() {
+        return None;
+    }
+
+    let mut repeat = true;
+    let action = match raw {
+        Keysym::Escape | Keysym::Return => {
+            repeat = false;
+            Action::ToggleOverview
+        }
+        Keysym::Left => Action::FocusColumnLeft,
+        Keysym::Right => Action::FocusColumnRight,
+        Keysym::Up => Action::FocusWindowOrWorkspaceUp,
+        Keysym::Down => Action::FocusWindowOrWorkspaceDown,
+        _ => return None,
+    };
+
+    Some(Bind {
+        key: Key {
+            trigger: Trigger::Keysym(raw),
+            modifiers: Modifiers::empty(),
+        },
+        action,
+        repeat,
+        cooldown: None,
+        allow_when_locked: false,
+        allow_inhibiting: false,
+        hotkey_overlay_title: None,
+    })
 }
 
 /// Convert smithay's `ModifiersState` (bool fields) into the
