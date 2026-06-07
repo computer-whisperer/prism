@@ -61,14 +61,19 @@ thiserror = "2.0"
 tracing = { version = "0.1.44", features = ["max_level_trace", "release_max_level_debug"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-# smithay: tracking upstream master (ahead of niri's pin). The Dispatch2/
-# GlobalDispatch2 rework (0d14cd65) replaced every `delegate_*!` macro with a
-# single `delegate_dispatch2!`, and `PointerConstraintsHandler` gained
-# `remove_constraint` (df73da71); prism is adapted for both. Migrate to
-# crates.io once a release catches up to what we use.
+# smithay: the computer-whisperer/smithay fork, branch
+# prism/dnd-no-data-device-cancel = upstream master (85f83ab6) + one carried
+# fix (a drop on a client with no wl_data_device must cancel the drag, not
+# report dnd_drop_performed — frozen Firefox tab tear-off over prism-bg; still
+# unfixed on master). Pointing the git dep straight at the fork instead of a
+# local `[patch]` path keeps the build reproducible off-machine. Repoint to
+# upstream/crates.io once the fix lands. Tracking master also means prism is
+# adapted for the Dispatch2/GlobalDispatch2 rework (0d14cd65, one
+# `delegate_dispatch2!`) and `PointerConstraintsHandler::remove_constraint`
+# (df73da71).
 [workspace.dependencies.smithay]
-git = "https://github.com/Smithay/smithay.git"
-rev = "85f83ab6"
+git = "https://github.com/computer-whisperer/smithay.git"
+rev = "1cf70502"
 default-features = false
 features = [
     "backend_drm",
@@ -81,8 +86,8 @@ features = [
 ]
 
 [workspace.dependencies.smithay-drm-extras]
-git = "https://github.com/Smithay/smithay.git"
-rev = "85f83ab6"
+git = "https://github.com/computer-whisperer/smithay.git"
+rev = "1cf70502"
 
 [profile.dev]
 opt-level = 1
@@ -94,13 +99,3 @@ opt-level = 3
 [profile.release]
 debug = "limited"
 lto = "thin"
-
-# Carry a local smithay fix on top of upstream master: drops onto clients
-# that never bound wl_data_device must cancel the drag, not report
-# dnd_drop_performed (frozen Firefox tab tear-off over prism-bg; upstream
-# smithay bug, present through at least 2026-06 master). The worktree is a
-# one-commit branch (prism/dnd-no-data-device-cancel) rebased onto the
-# pinned master rev in the computer-whisperer/smithay fork.
-# Drop this section when the fix lands upstream.
-[patch."https://github.com/Smithay/smithay.git"]
-smithay = { path = "../../compositor/smithay-prism-pin" }
