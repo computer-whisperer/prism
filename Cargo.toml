@@ -91,3 +91,13 @@ opt-level = 3
 [profile.release]
 debug = "limited"
 lto = "thin"
+
+# Carry a local smithay fix on top of the niri-aligned pin: drops onto
+# clients that never bound wl_data_device must cancel the drag, not
+# report dnd_drop_performed (frozen Firefox tab tear-off over prism-bg;
+# upstream smithay bug, present through at least 2026-06 master). The
+# worktree is a one-commit branch (prism/dnd-no-data-device-cancel) on
+# top of the exact pinned rev in the computer-whisperer/smithay fork.
+# Drop this section when the fix lands upstream and niri re-pins.
+[patch."https://github.com/Smithay/smithay.git"]
+smithay = { path = "../../compositor/smithay-prism-pin" }
