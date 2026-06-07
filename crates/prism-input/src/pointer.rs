@@ -252,6 +252,23 @@ pub fn on_pointer_button<I: PrismInputBackend>(
             }
         }
 
+        // Overview: plain LeftClick interacts with the zoomed cards
+        // (niri input/mod.rs overview branches). On a window it starts
+        // the move grab — a click (release before the layout's move
+        // threshold) then activates the window and zooms to its
+        // workspace, handled in `MoveGrab::end`; a drag interactively
+        // moves it. On a workspace card's background it zooms straight
+        // to that workspace. RMB/MMB spatial-movement grabs need niri's
+        // `SpatialMovementGrab`, which prism doesn't carry yet.
+        if state.layout.is_overview_open()
+            && button == BTN_LEFT
+            && overview_lmb_press(state, serial)
+        {
+            // Press consumed by the grab; the release is delivered by
+            // the grab's own button handler when it unsets.
+            return;
+        }
+
         // Mod+LeftClick / Mod+RightClick on a window installs an
         // interactive grab — move / resize respectively. Mirrors
         // niri's `on_pointer_button` triggers (input/mod.rs:2895+).
@@ -279,6 +296,68 @@ pub fn on_pointer_button<I: PrismInputBackend>(
 /// Match niri's hardcoded constants in `input/mod.rs::on_pointer_button`.
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+
+/// Handle an unmodified LeftClick press while the overview is open.
+/// On a window (the zoom-aware `window_under` resolves hits on the
+/// scaled cards): start the move grab — `MoveGrab::end` turns a click
+/// into activate-and-zoom-to-workspace. On a workspace card's
+/// background (narrow bounds — clicks in the gaps/backdrop do
+/// nothing): zoom to that workspace. Returns `true` if a grab consumed
+/// the press.
+fn overview_lmb_press(state: &mut PrismState, serial: smithay::utils::Serial) -> bool {
+    use smithay::input::pointer::Focus;
+
+    let px = state.pointer_pos.x as i32;
+    let py = state.pointer_pos.y as i32;
+    let Some(output_id) = state.output_containing((px, py)) else {
+        return false;
+    };
+    let Some(out) = state.wl_outputs.get(&output_id).cloned() else {
+        return false;
+    };
+    let origin = out.current_location();
+    let pos_within_output = Point::<f64, Logical>::from((
+        state.pointer_pos.x - origin.x as f64,
+        state.pointer_pos.y - origin.y as f64,
+    ));
+
+    if let Some((mapped, _hit)) = state.layout.window_under(&out, pos_within_output) {
+        let window = mapped.window.clone();
+        let Some(pointer) = state.seat.get_pointer() else {
+            return false;
+        };
+        let start_data = smithay::input::pointer::GrabStartData {
+            focus: None,
+            button: BTN_LEFT,
+            location: state.pointer_pos,
+        };
+        let Some(grab) = crate::MoveGrab::new(state, start_data, window, pos_within_output, out)
+        else {
+            return false;
+        };
+        pointer.set_grab(state, grab, serial, Focus::Clear);
+        // niri deliberately keeps the normal cursor here: in the
+        // overview a press is usually a click-to-activate, and
+        // flashing a grab cursor would be distracting.
+        return true;
+    }
+
+    // No window: a click on a workspace card's background switches to
+    // it and closes the overview (niri input/mod.rs:3002).
+    let ws_id = state
+        .layout
+        .monitor_for_output(&out)
+        .and_then(|mon| mon.workspace_under_narrow(pos_within_output))
+        .map(|ws| ws.id());
+    if let Some(ws_id) = ws_id {
+        if let Some((ws_idx, _)) = state.layout.find_workspace_by_id(ws_id) {
+            state.layout.focus_output(&out);
+            state.layout.toggle_overview_to_workspace(ws_idx);
+            crate::move_grab::queue_redraw_all(state);
+        }
+    }
+    false
+}
 
 /// Try to start an interactive move (Mod+LeftClick) or resize
 /// (Mod+RightClick) grab. Returns `true` if a grab was installed (in
@@ -372,6 +451,21 @@ pub fn on_pointer_axis<I: PrismInputBackend>(state: &mut PrismState, event: I::P
     let time = smithay::backend::input::Event::time_msec(&event);
 
     let source = event.source();
+
+    // Overview hardcoded wheel bindings: unmodified wheel up/down
+    // switches workspaces, left/right moves column focus, instead of
+    // scrolling clients (niri input/mod.rs:3115+ synthesizes
+    // `*UnderMouse` binds for this; prism dispatches the active-monitor
+    // actions — identical on a single monitor, and prism's multi-
+    // monitor focus tracking isn't wired yet anyway). Scrolls consumed
+    // here never reach Wayland clients.
+    if source == AxisSource::Wheel
+        && state.layout.is_overview_open()
+        && overview_wheel_scroll::<I>(state, &event)
+    {
+        return;
+    }
+
     let mut frame = AxisFrame::new(time).source(source);
 
     for axis in [Axis::Horizontal, Axis::Vertical] {
@@ -397,6 +491,97 @@ pub fn on_pointer_axis<I: PrismInputBackend>(state: &mut PrismState, event: I::P
 
     pointer.axis(state, frame);
     pointer.frame(state);
+}
+
+/// Handle a wheel-source axis event while the overview is open.
+/// Returns `true` when the event was consumed (any unmodified wheel
+/// scroll — even sub-tick amounts accumulate silently rather than
+/// reaching clients, matching niri). Modified scrolls, and scrolls
+/// over a Top/Overlay layer surface (a bar's volume scroll keeps
+/// working in the overview), pass through untouched.
+fn overview_wheel_scroll<I: PrismInputBackend>(
+    state: &mut PrismState,
+    event: &I::PointerAxisEvent,
+) -> bool {
+    use prism_config::Action;
+
+    // Unmodified wheel and Shift+wheel are the overview bindings;
+    // anything else passes through.
+    let Some(keyboard) = state.seat.get_keyboard() else {
+        return false;
+    };
+    let mods = crate::dispatch::modifiers_from_state(keyboard.modifier_state());
+    let shift = mods == prism_config::Modifiers::SHIFT;
+    if !mods.is_empty() && !shift {
+        return false;
+    }
+
+    // Scrolling a Top/Overlay layer surface (bar, launcher) keeps its
+    // normal meaning (niri's `should_handle_in_overview` gate).
+    if let Some((surface, _)) = &state.pointer_contents {
+        use smithay::wayland::shell::wlr_layer::Layer;
+        for out in state.wl_outputs.values() {
+            let map = smithay::desktop::layer_map_for_output(out);
+            if let Some(ls) =
+                map.layer_for_surface(surface, smithay::desktop::WindowSurfaceType::ALL)
+            {
+                if matches!(ls.layer(), Layer::Top | Layer::Overlay) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Vertical, unmodified: workspace switch, with niri's 50ms
+    // cooldown so one flick doesn't skip several workspaces.
+    // Vertical, Shift: column focus (niri's wheel-only-mouse
+    // affordance for horizontal movement).
+    let vertical = event.amount_v120(Axis::Vertical).unwrap_or(0.);
+    let ticks = state.overview_wheel_tracker_v.accumulate(vertical);
+    if ticks != 0 {
+        if shift {
+            let action = if ticks > 0 {
+                Action::FocusColumnRight
+            } else {
+                Action::FocusColumnLeft
+            };
+            for _ in 0..ticks.unsigned_abs() {
+                crate::actions::handle_action(state, action.clone());
+            }
+        } else {
+            let now = std::time::Instant::now();
+            let cooled = state.overview_wheel_last_switch.is_none_or(|last| {
+                now.duration_since(last) >= std::time::Duration::from_millis(50)
+            });
+            if cooled {
+                // One workspace per event regardless of tick count —
+                // the cooldown would swallow the extras anyway.
+                let action = if ticks > 0 {
+                    Action::FocusWorkspaceDown
+                } else {
+                    Action::FocusWorkspaceUp
+                };
+                crate::actions::handle_action(state, action);
+                state.overview_wheel_last_switch = Some(now);
+            }
+        }
+    }
+
+    // Horizontal: column focus (no cooldown, matching niri).
+    let horizontal = event.amount_v120(Axis::Horizontal).unwrap_or(0.);
+    let ticks = state.overview_wheel_tracker_h.accumulate(horizontal);
+    if ticks != 0 {
+        let action = if ticks > 0 {
+            Action::FocusColumnRight
+        } else {
+            Action::FocusColumnLeft
+        };
+        for _ in 0..ticks.unsigned_abs() {
+            crate::actions::handle_action(state, action.clone());
+        }
+    }
+
+    true
 }
 
 // ─── helpers ─────────────────────────────────────────────────────

@@ -2,9 +2,18 @@
 //!
 //! Cut-down port of niri's `input/move_grab.rs`. Drops the view-offset
 //! gesture (drag horizontally to scroll the workspace instead of moving
-//! the window), the overview integration, the floating toggle on the
-//! opposite mouse button, and the touch case. Those layer on top of
-//! the basic move once their backing subsystems land.
+//! the window), the floating toggle on the opposite mouse button, and
+//! the touch case. Those layer on top of the basic move once their
+//! backing subsystems land.
+//!
+//! Overview integration: niri's grab tracks a `GestureState` whose
+//! `Recognizing` stage (release before an 8px threshold = a click)
+//! activates the window and zooms to its workspace. Prism's grab
+//! begins the layout move on construction instead (entering the
+//! layout's `Starting` stage immediately), but keeps niri's 8px
+//! grab-side gate in `update()` — motion below it never reaches the
+//! layout, so on release `Layout::interactive_move_is_starting`
+//! answers the click-vs-drag question (see `end()`).
 //!
 //! What this *does* do:
 //!   - Installs a smithay `PointerGrab` for the duration of the drag,
@@ -36,6 +45,15 @@ pub struct MoveGrab {
     // even after the layout has stopped tracking the window (e.g.
     // window destroyed mid-drag).
     last_pointer: Point<f64, Logical>,
+    /// Whether the pointer has travelled past the 8px recognizing
+    /// threshold since the press (niri's `GestureState::Recognizing` →
+    /// `Move` gate). Until then, motion is withheld from the layout so
+    /// a click with sub-threshold jitter stays in `Starting` — the
+    /// layout's own promotion threshold only covers tiled windows
+    /// (floating ones promote on the first update), so the grab-side
+    /// gate is what keeps click-to-activate working on floating
+    /// windows in the overview.
+    recognized: bool,
 }
 
 impl MoveGrab {
@@ -60,11 +78,33 @@ impl MoveGrab {
             last_pointer: start_data.location,
             start_data,
             window,
+            recognized: false,
         })
     }
 
     fn end(&mut self, state: &mut PrismState) {
+        // A *click* — release before the layout promoted the move out
+        // of `Starting` — in the overview activates the clicked window
+        // and zooms to its workspace with a synchronized animation
+        // (niri move_grab.rs `on_ungrab`, `GestureState::Recognizing`).
+        let overview_click = state.layout.is_overview_open()
+            && state.layout.interactive_move_is_starting(&self.window);
+
         state.layout.interactive_move_end(&self.window);
+
+        if overview_click {
+            let res = state.layout.workspaces().find_map(|(mon, ws_idx, ws)| {
+                ws.windows()
+                    .any(|w| w.window == self.window)
+                    .then(|| (mon.map(|mon| mon.output().clone()), ws_idx))
+            });
+            if let Some((Some(output), ws_idx)) = res {
+                state.layout.focus_output(&output);
+                state.layout.toggle_overview_to_workspace(ws_idx);
+            }
+            state.layout.activate_window(&self.window);
+        }
+
         // Drag changed window placement; queue a full redraw so source
         // + destination outputs both repaint. Granular per-output
         // invalidation can replace this once we wire per-window-output
@@ -76,6 +116,21 @@ impl MoveGrab {
         if !self.window.alive() {
             return;
         }
+
+        // Recognizing gate: withhold motion from the layout until the
+        // pointer travels 8px from the press (niri move_grab.rs
+        // `on_frame`). Sub-threshold deltas are dropped, not
+        // accumulated — when the gate opens, the move starts from the
+        // window's rest position, same as niri.
+        if !self.recognized {
+            let c = location - self.start_data.location;
+            if c.x * c.x + c.y * c.y < 8. * 8. {
+                self.last_pointer = location;
+                return;
+            }
+            self.recognized = true;
+        }
+
         let delta = location - self.last_pointer;
         self.last_pointer = location;
 

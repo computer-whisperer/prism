@@ -507,6 +507,17 @@ pub struct PrismState {
     /// by hit-test and (later) cursor-plane setup. Starts at (0, 0).
     pub pointer_pos: smithay::utils::Point<f64, smithay::utils::Logical>,
 
+    /// Wheel-tick accumulators for the overview's hardcoded scroll
+    /// bindings (vertical = workspace switch, horizontal = column
+    /// focus) — the v120 → discrete-tick conversion niri's wheel
+    /// trackers do. Only consulted while the overview is open.
+    pub overview_wheel_tracker_v: prism_layout::input::ScrollTracker,
+    pub overview_wheel_tracker_h: prism_layout::input::ScrollTracker,
+    /// Last overview wheel workspace switch — niri puts a 50ms
+    /// cooldown on its synthesized workspace-switch bind so one flick
+    /// doesn't skip several workspaces.
+    pub overview_wheel_last_switch: Option<std::time::Instant>,
+
     /// The surface (and its global origin) last reported under the pointer,
     /// as resolved by [`PrismState::contents_under`]. Tracked so that focus
     /// can be re-evaluated after surface/layout changes (window moved,
@@ -862,6 +873,10 @@ impl PrismState {
             monitors_active: true,
             should_stop: false,
             pointer_pos: smithay::utils::Point::from((0.0, 0.0)),
+            // 120 = one wheel notch in v120 units.
+            overview_wheel_tracker_v: prism_layout::input::ScrollTracker::new(120),
+            overview_wheel_tracker_h: prism_layout::input::ScrollTracker::new(120),
+            overview_wheel_last_switch: None,
             pointer_contents: None,
             cursor_manager,
             cursor_texture_cache: CursorTextureCache::default(),

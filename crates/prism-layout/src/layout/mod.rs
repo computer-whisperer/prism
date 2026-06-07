@@ -3958,6 +3958,19 @@ impl<W: LayoutElement> Layout<W> {
         true
     }
 
+    /// Whether an interactive move for `window` is still in the
+    /// `Starting` stage — begun, but the pointer never crossed the
+    /// promotion threshold. On button release this distinguishes a
+    /// *click* from a drag: niri's `MoveGrab` tracks the same thing in
+    /// its `GestureState::Recognizing`, which prism's cut-down grab
+    /// doesn't carry — the layout state answers it instead.
+    pub fn interactive_move_is_starting(&self, window: &W::Id) -> bool {
+        matches!(
+            &self.interactive_move,
+            Some(InteractiveMoveState::Starting { window_id, .. }) if window_id == window
+        )
+    }
+
     pub fn interactive_move_end(&mut self, window: &W::Id) {
         let Some(move_) = &self.interactive_move else {
             return;
