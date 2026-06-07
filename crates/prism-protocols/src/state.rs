@@ -517,6 +517,17 @@ pub struct PrismState {
     /// cooldown on its synthesized workspace-switch bind so one flick
     /// doesn't skip several workspaces.
     pub overview_wheel_last_switch: Option<std::time::Instant>,
+    /// Accumulated (dx, dy) of an undecided 3-finger touchpad swipe.
+    /// `Some` from the swipe-begin until the 16px decision threshold
+    /// (GNOME Shell's), at which point the dominant axis picks the
+    /// workspace-switch (vertical) or view-offset (horizontal)
+    /// gesture and this resets to `None`.
+    pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
+    /// Begin/update/end edge detection for two-finger (axis
+    /// `Finger`-source) scrolling in the overview, which drives the
+    /// workspace-switch / view-offset gestures continuously — libinput
+    /// only reports swipe gestures for 3+ fingers.
+    pub overview_scroll_swipe_gesture: prism_layout::input::ScrollSwipeGesture,
 
     /// The surface (and its global origin) last reported under the pointer,
     /// as resolved by [`PrismState::contents_under`]. Tracked so that focus
@@ -798,6 +809,14 @@ impl PrismState {
         // Global kept alive by the display.
         let _pointer_constraints = PointerConstraintsState::new::<PrismState>(&dh);
 
+        // zwp_pointer_gestures_v1 — forwards touchpad swipe/pinch/hold
+        // gestures the compositor didn't consume (3/4-finger swipes drive
+        // workspace switching and the overview) to the focused client.
+        // Emission happens in prism-input's gesture handlers via the seat
+        // pointer's gesture_* methods. Global kept alive by the display.
+        let _pointer_gestures =
+            smithay::wayland::pointer_gestures::PointerGesturesState::new::<PrismState>(&dh);
+
         // wl_data_device_manager + wp_primary_selection_device_manager_v1.
         // GTK4 ≥ 4.22 hard-requires the former; without it every GTK
         // client refuses the wayland display. See crate::selection.
@@ -877,6 +896,8 @@ impl PrismState {
             overview_wheel_tracker_v: prism_layout::input::ScrollTracker::new(120),
             overview_wheel_tracker_h: prism_layout::input::ScrollTracker::new(120),
             overview_wheel_last_switch: None,
+            gesture_swipe_3f_cumulative: None,
+            overview_scroll_swipe_gesture: prism_layout::input::ScrollSwipeGesture::new(),
             pointer_contents: None,
             cursor_manager,
             cursor_texture_cache: CursorTextureCache::default(),
@@ -2239,6 +2260,7 @@ delegate_cursor_shape!(PrismState);
 // and the per-motion deltas are pushed from the input layer via
 // `PointerHandle::relative_motion`.
 delegate_relative_pointer!(PrismState);
+smithay::delegate_pointer_gestures!(PrismState);
 
 impl PointerConstraintsHandler for PrismState {
     fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {

@@ -307,19 +307,9 @@ const BTN_RIGHT: u32 = 0x111;
 fn overview_lmb_press(state: &mut PrismState, serial: smithay::utils::Serial) -> bool {
     use smithay::input::pointer::Focus;
 
-    let px = state.pointer_pos.x as i32;
-    let py = state.pointer_pos.y as i32;
-    let Some(output_id) = state.output_containing((px, py)) else {
+    let Some((out, pos_within_output)) = output_under_pointer(state) else {
         return false;
     };
-    let Some(out) = state.wl_outputs.get(&output_id).cloned() else {
-        return false;
-    };
-    let origin = out.current_location();
-    let pos_within_output = Point::<f64, Logical>::from((
-        state.pointer_pos.x - origin.x as f64,
-        state.pointer_pos.y - origin.y as f64,
-    ));
 
     if let Some((mapped, _hit)) = state.layout.window_under(&out, pos_within_output) {
         let window = mapped.window.clone();
@@ -389,19 +379,9 @@ fn try_begin_window_grab(
     }
 
     // Window + output + position-within-output under the cursor.
-    let px = state.pointer_pos.x as i32;
-    let py = state.pointer_pos.y as i32;
-    let Some(output_id) = state.output_containing((px, py)) else {
+    let Some((out, pos_within_output)) = output_under_pointer(state) else {
         return false;
     };
-    let Some(out) = state.wl_outputs.get(&output_id).cloned() else {
-        return false;
-    };
-    let origin = out.current_location();
-    let pos_within_output = Point::<f64, Logical>::from((
-        state.pointer_pos.x - origin.x as f64,
-        state.pointer_pos.y - origin.y as f64,
-    ));
     let Some((mapped, _hit)) = state.layout.window_under(&out, pos_within_output) else {
         return false;
     };
@@ -466,6 +446,18 @@ pub fn on_pointer_axis<I: PrismInputBackend>(state: &mut PrismState, event: I::P
         return;
     }
 
+    // Touchpad two-finger (and continuous-device) scroll in the
+    // overview drives the workspace-switch / view-offset gestures
+    // continuously instead of scrolling clients (niri
+    // input/mod.rs:3296). Outside the overview the helper winds down
+    // any gesture left over from an overview scroll and lets the
+    // event through.
+    if matches!(source, AxisSource::Finger | AxisSource::Continuous)
+        && overview_finger_scroll::<I>(state, &event)
+    {
+        return;
+    }
+
     let mut frame = AxisFrame::new(time).source(source);
 
     for axis in [Axis::Horizontal, Axis::Vertical] {
@@ -518,18 +510,8 @@ fn overview_wheel_scroll<I: PrismInputBackend>(
 
     // Scrolling a Top/Overlay layer surface (bar, launcher) keeps its
     // normal meaning (niri's `should_handle_in_overview` gate).
-    if let Some((surface, _)) = &state.pointer_contents {
-        use smithay::wayland::shell::wlr_layer::Layer;
-        for out in state.wl_outputs.values() {
-            let map = smithay::desktop::layer_map_for_output(out);
-            if let Some(ls) =
-                map.layer_for_surface(surface, smithay::desktop::WindowSurfaceType::ALL)
-            {
-                if matches!(ls.layer(), Layer::Top | Layer::Overlay) {
-                    return false;
-                }
-            }
-        }
+    if pointer_over_top_or_overlay_layer(state) {
+        return false;
     }
 
     // Vertical, unmodified: workspace switch, with niri's 50ms
@@ -582,6 +564,156 @@ fn overview_wheel_scroll<I: PrismInputBackend>(
     }
 
     true
+}
+
+/// Handle a Finger/Continuous-source axis event. Returns `true` when
+/// consumed: in the overview (unmodified, not over a bar) the scroll
+/// drives the workspace-switch (vertical) or view-offset (horizontal)
+/// gesture as a continuous swipe — `ScrollSwipeGesture` supplies the
+/// begin/update/end edges that wheel events don't have. When not
+/// handling, any gesture still ongoing from an overview scroll is
+/// wound down and the event passes to clients.
+fn overview_finger_scroll<I: PrismInputBackend>(
+    state: &mut PrismState,
+    event: &I::PointerAxisEvent,
+) -> bool {
+    let timestamp = std::time::Duration::from_micros(smithay::backend::input::Event::time(event));
+    let horizontal = event.amount(Axis::Horizontal).unwrap_or(0.);
+    let vertical = event.amount(Axis::Vertical).unwrap_or(0.);
+
+    let mods_empty = state
+        .seat
+        .get_keyboard()
+        .map(|kb| crate::dispatch::modifiers_from_state(kb.modifier_state()).is_empty())
+        .unwrap_or(false);
+
+    if state.layout.is_overview_open() && mods_empty && !pointer_over_top_or_overlay_layer(state) {
+        let action = state
+            .overview_scroll_swipe_gesture
+            .update(horizontal, vertical);
+        let is_vertical = state.overview_scroll_swipe_gesture.is_vertical();
+        let mut redraw = false;
+
+        if action.end() {
+            if is_vertical {
+                redraw |= state
+                    .layout
+                    .workspace_switch_gesture_end(Some(true))
+                    .is_some();
+            } else {
+                redraw |= state.layout.view_offset_gesture_end(Some(true)).is_some();
+            }
+        } else if is_vertical {
+            if action.begin() {
+                if let Some((out, _)) = output_under_pointer(state) {
+                    state.layout.workspace_switch_gesture_begin(&out, true);
+                    redraw = true;
+                }
+            }
+            if let Some(Some(_)) = state
+                .layout
+                .workspace_switch_gesture_update(vertical, timestamp, true)
+            {
+                redraw = true;
+            }
+        } else {
+            if action.begin() {
+                if let Some((out, pos_within_output)) = output_under_pointer(state) {
+                    // Extended (full-width) workspace bounds: a
+                    // horizontal scroll between cards still targets
+                    // the nearest one (niri workspace_under_cursor(true)).
+                    let ws_id = state
+                        .layout
+                        .monitor_for_output(&out)
+                        .and_then(|mon| mon.workspace_under(pos_within_output))
+                        .map(|(ws, _geo)| ws.id());
+                    if let Some(ws_id) = ws_id {
+                        if let Some((ws_idx, _)) = state.layout.find_workspace_by_id(ws_id) {
+                            state
+                                .layout
+                                .view_offset_gesture_begin(&out, Some(ws_idx), true);
+                            redraw = true;
+                        }
+                    }
+                }
+            }
+            if let Some(Some(_)) = state
+                .layout
+                .view_offset_gesture_update(horizontal, timestamp, true)
+            {
+                redraw = true;
+            }
+        }
+
+        if redraw {
+            crate::move_grab::queue_redraw_all(state);
+        }
+        return true;
+    }
+
+    // Not handling (overview closed mid-scroll, modifier pressed, or
+    // over a bar): wind down whichever gesture the overview scroll had
+    // going so it doesn't stay grabbed (niri's reset branch).
+    if state.overview_scroll_swipe_gesture.reset() {
+        let redraw = if state.overview_scroll_swipe_gesture.is_vertical() {
+            state
+                .layout
+                .workspace_switch_gesture_end(Some(true))
+                .is_some()
+        } else {
+            state.layout.view_offset_gesture_end(Some(true)).is_some()
+        };
+        if redraw {
+            crate::move_grab::queue_redraw_all(state);
+        }
+    }
+    false
+}
+
+/// The output under the pointer, and the pointer position within it
+/// (output-local logical coordinates).
+pub(crate) fn output_under_pointer(
+    state: &PrismState,
+) -> Option<(smithay::output::Output, Point<f64, Logical>)> {
+    let px = state.pointer_pos.x as i32;
+    let py = state.pointer_pos.y as i32;
+    let output_id = state.output_containing((px, py))?;
+    let out = state.wl_outputs.get(&output_id)?.clone();
+    let origin = out.current_location();
+    let pos_within_output = Point::<f64, Logical>::from((
+        state.pointer_pos.x - origin.x as f64,
+        state.pointer_pos.y - origin.y as f64,
+    ));
+    Some((out, pos_within_output))
+}
+
+/// Whether the pointer currently rests on a Top/Overlay layer surface
+/// (a bar, a launcher). Overview scroll bindings stand down there so
+/// the surface keeps its own scroll semantics (niri's
+/// `should_handle_in_overview` gate).
+///
+/// Deliberately narrower than niri's any-mapped-layer check: niri
+/// blocks pointer input to backdrop-placed Background layers in the
+/// overview, so its wallpaper never holds pointer focus there and the
+/// gate never fires for it. Prism's wallpaper IS the backdrop (the
+/// place-within-backdrop look) but stays a normal input-receiving
+/// layer — gating only Top/Overlay reproduces niri's *effective*
+/// behavior: scrolling over the wallpaper between cards switches
+/// workspaces.
+fn pointer_over_top_or_overlay_layer(state: &PrismState) -> bool {
+    let Some((surface, _)) = &state.pointer_contents else {
+        return false;
+    };
+    use smithay::wayland::shell::wlr_layer::Layer;
+    for out in state.wl_outputs.values() {
+        let map = smithay::desktop::layer_map_for_output(out);
+        if let Some(ls) = map.layer_for_surface(surface, smithay::desktop::WindowSurfaceType::ALL) {
+            if matches!(ls.layer(), Layer::Top | Layer::Overlay) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ─── helpers ─────────────────────────────────────────────────────

@@ -64,6 +64,14 @@ pub fn process_input_event<I: PrismInputBackend + 'static>(
         }
         PointerButton { event } => super::pointer::on_pointer_button::<I>(state, event),
         PointerAxis { event } => super::pointer::on_pointer_axis::<I>(state, event),
+        GestureSwipeBegin { event } => super::gestures::on_gesture_swipe_begin::<I>(state, event),
+        GestureSwipeUpdate { event } => super::gestures::on_gesture_swipe_update::<I>(state, event),
+        GestureSwipeEnd { event } => super::gestures::on_gesture_swipe_end::<I>(state, event),
+        GesturePinchBegin { event } => super::gestures::on_gesture_pinch_begin::<I>(state, event),
+        GesturePinchUpdate { event } => super::gestures::on_gesture_pinch_update::<I>(state, event),
+        GesturePinchEnd { event } => super::gestures::on_gesture_pinch_end::<I>(state, event),
+        GestureHoldBegin { event } => super::gestures::on_gesture_hold_begin::<I>(state, event),
+        GestureHoldEnd { event } => super::gestures::on_gesture_hold_end::<I>(state, event),
         // Everything below is awaiting its subsystem. Each line
         // points at the niri source so the port is mechanical when
         // we get there.
@@ -71,14 +79,6 @@ pub fn process_input_event<I: PrismInputBackend + 'static>(
         | TabletToolTip { .. }     // 3622
         | TabletToolProximity { .. } // 3730
         | TabletToolButton { .. }  // 3780
-        | GestureSwipeBegin { .. } // 3793
-        | GestureSwipeUpdate { .. }
-        | GestureSwipeEnd { .. }
-        | GesturePinchBegin { .. } // 3994
-        | GesturePinchUpdate { .. }
-        | GesturePinchEnd { .. }
-        | GestureHoldBegin { .. }  // 4048
-        | GestureHoldEnd { .. }
         | TouchDown { .. }         // 4111
         | TouchMotion { .. }
         | TouchUp { .. }

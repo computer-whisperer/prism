@@ -17,6 +17,7 @@
 pub mod actions;
 pub mod backend_ext;
 pub mod dispatch;
+pub mod gestures;
 pub mod move_grab;
 pub mod pointer;
 pub mod resize_grab;
