@@ -2633,7 +2633,76 @@ impl CompositorHandler for PrismState {
                         self.queue_initial_configure(toplevel);
                     }
                 }
-            } else if let Some((mapped, _)) = self.layout.find_window_and_output(surface) {
+            } else if let Some((mapped, output)) = self.layout.find_window_and_output(surface) {
+                let window = mapped.window.clone();
+                let output = output.cloned();
+
+                // Null-buffer unmap. process_surface_buffer (above)
+                // drops the SurfaceTexSlot on BufferAssignment::Removed,
+                // so an empty slot on a mapped root surface means this
+                // commit unmapped the toplevel (test client:
+                // wleird-unmap; real clients unmap to remap later).
+                // Previously only toplevel_destroyed removed windows, so
+                // this left a permanent invisible tile holding a column.
+                let has_texture = with_states(surface, |states| {
+                    states
+                        .data_map
+                        .get::<SurfaceTexSlot>()
+                        .map(|s| s.0.lock().unwrap().is_some())
+                        .unwrap_or(false)
+                });
+                if !has_texture {
+                    // The toplevel got unmapped. Mirrors niri
+                    // handlers/compositor.rs ("toplevel got unmapped"):
+                    // start the close animation BEFORE on_commit — the
+                    // snapshot must record the pre-unmap geometry, not
+                    // the refreshed (now bufferless) bbox.
+                    let transaction = prism_layout::utils::transaction::Transaction::new();
+                    self.layout.store_unmap_snapshot(&window);
+                    self.layout
+                        .start_close_animation_for_window(&window, transaction.blocker());
+                    window.on_commit();
+                    self.layout.remove_window(&window, transaction.clone());
+                    // If neighbours in a co-resize hold clones, cap how
+                    // long they can wait on this one (niri does the same).
+                    if !transaction.is_last() {
+                        if let Some(loop_handle) = self.loop_handle.as_ref() {
+                            transaction.register_deadline_timer(loop_handle);
+                        }
+                    }
+
+                    // Back to the pre-map stage: a remap re-runs window
+                    // rules + the initial commit-configure sequence
+                    // afresh, exactly like a brand-new toplevel.
+                    self.unmapped_windows
+                        .insert(surface.clone(), Unmapped::new(window));
+                    tracing::info!(
+                        surface_id = ?surface.id(),
+                        "xdg_toplevel unmapped (null buffer); back to pre-map stage"
+                    );
+
+                    // Render is damage-driven; repaint the vacated
+                    // region (same fallback policy as toplevel_destroyed).
+                    match output {
+                        Some(out) => {
+                            if let Some(name) = self
+                                .wl_outputs
+                                .iter()
+                                .find_map(|(id, o)| (o == &out).then_some(id.clone()))
+                            {
+                                self.output_redraw.entry(name).or_default().queue_redraw();
+                            }
+                        }
+                        None => {
+                            let ids: Vec<_> = self.outputs.keys().cloned().collect();
+                            for id in ids {
+                                self.output_redraw.entry(id).or_default().queue_redraw();
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 // Re-commit on an already-mapped window.
                 //
                 // First refresh the smithay Window's cached bbox from
@@ -2643,7 +2712,6 @@ impl CompositorHandler for PrismState {
                 // so all the downstream size readers — including
                 // `Tile::tile_size()` / `Column::width()` — see
                 // stale dimensions. Mirrors niri/src/handlers/compositor.rs:90.
-                let window = mapped.window.clone();
                 window.on_commit();
 
                 // Then forward through to the layout so it can update
