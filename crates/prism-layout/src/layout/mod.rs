@@ -4624,6 +4624,16 @@ impl<W: LayoutElement> Layout<W> {
     ) {
         let zoom = self.overview_zoom();
 
+        // prism's close "snapshot" is a screen copy out of the
+        // intermediate (not niri's re-render of the window's own
+        // elements), so the capture is only correct when tiles render
+        // 1:1 at their home positions. While the overview is zooming,
+        // the copy would grab the shrunken card region — a
+        // wrong-content ghost is worse than no animation, so skip.
+        if zoom != 1. {
+            return;
+        }
+
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
             if move_.tile.window().id() == window {
                 let Some(snapshot) = move_.tile.take_unmap_snapshot() else {
@@ -4656,21 +4666,27 @@ impl<W: LayoutElement> Layout<W> {
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
-                    for ws in &mut mon.workspaces {
+                    let active_idx = mon.active_workspace_idx;
+                    let switching = mon.workspace_switch.is_some();
+                    for (ws_idx, ws) in mon.workspaces.iter_mut().enumerate() {
                         if ws.has_window(window) {
-                            ws.start_close_animation_for_window(window, blocker);
+                            // Same screen-copy constraint as the overview
+                            // guard above: only the monitor's current
+                            // workspace, rendering at its home offset, has
+                            // its pixels where the capture rect expects
+                            // them. A close on a non-visible workspace (or
+                            // mid workspace-switch) skips the animation.
+                            if ws_idx == active_idx && !switching {
+                                ws.start_close_animation_for_window(window, blocker);
+                            }
                             return;
                         }
                     }
                 }
             }
-            MonitorSet::NoOutputs { workspaces, .. } => {
-                for ws in workspaces {
-                    if ws.has_window(window) {
-                        ws.start_close_animation_for_window(window, blocker);
-                        return;
-                    }
-                }
+            MonitorSet::NoOutputs { .. } => {
+                // Nothing renders without outputs — there is no frame to
+                // capture, so no animation to start.
             }
         }
     }

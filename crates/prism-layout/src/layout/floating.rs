@@ -1102,17 +1102,21 @@ impl<W: LayoutElement> FloatingSpace<W> {
     ) {
         let scale = Scale::from(self.scale);
 
-        // Closing windows first (under live tiles).
-        for closing in self.closing_windows.iter().rev() {
-            closing.render(closing.geometry().loc, scale, out);
-        }
-
         // `tiles` is stored top-to-bottom; `out` is back-to-front
         // (prism's painter order), so draw bottommost first.
         let active = self.active_window_id.clone();
         for (tile, tile_pos) in self.tiles_with_render_positions().rev() {
             let focus_ring = focus_ring && Some(tile.window().id()) == active.as_ref();
             tile.render(tile_pos, scale, focus_ring, ctx, out);
+        }
+
+        // Closing ghosts paint on top of the live tiles (niri pushes
+        // them first into its front-to-back list; in prism's
+        // back-to-front list they go last). Forward iteration puts the
+        // newest-closed ghost topmost. Floating positions are already
+        // view-independent, so no offset correction is needed.
+        for closing in &self.closing_windows {
+            closing.render(closing.geometry().loc, scale, out);
         }
     }
 

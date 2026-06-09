@@ -27,7 +27,11 @@ use crate::utils::transaction::TransactionBlocker;
 pub struct ClosingWindow {
     /// Stable element id, so the damage tracker tracks the replay across frames.
     id: ElementId,
-    /// Output-space rect the window occupied (the snapshot's placement + size).
+    /// Rect the window occupied (the snapshot's placement + size). In the
+    /// scrolling space this is workspace-absolute (niri semantics) — the
+    /// space subtracts its view position at capture and at replay; in the
+    /// floating space positions are view-independent, so it is output-space
+    /// as-is.
     geometry: Rectangle<f64, Logical>,
     /// The captured last frame. `None` until the integrator fills it on the
     /// first render after unmap (see [`Self::set_snapshot`]).
@@ -86,9 +90,10 @@ impl ClosingWindow {
     }
 
     /// Emit the shrink+fade replay of the captured frame. `location` is the
-    /// snapshot's top-left in output-logical pixels (the space passes
-    /// `geometry().loc`); `_scale` is the output scale, unused here since the
-    /// transform is expressed in logical space.
+    /// snapshot's top-left in output-logical pixels (the owning space passes
+    /// `geometry().loc` corrected for its current view position); `_scale` is
+    /// the output scale, unused here since the transform is expressed in
+    /// logical space.
     pub fn render(
         &self,
         location: Point<f64, Logical>,

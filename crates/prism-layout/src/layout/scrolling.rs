@@ -1557,9 +1557,17 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         &mut self,
         create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
     ) -> bool {
+        // `geometry()` is workspace-absolute (niri semantics); the
+        // intermediate holds the view, so the capture rect is the
+        // geometry shifted back by the current view position (the view
+        // hasn't moved since the close — the capture runs on the first
+        // render after unmap).
+        let view_pos = Point::from((self.view_pos(), 0.));
         for closing in &mut self.closing_windows {
             if closing.needs_snapshot() {
-                if let Some(snapshot) = create(closing.geometry()) {
+                let mut rect = closing.geometry();
+                rect.loc -= view_pos;
+                if let Some(snapshot) = create(rect) {
                     closing.set_snapshot(snapshot);
                 }
             }
@@ -2964,53 +2972,64 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     ) {
         let scale = Scale::from(self.scale);
 
-        // niri renders closing windows first (so they paint behind
-        // the active tiles).
-        for closing in self.closing_windows.iter().rev() {
-            closing.render(closing.geometry().loc, scale, out);
-        }
+        if !self.columns.is_empty() {
+            // niri's element lists are front-to-back while prism's
+            // painter list is back-to-front (same inversion the
+            // floating space fixed): walk the render order REVERSED so
+            // the active column/tile — which the iterators yield first
+            // — paints last, i.e. on top, during column slides, tabbed
+            // alpha fades and render offsets. Each column's tab
+            // indicator is emitted after its tiles for the same reason
+            // (niri draws it "on top").
+            let view_off = Point::from((-self.view_pos(), 0.));
+            let columns: Vec<_> = self.columns_in_render_order().collect();
+            for (col_i, (col, col_x)) in columns.into_iter().enumerate().rev() {
+                let col_off = Point::from((col_x, 0.));
+                let col_render_off = col.render_offset();
 
-        if self.columns.is_empty() {
-            return;
-        }
+                let tiles: Vec<_> = col.tiles_in_render_order().collect();
+                for (tile_i, (tile, tile_off, visible)) in tiles.into_iter().enumerate().rev() {
+                    let tile_pos =
+                        view_off + col_off + col_render_off + tile_off + tile.render_offset();
+                    // Round to physical pixels.
+                    let tile_pos = tile_pos.to_physical_precise_round(scale).to_logical(scale);
 
-        let mut first = true;
+                    // The focus ring goes on the render-order-first
+                    // tile of the render-order-first column (the
+                    // active tile).
+                    let focus_ring = focus_ring && col_i == 0 && tile_i == 0;
 
-        // This matches self.tiles_in_render_order().
-        let view_off = Point::from((-self.view_pos(), 0.));
-        for (col, col_x) in self.columns_in_render_order() {
-            let col_off = Point::from((col_x, 0.));
-            let col_render_off = col.render_offset();
+                    // In the scrolling layout, `visible` is currently used
+                    // only for hidden tabs in tabbed mode. We want to
+                    // animate their opacity when going in and out of
+                    // tabbed mode, so don't apply "visible" immediately
+                    // there. (niri's note.)
+                    let visible = visible || tile.alpha_animation.is_some();
+                    if !visible {
+                        continue;
+                    }
 
-            // Tab indicator on top of the column.
-            {
+                    tile.render(tile_pos, scale, focus_ring, ctx, out);
+                }
+
+                // Tab indicator on top of the column.
                 let pos = view_off + col_off + col_render_off;
                 let pos = pos.to_physical_precise_round(scale).to_logical(scale);
                 col.tab_indicator.render(pos, out);
             }
+        }
 
-            for (tile, tile_off, visible) in col.tiles_in_render_order() {
-                let tile_pos =
-                    view_off + col_off + col_render_off + tile_off + tile.render_offset();
-                // Round to physical pixels.
-                let tile_pos = tile_pos.to_physical_precise_round(scale).to_logical(scale);
-
-                // For the active tile (which comes first), draw the focus ring.
-                let focus_ring = focus_ring && first;
-                first = false;
-
-                // In the scrolling layout, `visible` is currently used
-                // only for hidden tabs in tabbed mode. We want to
-                // animate their opacity when going in and out of
-                // tabbed mode, so don't apply "visible" immediately
-                // there. (niri's note.)
-                let visible = visible || tile.alpha_animation.is_some();
-                if !visible {
-                    continue;
-                }
-
-                tile.render(tile_pos, scale, focus_ring, ctx, out);
-            }
+        // Closing ghosts paint on top of the live tiles (niri pushes
+        // them first into its front-to-back list). Geometry is
+        // workspace-absolute; subtract the CURRENT view position so
+        // the ghost tracks view scrolling during the animation.
+        // Forward iteration puts the newest-closed ghost topmost,
+        // matching niri's `.rev()` in the inverted list order.
+        let view_pos = Point::from((self.view_pos(), 0.));
+        for closing in &self.closing_windows {
+            let loc = closing.geometry().loc - view_pos;
+            let loc = loc.to_physical_precise_round(scale).to_logical(scale);
+            closing.render(loc, scale, out);
         }
     }
 
