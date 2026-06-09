@@ -1952,10 +1952,22 @@ fn run_integrated(
     }
 
     breadcrumb("entering dispatch loop");
+    // Errors break out of the loop instead of `?`-ing up: an early return
+    // drops locals in reverse declaration order — `event_loop` (declared
+    // after `state`) drops first, releasing DRM master via the libseat
+    // notifier, and `OutputContext::Drop` then runs `surface.clear()`
+    // masterless; the IPC socket cleanup is skipped too. Exactly the
+    // hazards the instrumented teardown below exists to avoid — fall
+    // through to it in all cases.
+    let mut loop_result: Result<()> = Ok(());
     while running.load(Ordering::SeqCst) && !state.should_stop {
-        event_loop
+        if let Err(e) = event_loop
             .dispatch(Some(Duration::from_millis(100)), &mut state)
-            .context("event_loop.dispatch")?;
+            .context("event_loop.dispatch")
+        {
+            loop_result = Err(e);
+            break;
+        }
 
         // Send the terminating `done()` on any wp_image_description_info_v1
         // resources whose info events were emitted during dispatch.
@@ -2024,19 +2036,27 @@ fn run_integrated(
         prism_protocols::foreign_toplevel::refresh(&mut state);
         prism_protocols::ext_workspace::refresh(&mut state);
 
-        state
+        if let Err(e) = state
             .display_handle
             .flush_clients()
-            .context("flush_clients")?;
+            .context("flush_clients")
+        {
+            loop_result = Err(e);
+            break;
+        }
         // Drain any outputs queued by this iteration (vblank handlers,
         // commit handlers, etc.). One pass — if rendering itself sets
         // more outputs Queued (it shouldn't), they'll drain on the next
         // iteration.
         redraw_queued_outputs(&mut state);
-        state
+        if let Err(e) = state
             .display_handle
             .flush_clients()
-            .context("flush_clients (after redraw)")?;
+            .context("flush_clients (after redraw)")
+        {
+            loop_result = Err(e);
+            break;
+        }
 
         // Clear the cached monotonic time so the next iteration's
         // `advance_animations` / `update_render_elements` / `refresh`
@@ -2049,8 +2069,16 @@ fn run_integrated(
         state.clock.clear();
     }
 
-    breadcrumb("dispatch loop exited cleanly");
-    tracing::info!("integrated loop stopped");
+    match &loop_result {
+        Ok(()) => {
+            breadcrumb("dispatch loop exited cleanly");
+            tracing::info!("integrated loop stopped");
+        }
+        Err(e) => {
+            breadcrumb(&format!("dispatch loop exited with ERROR: {e:#}"));
+            tracing::error!("integrated loop failed: {e:#}");
+        }
+    }
 
     // Drop the IPC socket file so we don't leave a stale node in
     // $XDG_RUNTIME_DIR (next bringup would remove it anyway, but it's
@@ -2151,7 +2179,7 @@ fn run_integrated(
         "shutdown: returning from run_integrated (total {}ms)",
         t_start.elapsed().as_millis()
     ));
-    Ok(())
+    loop_result
 }
 
 /// Present one frame on a specific output (identified by CRTC handle).
@@ -2407,6 +2435,11 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
             if let Some(entry) = state.output_redraw.get_mut(output_id) {
                 entry.redraw = RedrawState::Idle;
             }
+            // The render that would have serviced queued captures didn't
+            // happen, and Idle means none is coming until new damage — fail
+            // them now (matching the powered-off path) instead of leaving
+            // the client waiting on a frame that may never render.
+            state.fail_pending_screencopy(output_id);
         }
     }
 }
