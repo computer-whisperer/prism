@@ -5,30 +5,36 @@
 //! reply, both sides close). The long-lived event-stream form (niri's
 //! `EventStream` request) is future work.
 //!
-//! Dispatch is single-threaded on the main calloop — each connection
-//! is handled synchronously inside the listener's read-event handler,
-//! so requests cannot interleave with each other or with the render
-//! loop. That's the right semantics for state-mutating requests (e.g.
-//! a calibration tool flipping color overrides between sweep frames)
-//! and is acceptable for read-only ones since the payloads are tiny.
-//! A misbehaving client that connects but never sends data could
-//! block the loop; the per-socket read timeout below bounds that.
+//! Dispatch is single-threaded on the main calloop — requests cannot
+//! interleave with each other or with the render loop, which is the
+//! right semantics for state-mutating requests (e.g. a calibration
+//! tool flipping color overrides between sweep frames). Connection
+//! I/O, however, never blocks the loop: each accepted stream becomes
+//! its own nonblocking calloop source that accumulates bytes until the
+//! request line is complete, dispatches, and writes the reply —
+//! re-arming on write interest if the socket buffer fills. A client
+//! that connects and sends nothing (or trickles bytes) costs nothing
+//! per se; a wall-clock deadline reaps connections that overstay so
+//! they can't hold fds forever.
 //!
 //! Bringup wires in `insert_ipc_source` from main.rs after the
 //! wayland sources are up. The socket path lives in `$XDG_RUNTIME_DIR`
 //! and is exported via `PRISM_SOCKET` so child processes (and any
 //! `prism-tune` invocation) can find us.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, ErrorKind};
-use std::os::fd::{AsFd, OwnedFd};
+use std::io::{ErrorKind, Read};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use calloop::generic::Generic;
-use calloop::{Interest, LoopHandle, Mode, PostAction};
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 use prism_ipc::{
     self, ColorState, LogicalOutput, Output, OutputAction, OutputConfigChanged, Reply, Request,
     Response, ResponseCurveState, Transform,
@@ -57,15 +63,16 @@ pub fn insert_ipc_source(handle: &LoopHandle<'static, PrismState>) -> Result<Pat
         std::env::set_var(prism_ipc::socket::SOCKET_PATH_ENV, &path);
     }
 
+    let conn_handle = handle.clone();
     handle
         .insert_source(
             Generic::new(listener, Interest::READ, Mode::Level),
-            move |_event, listener, state| {
+            move |_event, listener, _state| {
                 loop {
                     match listener.accept() {
                         Ok((stream, _addr)) => {
-                            if let Err(e) = handle_connection(stream, state) {
-                                tracing::warn!("ipc connection handler error: {e:#}");
+                            if let Err(e) = insert_connection(&conn_handle, stream) {
+                                tracing::warn!("ipc: failed to register connection: {e:#}");
                             }
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -96,35 +103,236 @@ fn default_socket_path() -> PathBuf {
     base.join(format!("prism-{}.sock", std::process::id()))
 }
 
-/// Read one JSON request from `stream`, dispatch, write one JSON reply,
-/// then close. Connection lifetime is one request — clients that want
-/// to make multiple requests reconnect, which is what
-/// `prism_ipc::socket::Socket` does anyway.
-fn handle_connection(stream: UnixStream, state: &mut PrismState) -> Result<()> {
-    // Bound how long a slow / malicious client can hold the main loop.
-    stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .context("set_read_timeout")?;
-    stream
-        .set_write_timeout(Some(Duration::from_millis(500)))
-        .context("set_write_timeout")?;
+/// Ceiling on a connection's lifetime, accept to reply-flushed. Nothing
+/// blocks the loop on a slow client — this is garbage collection, so an
+/// idle or wedged peer can't hold its fd (and calloop slot) forever.
+/// Well-behaved clients complete in single-digit milliseconds.
+const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
 
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).context("read request line")?;
+/// Request lines are single small JSON objects; anything past this is a
+/// confused (or hostile) client and the connection is dropped.
+const MAX_REQUEST_BYTES: usize = 16 * 1024;
 
-    let (reply, fd): (Reply, Option<OwnedFd>) = match serde_json::from_str::<Request>(&line) {
-        Ok(req) => dispatch(state, req),
-        Err(e) => (Err(format!("parse request: {e}")), None),
+/// Register an accepted stream as its own nonblocking calloop source.
+/// The source accumulates bytes until the request line is complete,
+/// dispatches on the main loop, writes the reply, then closes — one
+/// request per connection; clients that want more reconnect, which is
+/// what `prism_ipc::socket::Socket` does anyway. A companion timer
+/// enforces [`CONNECTION_DEADLINE`] over the whole exchange.
+fn insert_connection(handle: &LoopHandle<'static, PrismState>, stream: UnixStream) -> Result<()> {
+    stream.set_nonblocking(true).context("set_nonblocking")?;
+
+    // Whichever source currently owns the connection (reader, then
+    // possibly a reply writer). The deadline timer kills it through
+    // this slot; every normal-completion path clears the slot and
+    // removes the timer.
+    let conn_token: Rc<RefCell<Option<RegistrationToken>>> = Rc::new(RefCell::new(None));
+
+    let timer_handle = handle.clone();
+    let timer_conn_token = conn_token.clone();
+    let timer_token = handle
+        .insert_source(
+            Timer::from_duration(CONNECTION_DEADLINE),
+            move |_deadline, _, _state| {
+                if let Some(token) = timer_conn_token.borrow_mut().take() {
+                    tracing::warn!(
+                        "ipc: connection exceeded {CONNECTION_DEADLINE:?} deadline, dropping"
+                    );
+                    timer_handle.remove(token);
+                }
+                TimeoutAction::Drop
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("insert connection deadline timer: {e}"))?;
+
+    let read_handle = handle.clone();
+    let read_conn_token = conn_token.clone();
+    let mut buf: Vec<u8> = Vec::new();
+    let inserted = handle.insert_source(
+        Generic::new(stream, Interest::READ, Mode::Level),
+        move |_event, stream, state| {
+            let mut chunk = [0u8; 4096];
+            let line_end = loop {
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    break pos;
+                }
+                let mut reader: &UnixStream = stream;
+                match reader.read(&mut chunk) {
+                    Ok(0) => {
+                        // EOF before a complete request line: client gave up.
+                        finish_connection(&read_handle, &read_conn_token, timer_token);
+                        return Ok(PostAction::Remove);
+                    }
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.len() > MAX_REQUEST_BYTES {
+                            tracing::warn!(
+                                "ipc: request exceeds {MAX_REQUEST_BYTES} bytes, dropping connection"
+                            );
+                            finish_connection(&read_handle, &read_conn_token, timer_token);
+                            return Ok(PostAction::Remove);
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        return Ok(PostAction::Continue);
+                    }
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        tracing::warn!("ipc: read error: {e}");
+                        finish_connection(&read_handle, &read_conn_token, timer_token);
+                        return Ok(PostAction::Remove);
+                    }
+                }
+            };
+
+            let line = String::from_utf8_lossy(&buf[..line_end]);
+            let (reply, fd): (Reply, Option<OwnedFd>) =
+                match serde_json::from_str::<Request>(&line) {
+                    Ok(req) => dispatch(state, req),
+                    Err(e) => (Err(format!("parse request: {e}")), None),
+                };
+            let mut text = match serde_json::to_string(&reply) {
+                Ok(text) => text,
+                Err(e) => {
+                    tracing::warn!("ipc: serialize reply: {e}");
+                    finish_connection(&read_handle, &read_conn_token, timer_token);
+                    return Ok(PostAction::Remove);
+                }
+            };
+            text.push('\n');
+            let mut pending = PendingReply {
+                bytes: text.into_bytes(),
+                sent: 0,
+                fd,
+            };
+
+            match pending.try_write(stream) {
+                Ok(true) => {
+                    finish_connection(&read_handle, &read_conn_token, timer_token);
+                    Ok(PostAction::Remove)
+                }
+                Ok(false) => {
+                    // Socket send buffer full mid-reply (large reply and/or
+                    // slow reader): hand the remainder to a write-interest
+                    // source on a dup'd fd and retire this read source. The
+                    // deadline timer stays armed and covers the writer too.
+                    insert_reply_writer(
+                        &read_handle,
+                        stream,
+                        pending,
+                        &read_conn_token,
+                        timer_token,
+                    );
+                    Ok(PostAction::Remove)
+                }
+                Err(e) => {
+                    tracing::warn!("ipc: write error: {e}");
+                    finish_connection(&read_handle, &read_conn_token, timer_token);
+                    Ok(PostAction::Remove)
+                }
+            }
+        },
+    );
+    match inserted {
+        Ok(token) => {
+            *conn_token.borrow_mut() = Some(token);
+            Ok(())
+        }
+        Err(e) => {
+            handle.remove(timer_token);
+            Err(anyhow::anyhow!("insert connection source: {e}"))
+        }
+    }
+}
+
+/// Normal-completion teardown shared by every connection path: clear the
+/// live-source slot (so the deadline timer finds nothing to kill) and
+/// retire the timer. The calling source removes itself by returning
+/// [`PostAction::Remove`].
+fn finish_connection(
+    handle: &LoopHandle<'static, PrismState>,
+    conn_token: &RefCell<Option<RegistrationToken>>,
+    timer_token: RegistrationToken,
+) {
+    conn_token.borrow_mut().take();
+    handle.remove(timer_token);
+}
+
+/// A serialized reply mid-flight to a client that isn't draining its
+/// socket as fast as we fill it. `fd` rides the first byte actually
+/// accepted (see `write_chunk_with_fd`).
+struct PendingReply {
+    bytes: Vec<u8>,
+    sent: usize,
+    fd: Option<OwnedFd>,
+}
+
+impl PendingReply {
+    /// Push as much of the reply as the socket accepts right now.
+    /// `Ok(true)` = fully written; `Ok(false)` = `WouldBlock`, re-arm.
+    fn try_write(&mut self, stream: &UnixStream) -> std::io::Result<bool> {
+        while self.sent < self.bytes.len() {
+            match prism_ipc::socket::write_chunk_with_fd(
+                stream,
+                &self.bytes[self.sent..],
+                &mut self.fd,
+            ) {
+                Ok(n) => self.sent += n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(false),
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Continue an interrupted reply write on a dedicated write-interest
+/// source (the read source retires itself after calling this). Works on
+/// a dup of the stream's fd — same open socket, independently owned by
+/// the new source. On registration failure the connection just drops;
+/// the client sees EOF mid-reply.
+fn insert_reply_writer(
+    handle: &LoopHandle<'static, PrismState>,
+    stream: &UnixStream,
+    mut pending: PendingReply,
+    conn_token: &Rc<RefCell<Option<RegistrationToken>>>,
+    timer_token: RegistrationToken,
+) {
+    let dup = match stream.try_clone() {
+        Ok(dup) => dup,
+        Err(e) => {
+            tracing::warn!("ipc: dup for reply writer failed: {e}");
+            finish_connection(handle, conn_token, timer_token);
+            return;
+        }
     };
-
-    prism_ipc::socket::write_reply_with_fd(
-        reader.get_mut(),
-        &reply,
-        fd.as_ref().map(|f| f.as_fd()),
-    )
-    .context("write reply")?;
-    Ok(())
+    let writer_handle = handle.clone();
+    let writer_conn_token = conn_token.clone();
+    let inserted = handle.insert_source(
+        Generic::new(dup, Interest::WRITE, Mode::Level),
+        move |_event, stream, _state| match pending.try_write(stream) {
+            Ok(true) => {
+                finish_connection(&writer_handle, &writer_conn_token, timer_token);
+                Ok(PostAction::Remove)
+            }
+            Ok(false) => Ok(PostAction::Continue),
+            Err(e) => {
+                tracing::warn!("ipc: write error: {e}");
+                finish_connection(&writer_handle, &writer_conn_token, timer_token);
+                Ok(PostAction::Remove)
+            }
+        },
+    );
+    match inserted {
+        Ok(token) => {
+            *conn_token.borrow_mut() = Some(token);
+        }
+        Err(e) => {
+            tracing::warn!("ipc: failed to register reply writer: {e}");
+            finish_connection(handle, conn_token, timer_token);
+        }
+    }
 }
 
 /// Route a parsed Request to the matching handler. Unsupported variants

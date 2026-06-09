@@ -4,7 +4,7 @@ use std::env;
 use std::io::{self, BufRead, BufReader, IoSlice, IoSliceMut, Write};
 use std::mem::MaybeUninit;
 use std::net::Shutdown;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -200,4 +200,36 @@ pub fn write_reply_with_fd(
         sent += writer.write(&buf.as_bytes()[sent..])?;
     }
     Ok(())
+}
+
+/// One write attempt on `stream` (which may be nonblocking), attaching
+/// `fd` as out-of-band ancillary data (`SCM_RIGHTS`) when present. The
+/// kernel ties the ancillary payload to the bytes accepted by the same
+/// `sendmsg`, so `fd` is consumed only once at least one byte goes out
+/// — a caller re-arming after `WouldBlock` neither drops the fd nor
+/// sends it twice. Returns the byte count accepted; the caller loops
+/// over the remainder. The incremental sibling of
+/// [`write_reply_with_fd`] for servers that must not block.
+pub fn write_chunk_with_fd(
+    stream: &UnixStream,
+    bytes: &[u8],
+    fd: &mut Option<OwnedFd>,
+) -> io::Result<usize> {
+    let Some(borrowed) = fd.as_ref().map(|f| f.as_fd()) else {
+        let mut writer: &UnixStream = stream;
+        return writer.write(bytes);
+    };
+
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut space);
+    let fds = [borrowed];
+    let pushed = ancillary.push(SendAncillaryMessage::ScmRights(&fds));
+    debug_assert!(pushed, "ancillary buffer too small for one fd");
+
+    let iov = [IoSlice::new(bytes)];
+    let sent = sendmsg(stream, &iov, &mut ancillary, SendFlags::empty())?;
+    if sent > 0 {
+        *fd = None;
+    }
+    Ok(sent)
 }
