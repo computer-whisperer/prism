@@ -36,6 +36,28 @@ fn fnv_f32s(xs: &[f32]) -> u64 {
     })
 }
 
+/// Fold an optional rect crop into a content token, expressed relative to
+/// the element origin (same convention as `SurfaceClip::mix_token`): a pure
+/// move stays a geometry-only diff, while a crop edge sweeping across the
+/// element re-damages it in place.
+fn mix_rect_clip(
+    c: u64,
+    clip: &Option<Rectangle<f64, Logical>>,
+    origin: Point<f64, Logical>,
+) -> u64 {
+    match clip {
+        None => c,
+        Some(r) => {
+            c ^ fnv_f32s(&[
+                (r.loc.x - origin.x) as f32,
+                (r.loc.y - origin.y) as f32,
+                r.size.w as f32,
+                r.size.h as f32,
+            ])
+        }
+    }
+}
+
 /// Logical → Vulkan-clip-space projection for one output.
 ///
 /// Clip space is `[-1, 1] × [-1, 1]` over the full framebuffer, so the mapping
@@ -512,6 +534,11 @@ pub struct BorderEl {
     /// (CSS order). Each side independently thickened; zero emits no stripe.
     pub thickness: [f64; 4],
     pub color_bt2020_nits: [f32; 4],
+    /// Rectangular crop (the overview/switch workspace-card band — see
+    /// [`RenderEl::crop_to_rect`]); `None` = uncropped. Each lowered stripe
+    /// is intersected with it, so a border straddling the card edge stops
+    /// exactly at the band instead of bleeding into the neighbour card.
+    pub clip: Option<Rectangle<f64, Logical>>,
 }
 
 impl BorderEl {
@@ -522,60 +549,47 @@ impl BorderEl {
         output_peak_nits_rgb: [f32; 3],
         out: &mut Vec<ElementDraw>,
     ) {
-        // Per-side thickness in clip space: project the outer rect and the
-        // inner rect (outer shrunk by the logical thickness on each side),
-        // then take the clip-space difference along each axis. This routes the
-        // logical→clip projection through without needing the output's pixel
-        // scale here.
-        let [t_log, r_log, b_log, l_log] = self.thickness;
-        let outer_clip = project(self.geometry);
-        let inner_logical = Rectangle::new(
-            self.geometry.loc + Point::from((l_log, t_log)),
-            Size::from((
-                self.geometry.size.w - (l_log + r_log),
-                self.geometry.size.h - (t_log + b_log),
-            )),
-        );
-        let inner_clip = project(inner_logical);
-
-        let [x_min, y_min, x_max, y_max] = outer_clip;
-        let t = inner_clip[1] - outer_clip[1]; // top
-        let r = outer_clip[2] - inner_clip[2]; // right
-        let b = outer_clip[3] - inner_clip[3]; // bottom
-        let l = inner_clip[0] - outer_clip[0]; // left
+        // Build the four stripes in logical space (the projection is
+        // affine, so projecting each stripe matches the old clip-space
+        // arithmetic exactly), intersect with the optional crop, project,
+        // emit. The horizontal stripes span the full width; the vertical
+        // ones fill between them — same tiling as before.
+        let [t, r, b, l] = self.thickness;
+        let g = self.geometry;
+        let stripes = [
+            // Top — full width × t.
+            Rectangle::new(g.loc, Size::from((g.size.w, t))),
+            // Bottom — full width × b.
+            Rectangle::new(
+                g.loc + Point::from((0.0, g.size.h - b)),
+                Size::from((g.size.w, b)),
+            ),
+            // Left — l × inner height (between the horizontal stripes).
+            Rectangle::new(
+                g.loc + Point::from((0.0, t)),
+                Size::from((l, g.size.h - t - b)),
+            ),
+            // Right — r × inner height.
+            Rectangle::new(
+                g.loc + Point::from((g.size.w - r, t)),
+                Size::from((r, g.size.h - t - b)),
+            ),
+        ];
 
         let color = self.color_bt2020_nits;
-        // Top stripe — full width × t.
-        if t > 0.0 {
+        for stripe in stripes {
+            if stripe.size.w <= 0.0 || stripe.size.h <= 0.0 {
+                continue;
+            }
+            let stripe = match self.clip {
+                Some(clip) => match stripe.intersection(clip) {
+                    Some(s) => s,
+                    None => continue,
+                },
+                None => stripe,
+            };
             out.push(solid_color_draw(
-                [x_min, y_min, x_max, y_min + t],
-                color,
-                white_view,
-                output_peak_nits_rgb,
-            ));
-        }
-        // Bottom stripe — full width × b.
-        if b > 0.0 {
-            out.push(solid_color_draw(
-                [x_min, y_max - b, x_max, y_max],
-                color,
-                white_view,
-                output_peak_nits_rgb,
-            ));
-        }
-        // Left stripe — l × inner-height (between the horizontal stripes).
-        if l > 0.0 {
-            out.push(solid_color_draw(
-                [x_min, y_min + t, x_min + l, y_max - b],
-                color,
-                white_view,
-                output_peak_nits_rgb,
-            ));
-        }
-        // Right stripe — r × inner-height.
-        if r > 0.0 {
-            out.push(solid_color_draw(
-                [x_max - r, y_min + t, x_max, y_max - b],
+                project(stripe),
                 color,
                 white_view,
                 output_peak_nits_rgb,
@@ -607,6 +621,11 @@ pub struct RoundedBoxEl {
     /// hollow ring of that per-side thickness; `None` draws a filled box.
     pub inset: Option<[f64; 4]>,
     pub color_bt2020_nits: [f32; 4],
+    /// Rectangular crop (the overview/switch workspace-card band — see
+    /// [`RenderEl::crop_to_rect`]); `None` = uncropped. Shrinks the drawn
+    /// quad only — the SDF box stays at `geometry`, so the visible part of
+    /// the rounded shape is unchanged, it just stops at the band edge.
+    pub clip: Option<Rectangle<f64, Logical>>,
 }
 
 impl RoundedBoxEl {
@@ -616,8 +635,19 @@ impl RoundedBoxEl {
         white_view: vk::ImageView,
         output_peak_nits_rgb: [f32; 3],
     ) -> ElementDraw {
+        // The crop shrinks the rasterized quad only; the SDF box below
+        // keeps the full geometry, so the shape is unchanged — it just
+        // stops at the crop edge. An empty intersection degenerates to a
+        // zero-area quad (no fragments).
+        let quad = match self.clip {
+            Some(clip) => self
+                .geometry
+                .intersection(clip)
+                .unwrap_or_else(|| Rectangle::new(self.geometry.loc, Size::default())),
+            None => self.geometry,
+        };
         let mut draw = solid_color_draw(
-            project(self.geometry),
+            project(quad),
             self.color_bt2020_nits,
             white_view,
             output_peak_nits_rgb,
@@ -832,11 +862,13 @@ impl RenderEl {
             Self::Border(b) => {
                 b.geometry = scaled(b.geometry, center, factor);
                 b.thickness = b.thickness.map(|t| t * factor);
+                b.clip = b.clip.map(|c| scaled(c, center, factor));
             }
             Self::RoundedBox(r) => {
                 r.geometry = scaled(r.geometry, center, factor);
                 r.radii = r.radii.map(|v| v * factor as f32);
                 r.inset = r.inset.map(|inset| inset.map(|v| v * factor));
+                r.clip = r.clip.map(|c| scaled(c, center, factor));
             }
             Self::Shadow(s) => {
                 s.geometry = scaled(s.geometry, center, factor);
@@ -870,8 +902,18 @@ impl RenderEl {
                     c.rect.loc += offset;
                 }
             }
-            Self::Border(b) => b.geometry.loc += offset,
-            Self::RoundedBox(r) => r.geometry.loc += offset,
+            Self::Border(b) => {
+                b.geometry.loc += offset;
+                if let Some(c) = &mut b.clip {
+                    c.loc += offset;
+                }
+            }
+            Self::RoundedBox(r) => {
+                r.geometry.loc += offset;
+                if let Some(c) = &mut r.clip {
+                    c.loc += offset;
+                }
+            }
             Self::Shadow(s) => {
                 s.geometry.loc += offset;
                 s.shadow_box.loc += offset;
@@ -888,9 +930,11 @@ impl RenderEl {
     /// should be dropped. Surfaces and solids get their clip box
     /// intersected with `bounds` (an existing rounded clip keeps its radii;
     /// a corner cut by the card edge keeps its rounding — a sub-pixel
-    /// divergence from niri's exact crop at overview zoom). The decoration
-    /// variants (border / rounded box / shadow) carry only their own SDF
-    /// box, so ones straddling the card edge are kept un-cropped.
+    /// divergence from niri's exact crop at overview zoom). Borders and
+    /// rounded boxes get their rect crop intersected (stripes / the drawn
+    /// quad stop at the band edge, the SDF shape itself is unchanged); a
+    /// shadow's quad is its own field separate from the SDF box, so its
+    /// geometry shrinks directly.
     pub fn crop_to_rect(&mut self, bounds: Rectangle<f64, Logical>) -> bool {
         let geometry = self.geometry();
         if geometry.intersection(bounds).is_none() {
@@ -898,6 +942,24 @@ impl RenderEl {
         }
         if bounds.contains_rect(geometry) {
             return true;
+        }
+        fn intersect_rect_clip(
+            clip: &mut Option<Rectangle<f64, Logical>>,
+            bounds: Rectangle<f64, Logical>,
+        ) -> bool {
+            match clip {
+                Some(c) => match c.intersection(bounds) {
+                    Some(r) => {
+                        *c = r;
+                        true
+                    }
+                    None => false,
+                },
+                None => {
+                    *clip = Some(bounds);
+                    true
+                }
+            }
         }
         match self {
             Self::Surface(s) => match &mut s.clip {
@@ -924,7 +986,24 @@ impl RenderEl {
                     });
                 }
             },
-            Self::Border(_) | Self::RoundedBox(_) | Self::Shadow(_) => {}
+            Self::Border(b) => {
+                if !intersect_rect_clip(&mut b.clip, bounds) {
+                    return false;
+                }
+            }
+            Self::RoundedBox(r) => {
+                if !intersect_rect_clip(&mut r.clip, bounds) {
+                    return false;
+                }
+            }
+            Self::Shadow(s) => {
+                // Geometry ∩ bounds is non-empty (checked above); the SDF
+                // parameters live in shadow_box/radii/sigma, so shrinking
+                // the quad crops the blur exactly.
+                if let Some(g) = s.geometry.intersection(bounds) {
+                    s.geometry = g;
+                }
+            }
         }
         true
     }
@@ -1000,7 +1079,16 @@ impl RenderEl {
                 if r.inset.is_some() || r.color_bt2020_nits[3] < 1.0 {
                     return;
                 }
-                push_rounded_box_bands(r.geometry, r.radii, out);
+                match r.clip {
+                    None => push_rounded_box_bands(r.geometry, r.radii, out),
+                    // Cropped: only the part of the interior the quad
+                    // actually rasterizes is opaque.
+                    Some(clip) => {
+                        let mut bands = Vec::with_capacity(2);
+                        push_rounded_box_bands(r.geometry, r.radii, &mut bands);
+                        out.extend(bands.iter().filter_map(|b| b.intersection(clip)));
+                    }
+                }
             }
             // A shadow is translucent everywhere — never an occluder.
             Self::Shadow(_) => {}
@@ -1048,17 +1136,24 @@ impl RenderEl {
             }
             Self::Border(b) => {
                 let c = fnv_f32s(&b.color_bt2020_nits);
-                b.thickness
+                let c = b
+                    .thickness
                     .iter()
-                    .fold(c, |h, t| (h ^ t.to_bits()).wrapping_mul(FNV_PRIME))
+                    .fold(c, |h, t| (h ^ t.to_bits()).wrapping_mul(FNV_PRIME));
+                // Crop folded in relative to the element origin, like the
+                // surface clip: a pure move stays a geometry-only diff, a
+                // band edge sweeping across re-damages in place.
+                mix_rect_clip(c, &b.clip, b.geometry.loc)
             }
             Self::RoundedBox(r) => {
                 let c = fnv_f32s(&r.color_bt2020_nits);
                 let c = fnv_f32s(&r.radii) ^ c;
-                r.inset
+                let c = r
+                    .inset
                     .unwrap_or([-1.0; 4]) // distinct from any real (≥ 0) inset
                     .iter()
-                    .fold(c, |h, t| (h ^ t.to_bits()).wrapping_mul(FNV_PRIME))
+                    .fold(c, |h, t| (h ^ t.to_bits()).wrapping_mul(FNV_PRIME));
+                mix_rect_clip(c, &r.clip, r.geometry.loc)
             }
             Self::Shadow(s) => {
                 // Shadow box + cut-out fingerprint relative to the quad
@@ -1167,6 +1262,7 @@ mod tests {
             geometry: geo,
             thickness: [2.0; 4],
             color_bt2020_nits: [10.0, 10.0, 10.0, 1.0],
+            clip: None,
         })
     }
 
@@ -1177,6 +1273,7 @@ mod tests {
             radii: [20.0; 4],
             inset,
             color_bt2020_nits: [10.0, 10.0, 10.0, alpha],
+            clip: None,
         })
     }
 
@@ -1482,5 +1579,82 @@ mod tests {
             solid(rect(50.0, 0.0, 50.0, 100.0), 1.0),
         ];
         assert_eq!(cull_occluded(&els), vec![false, true, true]);
+    }
+
+    /// A border straddling the crop edge picks up the rect clip (so its
+    /// stripes stop at the band) instead of being kept whole; one fully
+    /// outside is dropped.
+    #[test]
+    fn crop_clips_straddling_border() {
+        let mut el = border(rect(40.0, 40.0, 100.0, 100.0));
+        assert!(el.crop_to_rect(rect(0.0, 0.0, 100.0, 100.0)));
+        let RenderEl::Border(b) = &el else {
+            unreachable!()
+        };
+        assert_eq!(b.clip, Some(rect(0.0, 0.0, 100.0, 100.0)));
+        // Full geometry retained — the crop is the clip, not a reshape.
+        assert_eq!(b.geometry, rect(40.0, 40.0, 100.0, 100.0));
+
+        let mut outside = border(rect(200.0, 200.0, 10.0, 10.0));
+        assert!(!outside.crop_to_rect(rect(0.0, 0.0, 100.0, 100.0)));
+    }
+
+    /// Cropping a rounded box keeps its SDF geometry (the shape is cut at
+    /// the band edge, not reshaped) and shrinks its opaque bands to the
+    /// clipped region only.
+    #[test]
+    fn crop_clips_rounded_box_and_its_opaque_bands() {
+        let mut el = rounded(rect(40.0, 0.0, 100.0, 100.0), None, 1.0);
+        assert!(el.crop_to_rect(rect(0.0, 0.0, 100.0, 100.0)));
+        let RenderEl::RoundedBox(r) = &el else {
+            unreachable!()
+        };
+        assert_eq!(r.geometry, rect(40.0, 0.0, 100.0, 100.0));
+        assert_eq!(r.clip, Some(rect(0.0, 0.0, 100.0, 100.0)));
+
+        let mut opaque = Vec::new();
+        el.push_opaque_regions(&mut opaque);
+        for region in &opaque {
+            assert!(
+                region.loc.x + region.size.w <= 100.0,
+                "opaque region {region:?} extends past the crop edge"
+            );
+        }
+    }
+
+    /// Cropping a shadow shrinks the rasterized quad directly — its SDF
+    /// box is the separate `shadow_box` field, which must stay put so the
+    /// blur is cut at the band edge rather than reshaped. (The shrink
+    /// itself is caught by the damage diff's geometry compare; the content
+    /// token only needs to track the quad↔shadow_box *offset*, covered
+    /// below.)
+    #[test]
+    fn crop_shrinks_shadow_quad_not_its_sdf_box() {
+        let mk = || ShadowEl {
+            id: ElementId::alloc(),
+            geometry: rect(40.0, 0.0, 120.0, 120.0),
+            shadow_box: rect(50.0, 10.0, 100.0, 100.0),
+            radii: [8.0; 4],
+            sigma: 5.0,
+            cutout: None,
+            color_bt2020_nits: [0.0, 0.0, 0.0, 0.7],
+        };
+        let mut el = RenderEl::Shadow(mk());
+        assert!(el.crop_to_rect(rect(0.0, 0.0, 100.0, 100.0)));
+        let RenderEl::Shadow(s) = &el else {
+            unreachable!()
+        };
+        assert_eq!(s.geometry, rect(40.0, 0.0, 60.0, 100.0));
+        assert_eq!(s.shadow_box, rect(50.0, 10.0, 100.0, 100.0));
+
+        // A quad pinned in place while the casting box slides under it
+        // (band-edge crop during a card scroll) must re-damage via the
+        // token — the meta geometry is unchanged in that case.
+        let mut slid = mk();
+        slid.shadow_box.loc.x += 10.0;
+        assert_ne!(
+            RenderEl::Shadow(slid).content_token(),
+            RenderEl::Shadow(mk()).content_token()
+        );
     }
 }

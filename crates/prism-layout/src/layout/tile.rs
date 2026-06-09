@@ -1082,12 +1082,12 @@ impl<W: LayoutElement> Tile<W> {
     /// coordinates (this is **not** the window's top-left — the window sits
     /// inside the tile, inset by the border on all sides when one is drawn).
     ///
-    /// Heavily simplified from niri/src/layout/tile.rs's
-    /// `render_inner` (290 LOC): no resize crossfade, no offscreen
-    /// alpha compositing, no clipped-surface rounded corners, no
-    /// open-animation pop-in, no background blur, no xray. The
-    /// state machine that gates those still runs — when the matching
-    /// Vulkan elements land they plug in here.
+    /// Ported from niri/src/layout/tile.rs's `render_inner`, adapted to
+    /// prism's element vocabulary: the resize crossfade replays a
+    /// screen-copy snapshot instead of niri's offscreen re-render, the
+    /// tile-wide fade is a per-element `mul_alpha` instead of offscreen
+    /// alpha compositing, and clip-to-geometry uses the SDF surface
+    /// clip. Still missing vs niri: background blur, xray.
     ///
     /// `focus_ring_visible` lets the caller suppress the focus ring
     /// (used by niri for tabs / overview); mirrors niri's parameter
@@ -1108,6 +1108,11 @@ impl<W: LayoutElement> Tile<W> {
             .as_ref()
             .map_or(1., |a| a.anim.clamped_value()) as f32;
 
+        // Window-content opacity (the opacity window rule). `tile_alpha`
+        // is NOT folded in here — it multiplies the whole assembled tile
+        // (decorations included) at the bottom of this function, so an
+        // interactive-move / tab fade dims shadow, ring and border in
+        // lockstep with the content instead of leaving them opaque.
         let win_alpha = if self.window.is_ignoring_opacity_window_rule() {
             1.
         } else {
@@ -1116,7 +1121,6 @@ impl<W: LayoutElement> Tile<W> {
             let p = fullscreen_progress as f32;
             a * (1. - p) + p
         };
-        let win_alpha = win_alpha * tile_alpha;
 
         // Baba-is-float vertical bob — kept here rather than baked into
         // render_offset() because it's not reset by interactive move /
@@ -1150,7 +1154,7 @@ impl<W: LayoutElement> Tile<W> {
         // size so the backdrop fades in/out with the resize animation.
         if fullscreen_progress > 0. {
             let backdrop = Rectangle::new(location, self.animated_tile_size());
-            let alpha = fullscreen_progress as f32 * tile_alpha;
+            let alpha = fullscreen_progress as f32;
             let color_bt2020_nits =
                 prism_renderer::srgb_to_bt2020_nits(0., 0., 0., alpha, BACKDROP_SDR_WHITE_NITS);
             els.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
@@ -1205,9 +1209,6 @@ impl<W: LayoutElement> Tile<W> {
             }
         }
 
-        self.window
-            .render_popups(window_render_loc, scale, win_alpha, ctx, &mut els);
-
         // Resize crossfade. The live content above is already drawn at the
         // animated size (inc1: `animated_tile_size`/`animated_window_size`
         // interpolate, and border/ring/window_loc follow). Here we replay the
@@ -1220,6 +1221,8 @@ impl<W: LayoutElement> Tile<W> {
         // the decode pass, the same mechanism as the close animation. The
         // snapshot is in the intermediate's working space, so it replays as a
         // pass-through draw (no EOTF, identity primaries, premultiplied).
+        // Pushed before the popups below so an open popup stays on top of
+        // the fading old frame instead of being covered by it.
         if let Some(resize) = &self.resize_animation {
             if let Some(snapshot) = &resize.gpu_snapshot {
                 let progress = resize.anim.clamped_value().clamp(0.0, 1.0);
@@ -1244,6 +1247,20 @@ impl<W: LayoutElement> Tile<W> {
                         clip: None,
                     }));
                 }
+            }
+        }
+
+        self.window
+            .render_popups(window_render_loc, scale, win_alpha, ctx, &mut els);
+
+        // Tile-wide fade (interactive move at 0.75, tabbed-column fades):
+        // multiplied over every element — decorations, backdrop, content,
+        // crossfade, popups — so the whole tile dims as one. Surfaces that
+        // turn translucent drop their opaque regions inside mul_alpha, so
+        // occlusion culling stays correct.
+        if tile_alpha < 1. {
+            for el in &mut els {
+                el.mul_alpha(tile_alpha);
             }
         }
 

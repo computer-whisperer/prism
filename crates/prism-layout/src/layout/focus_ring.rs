@@ -189,6 +189,7 @@ impl FocusRing {
                 radii: cached.radii,
                 inset: cached.is_border.then_some(cached.thickness_logical),
                 color_bt2020_nits: cached.color_bt2020_nits,
+                clip: None,
             }));
         } else if cached.is_border {
             out.push(RenderEl::Border(BorderEl {
@@ -196,6 +197,7 @@ impl FocusRing {
                 geometry: outer_logical,
                 thickness: cached.thickness_logical,
                 color_bt2020_nits: cached.color_bt2020_nits,
+                clip: None,
             }));
         } else {
             out.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
