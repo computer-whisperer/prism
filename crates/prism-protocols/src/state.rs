@@ -2640,7 +2640,7 @@ impl CompositorHandler for PrismState {
         // their GPU import must refresh here or the render walk samples a stale
         // buffer (the bug behind partially-updating Firefox widgets). But doing
         // it for the *whole* tree every commit re-armed work for unchanged
-        // children — each `ensure_surface_textures` re-sets `acquire_pending`
+        // children — each `ensure_surface_textures` re-clears `acquire_waited`
         // (re-importing the client's implicit fence next render) and repeats a
         // layout lookup. So gate per child on its content version actually
         // advancing. The commit counter is the robust signal: a buffer-identity
@@ -3701,9 +3701,9 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
                     source,
                     by_gpu: carried,
                     shm_upload_commit: carried_commit,
-                    // Set per-commit in ensure_surface_textures (covers
-                    // same-buffer damage re-commits too); start false here.
-                    acquire_pending: false,
+                    // Cleared per-commit in ensure_surface_textures (covers
+                    // same-buffer damage re-commits too); start empty here.
+                    acquire_waited: std::collections::HashSet::new(),
                 });
             }
             Err(e) => tracing::warn!("surface buffer source build failed: {e:#}"),
@@ -4307,10 +4307,11 @@ fn ensure_surface_textures(state: &PrismState, surface: &WlSurface) {
                         tracing::warn!(gpu = ?g, "dmabuf materialize failed: {e:#}");
                     }
                 }
-                // The client wrote this buffer this commit — the next render
-                // that samples it must wait on its implicit write fence once
-                // (cleared in prepare_dmabuf_acquire_waits).
-                tex.acquire_pending = true;
+                // The client wrote this buffer this commit — on every GPU, the
+                // next render that samples it must wait on its implicit write
+                // fence once (GPUs re-add themselves via
+                // mark_dmabuf_acquire_waited after a confirmed render submit).
+                tex.acquire_waited.clear();
             }
             TexSource::Shm { .. } => {
                 // Upload only the regions the client damaged this commit
@@ -4504,13 +4505,14 @@ pub fn prepare_dmabuf_acquire_waits(
     for surface in surfaces {
         // Export the producer write fence under the surface lock (we need the
         // dmabuf plane fd); import it as a semaphore after releasing the lock.
-        // Clear `acquire_pending` here — this committed buffer gets its one
-        // wait now, so subsequent frames displaying it won't re-export.
+        // Deliberately does NOT mark the wait as done here: `present()` can
+        // still bail (FlipPending / no damage) without queueing any GPU work,
+        // and the retry must re-export. The caller marks via
+        // `mark_dmabuf_acquire_waited` once the render submit is confirmed.
         let fence_fd = with_states(surface, |states| {
             let slot = states.data_map.get::<SurfaceTexSlot>()?;
             let mut guard = slot.0.lock().unwrap();
             let tex = guard.as_mut()?;
-            tex.acquire_pending = false;
             let TexSource::Dmabuf { dmabuf, .. } = &tex.source else {
                 return None;
             };
@@ -4536,6 +4538,23 @@ pub fn prepare_dmabuf_acquire_waits(
         );
     }
     waits
+}
+
+/// Record that a render submit on `target_gpu` carrying the acquire waits for
+/// `surfaces` was actually queued: those surfaces' current buffers don't need
+/// another producer-fence wait on this GPU. Call ONLY on a confirmed
+/// `Presented` outcome — after FlipPending / SkippedNoDamage the waits went
+/// unused and the next attempt must re-export (see `acquire_waited`).
+pub fn mark_dmabuf_acquire_waited(surfaces: &[WlSurface], target_gpu: DrmDevId) {
+    for surface in surfaces {
+        with_states(surface, |states| {
+            if let Some(slot) = states.data_map.get::<SurfaceTexSlot>() {
+                if let Some(tex) = slot.0.lock().unwrap().as_mut() {
+                    tex.acquire_waited.insert(target_gpu);
+                }
+            }
+        });
+    }
 }
 
 /// Materialize a dmabuf-backed surface on GPU `g`: a zero-copy native
@@ -4595,9 +4614,9 @@ fn materialize_dmabuf_for_gpu(
         tex.by_gpu.insert(g, GpuTex::Native(img));
         // Freshly attached (incl. via the render-demand path, which doesn't go
         // through the per-commit ensure): its first sample must wait on the
-        // client's write fence. (Set even on a cache hit — the client may have
-        // rewritten this buffer's pixels since we last sampled it.)
-        tex.acquire_pending = true;
+        // client's write fence. (Cleared even on a cache hit — the client may
+        // have rewritten this buffer's pixels since we last sampled it.)
+        tex.acquire_waited.clear();
         return Ok(());
     }
 

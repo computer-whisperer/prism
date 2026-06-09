@@ -2798,10 +2798,12 @@ fn render_output_now(
             let Some(tex) = guard.as_ref() else { return };
             if tex.is_mirror_for(output_gpu_id) {
                 mirror_surfaces.borrow_mut().push(s.clone());
-            } else if tex.is_native_dmabuf_for(output_gpu_id) && tex.acquire_pending {
-                // Only surfaces written since their last acquire wait — keeps
-                // the per-frame sync_file/semaphore churn bounded to changed
-                // tiles (a static buffer's write is long done).
+            } else if tex.is_native_dmabuf_for(output_gpu_id)
+                && !tex.acquire_waited.contains(&output_gpu_id)
+            {
+                // Only surfaces written since this GPU's last acquire wait —
+                // keeps the per-frame sync_file/semaphore churn bounded to
+                // changed tiles (a static buffer's write is long done).
                 acquire_surfaces.borrow_mut().push(s.clone());
             }
         };
@@ -3098,7 +3100,15 @@ fn render_output_now(
     prism_protocols::destroy_render_wait_semaphores(state, output_gpu_id, render_waits);
 
     let present_sync_fd = match outcome {
-        prism_drm::PresentOutcome::Presented(fd) => fd,
+        prism_drm::PresentOutcome::Presented(fd) => {
+            // The render submit really carried the acquire waits — only now
+            // may these surfaces skip the producer-fence wait on this GPU.
+            // On FlipPending/Skipped below the waits went unused and the
+            // retry re-exports (clearing at prepare time put the fa62fb9
+            // blue-bleed race back on the flip-pending path).
+            prism_protocols::mark_dmabuf_acquire_waited(&acquire_surfaces, output_gpu_id);
+            fd
+        }
         // Flip still in flight — caller leaves the output Queued and retries.
         prism_drm::PresentOutcome::FlipPending => return Ok(RenderOutcome::FlipPending),
         // Nothing changed — caller arms an estimated vblank instead of waiting

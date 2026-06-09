@@ -198,14 +198,20 @@ pub struct SurfaceTexture {
     /// buffer swaps that reuse the per-GPU `ShmTexture`s (see
     /// `process_surface_buffer`). Unused for dmabuf/solid sources.
     pub shm_upload_commit: Option<CommitCounter>,
-    /// Whether this surface's (native dmabuf) buffer has been written by the
-    /// client since the last time the render path waited on its implicit fence.
-    /// Set on every dmabuf commit (`ensure_surface_textures`), cleared when
-    /// `prepare_dmabuf_acquire_waits` imports the fence. Gates the acquire wait
-    /// to once per committed buffer — a written buffer only needs syncing on
-    /// its first sample, not every frame it stays on screen — which keeps the
-    /// per-frame sync_file/semaphore churn bounded. Unused for shm/solid.
-    pub acquire_pending: bool,
+    /// GPUs whose render has already waited on the client's implicit write
+    /// fence for the CURRENTLY committed (native dmabuf) buffer. Emptied on
+    /// every dmabuf commit (`ensure_surface_textures`); a GPU is added by
+    /// `mark_dmabuf_acquire_waited` only after a render submit that carries
+    /// the imported fence in its wait list was actually queued — NOT at
+    /// fence-import time, because `present()` can return FlipPending /
+    /// SkippedNoDamage without submitting any GPU work, and clearing early
+    /// would let the retry sample the buffer with no producer wait (the
+    /// fa62fb9 blue-bleed race). Per-GPU so one output's wait doesn't eat
+    /// the fence for the other GPUs' renders. A written buffer only needs
+    /// syncing on its first sample per GPU, not every frame it stays on
+    /// screen — keeping the per-frame sync_file/semaphore churn bounded.
+    /// Unused for shm/solid.
+    pub acquire_waited: std::collections::HashSet<DrmDevId>,
 }
 
 impl SurfaceTexture {
@@ -214,7 +220,7 @@ impl SurfaceTexture {
             source,
             by_gpu: HashMap::new(),
             shm_upload_commit: None,
-            acquire_pending: false,
+            acquire_waited: std::collections::HashSet::new(),
         }
     }
 
