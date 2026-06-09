@@ -2366,18 +2366,34 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
         return;
     }
     match render_output_now(state, output_id) {
-        Ok(RenderOutcome::Presented(pending)) => {
+        Ok(RenderOutcome::Presented {
+            pending,
+            redraw_again,
+        }) => {
             let entry = state.output_redraw.entry(output_id.to_owned()).or_default();
             entry.pending_feedback = Some(pending);
+            // A redraw requested during the render (demand-materialized
+            // textures) must survive this transition, or the surfaces that
+            // rendered blank this frame stay blank until unrelated damage.
             entry.redraw = RedrawState::WaitingForVBlank {
-                redraw_needed: false,
+                redraw_needed: redraw_again,
             };
         }
-        Ok(RenderOutcome::SkippedNoDamage) => {
+        Ok(RenderOutcome::SkippedNoDamage { redraw_again }) => {
             // Nothing changed, so no page-flip and thus no real vblank will
             // arrive to advance the frame-callback cycle or resume animations.
             // Arm an estimated-vblank timer in its place.
             queue_estimated_vblank(state, output_id);
+            if redraw_again {
+                // Upgrade the armed timer to ...AndQueued (or Queued/Idle
+                // fallbacks) so the demand-materialize repaint happens at the
+                // estimated vblank — paced, not respinning the dispatch loop.
+                state
+                    .output_redraw
+                    .entry(output_id.to_owned())
+                    .or_default()
+                    .queue_redraw();
+            }
         }
         Ok(RenderOutcome::FlipPending) => {
             // Flip still in flight. Shouldn't normally happen (we only enter
@@ -3019,7 +3035,11 @@ fn render_output_now(
         prism_drm::PresentOutcome::FlipPending => return Ok(RenderOutcome::FlipPending),
         // Nothing changed — caller arms an estimated vblank instead of waiting
         // for a real one. No harvest (no scanout, so no presentation feedback).
-        prism_drm::PresentOutcome::SkippedNoDamage => return Ok(RenderOutcome::SkippedNoDamage),
+        prism_drm::PresentOutcome::SkippedNoDamage => {
+            return Ok(RenderOutcome::SkippedNoDamage {
+                redraw_again: !missing.is_empty(),
+            })
+        }
     };
 
     // Service queued dmabuf screencopy captures for this output now — right
@@ -3131,19 +3151,29 @@ fn render_output_now(
         drop(present_sync_fd);
     }
 
-    Ok(RenderOutcome::Presented(PendingFeedback {
-        presentation_cbs,
-        target_time,
-    }))
+    Ok(RenderOutcome::Presented {
+        pending: PendingFeedback {
+            presentation_cbs,
+            target_time,
+        },
+        redraw_again: !missing.is_empty(),
+    })
 }
 
 /// Outcome of [`render_output_now`] — mirrors `prism_drm::PresentOutcome` but
 /// carries the harvested `PendingFeedback` on the presented path.
 enum RenderOutcome {
     /// Rendered + flipped; the stash to fire at the matching vblank.
-    Presented(prism_protocols::PendingFeedback),
+    Presented {
+        pending: prism_protocols::PendingFeedback,
+        /// A repaint was requested *during* the render (the demand-materialize
+        /// net created textures that rendered blank this frame). The caller's
+        /// post-render state transition would otherwise destroy that request —
+        /// `queue_redraw` is a no-op while the state is `Queued`.
+        redraw_again: bool,
+    },
     /// Nothing changed; no flip happened. Caller arms an estimated vblank.
-    SkippedNoDamage,
+    SkippedNoDamage { redraw_again: bool },
     /// A previous flip is still in flight; caller retries next pass.
     FlipPending,
 }
