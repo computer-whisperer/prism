@@ -240,6 +240,44 @@ pub fn on_pointer_button<I: PrismInputBackend>(
     let button = event.button_code();
     let state_pressed = event.state() == ButtonState::Pressed;
 
+    // A button whose press was consumed by a `Mouse*` bind: swallow
+    // the matching release too, so the client never sees a dangling
+    // release (niri's `suppressed_buttons`; the pointer analogue of
+    // `suppressed_keys`).
+    if state.suppressed_buttons.remove(&button) {
+        return;
+    }
+
+    // Configured mouse-button binds (`Mod+MouseMiddle { ... }`) fire
+    // before any other press handling, mirroring niri's
+    // `on_pointer_button` order. Deliberately not gated on
+    // `is_grabbed`: niri dispatches mouse binds during grabs too.
+    if state_pressed {
+        use prism_config::Trigger;
+        use smithay::backend::input::MouseButton;
+        let trigger = match event.button() {
+            Some(MouseButton::Left) => Some(Trigger::MouseLeft),
+            Some(MouseButton::Right) => Some(Trigger::MouseRight),
+            Some(MouseButton::Middle) => Some(Trigger::MouseMiddle),
+            Some(MouseButton::Back) => Some(Trigger::MouseBack),
+            Some(MouseButton::Forward) => Some(Trigger::MouseForward),
+            _ => None,
+        };
+        if let Some(trigger) = trigger {
+            let (snapshot, mod_key) = binds_snapshot(state);
+            let mods = state
+                .seat
+                .get_keyboard()
+                .map(|kb| kb.modifier_state())
+                .unwrap_or_default();
+            if let Some(bind) = crate::dispatch::find_bind(&snapshot, mod_key, trigger, mods) {
+                state.suppressed_buttons.insert(button);
+                crate::dispatch::handle_bind(state, bind);
+                return;
+            }
+        }
+    }
+
     // Click-to-focus: on press, take keyboard focus to the surface
     // under the pointer AND make that surface's output the layout's
     // active monitor. Without the focus_output call the focus ring
@@ -552,11 +590,16 @@ pub fn on_pointer_axis<I: PrismInputBackend>(state: &mut PrismState, event: I::P
     // actions — identical on a single monitor, and prism's multi-
     // monitor focus tracking isn't wired yet anyway). Scrolls consumed
     // here never reach Wayland clients.
-    if source == AxisSource::Wheel
-        && state.layout.is_overview_open()
-        && overview_wheel_scroll::<I>(state, &event)
-    {
-        return;
+    if source == AxisSource::Wheel {
+        if state.layout.is_overview_open() && overview_wheel_scroll::<I>(state, &event) {
+            return;
+        }
+        // Configured `WheelScroll*` binds (Mod+wheel workspace switch
+        // and friends). Consumes the whole event when a bind exists
+        // for the held modifiers.
+        if wheel_bind_scroll::<I>(state, &event) {
+            return;
+        }
     }
 
     // Touchpad two-finger (and continuous-device) scroll in the
@@ -565,26 +608,64 @@ pub fn on_pointer_axis<I: PrismInputBackend>(state: &mut PrismState, event: I::P
     // input/mod.rs:3296). Outside the overview the helper winds down
     // any gesture left over from an overview scroll and lets the
     // event through.
-    if matches!(source, AxisSource::Finger | AxisSource::Continuous)
-        && overview_finger_scroll::<I>(state, &event)
-    {
-        return;
+    if matches!(source, AxisSource::Finger | AxisSource::Continuous) {
+        if overview_finger_scroll::<I>(state, &event) {
+            return;
+        }
+        // Configured `TouchpadScroll*` binds.
+        if finger_bind_scroll::<I>(state, &event) {
+            return;
+        }
     }
+
+    // Pass-through to the client under the pointer, scaled by the
+    // device scroll-factor (`mouse { scroll-factor }` for wheels,
+    // `touchpad { scroll-factor }` for finger scrolls) × the window
+    // rule's `scroll-factor` (niri input/mod.rs:3486).
+    let device_scroll_factor = {
+        let cfg = state.config.borrow();
+        match source {
+            AxisSource::Wheel => cfg.input.mouse.scroll_factor,
+            AxisSource::Finger => cfg.input.touchpad.scroll_factor,
+            _ => None,
+        }
+    };
+    let window_scroll_factor = {
+        use prism_layout::layout::LayoutElement as _;
+        state
+            .pointer_contents
+            .as_ref()
+            .map(|(surface, _)| state.find_root_shell_surface(surface))
+            .and_then(|root| state.layout.find_window_and_output(&root))
+            .and_then(|(mapped, _)| mapped.rules().scroll_factor)
+            .unwrap_or(1.)
+    };
+    let (h_factor, v_factor) = device_scroll_factor
+        .map(|f| f.h_v_factors())
+        .unwrap_or((1.0, 1.0));
+    let (h_factor, v_factor) = (
+        h_factor * window_scroll_factor,
+        v_factor * window_scroll_factor,
+    );
 
     let mut frame = AxisFrame::new(time).source(source);
 
     for axis in [Axis::Horizontal, Axis::Vertical] {
+        let factor = match axis {
+            Axis::Horizontal => h_factor,
+            Axis::Vertical => v_factor,
+        };
         if let Some(discrete) = event.amount_v120(axis) {
             // v120 increments are smithay's preferred high-resolution
             // discrete scroll signal.
-            frame = frame.v120(axis, discrete as i32);
+            frame = frame.v120(axis, (discrete * factor) as i32);
         }
         if let Some(amount) = event.amount(axis) {
-            frame = frame.value(axis, amount);
+            frame = frame.value(axis, amount * factor);
         } else if let Some(amount_discrete) = event.amount_v120(axis) {
             // Some backends only give discrete; convert to a smooth
             // value at ~10 px per notch, niri's default ratio.
-            frame = frame.value(axis, amount_discrete / 120.0 * 10.0);
+            frame = frame.value(axis, amount_discrete / 120.0 * 10.0 * factor);
         }
         // niri stops a wheel "frame" with a stop event for finger
         // scrolls when the amount is exactly zero — we forward that
@@ -596,6 +677,163 @@ pub fn on_pointer_axis<I: PrismInputBackend>(state: &mut PrismState, event: I::P
 
     pointer.axis(state, frame);
     pointer.frame(state);
+}
+
+/// Snapshot the bind table + resolved Mod key out of the config
+/// RefCell, so bind matching never holds the config borrow across an
+/// action (actions re-borrow config freely).
+fn binds_snapshot(state: &PrismState) -> (Vec<prism_config::Bind>, prism_config::ModKey) {
+    let cfg = state.config.borrow();
+    (
+        cfg.binds.0.clone(),
+        cfg.input.mod_key.unwrap_or(prism_config::ModKey::Super),
+    )
+}
+
+/// Dispatch configured `WheelScroll{Up,Down,Left,Right}` binds for a
+/// wheel-source axis event. Returns `true` when the event is consumed:
+/// if any wheel bind exists for the held modifier combination, the
+/// whole event is swallowed (sub-tick amounts accumulate in the wheel
+/// trackers rather than reaching clients) — niri's
+/// `mods_with_wheel_binds` gate. With no bind for these modifiers the
+/// trackers reset and the event passes through.
+fn wheel_bind_scroll<I: PrismInputBackend>(
+    state: &mut PrismState,
+    event: &I::PointerAxisEvent,
+) -> bool {
+    use prism_config::Trigger;
+
+    const WHEEL_TRIGGERS: &[Trigger] = &[
+        Trigger::WheelScrollUp,
+        Trigger::WheelScrollDown,
+        Trigger::WheelScrollLeft,
+        Trigger::WheelScrollRight,
+    ];
+
+    let mods = state
+        .seat
+        .get_keyboard()
+        .map(|kb| kb.modifier_state())
+        .unwrap_or_default();
+    let modifiers = crate::dispatch::modifiers_from_state(mods);
+    let (snapshot, mod_key) = binds_snapshot(state);
+
+    if !crate::dispatch::binds_have_trigger_for_mods(&snapshot, mod_key, WHEEL_TRIGGERS, modifiers)
+    {
+        state.horizontal_wheel_tracker.reset();
+        state.vertical_wheel_tracker.reset();
+        return false;
+    }
+
+    let horizontal = event.amount_v120(Axis::Horizontal).unwrap_or(0.);
+    let ticks = state.horizontal_wheel_tracker.accumulate(horizontal);
+    if ticks != 0 {
+        let left = crate::dispatch::find_bind(&snapshot, mod_key, Trigger::WheelScrollLeft, mods);
+        let right = crate::dispatch::find_bind(&snapshot, mod_key, Trigger::WheelScrollRight, mods);
+        if let Some(right) = right {
+            for _ in 0..ticks {
+                crate::dispatch::handle_bind(state, right.clone());
+            }
+        }
+        if let Some(left) = left {
+            for _ in ticks..0 {
+                crate::dispatch::handle_bind(state, left.clone());
+            }
+        }
+    }
+
+    let vertical = event.amount_v120(Axis::Vertical).unwrap_or(0.);
+    let ticks = state.vertical_wheel_tracker.accumulate(vertical);
+    if ticks != 0 {
+        let up = crate::dispatch::find_bind(&snapshot, mod_key, Trigger::WheelScrollUp, mods);
+        let down = crate::dispatch::find_bind(&snapshot, mod_key, Trigger::WheelScrollDown, mods);
+        if let Some(down) = down {
+            for _ in 0..ticks {
+                crate::dispatch::handle_bind(state, down.clone());
+            }
+        }
+        if let Some(up) = up {
+            for _ in ticks..0 {
+                crate::dispatch::handle_bind(state, up.clone());
+            }
+        }
+    }
+
+    true
+}
+
+/// Dispatch configured `TouchpadScroll{Up,Down,Left,Right}` binds for
+/// a finger/continuous-source axis event. Same consume-vs-passthrough
+/// shape as [`wheel_bind_scroll`], but accumulating pixel deltas
+/// (tick = 10) instead of v120 units.
+fn finger_bind_scroll<I: PrismInputBackend>(
+    state: &mut PrismState,
+    event: &I::PointerAxisEvent,
+) -> bool {
+    use prism_config::Trigger;
+
+    const FINGER_TRIGGERS: &[Trigger] = &[
+        Trigger::TouchpadScrollUp,
+        Trigger::TouchpadScrollDown,
+        Trigger::TouchpadScrollLeft,
+        Trigger::TouchpadScrollRight,
+    ];
+
+    let mods = state
+        .seat
+        .get_keyboard()
+        .map(|kb| kb.modifier_state())
+        .unwrap_or_default();
+    let modifiers = crate::dispatch::modifiers_from_state(mods);
+    let (snapshot, mod_key) = binds_snapshot(state);
+
+    if !crate::dispatch::binds_have_trigger_for_mods(&snapshot, mod_key, FINGER_TRIGGERS, modifiers)
+    {
+        state.horizontal_finger_scroll_tracker.reset();
+        state.vertical_finger_scroll_tracker.reset();
+        return false;
+    }
+
+    let horizontal = event.amount(Axis::Horizontal).unwrap_or(0.);
+    let ticks = state
+        .horizontal_finger_scroll_tracker
+        .accumulate(horizontal);
+    if ticks != 0 {
+        let left =
+            crate::dispatch::find_bind(&snapshot, mod_key, Trigger::TouchpadScrollLeft, mods);
+        let right =
+            crate::dispatch::find_bind(&snapshot, mod_key, Trigger::TouchpadScrollRight, mods);
+        if let Some(right) = right {
+            for _ in 0..ticks {
+                crate::dispatch::handle_bind(state, right.clone());
+            }
+        }
+        if let Some(left) = left {
+            for _ in ticks..0 {
+                crate::dispatch::handle_bind(state, left.clone());
+            }
+        }
+    }
+
+    let vertical = event.amount(Axis::Vertical).unwrap_or(0.);
+    let ticks = state.vertical_finger_scroll_tracker.accumulate(vertical);
+    if ticks != 0 {
+        let up = crate::dispatch::find_bind(&snapshot, mod_key, Trigger::TouchpadScrollUp, mods);
+        let down =
+            crate::dispatch::find_bind(&snapshot, mod_key, Trigger::TouchpadScrollDown, mods);
+        if let Some(down) = down {
+            for _ in 0..ticks {
+                crate::dispatch::handle_bind(state, down.clone());
+            }
+        }
+        if let Some(up) = up {
+            for _ in ticks..0 {
+                crate::dispatch::handle_bind(state, up.clone());
+            }
+        }
+    }
+
+    true
 }
 
 /// Handle a wheel-source axis event while the overview is open.
@@ -632,7 +870,7 @@ fn overview_wheel_scroll<I: PrismInputBackend>(
     // Vertical, Shift: column focus (niri's wheel-only-mouse
     // affordance for horizontal movement).
     let vertical = event.amount_v120(Axis::Vertical).unwrap_or(0.);
-    let ticks = state.overview_wheel_tracker_v.accumulate(vertical);
+    let ticks = state.vertical_wheel_tracker.accumulate(vertical);
     if ticks != 0 {
         if shift {
             let action = if ticks > 0 {
@@ -664,7 +902,7 @@ fn overview_wheel_scroll<I: PrismInputBackend>(
 
     // Horizontal: column focus (no cooldown, matching niri).
     let horizontal = event.amount_v120(Axis::Horizontal).unwrap_or(0.);
-    let ticks = state.overview_wheel_tracker_h.accumulate(horizontal);
+    let ticks = state.horizontal_wheel_tracker.accumulate(horizontal);
     if ticks != 0 {
         let action = if ticks > 0 {
             Action::FocusColumnRight

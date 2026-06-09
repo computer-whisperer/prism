@@ -494,12 +494,34 @@ pub struct PrismState {
     /// by hit-test and (later) cursor-plane setup. Starts at (0, 0).
     pub pointer_pos: smithay::utils::Point<f64, smithay::utils::Logical>,
 
-    /// Wheel-tick accumulators for the overview's hardcoded scroll
-    /// bindings (vertical = workspace switch, horizontal = column
-    /// focus) — the v120 → discrete-tick conversion niri's wheel
-    /// trackers do. Only consulted while the overview is open.
-    pub overview_wheel_tracker_v: prism_layout::input::ScrollTracker,
-    pub overview_wheel_tracker_h: prism_layout::input::ScrollTracker,
+    /// Wheel-tick accumulators (the v120 → discrete-tick conversion
+    /// niri's wheel trackers do). Shared by the overview's hardcoded
+    /// scroll bindings and the configured `WheelScroll*` bind dispatch
+    /// — sharing keeps accumulation seamless when the overview opens
+    /// or closes mid-scroll, matching niri's single tracker pair.
+    pub vertical_wheel_tracker: prism_layout::input::ScrollTracker,
+    pub horizontal_wheel_tracker: prism_layout::input::ScrollTracker,
+    /// Finger-scroll accumulators for the configured `TouchpadScroll*`
+    /// binds. Separate from the wheel trackers because finger deltas
+    /// are in pixels (tick = 10), not v120 units.
+    pub vertical_finger_scroll_tracker: prism_layout::input::ScrollTracker,
+    pub horizontal_finger_scroll_tracker: prism_layout::input::ScrollTracker,
+    /// Mouse button codes whose press was consumed by a configured
+    /// `Mouse*` bind; the matching release is swallowed so the focused
+    /// client never sees a dangling release (the pointer analogue of
+    /// `suppressed_keys`).
+    pub suppressed_buttons: std::collections::HashSet<u32>,
+    /// Per-bind cooldown deadlines (`cooldown-ms`): a bind found here
+    /// with a deadline still in the future does not fire. Instant-based
+    /// instead of niri's timer-token map — same semantics, no event
+    /// loop entanglement.
+    pub bind_cooldown_until: std::collections::HashMap<prism_config::Key, std::time::Instant>,
+    /// Active key-repeat timer for a held repeating bind (`repeat`,
+    /// default true): re-fires the bind's action at the keyboard's
+    /// repeat rate until any key release cancels it. Mirrors niri's
+    /// `bind_repeat_timer` (including its known limitation: any
+    /// release stops the repeat, not just the bound key's).
+    pub bind_repeat_timer: Option<RegistrationToken>,
     /// Last overview wheel workspace switch — niri puts a 50ms
     /// cooldown on its synthesized workspace-switch bind so one flick
     /// doesn't skip several workspaces.
@@ -883,9 +905,15 @@ impl PrismState {
             monitors_active: true,
             should_stop: false,
             pointer_pos: smithay::utils::Point::from((0.0, 0.0)),
-            // 120 = one wheel notch in v120 units.
-            overview_wheel_tracker_v: prism_layout::input::ScrollTracker::new(120),
-            overview_wheel_tracker_h: prism_layout::input::ScrollTracker::new(120),
+            // 120 = one wheel notch in v120 units; 10 = niri's
+            // pixels-per-tick for finger scrolls.
+            vertical_wheel_tracker: prism_layout::input::ScrollTracker::new(120),
+            horizontal_wheel_tracker: prism_layout::input::ScrollTracker::new(120),
+            vertical_finger_scroll_tracker: prism_layout::input::ScrollTracker::new(10),
+            horizontal_finger_scroll_tracker: prism_layout::input::ScrollTracker::new(10),
+            suppressed_buttons: std::collections::HashSet::new(),
+            bind_cooldown_until: std::collections::HashMap::new(),
+            bind_repeat_timer: None,
             overview_wheel_last_switch: None,
             gesture_swipe_3f_cumulative: None,
             overview_scroll_swipe_gesture: prism_layout::input::ScrollSwipeGesture::new(),
@@ -2697,7 +2725,7 @@ impl PrismState {
     /// their toplevel (or layer) surface. Mirrors niri's
     /// `find_root_shell_surface` (niri.rs:6125) — the layout only knows
     /// toplevel root surfaces, so resolve before querying it.
-    pub(crate) fn find_root_shell_surface(&self, surface: &WlSurface) -> WlSurface {
+    pub fn find_root_shell_surface(&self, surface: &WlSurface) -> WlSurface {
         let mut root = surface.clone();
         while let Some(parent) = get_parent(&root) {
             root = parent;

@@ -1,13 +1,16 @@
 //! Top-level input dispatch: libinput → PrismState bookkeeping →
 //! smithay seat → focused surface.
 //!
-//! This is the MVP port of niri's `State::process_input_event` (niri
+//! This is the port of niri's `State::process_input_event` (niri
 //! input/mod.rs, line 115). Coverage today:
 //!   - DeviceAdded / DeviceRemoved — capability bookkeeping on the seat
-//!   - Keyboard — focus dispatch + a single hardcoded quit binding
-//!     (Super+Escape). Per-key repeat, full config-driven binds,
-//!     accessibility, screenshot/MRU/exit-confirm UIs are deferred.
-//!   - Pointer motion/button/axis — handled in `super::pointer`.
+//!   - Keyboard — focus dispatch + config-driven binds with cooldown
+//!     and key-repeat (`handle_bind` / `start_key_repeat`), plus the
+//!     hardcoded VT-switch / emergency-quit / overview escape hatches.
+//!     Accessibility and the screenshot/MRU/exit-confirm UIs are
+//!     deferred.
+//!   - Pointer motion/button/axis — handled in `super::pointer`,
+//!     including `Mouse*` / `WheelScroll*` / `TouchpadScroll*` binds.
 //!
 //! Variants we ignore (logged at trace level so a stray tablet/touch
 //! event doesn't silently disappear): tablet, touch, gestures,
@@ -167,6 +170,18 @@ fn on_keyboard<I: PrismInputBackend>(state: &mut PrismState, event: I::KeyboardK
     let serial = SERIAL_COUNTER.next_serial();
     let time = smithay::backend::input::Event::time_msec(&event);
     let pressed = event.state() == KeyState::Pressed;
+
+    // Any key release stops bind key-repeat. Niri's behavior, with the
+    // same known imperfection (releasing a *different* key than the
+    // repeating one also stops the repeat — good enough).
+    if !pressed {
+        if let Some(token) = state.bind_repeat_timer.take() {
+            if let Some(handle) = state.loop_handle.as_ref() {
+                handle.remove(token);
+            }
+        }
+    }
+
     let key_code = event.key_code();
     // "Mod" in user binds maps to Super on TTY (defaults match niri's
     // mod-key resolution). When the config overrides input.mod_key we
@@ -286,9 +301,8 @@ fn on_keyboard<I: PrismInputBackend>(state: &mut PrismState, event: I::KeyboardK
     );
 
     if let Some(Some(bind)) = bind {
-        // TODO: cooldown enforcement, key-repeat timer for bind.repeat,
-        // allow_when_locked once we have a lock state, etc.
-        actions::handle_action(state, bind.action);
+        handle_bind(state, bind.clone());
+        start_key_repeat(state, bind);
     }
 
     // hide-when-typing: a key *press* hides the cursor (reappears on the
@@ -342,6 +356,103 @@ fn hardcoded_overview_bind(
     })
 }
 
+/// Run a matched bind's action, honoring its `cooldown-ms`. Ported
+/// from niri's `handle_bind` (input/mod.rs:643), with an Instant map
+/// instead of niri's timer-token map — same semantics (the bind can't
+/// fire again until the cooldown elapses), no event-loop entanglement.
+///
+/// `allow-when-locked` and `allow-inhibiting` still parse-only: prism
+/// has no session-lock state (issue #25) and no
+/// keyboard-shortcuts-inhibit support yet. Gate here when those land.
+pub(crate) fn handle_bind(state: &mut PrismState, bind: Bind) {
+    let Some(cooldown) = bind.cooldown else {
+        actions::handle_action(state, bind.action);
+        return;
+    };
+
+    let now = std::time::Instant::now();
+    if state
+        .bind_cooldown_until
+        .get(&bind.key)
+        .is_some_and(|&until| now < until)
+    {
+        return;
+    }
+    state.bind_cooldown_until.insert(bind.key, now + cooldown);
+    actions::handle_action(state, bind.action);
+}
+
+/// Arm the key-repeat timer for a held repeating bind (`repeat`,
+/// default true): after the keyboard's repeat delay, re-fire the
+/// bind's action at the repeat rate until any key release cancels the
+/// timer (see `on_keyboard`). Port of niri's `start_key_repeat`.
+fn start_key_repeat(state: &mut PrismState, bind: Bind) {
+    use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+
+    if !bind.repeat {
+        return;
+    }
+    let Some(handle) = state.loop_handle.clone() else {
+        // Headless / WLCS harness: no repeat, first fire already done.
+        return;
+    };
+
+    // Stop the previous bind's repeat, if any.
+    if let Some(token) = state.bind_repeat_timer.take() {
+        handle.remove(token);
+    }
+
+    let (repeat_delay, repeat_rate) = {
+        let cfg = state.config.borrow();
+        (
+            cfg.input.keyboard.repeat_delay,
+            cfg.input.keyboard.repeat_rate,
+        )
+    };
+    if repeat_rate == 0 {
+        return;
+    }
+    let repeat_duration = std::time::Duration::from_secs_f64(1. / f64::from(repeat_rate));
+
+    let timer = Timer::from_duration(std::time::Duration::from_millis(u64::from(repeat_delay)));
+    match handle.insert_source(timer, move |_, _, state| {
+        handle_bind(state, bind.clone());
+        TimeoutAction::ToDuration(repeat_duration)
+    }) {
+        Ok(token) => state.bind_repeat_timer = Some(token),
+        Err(e) => tracing::warn!("failed to arm bind key-repeat timer: {e}"),
+    }
+}
+
+/// Whether any bind exists on one of `triggers` for exactly this
+/// modifier combination. The scroll dispatch uses this to decide
+/// consume-vs-passthrough for the *whole* axis event — even sub-tick
+/// amounts accumulate silently rather than reaching clients when a
+/// bind exists for the held modifiers.
+///
+/// Per-event recompute of niri's precomputed `mods_with_wheel_binds` /
+/// `mods_with_finger_scroll_binds` sets (input/mod.rs:5012
+/// `mods_with_binds`) — the bind list is small and scroll events are
+/// infrequent, and recomputing can't go stale across config reloads.
+pub(crate) fn binds_have_trigger_for_mods(
+    binds: &[Bind],
+    mod_key: ModKey,
+    triggers: &[Trigger],
+    modifiers: Modifiers,
+) -> bool {
+    binds.iter().any(|bind| {
+        if !triggers.contains(&bind.key.trigger) {
+            return false;
+        }
+        let mut mods = bind.key.modifiers;
+        if mods.contains(Modifiers::COMPOSITOR) {
+            mods.remove(Modifiers::COMPOSITOR);
+            mods.insert(mod_key.to_modifiers());
+        }
+        mods == modifiers
+    })
+}
+
 /// Convert smithay's `ModifiersState` (bool fields) into the
 /// `bitflags` `Modifiers` set the bind table uses.
 pub(crate) fn modifiers_from_state(mods: ModifiersState) -> Modifiers {
@@ -371,7 +482,7 @@ pub(crate) fn modifiers_from_state(mods: ModifiersState) -> Modifiers {
 /// `(trigger, modifiers)`. The `COMPOSITOR` bit acts as an alias for
 /// `mod_key` so `Mod+Q` and (e.g.) `Super+Q` both match. Ported from
 /// niri input/mod.rs:4489 (`find_configured_bind`).
-fn find_bind(
+pub(crate) fn find_bind(
     binds: &[Bind],
     mod_key: ModKey,
     trigger: Trigger,

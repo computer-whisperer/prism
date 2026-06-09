@@ -1592,6 +1592,14 @@ fn run_integrated(
                             .collect(),
                     );
                     state.reload_config(config);
+                    // Re-apply per-device libinput settings with the new
+                    // input sections (niri does the same on reload). The
+                    // devices are clones of refcounted libinput handles, so
+                    // mutating a clone configures the real device.
+                    let cfg = state.config.borrow();
+                    for mut device in state.libinput_devices.iter().cloned() {
+                        prism_input::apply_libinput_settings(&cfg.input, &mut device);
+                    }
                 }
                 // Parse error: already logged by the watcher thread; keep
                 // running on the previous config.
@@ -1839,14 +1847,17 @@ fn run_integrated(
                 // Maintain the live libinput device set before the generic
                 // dispatch (which only sees the backend-agnostic Device
                 // trait). The set drives seat-capability recomputation on
-                // removal and is where the future per-device settings
-                // application (apply_libinput_settings) will iterate.
-                // Mirrors niri's process_libinput_event pre-pass.
+                // removal and the per-device settings re-application on
+                // config reload. Mirrors niri's process_libinput_event
+                // pre-pass, which also applies the device settings here —
+                // the only point with the concrete libinput Device in hand.
                 {
                     use smithay::backend::input::InputEvent;
                     match &mut event {
                         InputEvent::DeviceAdded { device } => {
                             state.libinput_devices.insert(device.clone());
+                            let cfg = state.config.borrow();
+                            prism_input::apply_libinput_settings(&cfg.input, device);
                         }
                         InputEvent::DeviceRemoved { device } => {
                             state.libinput_devices.remove(device);
