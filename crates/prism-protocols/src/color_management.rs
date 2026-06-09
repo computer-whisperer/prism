@@ -248,9 +248,10 @@ pub struct SurfaceColorFeedbackInner {
 }
 
 impl SurfaceColorFeedbackSlot {
-    /// Push `preferred_changed2` to every live feedback instance on
-    /// this surface, if the identity differs from what we last sent.
-    /// No-op if no feedback was ever requested for the surface.
+    /// Push the preferred-changed notification to every live feedback
+    /// instance on this surface, if the identity differs from what we
+    /// last sent. No-op if no feedback was ever requested for the
+    /// surface.
     pub fn notify_preferred_changed(states: &SurfaceData, identity: u64) {
         let Some(slot) = states.data_map.get::<SurfaceColorFeedbackSlot>() else {
             return;
@@ -260,11 +261,9 @@ impl SurfaceColorFeedbackSlot {
             return;
         }
         st.instances.retain(|w| w.upgrade().is_ok());
-        let hi = (identity >> 32) as u32;
-        let lo = (identity & 0xffff_ffff) as u32;
         for w in &st.instances {
             if let Ok(inst) = w.upgrade() {
-                inst.preferred_changed2(hi, lo);
+                send_preferred_changed(&inst, identity);
             }
         }
         st.last_sent_identity = Some(identity);
@@ -278,6 +277,26 @@ impl SurfaceColorFeedbackSlot {
 /// R=G=B=2.5375 corresponding to 203 cd/m² of Report ITU-R BT.2408-7."
 /// (2.5375 × 80 = 203.)
 const WINDOWS_SCRGB_ASSUMED_REF_NITS: f32 = 203.0;
+
+/// Send the version-appropriate preferred-changed event on a feedback
+/// resource. `preferred_changed2` (64-bit identity) exists only since
+/// v2 of the protocol; sending it to a v1 binding is a wire error —
+/// libwayland clients (e.g. Chromium/Electron, whose protocol snapshot
+/// predates v2) treat the unknown opcode as fatal and drop the
+/// connection. v1 clients get `preferred_changed` with the low 32 bits,
+/// matching the truncation `wp_image_description_v1.ready` uses.
+fn send_preferred_changed(
+    inst: &wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
+    identity: u64,
+) {
+    let lo = (identity & 0xffff_ffff) as u32;
+    if inst.version() >= 2 {
+        let hi = (identity >> 32) as u32;
+        inst.preferred_changed2(hi, lo);
+    } else {
+        inst.preferred_changed(lo);
+    }
+}
 
 /// The post-EOTF luminance multiplier the decode shader applies to land
 /// post-EOTF values in the anchored absolute-nits working space (the decode
@@ -800,9 +819,7 @@ impl Dispatch<WpColorManagerV1, ()> for PrismState {
                         .and_then(|s| s.0.lock().unwrap().current_output.clone());
                     if let Some(out_id) = current_output {
                         if let Some(desc) = state.color_management.output_preferred(&out_id) {
-                            let hi = (desc.identity >> 32) as u32;
-                            let lo = (desc.identity & 0xffff_ffff) as u32;
-                            instance.preferred_changed2(hi, lo);
+                            send_preferred_changed(&instance, desc.identity);
                             st.last_sent_identity = Some(desc.identity);
                         }
                     }
