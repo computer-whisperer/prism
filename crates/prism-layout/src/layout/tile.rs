@@ -617,6 +617,18 @@ impl<W: LayoutElement> Tile<W> {
         }
     }
 
+    /// Drop the resize animation outright. Used when the tile's workspace is
+    /// off screen at snapshot-capture time: there is no pre-resize frame in
+    /// the intermediate to crossfade from (and leaving `gpu_snapshot` empty
+    /// would re-request the capture next frame, copying unrelated pixels once
+    /// the workspace scrolls in). The tile isn't being rendered, so snapping
+    /// to the final size is invisible — and if the workspace scrolls back in
+    /// mid-animation, the settled size is more correct than a stale
+    /// mid-flight crossfade.
+    pub fn cancel_resize_animation(&mut self) {
+        self.resize_animation = None;
+    }
+
     pub fn animate_move_from(&mut self, from: Point<f64, Logical>) {
         self.animate_move_x_from(from.x);
         self.animate_move_y_from(from.y);

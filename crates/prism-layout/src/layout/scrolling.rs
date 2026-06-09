@@ -1599,6 +1599,22 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         any
     }
 
+    /// Drop closing windows whose capture never happened (workspace was off
+    /// screen — nothing of it is in the intermediate to copy, and a deferred
+    /// capture would copy unrelated pixels later). See
+    /// `Monitor::ensure_close_snapshots`.
+    pub fn cancel_pending_close_snapshots(&mut self) {
+        self.closing_windows.retain(|c| !c.needs_snapshot());
+    }
+
+    /// Drop in-flight resize animations (off-screen workspace at capture
+    /// time). See `Monitor::ensure_resize_snapshots`.
+    pub fn cancel_resize_animations(&mut self) {
+        for (tile, _pos) in self.tiles_with_render_positions_mut(false) {
+            tile.cancel_resize_animation();
+        }
+    }
+
     pub fn start_open_animation(&mut self, id: &W::Id) -> bool {
         self.columns
             .iter_mut()

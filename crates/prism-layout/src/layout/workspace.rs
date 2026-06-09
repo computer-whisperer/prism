@@ -351,6 +351,24 @@ impl<W: LayoutElement> Workspace<W> {
         scrolling || floating
     }
 
+    /// Drop closing windows that still need their GPU capture — used when this
+    /// workspace is off screen at capture time: it contributed no pixels to
+    /// the output intermediate, so there is nothing to copy (and a deferred
+    /// capture would copy unrelated pixels once the workspace scrolls in).
+    /// The close just doesn't replay, same policy as a failed allocation.
+    pub fn cancel_pending_close_snapshots(&mut self) {
+        self.scrolling.cancel_pending_close_snapshots();
+        self.floating.cancel_pending_close_snapshots();
+    }
+
+    /// Drop resize animations outright — the off-screen counterpart of
+    /// [`Self::ensure_resize_snapshots`]; see
+    /// `Monitor::ensure_resize_snapshots` for the rationale.
+    pub fn cancel_resize_animations(&mut self) {
+        self.scrolling.cancel_resize_animations();
+        self.floating.cancel_resize_animations();
+    }
+
     pub fn are_animations_ongoing(&self) -> bool {
         self.scrolling.are_animations_ongoing() || self.floating.are_animations_ongoing()
     }

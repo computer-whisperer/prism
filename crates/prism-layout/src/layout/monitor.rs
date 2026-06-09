@@ -328,26 +328,70 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     /// Fill any closing window on this monitor still missing its GPU capture;
-    /// return whether any closing window is present. See
-    /// `Layout::ensure_close_snapshots`.
+    /// return whether any closing window is present (on screen — an off-screen
+    /// card vacates nothing in this output's intermediate, so it doesn't force
+    /// the full decode). See `Layout::ensure_close_snapshots`.
+    ///
+    /// Workspaces pass view-local rects; the capture rect must address the
+    /// pixels in the output intermediate, so each rect goes through the same
+    /// transform `render_workspaces` applies — scale about the origin by the
+    /// overview zoom, translate to the card position. During a zoom/switch
+    /// *animation* the intermediate holds the previous frame's transform, so
+    /// the capture can be one frame of motion off — bounded and brief, the
+    /// same class of approximation as the "view hasn't moved since the close"
+    /// assumption in the scrolling space. Off-screen workspaces contributed no
+    /// pixels at all, now or earlier: their pending captures are cancelled
+    /// rather than deferred (a later capture would copy whatever happens to
+    /// land at that rect once the card scrolls in).
     pub fn ensure_close_snapshots(
         &mut self,
         create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
     ) -> bool {
+        let zoom = self.overview_zoom();
+        let output_geo = Rectangle::from_size(self.view_size);
+        let geo = self.workspaces_render_geo();
         let mut any = false;
-        for ws in &mut self.workspaces {
-            any |= ws.ensure_close_snapshots(create);
+        for (ws, geo) in zip(self.workspaces.iter_mut(), geo) {
+            if geo.intersection(output_geo).is_some() {
+                let mut create_at_card = |rect: Rectangle<f64, Logical>| {
+                    create(Rectangle::new(
+                        geo.loc + rect.loc.upscale(zoom),
+                        rect.size.upscale(zoom),
+                    ))
+                };
+                any |= ws.ensure_close_snapshots(&mut create_at_card);
+            } else {
+                ws.cancel_pending_close_snapshots();
+            }
         }
         any
     }
 
+    /// Resize-crossfade analogue of [`Self::ensure_close_snapshots`] — same
+    /// capture transform, same cancel-when-off-screen policy (the resize
+    /// animation on an off-screen tile is dropped outright: it was never
+    /// visible, and by the time the card scrolls in, snapping to the final
+    /// size is more correct than a late mid-flight animation).
     pub fn ensure_resize_snapshots(
         &mut self,
         create: &mut dyn FnMut(Rectangle<f64, Logical>) -> Option<Arc<SnapshotTexture>>,
     ) -> bool {
+        let zoom = self.overview_zoom();
+        let output_geo = Rectangle::from_size(self.view_size);
+        let geo = self.workspaces_render_geo();
         let mut any = false;
-        for ws in &mut self.workspaces {
-            any |= ws.ensure_resize_snapshots(create);
+        for (ws, geo) in zip(self.workspaces.iter_mut(), geo) {
+            if geo.intersection(output_geo).is_some() {
+                let mut create_at_card = |rect: Rectangle<f64, Logical>| {
+                    create(Rectangle::new(
+                        geo.loc + rect.loc.upscale(zoom),
+                        rect.size.upscale(zoom),
+                    ))
+                };
+                any |= ws.ensure_resize_snapshots(&mut create_at_card);
+            } else {
+                ws.cancel_resize_animations();
+            }
         }
         any
     }

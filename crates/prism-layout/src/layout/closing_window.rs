@@ -30,8 +30,11 @@ pub struct ClosingWindow {
     /// Rect the window occupied (the snapshot's placement + size). In the
     /// scrolling space this is workspace-absolute (niri semantics) — the
     /// space subtracts its view position at capture and at replay; in the
-    /// floating space positions are view-independent, so it is output-space
-    /// as-is.
+    /// floating space positions are view-independent, so it is
+    /// workspace-view-local as-is. Either way the resulting rect is card-
+    /// local: the monitor applies the overview-zoom + card-offset transform
+    /// on top, both when capturing (`Monitor::ensure_close_snapshots`) and
+    /// when rendering (`Monitor::render_workspaces`).
     geometry: Rectangle<f64, Logical>,
     /// The captured last frame. `None` until the integrator fills it on the
     /// first render after unmap (see [`Self::set_snapshot`]).
