@@ -1065,7 +1065,13 @@ fn run_integrated(
         None => vec!["/dev/dri/card0".into(), "/dev/dri/card1".into()],
     };
     let mut cards: Vec<prism_drm::DrmCardContext> = Vec::new();
-    let mut drm_notifiers: Vec<smithay::backend::drm::DrmDeviceNotifier> = Vec::new();
+    // Each notifier is paired with its card's DrmDevId: CRTC handles are
+    // per-device KMS object IDs, so vblanks must be matched by (card, crtc)
+    // — a bare crtc can alias across cards.
+    let mut drm_notifiers: Vec<(
+        prism_renderer::DrmDevId,
+        smithay::backend::drm::DrmDeviceNotifier,
+    )> = Vec::new();
     for path in &card_paths {
         match prism_drm::DrmCardContext::open(&mut session, path) {
             Ok((card, notifier)) => {
@@ -1073,8 +1079,9 @@ fn run_integrated(
                     "card opened: {} (drm {}:{})",
                     card.path, card.drm_dev_id.major, card.drm_dev_id.minor
                 ));
+                let card_dev = card.drm_dev_id;
                 cards.push(card);
-                drm_notifiers.push(notifier);
+                drm_notifiers.push((card_dev, notifier));
             }
             Err(e) => {
                 tracing::warn!("skipping card {path}: {e:#}");
@@ -1657,7 +1664,7 @@ fn run_integrated(
     // Keeping GPU work off the vblank thread is what lets wayland event
     // servicing keep up at refresh rate.
     let max_frames_copy = max_frames;
-    for drm_notifier in drm_notifiers.drain(..) {
+    for (card_dev, drm_notifier) in drm_notifiers.drain(..) {
         let running_for_vblank = running.clone();
         let frame_counter_for_vblank = frame_counter.clone();
         event_loop
@@ -1670,7 +1677,7 @@ fn run_integrated(
                             .as_ref()
                             .map(|m| time_to_monotonic(m.time))
                             .unwrap_or_else(clock_monotonic_now);
-                        on_vblank(state, crtc, presentation_time);
+                        on_vblank(state, card_dev, crtc, presentation_time);
                         let n = frame_counter_for_vblank.fetch_add(1, Ordering::SeqCst) + 1;
                         if let Some(max) = max_frames_copy {
                             if n >= max {
@@ -2180,19 +2187,22 @@ fn run_integrated(
 ///    Stage D will replace that with damage-driven scheduling.
 fn on_vblank(
     state: &mut prism_protocols::PrismState,
+    card: prism_renderer::DrmDevId,
     crtc: smithay::reexports::drm::control::crtc::Handle,
     presentation_time: Duration,
 ) {
     use prism_protocols::redraw::RedrawState;
 
-    // Resolve crtc → OutputId (small map; lookup is fine).
+    // Resolve (card, crtc) → OutputId (small map; lookup is fine). CRTC
+    // handles are per-device KMS object IDs and can alias across cards,
+    // so the card must participate in the match.
     let Some(output_id) = state
         .outputs
         .iter()
-        .find(|(_, o)| o.crtc == crtc)
+        .find(|(_, o)| o.gpu_id == card && o.crtc == crtc)
         .map(|(id, _)| id.clone())
     else {
-        breadcrumb(&format!("vblank for unknown crtc {crtc:?}"));
+        breadcrumb(&format!("vblank for unknown crtc {crtc:?} on {card:?}"));
         return;
     };
 
