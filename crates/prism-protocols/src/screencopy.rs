@@ -354,6 +354,14 @@ impl PrismState {
         with_damage: bool,
         kind: PendingKind,
     ) {
+        // A frame queued for an output that no longer exists can never be
+        // drained (submit/fail run only from that output's render paths) —
+        // the client would hang waiting for ready/failed forever.
+        if !self.outputs.contains_key(output_id) {
+            trace!("screencopy: output {output_id} gone, failing capture");
+            frame.failed();
+            return;
+        }
         self.screencopy_pending.push(PendingScreencopy {
             output_id: output_id.clone(),
             frame: frame.clone(),
@@ -600,7 +608,7 @@ impl PrismState {
         };
         let c = self.screencopy_inflight.remove(pos);
 
-        // Damage rect (whole captured region) for v3 with_damage clients.
+        // Damage rect (whole captured region) for with_damage clients.
         let (region_w, region_h) = match &c.kind {
             InflightKind::Dmabuf { region_wh, .. } => *region_wh,
             InflightKind::Shm { region, .. } => (region.2 as u32, region.3 as u32),
@@ -622,7 +630,9 @@ impl PrismState {
         }
 
         c.frame.flags(Flags::empty());
-        if c.with_damage && c.frame.version() >= 3 {
+        // `damage` is since="2", same as `copy_with_damage` itself — so
+        // with_damage implies the client can receive it.
+        if c.with_damage {
             c.frame.damage(0, 0, region_w, region_h);
         }
         // Timestamp the completion *now* (the GPU just finished).
