@@ -708,6 +708,16 @@ pub enum PresentOutcome {
     /// Rendered and submitted a page-flip; carries the present-completion
     /// SYNC_FD (handed to KMS as IN_FENCE_FD, returned for release wiring).
     Presented(std::os::fd::OwnedFd),
+    /// Rendered — the submit is on the GPU queue — but the atomic commit /
+    /// page-flip failed. Carries the render-completion SYNC_FD (what
+    /// `Presented` would have carried) so the caller can still account for
+    /// the in-flight GPU work (mirror back-sync, acquire-wait marking)
+    /// before propagating `error`. `frame_pending` stays false and the
+    /// damage baseline is not advanced, so the next attempt re-renders.
+    FlipFailed {
+        render_done: std::os::fd::OwnedFd,
+        error: anyhow::Error,
+    },
     /// Nothing changed since the last presented frame (empty damage) and a
     /// valid image is already on screen, so no render or flip happened. The
     /// caller should arm an estimated-vblank instead of waiting for a real one.
@@ -962,7 +972,12 @@ impl OutputContext {
                     Err(e) => format!("Err({e})"),
                 }
             ));
-            res?;
+            if let Err(error) = res {
+                return Ok(PresentOutcome::FlipFailed {
+                    render_done: present_sync,
+                    error,
+                });
+            }
             self.mode_set_done = true;
         } else {
             flip_trace(&format!(
@@ -982,7 +997,12 @@ impl OutputContext {
                     Err(e) => format!("Err({e})"),
                 }
             ));
-            res?;
+            if let Err(error) = res {
+                return Ok(PresentOutcome::FlipFailed {
+                    render_done: present_sync,
+                    error,
+                });
+            }
         }
         self.frame_pending = true;
         // The flip is submitted — this frame's damage has reached the scanout,

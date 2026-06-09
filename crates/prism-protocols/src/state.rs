@@ -4388,22 +4388,45 @@ pub fn materialize_surface_on_gpu(state: &PrismState, surface: &WlSurface, gpu: 
 /// import the resulting `sync_file` as a wait semaphore on the target GPU.
 /// The caller adds the returned semaphores to the target output's render
 /// submit (so the render waits for the copies GPU-side) and **must** pass
-/// them back to [`destroy_mirror_waits`] afterwards.
+/// them back to [`destroy_render_wait_semaphores`] afterwards.
+///
+/// Each copy submit in turn waits (GPU-side, on the home queue) on:
+/// - the client's implicit write fence for each copied dmabuf, so the copy
+///   never reads a buffer the client's GPU is still writing — the mirror
+///   analog of [`prepare_dmabuf_acquire_waits`], with the same per-buffer
+///   skip via `acquire_waited` (keyed by the *home* GPU; marked right after
+///   the copy submit is queued, which — unlike a present — is confirmed
+///   synchronously);
+/// - the target GPU's latest render-done fence
+///   ([`prism_renderer::MirrorCopier::render_done_dup`]), so overwriting
+///   the scratch can't tear a still-in-flight read of the previous frame.
 ///
 /// This is what keeps the cross-GPU path off the event loop: the copy is
-/// non-blocking and the render↔copy dependency is a GPU semaphore, not a
-/// CPU fence wait. Returns empty for outputs with no mirrored surfaces.
+/// non-blocking and every dependency is a GPU semaphore, not a CPU fence
+/// wait. Returns empty for outputs with no mirrored surfaces.
 pub fn prepare_mirror_waits(
     state: &PrismState,
     surfaces: &[WlSurface],
     target_gpu: DrmDevId,
 ) -> Vec<vk::Semaphore> {
+    use std::os::fd::AsFd;
+
     if surfaces.is_empty() {
         return Vec::new();
     }
-    // Gather copy ops grouped by home GPU (collect the vk::Image handles
-    // under each surface's lock; submit after releasing it).
-    let mut by_home: HashMap<DrmDevId, Vec<prism_renderer::MirrorCopyOp>> = HashMap::new();
+    /// Per-home-GPU batch: the copy ops plus the producer fences the copy
+    /// submit must wait on (and which surfaces they came from, for the
+    /// post-submit `acquire_waited` marking).
+    #[derive(Default)]
+    struct HomeBatch {
+        ops: Vec<prism_renderer::MirrorCopyOp>,
+        producer_fences: Vec<std::os::fd::OwnedFd>,
+        fenced_surfaces: Vec<WlSurface>,
+    }
+    // Gather copy ops grouped by home GPU (collect the vk::Image handles and
+    // export the write fences under each surface's lock; submit after
+    // releasing it).
+    let mut by_home: HashMap<DrmDevId, HomeBatch> = HashMap::new();
     for surface in surfaces {
         with_states(surface, |states| {
             let Some(slot) = states.data_map.get::<SurfaceTexSlot>() else {
@@ -4419,8 +4442,8 @@ pub fn prepare_mirror_waits(
                 ..
             }) = tex.by_gpu.get(&target_gpu)
             {
-                let ops = by_home.entry(*home).or_default();
-                ops.push(prism_renderer::MirrorCopyOp {
+                let batch = by_home.entry(*home).or_default();
+                batch.ops.push(prism_renderer::MirrorCopyOp {
                     src: home_src.image(),
                     dst: scratch.image(),
                     extent: scratch.extent(),
@@ -4429,11 +4452,27 @@ pub fn prepare_mirror_waits(
                 // two-plane YUV import, so its chroma image is the source.
                 if let Some(chroma) = chroma {
                     if let Some(chroma_src) = home_src.chroma_image() {
-                        ops.push(prism_renderer::MirrorCopyOp {
+                        batch.ops.push(prism_renderer::MirrorCopyOp {
                             src: chroma_src,
                             dst: chroma.scratch.image(),
                             extent: chroma.scratch.extent(),
                         });
+                    }
+                }
+                // Producer fence for this buffer, unless a previous copy on
+                // this home GPU already waited it (one wait per buffer per
+                // GPU; the set is cleared on every new commit). Plane 0
+                // carries the implicit fence, chroma planes share the BO.
+                if !tex.acquire_waited.contains(home) {
+                    if let TexSource::Dmabuf { dmabuf, .. } = &tex.source {
+                        if let Some(fd) = dmabuf
+                            .planes
+                            .first()
+                            .and_then(|p| crate::dmabuf_sync::export_read_fence(p.fd.as_fd()).ok())
+                        {
+                            batch.producer_fences.push(fd);
+                            batch.fenced_surfaces.push(surface.clone());
+                        }
                     }
                 }
             }
@@ -4444,19 +4483,74 @@ pub fn prepare_mirror_waits(
     let Some(target_copier) = state.mirror_copiers.get(&target_gpu) else {
         return waits;
     };
-    for (home, ops) in by_home {
+    for (home, batch) in by_home {
         let Some(home_copier) = state.mirror_copiers.get(&home) else {
             continue;
         };
-        match home_copier.copy_batch_async(&ops) {
-            Ok(fd) => match target_copier.import_wait_semaphore(fd) {
-                Ok(sem) => waits.push(sem),
-                Err(e) => tracing::warn!(?home, "mirror wait import failed: {e:#}"),
-            },
+        // Import the copy submit's waits on the home device: one semaphore
+        // per producer fence, plus the target's render-done fence. Surfaces
+        // whose fence fails to import are left out of the post-submit
+        // marking so the next frame retries the wait.
+        let mut copy_waits = Vec::new();
+        let mut fenced_surfaces = Vec::new();
+        for (fd, surface) in batch.producer_fences.into_iter().zip(batch.fenced_surfaces) {
+            match home_copier.import_wait_semaphore(fd) {
+                Ok(sem) => {
+                    copy_waits.push(sem);
+                    fenced_surfaces.push(surface);
+                }
+                Err(e) => {
+                    tracing::debug!(?home, "mirror producer-fence import failed: {e:#}")
+                }
+            }
+        }
+        if let Some(fd) = target_copier.render_done_dup() {
+            match home_copier.import_wait_semaphore(fd) {
+                Ok(sem) => copy_waits.push(sem),
+                Err(e) => tracing::debug!(?home, "mirror render-done import failed: {e:#}"),
+            }
+        }
+        match home_copier.copy_batch_async(&batch.ops, &copy_waits) {
+            Ok(fd) => {
+                // The copy submit carrying the producer waits is queued —
+                // these buffers don't need another wait on the home GPU.
+                mark_dmabuf_acquire_waited(&fenced_surfaces, home);
+                match target_copier.import_wait_semaphore(fd) {
+                    Ok(sem) => waits.push(sem),
+                    Err(e) => tracing::warn!(?home, "mirror wait import failed: {e:#}"),
+                }
+            }
             Err(e) => tracing::warn!(?home, "mirror copy submit failed: {e:#}"),
+        }
+        // Queued or failed, the imported copy-wait semaphores are done with;
+        // the home device's deferred-destroy queue frees them once its
+        // serials prove the submit (if any) completed.
+        for sem in copy_waits {
+            home_copier.destroy_imported_semaphore(sem);
         }
     }
     waits
+}
+
+/// Record the present-completion `sync_file` of a confirmed `Presented`
+/// outcome on `target_gpu` whose render sampled mirror scratches. The next
+/// home→scratch copy for that GPU waits a dup of it (see
+/// [`prepare_mirror_waits`]), closing the render→overwrite race on the
+/// shared LINEAR scratch. Call only when the present really queued a render
+/// submit — after FlipPending / SkippedNoDamage there is no new fence and
+/// the previously stored one must stay in place.
+pub fn note_mirror_render_done(
+    state: &PrismState,
+    target_gpu: DrmDevId,
+    render_done: &std::os::fd::OwnedFd,
+) {
+    let Some(copier) = state.mirror_copiers.get(&target_gpu) else {
+        return;
+    };
+    match render_done.try_clone() {
+        Ok(fd) => copier.note_render_done(fd),
+        Err(e) => tracing::warn!(?target_gpu, "dup of present sync fd failed: {e}"),
+    }
 }
 
 /// Destroy the render-wait semaphores returned by [`prepare_mirror_waits`] /
@@ -4540,11 +4634,15 @@ pub fn prepare_dmabuf_acquire_waits(
     waits
 }
 
-/// Record that a render submit on `target_gpu` carrying the acquire waits for
+/// Record that a GPU submit on `target_gpu` carrying the acquire waits for
 /// `surfaces` was actually queued: those surfaces' current buffers don't need
-/// another producer-fence wait on this GPU. Call ONLY on a confirmed
-/// `Presented` outcome — after FlipPending / SkippedNoDamage the waits went
-/// unused and the next attempt must re-export (see `acquire_waited`).
+/// another producer-fence wait on this GPU. Two callers, same rule — only a
+/// *confirmed* submit counts:
+/// - the render path, on a confirmed `Presented` outcome (after FlipPending /
+///   SkippedNoDamage the waits went unused and the next attempt must
+///   re-export — see `acquire_waited`);
+/// - [`prepare_mirror_waits`], right after a successful home-GPU copy submit
+///   (queued synchronously, so no Presented-style confirmation is needed).
 pub fn mark_dmabuf_acquire_waited(surfaces: &[WlSurface], target_gpu: DrmDevId) {
     for surface in surfaces {
         with_states(surface, |states| {

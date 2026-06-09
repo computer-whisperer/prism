@@ -33,10 +33,20 @@
 //! LINEAR images carry no compression metadata, so the home-side scratch
 //! image stays in `GENERAL` and the target-side import transitions once to
 //! `SHADER_READ_ONLY_OPTIMAL` — both map to the same physical byte layout.
-//! Cross-device visibility is provided by the copy submit's fence (radv
-//! flushes external-memory writes at the submit boundary) plus our
-//! single-threaded commit→render ordering: the copy completes during
-//! `commit`, the target samples during a later `render`.
+//! Three GPU-side dependencies order the path (none stall the event loop):
+//!
+//! 1. **producer → copy**: the copy submit waits the client's implicit
+//!    write fence (exported from the dmabuf, imported on the home GPU), so
+//!    it never reads a buffer the client's GPU is still writing — the
+//!    mirror-path analog of `prepare_dmabuf_acquire_waits`;
+//! 2. **copy → render**: the copy submit signals an exportable semaphore;
+//!    the target render imports and waits it. Cross-device visibility
+//!    rides along (radv flushes external-memory writes at the submit
+//!    boundary);
+//! 3. **render → next copy**: the target's present-completion `sync_file`
+//!    is stored per target device ([`MirrorCopier::note_render_done`]) and
+//!    the next copy submit waits a dup of it, so overwriting the scratch
+//!    can't tear a still-in-flight read of the previous frame.
 
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::Arc;
@@ -242,8 +252,11 @@ impl Drop for ExportableImage {
 
 /// One source→scratch copy for [`MirrorCopier::copy_batch_async`].
 pub struct MirrorCopyOp {
-    /// Client import on the home GPU (the copy source), in `UNDEFINED`
-    /// layout (imported untransitioned — it's only ever copied from).
+    /// Client import on the home GPU (the copy source). Treated as
+    /// `GENERAL` throughout, per the external-dmabuf convention: the DRM
+    /// modifier fixes the byte layout and no Vulkan transition ever
+    /// rewrites it (claiming `UNDEFINED` here would license the driver to
+    /// discard the very pixels being copied).
     pub src: vk::Image,
     /// The LINEAR exportable scratch image (copy destination), in `GENERAL`.
     pub dst: vk::Image,
@@ -281,6 +294,14 @@ pub struct MirrorCopier {
     /// finished (drives the deferred-destroy queue — matters when this is
     /// the only submitter on a render-less home GPU). 0 = never submitted.
     last_copy_serial: std::cell::Cell<u64>,
+    /// Present-completion `sync_file` of the latest render on this
+    /// (target) device that sampled mirror scratches. The next
+    /// home→scratch copy waits a dup of it so the overwrite can't tear an
+    /// in-flight read. Kept until replaced, not taken: a FlipPending retry
+    /// re-runs the copy with no new render in between and must re-wait the
+    /// same fence (taking it would put the tear back on that path — same
+    /// class as the acquire-fence FlipPending bug).
+    render_done: std::cell::RefCell<Option<OwnedFd>>,
 }
 
 impl MirrorCopier {
@@ -330,6 +351,28 @@ impl MirrorCopier {
             sem,
             sem_fd_loader,
             last_copy_serial: std::cell::Cell::new(0),
+            render_done: std::cell::RefCell::new(None),
+        })
+    }
+
+    /// Record the present-completion `sync_file` of a render on this
+    /// (target) device that sampled mirror scratches. Call only on a
+    /// confirmed `Presented` outcome — that's when the fd provably covers
+    /// a queued render submit.
+    pub fn note_render_done(&self, fd: OwnedFd) {
+        *self.render_done.borrow_mut() = Some(fd);
+    }
+
+    /// Dup of the latest render-done fd (see [`note_render_done`]), for a
+    /// home GPU to import and wait in its next copy submit. `None` before
+    /// the first present, or if the dup fails.
+    ///
+    /// [`note_render_done`]: MirrorCopier::note_render_done
+    pub fn render_done_dup(&self) -> Option<OwnedFd> {
+        self.render_done.borrow().as_ref().and_then(|fd| {
+            fd.try_clone()
+                .map_err(|e| tracing::warn!("dup of mirror render-done fd failed: {e}"))
+                .ok()
         })
     }
 
@@ -339,11 +382,22 @@ impl MirrorCopier {
     /// "copies complete". The caller imports the fd on the target GPU
     /// ([`import_wait_semaphore`]) and waits on it in the render submit.
     ///
-    /// Each `src` is in `UNDEFINED` (untransitioned client import); we move
-    /// it to `TRANSFER_SRC_OPTIMAL` for the copy. Each `dst` stays `GENERAL`.
+    /// Each `src` is read in `GENERAL` (external-dmabuf convention — see
+    /// [`MirrorCopyOp::src`]); each `dst` stays `GENERAL`.
+    ///
+    /// `waits` are binary semaphores imported on this (home) device that
+    /// the copy submit waits before executing: the clients' implicit write
+    /// fences and the target's previous render-done fence. The wait
+    /// consumes their payloads; the caller retires them afterwards via
+    /// [`destroy_imported_semaphore`].
     ///
     /// [`import_wait_semaphore`]: MirrorCopier::import_wait_semaphore
-    pub fn copy_batch_async(&self, copies: &[MirrorCopyOp]) -> Result<OwnedFd> {
+    /// [`destroy_imported_semaphore`]: MirrorCopier::destroy_imported_semaphore
+    pub fn copy_batch_async(
+        &self,
+        copies: &[MirrorCopyOp],
+        waits: &[vk::Semaphore],
+    ) -> Result<OwnedFd> {
         let device = &self.device.raw;
         unsafe {
             // Gate reuse on the previous copy finishing (no-op in steady
@@ -368,19 +422,30 @@ impl MirrorCopier {
 
             for op in copies {
                 let pre = [
+                    // src: GENERAL → GENERAL, never UNDEFINED — a transition
+                    // out of UNDEFINED licenses the driver to discard the
+                    // contents (a no-op on radv where modifier images have
+                    // fixed layouts, but UB per spec). This is purely a
+                    // visibility barrier for the transfer read; ordering
+                    // against the client's writes is the submit-level wait
+                    // on its implicit fence.
                     vk::ImageMemoryBarrier2::default()
                         .image(op.src)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(vk::ImageLayout::GENERAL)
                         .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
                         .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
                         .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
                         .subresource_range(color_subresource()),
+                    // dst: WAW against the previous frame's copy (the
+                    // cross-device read of the previous frame is ordered by
+                    // the render-done wait at submit level).
                     vk::ImageMemoryBarrier2::default()
                         .image(op.dst)
                         .old_layout(vk::ImageLayout::GENERAL)
                         .new_layout(vk::ImageLayout::GENERAL)
                         .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                         .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
                         .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                         .subresource_range(color_subresource()),
@@ -400,7 +465,7 @@ impl MirrorCopier {
                 device.cmd_copy_image(
                     self.cb,
                     op.src,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
                     op.dst,
                     vk::ImageLayout::GENERAL,
                     &region,
@@ -427,10 +492,19 @@ impl MirrorCopier {
                 .vk_ctx("end_command_buffer (mirror copy)")?;
 
             let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(self.cb)];
+            let wait_infos: Vec<vk::SemaphoreSubmitInfo> = waits
+                .iter()
+                .map(|&sem| {
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(sem)
+                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                })
+                .collect();
             let signal = [vk::SemaphoreSubmitInfo::default()
                 .semaphore(self.sem)
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
             let submits = [vk::SubmitInfo2::default()
+                .wait_semaphore_infos(&wait_infos)
                 .command_buffer_infos(&cb_infos)
                 .signal_semaphore_infos(&signal)];
             let serial = self.device.note_submit();

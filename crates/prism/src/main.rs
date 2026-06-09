@@ -3107,7 +3107,25 @@ fn render_output_now(
             // retry re-exports (clearing at prepare time put the fa62fb9
             // blue-bleed race back on the flip-pending path).
             prism_protocols::mark_dmabuf_acquire_waited(&acquire_surfaces, output_gpu_id);
+            // If this render sampled mirror scratches, store its completion
+            // fence (a dup of the present SYNC_FD) so the next home→scratch
+            // copy waits it instead of overwriting mid-read.
+            if !mirror_surfaces.is_empty() {
+                prism_protocols::note_mirror_render_done(state, output_gpu_id, &fd);
+            }
             fd
+        }
+        // Rendered but the flip failed: the render submit is in flight and
+        // really carried the acquire waits / sampled the mirror scratches, so
+        // do the same GPU-side bookkeeping as `Presented` (skipping it would
+        // let the next copy overwrite a scratch this render is still reading),
+        // then propagate the flip error as before.
+        prism_drm::PresentOutcome::FlipFailed { render_done, error } => {
+            prism_protocols::mark_dmabuf_acquire_waited(&acquire_surfaces, output_gpu_id);
+            if !mirror_surfaces.is_empty() {
+                prism_protocols::note_mirror_render_done(state, output_gpu_id, &render_done);
+            }
+            return Err(error);
         }
         // Flip still in flight — caller leaves the output Queued and retries.
         prism_drm::PresentOutcome::FlipPending => return Ok(RenderOutcome::FlipPending),
