@@ -1019,8 +1019,21 @@ impl RenderEl {
             // in too: a fade / wp_alpha_modifier change repaints in place even
             // though the buffer commit count is unchanged (a multiplier-only
             // commit attaches no buffer, so `content_commit` doesn't advance).
+            // Same reasoning for the color params and the viewport source
+            // rect: a commit changing only the color-management image
+            // description or wp_viewport source attaches no buffer either,
+            // yet changes every rendered pixel.
             Self::Surface(s) => {
                 let c = (s.content_commit ^ s.alpha.to_bits() as u64).wrapping_mul(FNV_PRIME);
+                let c = (c ^ fnv_f32s(&s.src_rect_uv)).wrapping_mul(FNV_PRIME);
+                let c = (c ^ s.color.transfer as u64).wrapping_mul(FNV_PRIME);
+                let c = (c ^ s.color.yuv_matrix as u64).wrapping_mul(FNV_PRIME);
+                let c = c ^ fnv_f32s(&[s.color.sdr_white_nits]);
+                let c = s
+                    .color
+                    .primaries_to_bt2020
+                    .iter()
+                    .fold(c, |h, row| h ^ fnv_f32s(row));
                 match &s.clip {
                     None => c,
                     Some(clip) => clip.mix_token(c, s.geometry.loc),
