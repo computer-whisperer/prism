@@ -308,6 +308,7 @@ impl ImportedImage {
             let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
             let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
                 .vk_ctx("create_fence (dmabuf transition)")?;
+            let serial = self.device.note_submit();
             let submit_result =
                 unsafe { device.queue_submit2(self.device.graphics_queue, &submits, fence) };
             if let Err(e) = submit_result {
@@ -319,6 +320,9 @@ impl ImportedImage {
             }
             let wait = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
             unsafe { device.destroy_fence(fence, None) };
+            if wait.is_ok() {
+                self.device.note_completed(serial);
+            }
             wait.vk_ctx("wait_for_fences (dmabuf transition)")
         })();
 
@@ -329,15 +333,24 @@ impl ImportedImage {
 
 impl Drop for ImportedImage {
     fn drop(&mut self) {
-        unsafe {
-            self.device.raw.destroy_image_view(self.view, None);
-            self.device.raw.destroy_image(self.image, None);
-            self.device.raw.free_memory(self.memory, None);
-            if let Some(c) = self.chroma.as_ref() {
-                self.device.raw.destroy_image_view(c.view, None);
-                self.device.raw.destroy_image(c.image, None);
-                self.device.raw.free_memory(c.memory, None);
-            }
+        // Dropped on EVERY buffer swap of a double-buffered dmabuf client
+        // (process_surface_buffer replaces the import when the committed
+        // wl_buffer changes), while up to FRAMES_IN_FLIGHT submissions
+        // referencing the view may still be executing. Retire instead of
+        // destroying: the deferred queue frees the handles once the frame
+        // slot fences prove every such submission complete. (Survived as an
+        // immediate destroy only thanks to amdgpu's fence-deferred VM unmap.)
+        self.device.retire(crate::device::Retired::Image {
+            image: self.image,
+            view: self.view,
+            memory: self.memory,
+        });
+        if let Some(c) = self.chroma.as_ref() {
+            self.device.retire(crate::device::Retired::Image {
+                image: c.image,
+                view: c.view,
+                memory: c.memory,
+            });
         }
     }
 }

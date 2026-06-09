@@ -83,11 +83,16 @@ impl Intermediate {
 
 impl Drop for Intermediate {
     fn drop(&mut self) {
-        unsafe {
-            self.device.raw.destroy_image_view(self.view, None);
-            self.device.raw.destroy_image(self.image, None);
-            self.device.raw.free_memory(self.memory, None);
-        }
+        // Retired, not destroyed: on an in-place realloc
+        // (`ensure_intermediate` on extent change) the in-flight previous
+        // frame still samples this image; the deferred queue holds it until
+        // the slot fences prove otherwise. At teardown `Device::drop` drains
+        // after `device_wait_idle`, preserving the old guarantees.
+        self.device.retire(crate::device::Retired::Image {
+            image: self.image,
+            view: self.view,
+            memory: self.memory,
+        });
     }
 }
 

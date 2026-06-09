@@ -63,6 +63,133 @@ pub struct Device {
     pub physical: PhysicalDeviceInfo,
     pub raw: ash::Device,
     pub graphics_queue: vk::Queue,
+    /// Deferred-destroy queue — see [`Device::retire`].
+    deferred: std::sync::Mutex<DeferredDestroy>,
+}
+
+/// A GPU object handed to [`Device::retire`] for deferred destruction: it is
+/// destroyed only once every queue submission issued *before* the retirement
+/// has completed, so in-flight frames can still reference it safely.
+#[derive(Debug)]
+pub enum Retired {
+    /// An image with its view and backing memory (e.g. a dmabuf import, an
+    /// shm/snapshot texture, the persistent intermediate).
+    Image {
+        image: vk::Image,
+        view: vk::ImageView,
+        memory: vk::DeviceMemory,
+    },
+    /// A buffer with its backing memory (e.g. an upload staging buffer).
+    Buffer {
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+    },
+    /// A binary semaphore (e.g. an imported render-wait semaphore — the spec
+    /// forbids destroying it before the batch that waited on it completes).
+    Semaphore(vk::Semaphore),
+    Fence(vk::Fence),
+    CommandPool(vk::CommandPool),
+}
+
+/// Book-keeping for the deferred-destroy queue.
+///
+/// Correctness rests on two facts: prism puts all GPU work on the single
+/// `graphics_queue`, and Vulkan's implicit ordering guarantees a fence
+/// signal waits for *all* commands submitted to the queue before it
+/// (spec §7.2, "Implicit Synchronization Guarantees"). So a monotonic
+/// per-submission serial plus "fence for serial N signalled" proves every
+/// submission ≤ N is complete, across every renderer/copier/uploader
+/// sharing the device.
+#[derive(Default)]
+struct DeferredDestroy {
+    /// Serial of the most recent submission to `graphics_queue`. Bumped via
+    /// [`Device::note_submit`] immediately before each `vkQueueSubmit`.
+    submitted: u64,
+    /// Highest serial proven complete by a fence/idle wait
+    /// ([`Device::note_completed`]).
+    completed: u64,
+    /// Retired objects, each stamped with the `submitted` serial at
+    /// retirement time — i.e. the last submission that could reference it.
+    retired: Vec<(u64, Retired)>,
+}
+
+impl Device {
+    /// Allocate the serial for a submission about to be enqueued on
+    /// `graphics_queue`. MUST be called (once) before **every**
+    /// `vkQueueSubmit2` on this device, or a [`Self::retire`]d object that
+    /// the unsequenced submission references could be destroyed under it.
+    /// Returns the serial; pass it to [`Self::note_completed`] from
+    /// whichever fence/idle wait later proves that submission finished.
+    pub fn note_submit(&self) -> u64 {
+        let mut d = self.deferred.lock().unwrap();
+        d.submitted += 1;
+        d.submitted
+    }
+
+    /// Record that the submission with `serial` (and, by single-queue fence
+    /// ordering, every earlier one) has completed, then destroy any retired
+    /// objects that are no longer referenced. Call after a successful
+    /// `wait_for_fences` / `queue_wait_idle` tied to that submission.
+    pub fn note_completed(&self, serial: u64) {
+        let mut to_destroy = Vec::new();
+        {
+            let mut d = self.deferred.lock().unwrap();
+            if serial > d.completed {
+                d.completed = serial;
+            }
+            let completed = d.completed;
+            let mut i = 0;
+            while i < d.retired.len() {
+                if d.retired[i].0 <= completed {
+                    to_destroy.push(d.retired.swap_remove(i).1);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        // Destroy outside the lock (destruction can be slow; nothing else
+        // can resurrect a popped entry).
+        for r in to_destroy {
+            unsafe { self.destroy_retired(r) };
+        }
+    }
+
+    /// Queue a GPU object for destruction once every submission issued so
+    /// far has completed. If the queue is already proven idle past the
+    /// current serial, destroys immediately.
+    pub fn retire(&self, r: Retired) {
+        let mut d = self.deferred.lock().unwrap();
+        if d.submitted <= d.completed {
+            drop(d);
+            unsafe { self.destroy_retired(r) };
+            return;
+        }
+        let stamp = d.submitted;
+        d.retired.push((stamp, r));
+    }
+
+    /// Destroy one retired object. Caller must guarantee no in-flight
+    /// submission references it.
+    unsafe fn destroy_retired(&self, r: Retired) {
+        match r {
+            Retired::Image {
+                image,
+                view,
+                memory,
+            } => {
+                self.raw.destroy_image_view(view, None);
+                self.raw.destroy_image(image, None);
+                self.raw.free_memory(memory, None);
+            }
+            Retired::Buffer { buffer, memory } => {
+                self.raw.destroy_buffer(buffer, None);
+                self.raw.free_memory(memory, None);
+            }
+            Retired::Semaphore(sem) => self.raw.destroy_semaphore(sem, None),
+            Retired::Fence(fence) => self.raw.destroy_fence(fence, None),
+            Retired::CommandPool(pool) => self.raw.destroy_command_pool(pool, None),
+        }
+    }
 }
 
 /// One entry from `vkGetPhysicalDeviceFormatProperties2` +
@@ -217,6 +344,7 @@ impl Device {
             physical: info,
             raw,
             graphics_queue,
+            deferred: std::sync::Mutex::new(DeferredDestroy::default()),
         }))
     }
 }
@@ -225,6 +353,12 @@ impl Drop for Device {
     fn drop(&mut self) {
         unsafe {
             let _ = self.raw.device_wait_idle();
+            // Idle ⇒ every submission completed; drain whatever the deferred
+            // queue still holds before the device goes away.
+            let retired = std::mem::take(&mut self.deferred.lock().unwrap().retired);
+            for (_, r) in retired {
+                self.destroy_retired(r);
+            }
             self.raw.destroy_device(None);
         }
     }

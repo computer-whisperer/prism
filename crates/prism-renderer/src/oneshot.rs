@@ -51,6 +51,7 @@ impl OneshotPool {
 
         let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
+        let serial = self.device.note_submit();
         unsafe {
             self.device
                 .raw
@@ -60,6 +61,8 @@ impl OneshotPool {
 
         unsafe { self.device.raw.queue_wait_idle(self.device.graphics_queue) }
             .vk_ctx("queue_wait_idle (oneshot)")?;
+        // Queue idle ⇒ this serial (and everything before it) completed.
+        self.device.note_completed(serial);
 
         unsafe { self.device.raw.free_command_buffers(self.pool, &[cb]) };
         trace!("oneshot submit complete");

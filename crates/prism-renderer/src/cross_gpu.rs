@@ -276,6 +276,11 @@ pub struct MirrorCopier {
     /// unsignals it, so it's reusable next frame).
     sem: vk::Semaphore,
     sem_fd_loader: external_semaphore_fd::Device,
+    /// Device submission serial of the last copy submit; reported to
+    /// `Device::note_completed` when the reuse-gate fence wait proves it
+    /// finished (drives the deferred-destroy queue — matters when this is
+    /// the only submitter on a render-less home GPU). 0 = never submitted.
+    last_copy_serial: std::cell::Cell<u64>,
 }
 
 impl MirrorCopier {
@@ -324,6 +329,7 @@ impl MirrorCopier {
             fence,
             sem,
             sem_fd_loader,
+            last_copy_serial: std::cell::Cell::new(0),
         })
     }
 
@@ -348,6 +354,7 @@ impl MirrorCopier {
             device
                 .reset_fences(&[self.fence])
                 .vk_ctx("reset_fences (mirror copy)")?;
+            self.device.note_completed(self.last_copy_serial.get());
             device
                 .reset_command_buffer(self.cb, vk::CommandBufferResetFlags::empty())
                 .vk_ctx("reset_command_buffer (mirror copy)")?;
@@ -426,9 +433,11 @@ impl MirrorCopier {
             let submits = [vk::SubmitInfo2::default()
                 .command_buffer_infos(&cb_infos)
                 .signal_semaphore_infos(&signal)];
+            let serial = self.device.note_submit();
             device
                 .queue_submit2(self.device.graphics_queue, &submits, self.fence)
                 .vk_ctx("queue_submit2 (mirror copy)")?;
+            self.last_copy_serial.set(serial);
         }
 
         // Export the just-signalled semaphore as a sync_file fd. Per spec the
@@ -485,12 +494,15 @@ impl MirrorCopier {
         }
     }
 
-    /// Destroy a semaphore returned by [`import_wait_semaphore`], after the
-    /// render submit that waited on it has been queued.
+    /// Retire a semaphore returned by [`import_wait_semaphore`] once the
+    /// render submit that waits on it has been queued. The spec forbids
+    /// destroying a semaphore before the waiting batch completes execution,
+    /// so this goes through the device's deferred-destroy queue rather than
+    /// an immediate `vkDestroySemaphore`.
     ///
     /// [`import_wait_semaphore`]: MirrorCopier::import_wait_semaphore
     pub fn destroy_imported_semaphore(&self, sem: vk::Semaphore) {
-        unsafe { self.device.raw.destroy_semaphore(sem, None) };
+        self.device.retire(crate::device::Retired::Semaphore(sem));
     }
 }
 
@@ -539,6 +551,7 @@ fn submit_and_wait(device: &Device, cb: vk::CommandBuffer) -> Result<()> {
     .vk_ctx("create_fence (mirror init submit)")?;
     let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
     let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
+    let serial = device.note_submit();
     let res = unsafe {
         device
             .raw
@@ -549,6 +562,9 @@ fn submit_and_wait(device: &Device, cb: vk::CommandBuffer) -> Result<()> {
         unsafe { device.raw.wait_for_fences(&[fence], true, u64::MAX) }
             .vk_ctx("wait_for_fences (mirror init)")
     });
+    if res.is_ok() {
+        device.note_completed(serial);
+    }
     unsafe { device.raw.destroy_fence(fence, None) };
     res
 }

@@ -11,9 +11,9 @@
 //! `sdr_white = 1.0`) — no re-decode, full HDR fidelity.
 //!
 //! Lifetime: held (via `Arc`) by the layout's `ClosingWindow` for the duration
-//! of the animation (~250 ms). Like [`crate::upload::ShmTexture`], `Drop` does a
-//! `device_wait_idle` before freeing — heavy, but window close is rare and it
-//! sidesteps tracking which frames-in-flight still sample the image.
+//! of the animation (~250 ms). `Drop` retires the image into the device's
+//! deferred-destroy queue, which frees it once the frame-slot fences prove no
+//! in-flight frame still samples it.
 
 use std::sync::Arc;
 
@@ -108,14 +108,14 @@ impl SnapshotTexture {
 
 impl Drop for SnapshotTexture {
     fn drop(&mut self) {
-        unsafe {
-            // Same conservative approach as `ShmTexture`: stall until the GPU is
-            // idle so no in-flight frame is still sampling this image. Window
-            // close is rare, so the cost is irrelevant.
-            let _ = self.device.raw.device_wait_idle();
-            self.device.raw.destroy_image_view(self.view, None);
-            self.device.raw.destroy_image(self.image, None);
-            self.device.raw.free_memory(self.memory, None);
-        }
+        // Retired, not destroyed: the deferred queue frees the image once the
+        // frame-slot fences prove no in-flight frame still samples it. (The
+        // old `device_wait_idle` here cost a full GPU drain at the end of
+        // every close animation.)
+        self.device.retire(crate::device::Retired::Image {
+            image: self.image,
+            view: self.view,
+            memory: self.memory,
+        });
     }
 }

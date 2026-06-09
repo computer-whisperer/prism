@@ -643,12 +643,14 @@ struct GradientTexture {
 
 impl Drop for GradientTexture {
     fn drop(&mut self) {
-        unsafe {
-            let _ = self.device.raw.device_wait_idle();
-            self.device.raw.destroy_image_view(self.view, None);
-            self.device.raw.destroy_image(self.image, None);
-            self.device.raw.free_memory(self.memory, None);
-        }
+        // Retired, not destroyed: in-flight frames may still sample the
+        // gradient; the deferred queue frees it once the slot fences prove
+        // otherwise (and the old device_wait_idle here was a full stall).
+        self.device.retire(prism_renderer::Retired::Image {
+            image: self.image,
+            view: self.view,
+            memory: self.memory,
+        });
     }
 }
 
@@ -833,6 +835,7 @@ fn build_gradient_texture(
     }
     let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
     let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cbs)];
+    let serial = device.note_submit();
     unsafe {
         device
             .raw
@@ -842,6 +845,7 @@ fn build_gradient_texture(
         device.raw.destroy_buffer(staging, None);
         device.raw.free_memory(staging_mem, None);
     }
+    device.note_completed(serial);
 
     let view = prism_renderer::create_view(&device, image, vk::Format::R16G16B16A16_SFLOAT)?;
     Ok(GradientTexture {
@@ -3087,8 +3091,10 @@ fn render_output_now(
         )?
     };
     // The render submit has been queued with the waits in its dependency list
-    // (or, on skip / flip-pending, never used them); either way the imported
-    // semaphores can be destroyed now.
+    // (or, on skip / flip-pending, never used them); either way hand the
+    // imported semaphores to the deferred-destroy queue — the spec forbids
+    // destroying a semaphore before the batch waiting on it completes, so
+    // they're freed once the slot fences prove that.
     prism_protocols::destroy_render_wait_semaphores(state, output_gpu_id, render_waits);
 
     let present_sync_fd = match outcome {

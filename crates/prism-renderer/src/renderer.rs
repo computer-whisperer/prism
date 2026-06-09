@@ -83,6 +83,11 @@ struct FrameSlot {
     /// **unsignals** the semaphore, so on each frame we re-signal it via
     /// the submit then re-export.
     present_semaphore: vk::Semaphore,
+    /// Device submission serial of this slot's last submit
+    /// ([`Device::note_submit`]). When the slot's fence wait returns, this
+    /// serial is reported to [`Device::note_completed`], driving the
+    /// deferred-destroy queue. 0 = never submitted (note_completed no-op).
+    submit_serial: u64,
 }
 
 pub struct Renderer {
@@ -165,6 +170,7 @@ impl Renderer {
                 cmd_buffer: cb,
                 fence,
                 present_semaphore,
+                submit_serial: 0,
             });
         }
         let slots: [FrameSlot; FRAMES_IN_FLIGHT] = slots
@@ -461,7 +467,10 @@ impl Renderer {
         // for cross-GPU mirror copies (a home GPU's copy into the shared
         // scratch must complete before this GPU samples it). Empty for the
         // common case (native textures, no mirror). Consumed by the wait;
-        // the caller destroys them after this returns.
+        // the caller hands them to `Device::retire` after this returns (the
+        // spec forbids destroying a semaphore before the batch waiting on
+        // it completes execution — the deferred-destroy queue holds them
+        // until this submission's slot fence proves that).
         wait_semaphores: &[vk::Semaphore],
         // Window-close snapshots to capture from the intermediate this frame,
         // recorded before the decode pass (which would otherwise repaint over
@@ -494,7 +503,15 @@ impl Renderer {
         let intermediate = self.intermediate.as_ref().unwrap();
 
         let slot_idx = self.next_slot;
-        let slot = &self.slots[slot_idx];
+        let (slot_fence, slot_cb, slot_present_semaphore, slot_prev_serial) = {
+            let slot = &self.slots[slot_idx];
+            (
+                slot.fence,
+                slot.cmd_buffer,
+                slot.present_semaphore,
+                slot.submit_serial,
+            )
+        };
 
         // Wait for this slot's previous use to finish. With N=2 frames in
         // flight and a 60Hz vblank cadence, this is essentially free —
@@ -502,12 +519,16 @@ impl Renderer {
         unsafe {
             self.device
                 .raw
-                .wait_for_fences(&[slot.fence], true, u64::MAX)
+                .wait_for_fences(&[slot_fence], true, u64::MAX)
         }
         .vk_ctx("wait_for_fences (slot)")?;
-        unsafe { self.device.raw.reset_fences(&[slot.fence]) }.vk_ctx("reset_fences (slot)")?;
+        unsafe { self.device.raw.reset_fences(&[slot_fence]) }.vk_ctx("reset_fences (slot)")?;
+        // This slot's previous submission has provably completed — advance the
+        // device's deferred-destroy queue (frees retired dmabuf imports, shm
+        // textures, wait semaphores, … that no in-flight frame references).
+        self.device.note_completed(slot_prev_serial);
 
-        let cb = slot.cmd_buffer;
+        let cb = slot_cb;
         unsafe {
             self.device
                 .raw
@@ -954,7 +975,7 @@ impl Renderer {
         // fence. The fence stays for our internal slot-reuse gate; the
         // semaphore exists so we can export a sync_file fd handle to KMS.
         let signal_sem = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(slot.present_semaphore)
+            .semaphore(slot_present_semaphore)
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
         // Wait on any cross-GPU mirror copies before the decode pass samples
         // their scratch textures. Fragment-shader stage = where the decode
@@ -971,12 +992,14 @@ impl Renderer {
             .command_buffer_infos(&cb_infos)
             .wait_semaphore_infos(&wait_sems)
             .signal_semaphore_infos(&signal_sem)];
+        let serial = self.device.note_submit();
         unsafe {
             self.device
                 .raw
-                .queue_submit2(self.device.graphics_queue, &submit, slot.fence)
+                .queue_submit2(self.device.graphics_queue, &submit, slot_fence)
         }
         .vk_ctx("queue_submit2 (renderer)")?;
+        self.slots[slot_idx].submit_serial = serial;
 
         // Export the just-signalled semaphore as a Linux sync_file fd.
         // Per VK_KHR_external_semaphore_fd spec, the export transfers
@@ -984,7 +1007,7 @@ impl Renderer {
         // unsignals the VkSemaphore — so the next queue_submit2 for this
         // slot is free to re-signal it.
         let get_info = vk::SemaphoreGetFdInfoKHR::default()
-            .semaphore(slot.present_semaphore)
+            .semaphore(slot_present_semaphore)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
         let raw_fd = unsafe { self.semaphore_fd_loader.get_semaphore_fd(&get_info) }
             .vk_ctx("vkGetSemaphoreFdKHR (SYNC_FD)")?;

@@ -479,14 +479,15 @@ impl Target {
 
 impl Drop for Target {
     fn drop(&mut self) {
-        // No GPU work references the offscreen at teardown: a realloc/teardown
-        // only happens between captures, and the encoder drains the device
-        // before dropping.
-        unsafe {
-            self.device.raw.destroy_image_view(self.view, None);
-            self.device.raw.destroy_image(self.image, None);
-            self.device.raw.free_memory(self.memory, None);
-        }
+        // Retired, not destroyed: an `ensure_target` realloc (output extent
+        // change) can fire while the AsyncSlot's previous capture still
+        // renders into this offscreen — the deferred queue holds it until
+        // the device's fence waits prove that submission complete.
+        self.device.retire(crate::device::Retired::Image {
+            image: self.image,
+            view: self.view,
+            memory: self.memory,
+        });
     }
 }
 
@@ -514,6 +515,10 @@ struct AsyncSlot {
     /// exported as the returned sync_fd. The export unsignals it for reuse.
     semaphore: vk::Semaphore,
     fd_loader: external_semaphore_fd::Device,
+    /// Device submission serial of the last capture submit; reported to
+    /// `Device::note_completed` when the reuse-gate fence wait proves it
+    /// finished (drives the deferred-destroy queue). 0 = never submitted.
+    last_submit_serial: std::cell::Cell<u64>,
 }
 
 impl AsyncSlot {
@@ -549,6 +554,7 @@ impl AsyncSlot {
             fence,
             semaphore,
             fd_loader,
+            last_submit_serial: std::cell::Cell::new(0),
         })
     }
 
@@ -559,6 +565,7 @@ impl AsyncSlot {
         unsafe { raw.wait_for_fences(&[self.fence], true, u64::MAX) }
             .vk_ctx("wait_for_fences (capture async slot)")?;
         unsafe { raw.reset_fences(&[self.fence]) }.vk_ctx("reset_fences (capture async slot)")?;
+        self.device.note_completed(self.last_submit_serial.get());
         unsafe { raw.reset_command_buffer(self.cmd_buffer, vk::CommandBufferResetFlags::empty()) }
             .vk_ctx("reset_command_buffer (capture async slot)")?;
         let begin = vk::CommandBufferBeginInfo::default()
@@ -579,12 +586,14 @@ impl AsyncSlot {
         let submit = [vk::SubmitInfo2::default()
             .command_buffer_infos(&cb_infos)
             .signal_semaphore_infos(&signal)];
+        let serial = device.note_submit();
         unsafe {
             device
                 .raw
                 .queue_submit2(device.graphics_queue, &submit, self.fence)
         }
         .vk_ctx("queue_submit2 (capture async)")?;
+        self.last_submit_serial.set(serial);
         let get_info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(self.semaphore)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);

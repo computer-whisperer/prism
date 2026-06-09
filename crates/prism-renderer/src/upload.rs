@@ -41,6 +41,10 @@ pub struct ShmTexture {
     /// Signalled by each upload's submit; waited at the start of the next
     /// upload to gate staging-buffer reuse. Created signalled.
     upload_fence: vk::Fence,
+    /// Device submission serial of the last upload submit; reported to
+    /// `Device::note_completed` when the fence wait proves it finished
+    /// (drives the deferred-destroy queue). 0 = never submitted.
+    last_submit_serial: u64,
     /// False until the first upload has initialized the image contents and
     /// layout. The first upload is always full-extent and acquires from
     /// UNDEFINED; later uploads acquire from SHADER_READ_ONLY_OPTIMAL.
@@ -180,6 +184,7 @@ impl ShmTexture {
             command_pool,
             cmd_buffer,
             upload_fence,
+            last_submit_serial: 0,
             initialized: false,
             image,
             view,
@@ -254,6 +259,7 @@ impl ShmTexture {
         .vk_ctx("wait_for_fences (shm upload)")?;
         unsafe { self.device.raw.reset_fences(&[self.upload_fence]) }
             .vk_ctx("reset_fences (shm upload)")?;
+        self.device.note_completed(self.last_submit_serial);
 
         // Copy the damaged rows into staging at their tightly-packed offsets.
         // Staging mirrors the image (row stride = row_bytes), so the GPU copy
@@ -408,12 +414,14 @@ impl ShmTexture {
 
         let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
+        let serial = self.device.note_submit();
         unsafe {
             self.device
                 .raw
                 .queue_submit2(self.device.graphics_queue, &submit, self.upload_fence)
         }
         .vk_ctx("queue_submit2 (shm upload)")?;
+        self.last_submit_serial = serial;
 
         self.initialized = true;
         let _ = self.staging_size; // silence dead-code on this field; useful for future asserts
@@ -423,19 +431,23 @@ impl ShmTexture {
 
 impl Drop for ShmTexture {
     fn drop(&mut self) {
-        unsafe {
-            let _ = self.device.raw.device_wait_idle();
-            self.device.raw.destroy_fence(self.upload_fence, None);
-            self.device
-                .raw
-                .destroy_command_pool(self.command_pool, None);
-            self.device.raw.unmap_memory(self.staging_memory);
-            self.device.raw.destroy_buffer(self.staging_buffer, None);
-            self.device.raw.free_memory(self.staging_memory, None);
-            self.device.raw.destroy_image_view(self.view, None);
-            self.device.raw.destroy_image(self.image, None);
-            self.device.raw.free_memory(self.image_memory, None);
-        }
+        use crate::device::Retired;
+        // Retire everything the GPU may still reference instead of the old
+        // `device_wait_idle` (a full-pipeline stall on every shm texture
+        // realloc/close). Unmapping is a host-side operation and is safe
+        // while the GPU reads the memory; the free is what's deferred.
+        unsafe { self.device.raw.unmap_memory(self.staging_memory) };
+        self.device.retire(Retired::Fence(self.upload_fence));
+        self.device.retire(Retired::CommandPool(self.command_pool));
+        self.device.retire(Retired::Buffer {
+            buffer: self.staging_buffer,
+            memory: self.staging_memory,
+        });
+        self.device.retire(Retired::Image {
+            image: self.image,
+            view: self.view,
+            memory: self.image_memory,
+        });
     }
 }
 
