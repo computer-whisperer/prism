@@ -44,8 +44,17 @@ use smithay::output::Output;
 pub fn handle_action(state: &mut PrismState, action: Action) {
     use Action as A;
     match action {
-        A::Quit(_skip_confirmation) => {
-            tracing::info!("action: Quit");
+        A::Quit(skip_confirmation) => {
+            // No exit-confirmation dialog exists yet (overlay/text UI is
+            // deferred), so both forms quit immediately — but say so when
+            // the user asked for the confirming variant.
+            if skip_confirmation {
+                tracing::info!("action: Quit");
+            } else {
+                tracing::info!(
+                    "action: Quit (confirmation dialog not implemented; quitting immediately)"
+                );
+            }
             state.should_stop = true;
         }
         A::ChangeVt(vt) => {
@@ -868,52 +877,58 @@ pub fn handle_action(state: &mut PrismState, action: Action) {
                 queue_redraw_active_output(state);
             }
         }
+        // The ById arms iterate via `with_windows_mut`, not
+        // `workspaces_mut()`: it also covers a window that is
+        // mid-interactive-move (not in any workspace) and the no-outputs
+        // monitor set. Redraws are queued only when the id resolved.
         A::ToggleWindowRuleOpacityById(id) => {
             let mut toggled = false;
-            if let Some(window) = state
-                .layout
-                .workspaces_mut()
-                .find_map(|ws| ws.windows_mut().find(|w| w.id().get() == id))
-            {
-                if window.rules().opacity.is_some_and(|o| o != 1.) {
+            state.layout.with_windows_mut(|window, _| {
+                if window.id().get() == id && window.rules().opacity.is_some_and(|o| o != 1.) {
                     window.toggle_ignore_opacity_window_rule();
                     toggled = true;
                 }
-            }
+            });
             if toggled {
                 queue_redraw_active_output(state);
             }
         }
         A::ToggleWindowUrgent(id) => {
-            if let Some(window) = state
-                .layout
-                .workspaces_mut()
-                .find_map(|ws| ws.windows_mut().find(|w| w.id().get() == id))
-            {
-                let urgent = window.is_urgent();
-                window.set_urgent(!urgent);
+            let mut changed = false;
+            state.layout.with_windows_mut(|window, _| {
+                if window.id().get() == id {
+                    let urgent = window.is_urgent();
+                    window.set_urgent(!urgent);
+                    changed = true;
+                }
+            });
+            if changed {
+                queue_redraw_active_output(state);
             }
-            queue_redraw_active_output(state);
         }
         A::SetWindowUrgent(id) => {
-            if let Some(window) = state
-                .layout
-                .workspaces_mut()
-                .find_map(|ws| ws.windows_mut().find(|w| w.id().get() == id))
-            {
-                window.set_urgent(true);
+            let mut changed = false;
+            state.layout.with_windows_mut(|window, _| {
+                if window.id().get() == id {
+                    window.set_urgent(true);
+                    changed = true;
+                }
+            });
+            if changed {
+                queue_redraw_active_output(state);
             }
-            queue_redraw_active_output(state);
         }
         A::UnsetWindowUrgent(id) => {
-            if let Some(window) = state
-                .layout
-                .workspaces_mut()
-                .find_map(|ws| ws.windows_mut().find(|w| w.id().get() == id))
-            {
-                window.set_urgent(false);
+            let mut changed = false;
+            state.layout.with_windows_mut(|window, _| {
+                if window.id().get() == id {
+                    window.set_urgent(false);
+                    changed = true;
+                }
+            });
+            if changed {
+                queue_redraw_active_output(state);
             }
-            queue_redraw_active_output(state);
         }
 
         A::PowerOffMonitors => {

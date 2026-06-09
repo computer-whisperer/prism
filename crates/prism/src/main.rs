@@ -1835,7 +1835,25 @@ fn run_integrated(
         let input_backend = LibinputInputBackend::new(libinput);
         event_loop
             .handle()
-            .insert_source(input_backend, |event, _, state| {
+            .insert_source(input_backend, |mut event, _, state| {
+                // Maintain the live libinput device set before the generic
+                // dispatch (which only sees the backend-agnostic Device
+                // trait). The set drives seat-capability recomputation on
+                // removal and is where the future per-device settings
+                // application (apply_libinput_settings) will iterate.
+                // Mirrors niri's process_libinput_event pre-pass.
+                {
+                    use smithay::backend::input::InputEvent;
+                    match &mut event {
+                        InputEvent::DeviceAdded { device } => {
+                            state.libinput_devices.insert(device.clone());
+                        }
+                        InputEvent::DeviceRemoved { device } => {
+                            state.libinput_devices.remove(device);
+                        }
+                        _ => {}
+                    }
+                }
                 prism_input::process_input_event(state, event);
             })
             .map_err(|e| anyhow!("insert libinput source: {e}"))?;

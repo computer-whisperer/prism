@@ -121,16 +121,42 @@ fn on_device_added(state: &mut PrismState, device: impl Device) {
     // touch / tablet capabilities deferred (no handlers yet).
 }
 
-fn on_device_removed(_state: &mut PrismState, device: impl Device) {
-    // Today: log only. A real impl would re-evaluate seat
-    // capabilities after the last device of a given kind unplugs.
-    // See niri input/mod.rs:255.
+fn on_device_removed(state: &mut PrismState, device: impl Device) {
+    let had_kb = device.has_capability(DeviceCapability::Keyboard);
+    let had_ptr = device.has_capability(DeviceCapability::Pointer);
     tracing::info!(
-        "input: device removed (kb={} ptr={} touch={})",
-        device.has_capability(DeviceCapability::Keyboard),
-        device.has_capability(DeviceCapability::Pointer),
+        "input: device removed (kb={had_kb} ptr={} touch={})",
+        had_ptr,
         device.has_capability(DeviceCapability::Touch),
     );
+
+    // Re-evaluate seat capabilities: when the last device of a kind
+    // unplugs, stop advertising it on wl_seat (niri input/mod.rs:255).
+    // `libinput_devices` is maintained by the libinput source pre-pass in
+    // main.rs and has already had this device removed; non-libinput
+    // backends (WLCS) don't populate it, but there the seat lives for the
+    // harness's lifetime anyway.
+    use smithay::reexports::input as libinput;
+    if had_kb
+        && state.seat.get_keyboard().is_some()
+        && !state
+            .libinput_devices
+            .iter()
+            .any(|d| d.has_capability(libinput::DeviceCapability::Keyboard))
+    {
+        state.seat.remove_keyboard();
+        tracing::info!("seat: last keyboard unplugged — keyboard capability removed");
+    }
+    if had_ptr
+        && state.seat.get_pointer().is_some()
+        && !state
+            .libinput_devices
+            .iter()
+            .any(|d| d.has_capability(libinput::DeviceCapability::Pointer))
+    {
+        state.seat.remove_pointer();
+        tracing::info!("seat: last pointer unplugged — pointer capability removed");
+    }
 }
 
 fn on_keyboard<I: PrismInputBackend>(state: &mut PrismState, event: I::KeyboardKeyEvent) {
@@ -213,7 +239,13 @@ fn on_keyboard<I: PrismInputBackend>(state: &mut PrismState, event: I::KeyboardK
                          (wayland-only / headless mode)"
                     ),
                 }
-                this.suppressed_keys.insert(key_code);
+                // The release will land on the other VT, so a suppression
+                // entry for this key would dangle and intercept the release
+                // of the *next* plain press of the same F-key (stuck key for
+                // one cycle). Clear the whole set instead, mirroring
+                // `A::ChangeVt` — a dangling release forwarded to a client
+                // that never saw the press is harmless.
+                this.suppressed_keys.clear();
                 return FilterResult::Intercept(None);
             }
 

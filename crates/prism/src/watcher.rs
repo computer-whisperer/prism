@@ -96,7 +96,19 @@ impl Watcher {
                     };
 
                     match inner.check() {
-                        CheckResult::Missing => continue,
+                        CheckResult::Missing => {
+                            // An explicit load-config-file trigger must still
+                            // attempt the load (and surface the failure) even
+                            // while the file can't be stat'd — a bare
+                            // `continue` here silently swallowed it.
+                            if !should_load {
+                                continue;
+                            }
+                            tracing::warn!(
+                                "config file {:?} missing/unreadable; attempting explicit load anyway",
+                                inner.path
+                            );
+                        }
                         CheckResult::Unchanged => (),
                         CheckResult::Changed => {
                             tracing::debug!("config file changed");

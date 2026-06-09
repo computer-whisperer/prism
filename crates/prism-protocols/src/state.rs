@@ -1454,7 +1454,17 @@ impl PrismState {
             None => Scale::Integer(1),
             Some(s) => {
                 let v = s.0;
-                if v == v.trunc() && v >= 1.0 {
+                if v < 0.1 {
+                    // The config type's range floor is 0 (FloatOrInt<0, 10>),
+                    // so `scale 0` parses — but a zero/near-zero scale makes
+                    // every logical-size division degenerate. Refuse it here.
+                    tracing::warn!(
+                        connector = %output_name.connector,
+                        scale = v,
+                        "output scale below 0.1 is degenerate; using 1"
+                    );
+                    Scale::Integer(1)
+                } else if v == v.trunc() && v >= 1.0 {
                     Scale::Integer(v as i32)
                 } else {
                     Scale::Fractional(v)
