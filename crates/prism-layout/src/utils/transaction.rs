@@ -1,11 +1,15 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use atomic::Ordering;
+// niri uses a bare `std::sync::mpsc::Sender` here and drains it manually
+// in its per-dispatch refresh; prism's notifications ride a calloop
+// channel instead, so completion wakes the loop and dispatches without a
+// dedicated drain point. Same `send` signature, same error type.
+use calloop::channel::Sender;
 use calloop::ping::{make_ping, Ping};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::LoopHandle;

@@ -68,8 +68,9 @@ use smithay::utils::{IsAlive, Logical, Rectangle, Serial, Transform};
 use smithay::wayland::alpha_modifier::AlphaModifierState;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    add_pre_commit_hook, get_parent, get_role, with_states, with_surface_tree_downward,
-    CompositorClientState, CompositorHandler, CompositorState, TraversalAction,
+    add_blocker, add_pre_commit_hook, get_parent, get_role, with_states,
+    with_surface_tree_downward, CompositorClientState, CompositorHandler, CompositorState,
+    TraversalAction,
 };
 use smithay::wayland::content_type::ContentTypeState;
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
@@ -336,6 +337,18 @@ pub struct PrismState {
     /// happens after the event loop is built, so this is a
     /// theoretical window).
     pub loop_handle: Option<LoopHandle<'static, PrismState>>,
+    /// Sender side of the transaction-completion channel. When a
+    /// multi-window [`Transaction`] completes (all participants
+    /// committed, or the 300 ms deadline fired), it sends each blocked
+    /// client here; the receiver (inserted in [`Self::set_loop_handle`])
+    /// calls `CompositorClientState::blocker_cleared` so smithay applies
+    /// the queued commits. niri drains an mpsc in its per-dispatch
+    /// refresh instead; a calloop channel needs no drain point. `None`
+    /// until set_loop_handle — the pre-commit hook then skips blocker
+    /// wiring (commits just apply unsynchronized).
+    ///
+    /// [`Transaction`]: prism_layout::utils::transaction::Transaction
+    pub transaction_notify_tx: Option<calloop::channel::Sender<Client>>,
     /// Toplevels that exist but aren't in the layout yet, keyed by
     /// root wl_surface. A window lives here from `new_toplevel` until
     /// its first buffer commit maps it into the layout. The initial
@@ -877,6 +890,7 @@ impl PrismState {
             drm_syncobj_state: None,
             primary_gpu_id: primary_gpu,
             loop_handle: None,
+            transaction_notify_tx: None,
             unmapped_windows: HashMap::new(),
             satellite: None,
             layer_shell_state,
@@ -950,6 +964,31 @@ impl PrismState {
         // the global is advertised before clients connect (set_loop_handle
         // runs before the wayland socket is inserted).
         self.idle_notifier = Some(IdleNotifierState::new(&self.display_handle, handle.clone()));
+
+        // Transaction-completion notifications: when a multi-window
+        // resize transaction completes, each blocked client arrives on
+        // this channel and gets its queued commits re-evaluated. See
+        // `transaction_notify_tx` and the mapped-toplevel pre-commit
+        // hook in `map_new_window`.
+        let (tx, rx) = calloop::channel::channel();
+        match handle.insert_source(rx, |event, _, state: &mut PrismState| {
+            if let calloop::channel::Event::Msg(client) = event {
+                let dh = state.display_handle.clone();
+                use smithay::wayland::compositor::CompositorHandler;
+                state
+                    .client_compositor_state(&client)
+                    .blocker_cleared(state, &dh);
+            }
+        }) {
+            Ok(_token) => self.transaction_notify_tx = Some(tx),
+            Err(e) => {
+                // Leave the sender unset: the pre-commit hook then never
+                // adds transaction blockers, so commits apply
+                // unsynchronized instead of hanging until the deadline.
+                tracing::warn!("transaction notify channel insert failed: {e}");
+            }
+        }
+
         self.loop_handle = Some(handle);
     }
 
@@ -1963,10 +2002,11 @@ impl PrismState {
             })
             .map(|(mapped, _)| mapped.window.clone());
 
-        // Pre-commit hook: drives the resize animation's
-        // snapshot capture. niri also uses it for
-        // dmabuf-readiness blockers + the post-commit
-        // transaction queue, which we don't have yet.
+        // Pre-commit hook: drains the transaction queue and
+        // drives the resize animation's snapshot capture.
+        // niri also uses it for dmabuf-readiness blockers;
+        // prism instead waits on the client's implicit write
+        // fence at render time (see prepare_dmabuf_acquire_waits).
         //
         // It fires before `on_commit_buffer_handler`
         // applies the new buffer, so the window still
@@ -1979,7 +2019,7 @@ impl PrismState {
         // and we store the snapshot; `Tile::update_window`
         // later consumes it (`take_animation_snapshot`) to
         // seed `ResizeAnimation.size_from`. Mirrors niri's
-        // `Mapped::pre_commit`.
+        // `add_mapped_toplevel_pre_commit_hook`.
         let hook = add_pre_commit_hook::<PrismState, _>(surface, |state, _dh, surface| {
             // The serial the client acked with this
             // commit (set by ack_configure, processed
@@ -1995,10 +2035,46 @@ impl PrismState {
             };
             // None until the window is mapped into the
             // layout — initial pre-map commits no-op.
-            if let Some((mapped, _)) = state.layout.find_window_and_output_mut(surface) {
-                if mapped.should_animate_commit(serial) {
-                    mapped.store_animation_snapshot();
+            let Some((mapped, _)) = state.layout.find_window_and_output_mut(surface) else {
+                return;
+            };
+
+            // Drain this commit's transaction (niri parity). A
+            // transactional configure (multi-window column resize)
+            // queued a clone of the column's Transaction against the
+            // configure serial; this commit fulfills our window's part.
+            // If other windows in the transaction haven't committed yet,
+            // block THIS commit on the transaction so all windows
+            // resize in lockstep — the blocker releases when the last
+            // participant commits (its drop completes the transaction
+            // and notifies us via transaction_notify_tx) or when the
+            // 300 ms deadline fires.
+            if let Some(transaction) = mapped.take_pending_transaction(serial) {
+                // Already completed = it ran past the deadline.
+                let disable = state.config.borrow().debug.disable_transactions;
+                if !transaction.is_completed() && !disable {
+                    if let Some(loop_handle) = state.loop_handle.as_ref() {
+                        transaction.register_deadline_timer(loop_handle);
+                    }
+                    // Last holder: dropping it below completes the
+                    // transaction and wakes the other windows' blocked
+                    // commits — no blocker needed on our own surface.
+                    if !transaction.is_last() {
+                        if let (Some(tx), Some(client)) =
+                            (state.transaction_notify_tx.as_ref(), surface.client())
+                        {
+                            transaction.add_notification(tx.clone(), client.clone());
+                            add_blocker(surface, transaction.blocker());
+                        }
+                    }
                 }
+                // Transaction dropped here. niri keeps it alive until
+                // the commit's dmabuf is ready; prism's producer-sync
+                // happens at render time, so there's nothing to wait on.
+            }
+
+            if mapped.should_animate_commit(serial) {
+                mapped.store_animation_snapshot();
             }
         });
 
