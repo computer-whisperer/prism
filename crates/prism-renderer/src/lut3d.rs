@@ -244,8 +244,15 @@ impl Lut3dTexture {
         let staging_buffer = self.staging_buffer;
         let cube_edge = self.cube_edge;
         self.oneshot.record_and_submit(|raw, cb| unsafe {
+            // src = FRAGMENT_SHADER/SAMPLED_READ, not TOP_OF_PIPE: a
+            // recalibration-time upload races the ≤ FRAMES_IN_FLIGHT frames
+            // whose encode pass is still sampling this LUT — the transfer
+            // must wait for those reads, or the write overlaps them
+            // (transient corruption, spec UB). The oneshot's post-submit
+            // idle wait only orders *later* work, not the in-flight frames.
             let to_xfer = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .src_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                 .dst_stage_mask(vk::PipelineStageFlags2::COPY)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .old_layout(vk::ImageLayout::UNDEFINED)
