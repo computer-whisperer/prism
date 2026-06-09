@@ -253,9 +253,9 @@ pub struct PrismState {
     /// [`crate::selection`]).
     pub primary_selection_state: PrimarySelectionState,
     /// Active drag-and-drop cursor icon, set while a DnD grab is
-    /// in flight. Currently *stored only* — the render path doesn't
-    /// draw it yet, so drags work functionally but without a visual
-    /// preview. See [`crate::selection`] for the TODO.
+    /// in flight. The render walk draws it on the output under the
+    /// pointer, offset by the accumulated `wl_surface.offset` deltas
+    /// (see the commit handler's DnD-icon block).
     pub dnd_icon: Option<crate::selection::DndIcon>,
     /// wp_viewporter global. mpv (with `--vo=gpu --gpu-context=wayland`)
     /// hard-requires this to attach destination/source rects to each
@@ -349,6 +349,12 @@ pub struct PrismState {
     ///
     /// [`Transaction`]: prism_layout::utils::transaction::Transaction
     pub transaction_notify_tx: Option<calloop::channel::Sender<Client>>,
+    /// Whether the session is still in its startup phase — the input to
+    /// window-rule `match at-startup=true/false`. niri semantics: true
+    /// for the first 60 seconds, flipped by a timer registered in
+    /// [`Self::set_loop_handle`], which also force-recomputes every
+    /// mapped window's rules so at-startup-only matches drop off.
+    pub is_at_startup: bool,
     /// Toplevels that exist but aren't in the layout yet, keyed by
     /// root wl_surface. A window lives here from `new_toplevel` until
     /// its first buffer commit maps it into the layout. The initial
@@ -891,6 +897,7 @@ impl PrismState {
             primary_gpu_id: primary_gpu,
             loop_handle: None,
             transaction_notify_tx: None,
+            is_at_startup: true,
             unmapped_windows: HashMap::new(),
             satellite: None,
             layer_shell_state,
@@ -987,6 +994,21 @@ impl PrismState {
                 // unsynchronized instead of hanging until the deadline.
                 tracing::warn!("transaction notify channel insert failed: {e}");
             }
+        }
+
+        // End of the startup phase (niri parity: 60 s). Window-rule
+        // `match at-startup=true` applies to windows opened before this
+        // fires; on the flip, every mapped window re-resolves so
+        // at-startup-only matches drop their rules.
+        let timer = Timer::from_duration(std::time::Duration::from_secs(60));
+        if let Err(e) = handle.insert_source(timer, |_, _, state: &mut PrismState| {
+            state.is_at_startup = false;
+            if state.recompute_window_rules() {
+                queue_redraw_all(state);
+            }
+            TimeoutAction::Drop
+        }) {
+            tracing::warn!("startup-phase timer insert failed: {e} (at-startup stays true)");
         }
 
         self.loop_handle = Some(handle);
@@ -1714,12 +1736,10 @@ impl PrismState {
         };
 
         let config = self.config.borrow();
-        // `is_at_startup = false`: prism has no startup phase, so
-        // `match at-startup=true` never applies.
         let rules = ResolvedWindowRules::compute(
             &config.window_rules,
             WindowRef::Unmapped(unmapped),
-            false,
+            self.is_at_startup,
         );
 
         let Unmapped { window, state, .. } = unmapped;
@@ -2260,27 +2280,95 @@ impl PrismState {
         }
 
         if window_rules_changed {
-            // Force-recompute every mapped window's resolved rules, and give
-            // the layout a chance to re-configure windows whose rules
-            // changed (sizing rules affect tile geometry). Unmapped windows
-            // are a known gap — prism doesn't resolve rules at
-            // initial-configure time yet.
-            let config = Rc::clone(&self.config);
-            let config = config.borrow();
-            let mut changed_windows = Vec::new();
-            self.layout.with_windows_mut(|mapped, _output| {
-                if mapped.recompute_window_rules(&config.window_rules, false) {
-                    changed_windows.push(mapped.window.clone());
-                }
-            });
-            for win in changed_windows {
-                self.layout.update_window(&win, None);
-            }
+            self.recompute_window_rules();
         }
 
         // Decoration/rule changes re-damage via element content tokens; a
         // full redraw pass picks them all up on the next frame.
         queue_redraw_all(self);
+    }
+
+    /// Force-recompute every window's resolved rules — mapped windows
+    /// through the layout (re-configuring those whose rules changed,
+    /// since sizing rules affect tile geometry), and configured-but-
+    /// unmapped windows in place (their recorded rules are consumed at
+    /// map time). Returns whether any mapped window changed. Callers:
+    /// config hot-reload (rules section edited) and the startup-phase
+    /// flip (`at-startup` matches drop off). Mirrors niri's
+    /// `recompute_window_rules`.
+    pub fn recompute_window_rules(&mut self) -> bool {
+        let is_at_startup = self.is_at_startup;
+        let config = Rc::clone(&self.config);
+        let config = config.borrow();
+
+        for unmapped in self.unmapped_windows.values_mut() {
+            let new_rules = ResolvedWindowRules::compute(
+                &config.window_rules,
+                WindowRef::Unmapped(unmapped),
+                is_at_startup,
+            );
+            if let InitialConfigureState::Configured { rules, .. } = &mut unmapped.state {
+                *rules = new_rules;
+            }
+        }
+
+        let mut changed_windows = Vec::new();
+        self.layout.with_windows_mut(|mapped, _output| {
+            if mapped.recompute_window_rules(&config.window_rules, is_at_startup) {
+                changed_windows.push(mapped.window.clone());
+            }
+        });
+        drop(config);
+        let any_changed = !changed_windows.is_empty();
+        for win in changed_windows {
+            self.layout.update_window(&win, None);
+        }
+        any_changed
+    }
+
+    /// Re-resolve window rules after a title or app-id change — rules
+    /// matching on title (e.g. "Save As" dialogs) must re-apply when the
+    /// title arrives or changes after mapping. Port of niri's
+    /// `update_window_rules` (handlers/xdg_shell.rs): an unmapped-but-
+    /// configured window updates its recorded rules in place (consumed at
+    /// map time); a mapped window recomputes, and on change re-runs
+    /// `update_window` + queues a redraw on its output.
+    pub fn update_window_rules(&mut self, toplevel: &ToplevelSurface) {
+        let is_at_startup = self.is_at_startup;
+        let config = Rc::clone(&self.config);
+        let config = config.borrow();
+        let window_rules = &config.window_rules;
+
+        if let Some(unmapped) = self.unmapped_windows.get_mut(toplevel.wl_surface()) {
+            let new_rules = ResolvedWindowRules::compute(
+                window_rules,
+                WindowRef::Unmapped(unmapped),
+                is_at_startup,
+            );
+            if let InitialConfigureState::Configured { rules, .. } = &mut unmapped.state {
+                *rules = new_rules;
+            }
+        } else if let Some((mapped, output)) = self
+            .layout
+            .find_window_and_output_mut(toplevel.wl_surface())
+        {
+            if mapped.recompute_window_rules(window_rules, is_at_startup) {
+                let output = output.cloned();
+                let window = mapped.window.clone();
+                drop(config);
+                self.layout.update_window(&window, None);
+
+                if let Some(out) = output {
+                    if let Some(name) = self
+                        .wl_outputs
+                        .iter()
+                        .find_map(|(id, o)| (o == &out).then_some(id.clone()))
+                    {
+                        self.output_redraw.entry(name).or_default().queue_redraw();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3126,11 +3214,12 @@ impl XdgShellHandler for PrismState {
         // back."
         //
         // Mirrors niri's `Layout::remove_window` call from its
-        // unmap path. `Transaction::new()` is an empty transaction
-        // (we don't yet thread the cross-window commit-atomicity
-        // transaction system that niri uses to keep resize neighbours
-        // in sync; a fresh transaction is the "don't coordinate with
-        // anyone" default).
+        // unmap path. A fresh `Transaction::new()` is the "don't
+        // coordinate with anyone" default — the surface is already
+        // destroyed, so there is no commit to gate (unlike the
+        // null-buffer unmap path in the commit handler, which
+        // registers its transaction's deadline for co-resize
+        // neighbours).
         let wl_surface = surface.wl_surface();
         let lookup = self
             .layout
@@ -3179,6 +3268,14 @@ impl XdgShellHandler for PrismState {
                 }
             }
         }
+    }
+
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        self.update_window_rules(&surface);
+    }
+
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        self.update_window_rules(&surface);
     }
 }
 
