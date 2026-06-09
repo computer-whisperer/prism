@@ -715,6 +715,16 @@ pub struct ColorSurfaceData {
     pub surface: smithay::reexports::wayland_server::Weak<WlSurface>,
 }
 
+/// Per-`wl_surface` marker: whether a live `WpColorManagementSurfaceV1`
+/// exists for the surface. The spec allows at most one — a duplicate
+/// `get_surface` is the `surface_exists` protocol error. Beyond spec
+/// conformance, the marker keeps two live objects from clobbering each
+/// other's set/unset through the shared [`SurfaceColorSlot`]. Set on
+/// `get_surface`, cleared when the object is destroyed (smithay's
+/// alpha-modifier/content-type pattern).
+#[derive(Default)]
+struct SurfaceColorObjectMarker(std::sync::atomic::AtomicBool);
+
 /// User data for `WpColorManagementSurfaceFeedbackV1`. Same shape as
 /// `ColorSurfaceData` — a Weak to the underlying surface so the
 /// get_preferred / get_preferred_parametric requests can resolve the
@@ -786,6 +796,25 @@ impl Dispatch<WpColorManagerV1, ()> for PrismState {
                 let _ = data_init.init(id, ColorOutputData { output_id });
             }
             Request::GetSurface { id, surface } => {
+                // At most one color-management surface object per
+                // wl_surface (atomic swap marks it taken in the same
+                // step that reads the old state). Leaving `id`
+                // uninitialized on the error path is fine — post_error
+                // kills the client.
+                let already = compositor::with_states(&surface, |states| {
+                    states
+                        .data_map
+                        .insert_if_missing_threadsafe(SurfaceColorObjectMarker::default);
+                    let marker = states.data_map.get::<SurfaceColorObjectMarker>().unwrap();
+                    marker.0.swap(true, std::sync::atomic::Ordering::Relaxed)
+                });
+                if already {
+                    resource.post_error(
+                        wp_color_manager_v1::Error::SurfaceExists,
+                        "wl_surface already has a wp_color_management_surface_v1".to_string(),
+                    );
+                    return;
+                }
                 let data = ColorSurfaceData {
                     surface: surface.downgrade(),
                 };
@@ -1594,11 +1623,17 @@ impl Dispatch<WpColorManagementSurfaceV1, ColorSurfaceData> for PrismState {
         _resource: &WpColorManagementSurfaceV1,
         data: &ColorSurfaceData,
     ) {
-        // Same intent as the Destroy request — if the resource went
-        // away by client disconnect rather than explicit destroy,
-        // still clean up.
+        // Runs on explicit Destroy and on client disconnect alike:
+        // queue the spec-mandated unset (idempotent with the Destroy
+        // arm above) and free the one-object-per-surface marker so a
+        // later get_surface on the same wl_surface succeeds.
         if let Ok(surface) = data.surface.upgrade() {
             queue_unset(&surface);
+            compositor::with_states(&surface, |states| {
+                if let Some(marker) = states.data_map.get::<SurfaceColorObjectMarker>() {
+                    marker.0.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
         }
     }
 }
