@@ -39,6 +39,7 @@ use prism_ipc::{
     self, ColorState, LogicalOutput, Output, OutputAction, OutputConfigChanged, Reply, Request,
     Response, ResponseCurveState, Transform,
 };
+use prism_layout::utils::with_toplevel_role;
 use prism_protocols::PrismState;
 use smithay::utils::Size;
 
@@ -346,13 +347,20 @@ fn dispatch(state: &mut PrismState, req: Request) -> (Reply, Option<OwnedFd>) {
         ),
         Request::Outputs => (Ok(Response::Outputs(collect_outputs(state))), None),
         Request::FocusedOutput => {
-            // True focus tracking lives in input dispatch (not yet
-            // multi-output-aware); for now report the first connected
-            // output so the IPC at least has a defined answer.
-            let map = collect_outputs(state);
-            let first = map.into_values().next();
-            (Ok(Response::FocusedOutput(first)), None)
+            // The layout's active monitor is the focused output (the one
+            // carrying the focus ring).
+            let focused = state.active_output().and_then(|active| {
+                let id = state
+                    .wl_outputs
+                    .iter()
+                    .find(|(_, wl)| **wl == active)
+                    .map(|(id, _)| id.clone())?;
+                collect_outputs(state).remove(&id)
+            });
+            (Ok(Response::FocusedOutput(focused)), None)
         }
+        Request::Workspaces => (Ok(Response::Workspaces(collect_workspaces(state))), None),
+        Request::Windows => (Ok(Response::Windows(collect_windows(state))), None),
         Request::Output { output, action } => (handle_output_action(state, &output, action), None),
         Request::CaptureFrame { output } => handle_capture_frame(state, &output),
         Request::GamutMesh { output } => (handle_gamut_mesh(state, &output), None),
@@ -478,21 +486,22 @@ fn collect_outputs(state: &PrismState) -> HashMap<String, Output> {
             refresh_rate: mode.vrefresh() * 1000,
             is_preferred: true,
         }];
-        let logical = state
-            .wl_outputs
-            .get(&ctx.connector_name)
-            .and_then(|wl| state.layout.monitor_for_output(wl))
-            .map(|monitor| {
-                let view: Size<f64, smithay::utils::Logical> = monitor.view_size();
-                LogicalOutput {
-                    x: 0,
-                    y: 0,
-                    width: view.w as u32,
-                    height: view.h as u32,
-                    scale: 1.0,
-                    transform: Transform::Normal,
-                }
-            });
+        let logical = state.wl_outputs.get(&ctx.connector_name).and_then(|wl| {
+            let monitor = state.layout.monitor_for_output(wl)?;
+            let view: Size<f64, smithay::utils::Logical> = monitor.view_size();
+            // Position/scale/transform live on the smithay Output —
+            // `layout_outputs()` assigns the location, the config the
+            // rest. Region-capture tooling (slurp-style) keys off these.
+            let loc = wl.current_location();
+            Some(LogicalOutput {
+                x: loc.x,
+                y: loc.y,
+                width: view.w as u32,
+                height: view.h as u32,
+                scale: wl.current_scale().fractional_scale(),
+                transform: ipc_transform(wl.current_transform()),
+            })
+        });
         // Snapshot the effective color pipeline state so callers
         // (calibration tooling, debug UIs) can branch on HDR/SDR mode
         // and read the current per-channel peaks + response curve
@@ -536,6 +545,69 @@ fn collect_outputs(state: &PrismState) -> HashMap<String, Output> {
         map.insert(ctx.connector_name.clone(), info);
     }
     map
+}
+
+/// smithay output transform → IPC vocabulary.
+fn ipc_transform(t: smithay::utils::Transform) -> Transform {
+    use smithay::utils::Transform as T;
+    match t {
+        T::Normal => Transform::Normal,
+        T::_90 => Transform::_90,
+        T::_180 => Transform::_180,
+        T::_270 => Transform::_270,
+        T::Flipped => Transform::Flipped,
+        T::Flipped90 => Transform::Flipped90,
+        T::Flipped180 => Transform::Flipped180,
+        T::Flipped270 => Transform::Flipped270,
+    }
+}
+
+/// Build the IPC `Workspace` list straight from the layout. (niri serves
+/// this from cached event-stream state because its IPC thread can't
+/// touch the compositor; prism dispatches on the main calloop and reads
+/// the layout directly.)
+fn collect_workspaces(state: &PrismState) -> Vec<prism_ipc::Workspace> {
+    let focused_ws_id = state.layout.active_workspace().map(|ws| ws.id().get());
+    state
+        .layout
+        .workspaces()
+        .map(|(mon, ws_idx, ws)| {
+            let id = ws.id().get();
+            prism_ipc::Workspace {
+                id,
+                idx: u8::try_from(ws_idx + 1).unwrap_or(u8::MAX),
+                name: ws.name().cloned(),
+                output: mon.map(|mon| mon.output_name().clone()),
+                is_urgent: ws.is_urgent(),
+                is_active: mon.is_some_and(|mon| mon.active_workspace_idx() == ws_idx),
+                is_focused: Some(id) == focused_ws_id,
+                active_window_id: ws.active_window().map(|win| win.id().get()),
+            }
+        })
+        .collect()
+}
+
+/// Build the IPC `Window` list straight from the layout (same rationale
+/// as [`collect_workspaces`]). The `WindowLayout` comes ready-made from
+/// the layout walk.
+fn collect_windows(state: &PrismState) -> Vec<prism_ipc::Window> {
+    let mut windows = Vec::new();
+    state.layout.with_windows(|mapped, _, ws_id, layout| {
+        let window = with_toplevel_role(mapped.toplevel(), |role| prism_ipc::Window {
+            id: mapped.id().get(),
+            title: role.title.clone(),
+            app_id: role.app_id.clone(),
+            pid: mapped.credentials().map(|c| c.pid),
+            workspace_id: ws_id.map(|id| id.get()),
+            is_focused: mapped.is_focused(),
+            is_floating: mapped.is_floating(),
+            is_urgent: mapped.is_urgent(),
+            layout,
+            focus_timestamp: mapped.get_focus_timestamp().map(prism_ipc::Timestamp::from),
+        });
+        windows.push(window);
+    });
+    windows
 }
 
 /// Apply a state-mutating `OutputAction`. Color-related variants are

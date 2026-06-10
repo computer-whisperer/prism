@@ -97,7 +97,7 @@ color reforms. **All 06-09 review fixes are runtime-unverified.**
 | Screen capture: wlr-screencopy, SHM + dmabuf, async from the render loop | ✅ grim / ☐ recording perf (see deferred-work) |
 | ext-workspace-v1 + wlr-foreign-toplevel (+ ext list) for status bars | ☐ — needs a waybar run |
 | `wp_alpha_modifier_v1` | ☐ |
-| IPC: nonblocking per-connection socket; version/outputs/focused-output/output actions, LUT push over memfd | ✅ / ☐ nonblocking rework (aad4323); introspection requests not implemented |
+| IPC: nonblocking per-connection socket; version/outputs/focused-output/workspaces/windows/output actions, LUT push over memfd | ✅ / ☐ nonblocking rework (aad4323) + introspection requests; EventStream not implemented |
 | Session: `prism-session` (systemd --user units, real user bus), spawn-at-startup + env, child signal-mask reset | ✅ |
 | WLCS protocol-conformance harness (curated subset, 6-entry expected-failures allowlist) | ✅ |
 | Packaging: PKGBUILD + .SRCINFO (AUR push pending release tag) | ☐ |
@@ -108,8 +108,8 @@ Details and triggers in [deferred-work.md](deferred-work.md). Feature-sized gaps
 are tracked as GitHub issues. The notable ones:
 
 - **IME / text-input** (#26) — none.
-- **IPC introspection** (#28) — Workspaces/Windows/EventStream unimplemented;
-  `LogicalOutput` hardcodes position, so multi-monitor region capture mis-targets.
+- **IPC EventStream** (#28) — one-shot Workspaces/Windows/Outputs work;
+  the long-lived event-stream form (status-bar push updates) doesn't exist.
 - **Insert hint + tab indicator** (#29) — layout computes them; rendering is stubbed.
 - **Layer rules** — the `layer-rule` config section parses but nothing computes
   `ResolvedLayerRules`; the section is inert (no issue filed yet).

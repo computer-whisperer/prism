@@ -271,13 +271,15 @@ scale, so fractional-scale clients render it at the wrong scale (split out of
 `refresh_pointer_outputs` — per-output bbox overlap → `output_update` +
 `send_scale_transform` — which prism lacks for cursor surfaces too.
 
-### IPC introspection (#28)
+### IPC EventStream (#28)
 
-`Workspaces`, `Windows`, and `EventStream` IPC requests return "not
-implemented", and `LogicalOutput` hardcodes `x:0, y:0` — so scripting parity
-with niri's `niri msg` doesn't exist yet and multi-monitor region capture
-(slurp-style) mis-targets. The event-stream design should follow niri's
-(initial-state replay + deltas).
+One-shot introspection (`Workspaces`, `Windows`, `Outputs` with real
+logical position/scale/transform, `FocusedOutput`) works; the long-lived
+`EventStream` form — what status bars want for push updates — doesn't
+exist. It needs the connection model extended past one-shot
+request/reply plus niri's cached event-stream state (initial-state
+replay + deltas). Non-color output actions also still return "not
+implemented".
 
 ### Quit confirmation
 
