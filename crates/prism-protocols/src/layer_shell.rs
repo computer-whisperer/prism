@@ -165,6 +165,11 @@ impl PrismState {
     /// window) and over `OnDemand` Bottom/Background layer surfaces;
     /// `Exclusive` surfaces and Top/Overlay `OnDemand` focus stay above
     /// it, mirroring niri's priority order (niri.rs:1210-1240).
+    ///
+    /// A locked session outranks everything: only the lock surface (or
+    /// no surface at all) may hold the keyboard — even `Exclusive`
+    /// layer surfaces lose it (niri puts only the exit-confirm dialog
+    /// above the lock; prism has none).
     pub fn update_keyboard_focus(&mut self) {
         let overview_open = self.layout.is_overview_open();
 
@@ -177,7 +182,11 @@ impl PrismState {
             })
         });
 
-        let new_focus = if let Some(surface) = layer_target {
+        let new_focus = if self.is_locked() {
+            KeyboardFocus::LockScreen {
+                surface: self.lock_surface_focus(),
+            }
+        } else if let Some(surface) = layer_target {
             KeyboardFocus::LayerShell { surface }
         } else if overview_open {
             KeyboardFocus::Overview
@@ -191,18 +200,16 @@ impl PrismState {
             }
         };
 
-        // Same effective focus → no-op. Overview compares by variant: it
-        // has no surface, but so does an empty Layout focus, and the two
-        // route keys differently.
-        let same = if self.keyboard_focus.is_overview() || new_focus.is_overview() {
-            self.keyboard_focus.is_overview() == new_focus.is_overview()
-        } else {
-            match (self.keyboard_focus.surface(), new_focus.surface()) {
+        // Same effective focus → no-op. Variant matters even with equal
+        // surfaces: Overview, an empty Layout focus, and a surface-less
+        // LockScreen all carry no surface but route keys differently.
+        let same = std::mem::discriminant(&self.keyboard_focus)
+            == std::mem::discriminant(&new_focus)
+            && match (self.keyboard_focus.surface(), new_focus.surface()) {
                 (Some(a), Some(b)) => a.id() == b.id(),
                 (None, None) => true,
                 _ => false,
-            }
-        };
+            };
         if same {
             return;
         }

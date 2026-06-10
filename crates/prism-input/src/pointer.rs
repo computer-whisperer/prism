@@ -1035,6 +1035,12 @@ fn overview_finger_scroll<I: PrismInputBackend>(
 ///     grab is allowed so dragging a window into the corner opens the
 ///     overview; DnD likewise (drag across workspaces).
 fn maybe_trigger_hot_corner(state: &mut PrismState, was_inside: bool) {
+    // No overview from a locked screen. (The `current_focus` guard
+    // below doesn't cover the corner of an output whose lock surface
+    // is missing — focus is None there.)
+    if state.is_locked() {
+        return;
+    }
     let Some(pointer) = state.seat.get_pointer() else {
         return;
     };
@@ -1267,6 +1273,12 @@ pub fn refresh_pointer_focus(state: &mut PrismState) {
 /// indicator — an `Activate`-only hit — never surfaces a window to ffm in the
 /// first place.
 fn maybe_focus_follows_mouse(state: &mut PrismState) {
+    // Locked: ffm reaches into the layout directly (focus_output /
+    // window activation), bypassing the lock-gated contents_under —
+    // don't move session focus from under the lock screen.
+    if state.is_locked() {
+        return;
+    }
     let Some(ffm) = state.config.borrow().input.focus_follows_mouse else {
         return;
     };

@@ -36,8 +36,13 @@ pub enum KeyboardFocus {
     /// input path routes unmodified Esc/Return/arrows to the hardcoded
     /// overview binds (niri's `hardcoded_overview_bind`).
     Overview,
+    /// The session is locked (ext-session-lock-v1). `surface` is the
+    /// lock surface keys go to — the one on the output under the cursor
+    /// (falling back to the active/first output), `None` while the lock
+    /// client has no surface there (keys then go to no client; binds
+    /// are still filtered by `allow-when-locked`).
+    LockScreen { surface: Option<WlSurface> },
     // Variants to re-add as the corresponding subsystems land:
-    //   LockScreen { surface: Option<WlSurface> } — ext-session-lock
     //   ScreenshotUi                            — niri-style overlay
     //   ExitConfirmDialog                       — niri-style overlay
     //   Mru                                     — alt-tab style switcher
@@ -55,6 +60,7 @@ impl KeyboardFocus {
             KeyboardFocus::Layout { surface } => surface.as_ref(),
             KeyboardFocus::LayerShell { surface } => Some(surface),
             KeyboardFocus::Overview => None,
+            KeyboardFocus::LockScreen { surface } => surface.as_ref(),
         }
     }
 
@@ -63,6 +69,7 @@ impl KeyboardFocus {
             KeyboardFocus::Layout { surface } => surface,
             KeyboardFocus::LayerShell { surface } => Some(surface),
             KeyboardFocus::Overview => None,
+            KeyboardFocus::LockScreen { surface } => surface,
         }
     }
 
@@ -76,6 +83,10 @@ impl KeyboardFocus {
 
     pub fn is_overview(&self) -> bool {
         matches!(self, KeyboardFocus::Overview)
+    }
+
+    pub fn is_lock_screen(&self) -> bool {
+        matches!(self, KeyboardFocus::LockScreen { .. })
     }
 }
 

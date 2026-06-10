@@ -64,6 +64,21 @@ impl PrismState {
         let output_loc = Point::<f64, Logical>::from((output_loc.x as f64, output_loc.y as f64));
         let pos_within_output = pos - output_loc;
 
+        // Locked session: the lock surface is the only input target —
+        // no layer chrome, no windows, no hot corner (niri.rs:3297).
+        // With no (live) lock surface on this output, nothing accepts
+        // input.
+        if self.is_locked() {
+            let ls = self.lock_surfaces.get(&output_id).filter(|ls| ls.alive())?;
+            let (surface, surface_pos) = smithay::desktop::utils::under_from_surface_tree(
+                ls.wl_surface(),
+                pos_within_output,
+                (0, 0),
+                WindowSurfaceType::ALL,
+            )?;
+            return Some((surface, surface_pos.to_f64() + output_loc));
+        }
+
         // Resolve a layout-window hit. `HitType::Input { win_pos }` carries
         // the window buffer's position within the output (same semantics as
         // niri's, since `Tile::hit` is a direct port); offset into the window

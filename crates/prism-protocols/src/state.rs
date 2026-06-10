@@ -3101,6 +3101,15 @@ impl XdgShellHandler for PrismState {
             return;
         };
 
+        // Locked session: only the lock client's own popups may grab —
+        // a session window's menu must not pull keyboard focus off the
+        // lock screen (niri handlers/xdg_shell.rs:283).
+        if self.is_locked() && Some(&root) != self.lock_surface_focus().as_ref() {
+            tracing::trace!("ignoring popup grab: session is locked");
+            let _ = smithay::desktop::PopupManager::dismiss_popup(&root, &kind);
+            return;
+        }
+
         let mut grab = match self.popups.grab_popup(root, kind, &seat, serial) {
             Ok(grab) => grab,
             Err(err) => {

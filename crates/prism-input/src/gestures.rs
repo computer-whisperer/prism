@@ -38,15 +38,21 @@ pub fn on_gesture_swipe_begin<I: PrismInputBackend>(
     state: &mut PrismState,
     event: I::GestureSwipeBeginEvent,
 ) {
-    if event.fingers() == 3 {
-        state.gesture_swipe_3f_cumulative = Some((0., 0.));
-        // We handled this event.
-        return;
-    } else if event.fingers() == 4 {
-        state.layout.overview_gesture_begin();
-        queue_redraw_all(state);
-        // We handled this event.
-        return;
+    // Locked: the compositor gestures (3f workspace switch, 4f
+    // overview) act on the layout, which a locked screen must not
+    // reflect or perturb. Plain client gestures still forward below —
+    // pointer focus is lock-gated in `contents_under`.
+    if !state.is_locked() {
+        if event.fingers() == 3 {
+            state.gesture_swipe_3f_cumulative = Some((0., 0.));
+            // We handled this event.
+            return;
+        } else if event.fingers() == 4 {
+            state.layout.overview_gesture_begin();
+            queue_redraw_all(state);
+            // We handled this event.
+            return;
+        }
     }
 
     let serial = SERIAL_COUNTER.next_serial();

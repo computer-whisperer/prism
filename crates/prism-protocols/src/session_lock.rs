@@ -295,6 +295,27 @@ impl PrismState {
         self.lock_surfaces.insert(id, surface);
     }
 
+    /// The lock surface keyboard input should go to: the one on the
+    /// output under the cursor, else the layout's active output, else
+    /// the first output. `None` while the lock client has no (live)
+    /// surface there. Niri's `lock_surface_focus` (niri.rs:3647).
+    pub fn lock_surface_focus(&self) -> Option<WlSurface> {
+        let under_cursor =
+            self.output_containing((self.pointer_pos.x as i32, self.pointer_pos.y as i32));
+        let output_id = under_cursor
+            .or_else(|| {
+                let active = self.layout.active_output()?;
+                self.wl_outputs
+                    .iter()
+                    .find_map(|(id, o)| (o == active).then(|| id.clone()))
+            })
+            .or_else(|| self.outputs.keys().next().cloned())?;
+        self.lock_surfaces
+            .get(&output_id)
+            .filter(|ls| ls.alive())
+            .map(|ls| ls.wl_surface().clone())
+    }
+
     /// Commit on a surface with the `ext_session_lock_surface_v1` role:
     /// while waiting, a newly mapped surface may complete the set;
     /// afterwards it's a repaint of that output's lock screen.
