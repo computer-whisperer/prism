@@ -41,8 +41,19 @@ use prism_protocols::PrismState;
 use smithay::desktop::Window;
 use smithay::output::Output;
 
-pub fn handle_action(state: &mut PrismState, action: Action) {
+/// Execute a dispatched action. `allow_when_locked` carries the bind's
+/// `allow-when-locked` flag (false for non-bind dispatch paths like the
+/// overview's wheel-scroll actions).
+///
+/// The session-lock gate lives HERE, not in the bind path, so every
+/// dispatch route — binds, key-repeat, the overview's direct pointer
+/// dispatches, and future callers — is covered (niri puts it in
+/// `do_action` for the same reason, input/mod.rs:677).
+pub fn handle_action(state: &mut PrismState, action: Action, allow_when_locked: bool) {
     use Action as A;
+    if state.is_locked() && !(allow_when_locked || allowed_when_locked(&action)) {
+        return;
+    }
     match action {
         A::Quit(skip_confirmation) => {
             // No exit-confirmation dialog exists yet (overlay/text UI is
@@ -1129,6 +1140,22 @@ fn move_active_workspace_to(state: &mut PrismState, target: Option<Output>) {
     if state.layout.move_workspace_to_output(&out) {
         queue_redraw_active_output(state);
     }
+}
+
+/// Actions that fire on a locked session even without
+/// `allow-when-locked` — escape hatches and hardware toggles that can't
+/// leak session content (niri input/mod.rs:4635).
+fn allowed_when_locked(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Quit(_)
+            | Action::ChangeVt(_)
+            | Action::Suspend
+            | Action::PowerOffMonitors
+            | Action::PowerOnMonitors
+            | Action::SwitchLayout(_)
+            | Action::ToggleKeyboardShortcutsInhibit
+    )
 }
 
 /// Queue a redraw on whatever output currently hosts the focus. The

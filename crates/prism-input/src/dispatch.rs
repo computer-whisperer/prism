@@ -361,17 +361,14 @@ fn hardcoded_overview_bind(
 /// instead of niri's timer-token map — same semantics (the bind can't
 /// fire again until the cooldown elapses), no event-loop entanglement.
 ///
-/// While the session is locked, only binds marked `allow-when-locked`
-/// (plus the always-safe action set below) fire — every dispatch path
-/// funnels through here (initial press, key-repeat, mouse/wheel/scroll
-/// binds), so this is the single gate. `allow-inhibiting` remains
-/// parse-only pending keyboard-shortcuts-inhibit support.
+/// The session-lock `allow-when-locked` gate lives in
+/// `actions::handle_action` (so it also covers non-bind dispatch
+/// paths); this just threads the bind's flag through.
+/// `allow-inhibiting` remains parse-only pending
+/// keyboard-shortcuts-inhibit support.
 pub(crate) fn handle_bind(state: &mut PrismState, bind: Bind) {
-    if state.is_locked() && !(bind.allow_when_locked || allowed_when_locked(&bind.action)) {
-        return;
-    }
     let Some(cooldown) = bind.cooldown else {
-        actions::handle_action(state, bind.action);
+        actions::handle_action(state, bind.action, bind.allow_when_locked);
         return;
     };
 
@@ -384,24 +381,7 @@ pub(crate) fn handle_bind(state: &mut PrismState, bind: Bind) {
         return;
     }
     state.bind_cooldown_until.insert(bind.key, now + cooldown);
-    actions::handle_action(state, bind.action);
-}
-
-/// Actions that fire on a locked session even without
-/// `allow-when-locked` — escape hatches and hardware toggles that can't
-/// leak session content (niri input/mod.rs:4635).
-fn allowed_when_locked(action: &prism_config::Action) -> bool {
-    use prism_config::Action;
-    matches!(
-        action,
-        Action::Quit(_)
-            | Action::ChangeVt(_)
-            | Action::Suspend
-            | Action::PowerOffMonitors
-            | Action::PowerOnMonitors
-            | Action::SwitchLayout(_)
-            | Action::ToggleKeyboardShortcutsInhibit
-    )
+    actions::handle_action(state, bind.action, bind.allow_when_locked);
 }
 
 /// Arm the key-repeat timer for a held repeating bind (`repeat`,

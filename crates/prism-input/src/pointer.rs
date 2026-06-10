@@ -287,12 +287,21 @@ pub fn on_pointer_button<I: PrismInputBackend>(
     // somewhere else. niri runs the same `focus_output` from its
     // input handlers.
     if state_pressed && !pointer.is_grabbed() {
+        // Locked session: none of the compositor's own click grabs may
+        // start — they reach into the layout directly (window_under /
+        // workspace_under), bypassing the lock-gated contents_under,
+        // and would let someone at the lock screen rearrange session
+        // windows blind. Click-to-focus below is safe (it resolves via
+        // the gated surface_under_pointer). niri gets the same effect
+        // by lock-gating window_under itself (niri.rs:3240).
+        let locked = state.is_locked();
+
         // Spatial-movement drags run before click-to-focus: RMB in the
         // overview pans the workspace view; Mod+MMB pans / switches
         // workspaces anywhere. niri deliberately does NOT activate the
         // window under the cursor for these (avoids surprise scrolling
         // when Mod+MMB-clicking a partially off-screen window).
-        if spatial_movement_press(state, button, serial) {
+        if !locked && spatial_movement_press(state, button, serial) {
             return;
         }
 
@@ -323,7 +332,8 @@ pub fn on_pointer_button<I: PrismInputBackend>(
         // moves it. On a workspace card's background it zooms straight
         // to that workspace. (RMB/MMB drags were handled above by
         // `spatial_movement_press`.)
-        if state.layout.is_overview_open()
+        if !locked
+            && state.layout.is_overview_open()
             && button == BTN_LEFT
             && overview_lmb_press(state, serial)
         {
@@ -335,7 +345,7 @@ pub fn on_pointer_button<I: PrismInputBackend>(
         // Mod+LeftClick / Mod+RightClick on a window installs an
         // interactive grab — move / resize respectively. Mirrors
         // niri's `on_pointer_button` triggers (input/mod.rs:2895+).
-        if try_begin_window_grab(state, button, serial) {
+        if !locked && try_begin_window_grab(state, button, serial) {
             // Don't forward this button press to clients — the press
             // is consumed by the grab. The release will be delivered
             // by the grab's own button handler when it unsets.
@@ -590,8 +600,14 @@ pub fn on_pointer_axis<I: PrismInputBackend>(state: &mut PrismState, event: I::P
     // actions — identical on a single monitor, and prism's multi-
     // monitor focus tracking isn't wired yet anyway). Scrolls consumed
     // here never reach Wayland clients.
+    // Locked: the overview scroll helpers reach into the layout
+    // (workspace focus / view-offset gestures) without going through
+    // the lock-gated contents_under. Bind scrolls stay routed — their
+    // actions are lock-gated in handle_action. (niri's equivalents are
+    // inert while locked because its window/workspace_under are gated.)
+    let locked = state.is_locked();
     if source == AxisSource::Wheel {
-        if state.layout.is_overview_open() && overview_wheel_scroll::<I>(state, &event) {
+        if !locked && state.layout.is_overview_open() && overview_wheel_scroll::<I>(state, &event) {
             return;
         }
         // Configured `WheelScroll*` binds (Mod+wheel workspace switch
@@ -609,7 +625,7 @@ pub fn on_pointer_axis<I: PrismInputBackend>(state: &mut PrismState, event: I::P
     // any gesture left over from an overview scroll and lets the
     // event through.
     if matches!(source, AxisSource::Finger | AxisSource::Continuous) {
-        if overview_finger_scroll::<I>(state, &event) {
+        if !locked && overview_finger_scroll::<I>(state, &event) {
             return;
         }
         // Configured `TouchpadScroll*` binds.
@@ -879,7 +895,7 @@ fn overview_wheel_scroll<I: PrismInputBackend>(
                 Action::FocusColumnLeft
             };
             for _ in 0..ticks.unsigned_abs() {
-                crate::actions::handle_action(state, action.clone());
+                crate::actions::handle_action(state, action.clone(), false);
             }
         } else {
             let now = std::time::Instant::now();
@@ -894,7 +910,7 @@ fn overview_wheel_scroll<I: PrismInputBackend>(
                 } else {
                     Action::FocusWorkspaceUp
                 };
-                crate::actions::handle_action(state, action);
+                crate::actions::handle_action(state, action, false);
                 state.overview_wheel_last_switch = Some(now);
             }
         }
@@ -910,7 +926,7 @@ fn overview_wheel_scroll<I: PrismInputBackend>(
             Action::FocusColumnLeft
         };
         for _ in 0..ticks.unsigned_abs() {
-            crate::actions::handle_action(state, action.clone());
+            crate::actions::handle_action(state, action.clone(), false);
         }
     }
 

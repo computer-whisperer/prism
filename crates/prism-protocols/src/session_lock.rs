@@ -113,7 +113,9 @@ impl SessionLockHandler for PrismState {
         let Some(output) = Output::from_resource(&wl_output) else {
             return;
         };
-        configure_lock_surface(&surface, &output);
+        // Validation (client match, duplicate output) and the initial
+        // configure both live in new_lock_surface — a discarded surface
+        // must not be configured.
         self.new_lock_surface(surface, &output);
     }
 }
@@ -279,7 +281,8 @@ impl PrismState {
             LockState::WaitingForSurfaces { confirmation, .. } => confirmation.ext_session_lock(),
             LockState::Locking(confirmation) => confirmation.ext_session_lock(),
             LockState::Locked(lock) => lock,
-        };
+        }
+        .clone();
         if lock.client() != surface.wl_surface().client() {
             tracing::debug!("ignoring lock surface from an unrelated client");
             return;
@@ -292,6 +295,18 @@ impl PrismState {
             tracing::error!("lock surface for an unknown output");
             return;
         };
+        // Two lock surfaces for one output is a protocol error. smithay
+        // catches the same WlOutput resource used twice; this covers a
+        // client that bound wl_output twice.
+        if self.lock_surfaces.contains_key(&id) {
+            use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::Error;
+            lock.post_error(
+                Error::DuplicateOutput,
+                "session lock surface already exists for this output",
+            );
+            return;
+        }
+        configure_lock_surface(&surface, output);
         self.lock_surfaces.insert(id, surface);
     }
 

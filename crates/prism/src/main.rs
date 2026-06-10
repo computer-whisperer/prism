@@ -2023,9 +2023,11 @@ fn run_integrated(
         // their column geometry and pile up at (0,0) at their own
         // preferred size. niri does the same via
         // `state.refresh_and_flush_clients()` after every dispatch.
-        // `is_active=true` is the layout-focus flag — true while the
-        // layout owns keyboard focus (no lock screen / overlay UI
-        // intercepting); for prism today that's always.
+        // `is_active=true` is the layout-focus flag. niri also passes
+        // true while the session is locked (its LockScreen focus maps
+        // to layout_is_active = true), so the lock doesn't deactivate
+        // session windows; overlay UIs that would pass false don't
+        // exist in prism yet.
         state.layout.refresh(true);
 
         // Re-resolve window rules for windows whose match inputs changed this
@@ -2424,6 +2426,16 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
         // A powered-off output never renders, so any queued dmabuf capture for it
         // would hang the client — fail them now instead.
         state.fail_pending_screencopy(output_id);
+        // A dark panel scans out nothing, so for lock purposes it
+        // counts as showing a locked frame — without this, a lock
+        // requested while EVERY output is DPMS'd (classic swayidle
+        // dpms-then-lock config) would wait forever for a render that
+        // can't happen and never confirm to the client. niri's
+        // equivalent is updating lock_render_state on skipped renders
+        // when !monitors_active (niri.rs:4640).
+        if state.is_locked() {
+            state.note_lock_render(output_id, true);
+        }
         return;
     }
     match render_output_now(state, output_id) {
@@ -3443,6 +3455,28 @@ fn send_frame_callbacks(
             state.output_containing((state.pointer_pos.x as i32, state.pointer_pos.y as i32));
         if under.as_deref() == Some(output_id) {
             send_frames_surface_tree(icon_surface, &smithay_output, time, None, &mut should_send);
+        }
+    }
+
+    // This output's session-lock surface (niri.rs:5077). Lockers
+    // throttle their redraw on wl_surface.frame like any client —
+    // starving them freezes swaylock's password indicator.
+    if let Some(ls) = state.lock_surfaces.get(output_id).filter(|ls| ls.alive()) {
+        send_frames_surface_tree(
+            ls.wl_surface(),
+            &smithay_output,
+            time,
+            None,
+            &mut should_send,
+        );
+        for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(ls.wl_surface()) {
+            send_frames_surface_tree(
+                popup.wl_surface(),
+                &smithay_output,
+                time,
+                None,
+                &mut should_send,
+            );
         }
     }
 }
