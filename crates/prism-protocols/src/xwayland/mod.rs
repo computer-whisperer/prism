@@ -114,14 +114,32 @@ fn pick_x11_display(start: u32) -> anyhow::Result<(u32, OwnedFd, Unlink)> {
 /// and return true. Conservative on every doubt: unreadable contents, a
 /// non-PID payload, or a `kill(pid, 0)` answer other than ESRCH (alive, or
 /// alive-but-not-ours EPERM) all leave the lock in place.
+///
+/// /tmp is world-writable, so the lock's contents are untrusted: open
+/// without following symlinks and without blocking (a planted FIFO would
+/// hang a plain open forever), and read only the 11 bytes the `"%10d\n"`
+/// lock format occupies.
 fn reclaim_stale_x11_lock(lock_path: &str) -> bool {
-    let Ok(contents) = std::fs::read_to_string(lock_path) else {
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    let Ok(fd) = open(lock_path, flags, rustix::fs::Mode::empty()) else {
         return false;
     };
-    // X11 lock format: "%10d\n".
-    let Ok(pid) = contents.trim().parse::<i32>() else {
+    let mut buf = [0u8; 11];
+    let Ok(n) = rustix::io::read(&fd, &mut buf) else {
         return false;
     };
+    let Some(pid) = std::str::from_utf8(&buf[..n])
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+    else {
+        return false;
+    };
+    // kill(2) treats 0 and negatives as process-group addressing (and
+    // rustix debug-asserts on them); only a real positive PID is a
+    // plausible lock owner.
+    if pid <= 0 {
+        return false;
+    }
     let Some(pid) = rustix::process::Pid::from_raw(pid) else {
         return false;
     };
