@@ -85,18 +85,51 @@ fn ensure_x11_unix_perms() -> anyhow::Result<()> {
 /// Find a free X11 display number starting at `start`, reserving it by
 /// creating its `/tmp/.X{n}-lock` file. Returns the number, the open lock
 /// fd, and an unlink guard for the lock file.
+///
+/// A lock file whose recorded owner is dead (unclean shutdown of a previous
+/// session) is reclaimed: unlinked and re-created, Mutter-style. Without
+/// this, every crash permanently burned a display number — and a crashed
+/// `:0` made clients that hardcode `DISPLAY=:0` unable to connect until the
+/// lock was removed by hand.
 fn pick_x11_display(start: u32) -> anyhow::Result<(u32, OwnedFd, Unlink)> {
     for n in start..start + 50 {
         let lock_path = format!("/tmp/.X{n}-lock");
         let flags = OFlags::WRONLY | OFlags::CLOEXEC | OFlags::CREATE | OFlags::EXCL;
-        let Ok(lock_fd) = open(&lock_path, flags, 0o444.into()) else {
-            // FIXME: check if the target process is dead and reuse the lock.
-            continue;
-        };
-        return Ok((n, lock_fd, Unlink(lock_path)));
+        // Second iteration retries once after reclaiming a stale lock.
+        for attempt in 0..2 {
+            match open(&lock_path, flags, 0o444.into()) {
+                Ok(lock_fd) => return Ok((n, lock_fd, Unlink(lock_path))),
+                Err(Errno::EXIST) if attempt == 0 && reclaim_stale_x11_lock(&lock_path) => {
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
     }
 
     Err(anyhow!("no free X11 display found after 50 attempts"))
+}
+
+/// If `lock_path` records a PID that is no longer running, unlink the lock
+/// and return true. Conservative on every doubt: unreadable contents, a
+/// non-PID payload, or a `kill(pid, 0)` answer other than ESRCH (alive, or
+/// alive-but-not-ours EPERM) all leave the lock in place.
+fn reclaim_stale_x11_lock(lock_path: &str) -> bool {
+    let Ok(contents) = std::fs::read_to_string(lock_path) else {
+        return false;
+    };
+    // X11 lock format: "%10d\n".
+    let Ok(pid) = contents.trim().parse::<i32>() else {
+        return false;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+        return false;
+    };
+    if rustix::process::test_kill_process(pid) != Err(Errno::SRCH) {
+        return false;
+    }
+    tracing::info!("reclaiming stale X11 lock {lock_path} (owner {pid:?} is dead)");
+    unlink(lock_path).is_ok()
 }
 
 fn bind_to_socket(addr: &SocketAddr) -> anyhow::Result<UnixListener> {
