@@ -130,13 +130,18 @@ pub fn emit_calibration_matrix(ctx: &mut ShaderCtx, in_rgb: spirv::Word) -> spir
 /// runtime policy knob (e.g. `sdr-reference-nits`) can silently re-scale a
 /// baked calibration.
 ///
-/// Today's encode path used piecewise sRGB OETF (12.92*c for small c, else
-/// 1.055*c^(1/2.4) - 0.055). We approximate with the pure-pow form over the
-/// whole range; the error is < 0.5/255 at any byte and the gradient anchor-
-/// point test still passes. Keeps the SPIR-V short and avoids per-component
-/// branch instructions.
+/// Exact piecewise sRGB OETF (IEC 61966-2-1): `12.92*c` for
+/// `c <= 0.0031308`, else `1.055*c^(1/2.4) - 0.055`. Both segments are
+/// computed unconditionally and merged with a component-wise `OpSelect` —
+/// no branches, so no divergence cost. Exactness matters: the decode shader
+/// and every CPU-side helper (`diagnose::srgb_eotf`, prism-tune's
+/// `srgb_oetf`) are piecewise, and `drive_identity_lut` relies on
+/// encode being the true inverse of decode for code-value-stable SDR
+/// passthrough. The pure-pow form this replaced deviated up to ~2/255
+/// in the toe (slight black crush).
 pub fn emit_output_transfer_srgb(ctx: &mut ShaderCtx, in_drive: spirv::Word) -> spirv::Word {
     let vec3_t = ctx.types.vec3;
+    let bool_t = ctx.types.bool_t;
     let f_zero = ctx.consts.f_zero;
     let f_one = ctx.consts.f_one;
 
@@ -144,6 +149,15 @@ pub fn emit_output_transfer_srgb(ctx: &mut ShaderCtx, in_drive: spirv::Word) -> 
     let one_vec = ctx.vec3_splat(f_one);
     let clamped = ctx.glsl_call_vec3(GLSL_FCLAMP, [in_drive, zero_vec, one_vec]);
 
+    // Linear toe: 12.92 * c.
+    let toe_scale = ctx.const_f32(12.92);
+    let toe_scale_vec = ctx.vec3_splat(toe_scale);
+    let toe = ctx
+        .b
+        .f_mul(vec3_t, None, clamped, toe_scale_vec)
+        .expect("12.92 * c");
+
+    // Power segment: 1.055 * c^(1/2.4) - 0.055.
     let inv_24 = ctx.const_f32(1.0 / 2.4);
     let inv_24_vec = ctx.vec3_splat(inv_24);
     let c_pow = ctx.glsl_call_vec3(GLSL_POW, [clamped, inv_24_vec]);
@@ -155,10 +169,25 @@ pub fn emit_output_transfer_srgb(ctx: &mut ShaderCtx, in_drive: spirv::Word) -> 
         .expect("c_pow * 1.055");
     let bias = ctx.const_f32(0.055);
     let bias_vec = ctx.vec3_splat(bias);
-    let result = ctx
+    let powered = ctx
         .b
         .f_sub(vec3_t, None, scaled, bias_vec)
         .expect("- 0.055");
+
+    // Component-wise select on the spec threshold. `type_vector` dedupes,
+    // so re-requesting bvec3 here is free.
+    let bvec3_t = ctx.b.type_vector(bool_t, 3);
+    let threshold = ctx.const_f32(0.003_130_8);
+    let threshold_vec = ctx.vec3_splat(threshold);
+    let in_toe = ctx
+        .b
+        .f_ord_less_than_equal(bvec3_t, None, clamped, threshold_vec)
+        .expect("c <= 0.0031308");
+    let result = ctx
+        .b
+        .select(vec3_t, None, in_toe, toe, powered)
+        .expect("select toe / power segment");
+
     let zero_vec2 = ctx.vec3_splat(f_zero);
     let one_vec2 = ctx.vec3_splat(f_one);
     ctx.glsl_call_vec3(GLSL_FCLAMP, [result, zero_vec2, one_vec2])

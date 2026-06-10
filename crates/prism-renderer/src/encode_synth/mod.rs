@@ -219,6 +219,16 @@ mod tests {
         assert_eq!(spv[0], 0x07230203, "missing SPIR-V magic");
     }
 
+    /// Default sRGB chain emits a well-formed module — exercises the
+    /// piecewise-OETF path (vector compare + OpSelect) in
+    /// `emit_output_transfer_srgb`.
+    #[test]
+    fn default_srgb_chain_synthesizes() {
+        let spv = synthesize_fragment_shader(&EncodeConfig::default_srgb()).expect("synthesize");
+        assert!(!spv.is_empty(), "empty SPIR-V");
+        assert_eq!(spv[0], 0x07230203, "missing SPIR-V magic");
+    }
+
     /// Synthetic chain that omits Lut3d still synthesizes — exercises the
     /// no-LUT branch of `ShaderCtx::new` so a future refactor doesn't
     /// silently regress the matrix+curve path.

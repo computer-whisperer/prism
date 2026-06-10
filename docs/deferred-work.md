@@ -25,14 +25,6 @@ until we have mixed SDR+HDR content to tune against. The cases (HDR→SDR, SDR�
 HDR→HDR peak mismatch, cross-gamut) are inventoried in
 [color-management.md](color-management.md).
 
-### sRGB OETF piecewise toe (#32, second half)
-
-The synthesized sRGB encode uses the pure 2.4-gamma approximation, not the
-piecewise sRGB curve with its linear toe — near-black output is slightly off on
-SDR panels. The LUT-upload barrier half of #32 landed (d226a07); the toe is the
-remaining half. Cost: swap the encode fragment's transfer to the piecewise form
-and re-anchor the headless gradient self-test.
-
 ### Automatic HDR enablement from EDID
 
 EDID is parsed and used to match per-output config blocks, but HDR is turned on by

@@ -114,8 +114,7 @@ are tracked as GitHub issues. The notable ones:
 - **Layer rules** — the `layer-rule` config section parses but nothing computes
   `ResolvedLayerRules`; the section is inert (no issue filed yet).
 - **Tone mapping** — decode (over-bright input) and encode (above-peak) both
-  hard-clip. No EETF/Reinhard/Hable operator yet. (#32 also covers the sRGB
-  OETF piecewise toe.)
+  hard-clip. No EETF/Reinhard/Hable operator yet.
 - **Touch input** — no `wl_touch` (keyboard + pointer are wired).
 - **Desktop output hotplug** — desktop outputs are opened at startup; only
   DRM-lease (VR) connectors hot-plug at runtime. CRTC rebinding isn't done either.
