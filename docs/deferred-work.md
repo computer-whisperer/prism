@@ -263,10 +263,13 @@ Not started.
 
 No `zwp_text_input` / `input_method` — no CJK or on-screen-keyboard input.
 
-### Data control (#27)
+### DnD icon output enter/leave
 
-No wlr-data-control / ext-data-control — clipboard managers (cliphist et al.)
-silently see nothing (`selection.rs:50`).
+The drag icon surface never receives `wl_surface.enter`/`leave` or a preferred
+scale, so fractional-scale clients render it at the wrong scale (split out of
+#27; see the deferred list in `selection.rs`). The fix is a port of niri's
+`refresh_pointer_outputs` — per-output bbox overlap → `output_update` +
+`send_scale_transform` — which prism lacks for cursor surfaces too.
 
 ### IPC introspection (#28)
 

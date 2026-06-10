@@ -1,8 +1,10 @@
 //! Clipboard + primary selection + drag-and-drop wiring.
 //!
-//! Backs three protocols:
+//! Backs five protocols:
 //!   - `wl_data_device_manager` (v3) — standard clipboard + DnD.
 //!   - `wp_primary_selection_device_manager_v1` — middle-click paste.
+//!   - `zwlr_data_control_manager_v1` + `ext_data_control_manager_v1` —
+//!     clipboard managers (cliphist, `wl-paste --watch`, clipman).
 //!   - DnD grab handling (smithay's `input::dnd`) — pointer + touch.
 //!
 //! ## Why this exists at all
@@ -47,10 +49,6 @@
 //!     sent output enter/leave, so fractional-scale clients can't pick
 //!     a preferred scale for it (niri dispatches these from its
 //!     render-walk visibility tracking).
-//!   - **wlr_data_control / ext_data_control.** Clipboard *manager*
-//!     protocols used by tools like `cliphist`, `wl-paste --watch`,
-//!     and `clipman`. The core clipboard works without them; add when
-//!     a clipboard manager workflow is desired.
 //!   - **Compositor-set selections.** [`SelectionHandler`] requires
 //!     us to declare a `SelectionUserData` type for clipboard data
 //!     the *compositor* writes (e.g. after a screenshot). We use
@@ -76,8 +74,14 @@ use smithay::utils::{Logical, Point};
 use smithay::wayland::selection::data_device::{
     DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
 };
+use smithay::wayland::selection::ext_data_control::{
+    DataControlHandler as ExtDataControlHandler, DataControlState as ExtDataControlState,
+};
 use smithay::wayland::selection::primary_selection::{
     PrimarySelectionHandler, PrimarySelectionState,
+};
+use smithay::wayland::selection::wlr_data_control::{
+    DataControlHandler as WlrDataControlHandler, DataControlState as WlrDataControlState,
 };
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::SelectionTarget;
@@ -272,5 +276,23 @@ impl PrismState {
 impl PrimarySelectionHandler for PrismState {
     fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
         &mut self.primary_selection_state
+    }
+}
+
+// ─── Data-control (clipboard managers) ──────────────────────────────────────
+//
+// Both variants ship the same protocol with different namespaces:
+// wlr is the legacy one everything supports, ext is the standardized
+// successor. Routed by the blanket `delegate_dispatch2!` in state.rs.
+
+impl WlrDataControlHandler for PrismState {
+    fn data_control_state(&mut self) -> &mut WlrDataControlState {
+        &mut self.wlr_data_control_state
+    }
+}
+
+impl ExtDataControlHandler for PrismState {
+    fn data_control_state(&mut self) -> &mut ExtDataControlState {
+        &mut self.ext_data_control_state
     }
 }

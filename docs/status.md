@@ -92,6 +92,7 @@ color reforms. **All 06-09 review fixes are runtime-unverified.**
 | `ext-session-lock-v1`: niri-port state machine (lock confirmed only after every powered output presents a locked frame), lock-only render path, lock-screen focus + pointer gating, `allow-when-locked` binds | ☐ — needs a swaylock pass |
 | `wp_color_management_v1`: output + surface paths, feedback, `surface_exists`, version-gated events | ✅ output path / ☐ 06-09 fixes |
 | Drag and drop: full data-device, drag-icon rendering, drop-target activation, smithay fork fix for data-device-less targets | ✅ — Firefox tab tear-off |
+| Clipboard managers: wlr-data-control + ext-data-control (primary selection included) | ☐ — needs a cliphist/wl-paste --watch run |
 | Xwayland: on-demand xwayland-satellite | ✅ |
 | Screen capture: wlr-screencopy, SHM + dmabuf, async from the render loop | ✅ grim / ☐ recording perf (see deferred-work) |
 | ext-workspace-v1 + wlr-foreign-toplevel (+ ext list) for status bars | ☐ — needs a waybar run |
@@ -107,7 +108,6 @@ Details and triggers in [deferred-work.md](deferred-work.md). Feature-sized gaps
 are tracked as GitHub issues. The notable ones:
 
 - **IME / text-input** (#26) — none.
-- **Clipboard managers** (#27) — no wlr/ext-data-control.
 - **IPC introspection** (#28) — Workspaces/Windows/EventStream unimplemented;
   `LogicalOutput` hardcodes position, so multi-monitor region capture mis-targets.
 - **Insert hint + tab indicator** (#29) — layout computes them; rendering is stubbed.

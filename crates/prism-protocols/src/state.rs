@@ -89,7 +89,9 @@ use smithay::wayland::pointer_constraints::{
 use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::{set_data_device_focus, DataDeviceState};
+use smithay::wayland::selection::ext_data_control::DataControlState as ExtDataControlState;
 use smithay::wayland::selection::primary_selection::{set_primary_focus, PrimarySelectionState};
+use smithay::wayland::selection::wlr_data_control::DataControlState as WlrDataControlState;
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::dialog::{XdgDialogHandler, XdgDialogState};
 use smithay::wayland::shell::xdg::{
@@ -252,6 +254,15 @@ pub struct PrismState {
     /// clients (no per-client filter — see TODO in
     /// [`crate::selection`]).
     pub primary_selection_state: PrimarySelectionState,
+    /// `zwlr_data_control_manager_v1` — the wlr clipboard-manager
+    /// protocol (cliphist, `wl-paste --watch`, clipman). Constructed
+    /// with the primary-selection state so managers can watch
+    /// middle-click paste too. Advertised to all clients (prism has
+    /// no security-context sandboxing to filter on, unlike niri).
+    pub wlr_data_control_state: WlrDataControlState,
+    /// `ext_data_control_manager_v1` — the standardized successor to
+    /// wlr-data-control; newer tools bind this one first.
+    pub ext_data_control_state: ExtDataControlState,
     /// Active drag-and-drop cursor icon, set while a DnD grab is
     /// in flight. The render walk draws it on the output under the
     /// pointer, offset by the accumulated `wl_surface.offset` deltas
@@ -879,6 +890,18 @@ impl PrismState {
         let data_device_state = DataDeviceState::new::<PrismState>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<PrismState>(&dh);
 
+        // Clipboard-manager protocols (wlr + ext variants), built on top
+        // of the selection providers above. Passing the primary-selection
+        // state lets managers watch middle-click paste as well.
+        let wlr_data_control_state =
+            WlrDataControlState::new::<PrismState, _>(&dh, Some(&primary_selection_state), |_| {
+                true
+            });
+        let ext_data_control_state =
+            ExtDataControlState::new::<PrismState, _>(&dh, Some(&primary_selection_state), |_| {
+                true
+            });
+
         // wp_alpha_modifier_v1 — a per-surface opacity multiplier, committed
         // as double-buffered surface state (smithay caches it in
         // `AlphaModifierSurfaceCachedState`). Consumed by the render walk
@@ -906,6 +929,8 @@ impl PrismState {
             seat,
             data_device_state,
             primary_selection_state,
+            wlr_data_control_state,
+            ext_data_control_state,
             dnd_icon: None,
             viewporter,
             presentation,
