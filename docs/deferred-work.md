@@ -206,11 +206,11 @@ No `wl_touch` — keyboard and pointer are wired (libinput → seat → focused 
 touch is not. (WLCS touch tests are skipped accordingly.) Add when a touch device
 or touch-driven client is in play.
 
-### Bind gating: allow-when-locked / allow-inhibiting
+### Bind gating: allow-inhibiting
 
-Both bind flags parse but aren't enforced: `allow-when-locked` is meaningless
-until session lock exists (#25), and `allow-inhibiting` until
-keyboard-shortcuts-inhibit is wired. Land each alongside its protocol.
+`allow-when-locked` is enforced (session lock landed, #25);
+`allow-inhibiting` still parses without effect until
+keyboard-shortcuts-inhibit is wired — land it alongside that protocol.
 
 ### Cursor: hardware-plane constraints
 
@@ -258,12 +258,6 @@ the Mutter-style D-Bus portal interface, reusing the shared
 Not started.
 
 ## Wayland / protocol
-
-### Session lock (#25)
-
-No `ext-session-lock-v1` — there is no way to lock the screen. The biggest
-user-facing protocol gap. Also gates `allow-when-locked` bind enforcement and a
-real `Quit` confirmation flow.
 
 ### Text input / IME (#26)
 

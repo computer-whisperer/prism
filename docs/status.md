@@ -89,6 +89,7 @@ color reforms. **All 06-09 review fixes are runtime-unverified.**
 | Core + xdg-shell + the optional set: viewporter, presentation, fractional-scale, content-type, xdg-activation, xdg-decoration, single-pixel-buffer, idle-notify/-inhibit, output-power-management, drm-syncobj | ✅ |
 | `wlr_layer_shell`: 4 layers color-managed, exclusive zones, keyboard interactivity | ✅ — waybar, swaybg, fuzzel |
 | Layer-shell popups (`get_popup`) | ☐ |
+| `ext-session-lock-v1`: niri-port state machine (lock confirmed only after every powered output presents a locked frame), lock-only render path, lock-screen focus + pointer gating, `allow-when-locked` binds | ☐ — needs a swaylock pass |
 | `wp_color_management_v1`: output + surface paths, feedback, `surface_exists`, version-gated events | ✅ output path / ☐ 06-09 fixes |
 | Drag and drop: full data-device, drag-icon rendering, drop-target activation, smithay fork fix for data-device-less targets | ✅ — Firefox tab tear-off |
 | Xwayland: on-demand xwayland-satellite | ✅ |
@@ -105,7 +106,6 @@ color reforms. **All 06-09 review fixes are runtime-unverified.**
 Details and triggers in [deferred-work.md](deferred-work.md). Feature-sized gaps
 are tracked as GitHub issues. The notable ones:
 
-- **Session lock** (#25) — no `ext-session-lock-v1`; there is no screen locker.
 - **IME / text-input** (#26) — none.
 - **Clipboard managers** (#27) — no wlr/ext-data-control.
 - **IPC introspection** (#28) — Workspaces/Windows/EventStream unimplemented;
