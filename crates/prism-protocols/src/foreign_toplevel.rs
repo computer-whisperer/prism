@@ -5,8 +5,9 @@
 //! - `ext_foreign_toplevel_list_v1` — the modern read-only window list
 //!   (identifier + title + app_id).
 //! - `zwlr_foreign_toplevel_manager_v1` (v3) — the wlr list with state
-//!   (activated/maximized/fullscreen), per-output enter/leave, and control
-//!   requests (activate, close, set_fullscreen, set_maximized).
+//!   (activated/maximized/fullscreen), per-output enter/leave, parent
+//!   links (dialog grouping), and control requests (activate, close,
+//!   set_fullscreen, set_maximized).
 //!
 //! Ported from niri `src/protocols/foreign_toplevel.rs`, restructured to
 //! prism idiom: `Dispatch`/`GlobalDispatch` are implemented directly on
@@ -70,7 +71,12 @@ struct ToplevelData {
     /// Per wlr handle, the wl_outputs we sent `output_enter` for (so an
     /// output change can send the matching `output_leave`).
     wlr_management_instances: HashMap<ZwlrForeignToplevelHandleV1, Vec<WlOutput>>,
-    // FIXME: parent.
+    /// The *effective* parent last sent on the wlr handles (v3 `parent`
+    /// event): the xdg parent if that surface is itself a tracked
+    /// toplevel, else None. Storing the effective value means a parent
+    /// that maps (or closes) later flips it and re-emits. See
+    /// [`refresh_parents`].
+    parent: Option<WlSurface>,
 }
 
 impl ForeignToplevelManagerState {
@@ -118,6 +124,7 @@ pub fn refresh(state: &mut PrismState) {
     // will first deactivate the previous window and only then activate the
     // newly focused window.
     let mut focused = None;
+    let mut parent_updates = Vec::new();
     state.layout.with_windows(|mapped, output, _, _| {
         let toplevel = mapped.toplevel();
         let wl_surface = toplevel.wl_surface();
@@ -126,6 +133,8 @@ pub fn refresh(state: &mut PrismState) {
                 tracing::error!("mapped must have had initial commit");
                 return;
             };
+
+            parent_updates.push((wl_surface.clone(), role.parent.clone()));
 
             if state.keyboard_focus.surface() == Some(wl_surface) {
                 focused = Some((mapped.id(), mapped.window.clone(), output.cloned()));
@@ -163,6 +172,60 @@ pub fn refresh(state: &mut PrismState) {
                 true,
             );
         });
+    }
+
+    // Parent links go last so that a parent mapped in this same cycle
+    // already has its handles created.
+    refresh_parents(protocol_state, parent_updates);
+}
+
+/// Emit wlr v3 `parent` deltas. The effective parent is the xdg parent
+/// surface if it is itself a tracked toplevel, else null — so a parent
+/// closing (or a child outliving an unmapped parent) re-emits null, and a
+/// parent appearing re-emits the handle. Each child handle is paired with
+/// the parent's handle for the same client (wlroots matches by client
+/// too); if a client somehow has no handle for the parent, null is sent.
+fn refresh_parents(
+    protocol_state: &mut ForeignToplevelManagerState,
+    updates: Vec<(WlSurface, Option<WlSurface>)>,
+) {
+    for (surface, raw_parent) in updates {
+        let effective = raw_parent.filter(|p| protocol_state.toplevels.contains_key(p));
+        let Some(data) = protocol_state.toplevels.get(&surface) else {
+            continue;
+        };
+        if data.parent == effective {
+            continue;
+        }
+
+        let parent_handles: Vec<ZwlrForeignToplevelHandleV1> = effective
+            .as_ref()
+            .map(|p| {
+                protocol_state.toplevels[p]
+                    .wlr_management_instances
+                    .keys()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let events: Vec<_> = data
+            .wlr_management_instances
+            .keys()
+            .filter(|i| i.version() >= zwlr_foreign_toplevel_handle_v1::EVT_PARENT_SINCE)
+            .map(|i| {
+                let parent = parent_handles
+                    .iter()
+                    .find(|p| p.client() == i.client())
+                    .cloned();
+                (i.clone(), parent)
+            })
+            .collect();
+        for (instance, parent) in events {
+            instance.parent(parent.as_ref());
+            instance.done();
+        }
+
+        protocol_state.toplevels.get_mut(&surface).unwrap().parent = effective;
     }
 }
 
@@ -298,6 +361,9 @@ fn refresh_toplevel(
                 output: output.cloned(),
                 ext_list_instances: HashSet::new(),
                 wlr_management_instances: HashMap::new(),
+                // The real parent (if any) is emitted by the parent pass
+                // later in this same refresh cycle.
+                parent: None,
             };
 
             for manager in &protocol_state.ext_list_instances {
@@ -573,7 +639,46 @@ impl GlobalDispatch<ZwlrForeignToplevelManagerV1, ()> for PrismState {
             data.add_wlr_instance(handle, client, &manager);
         }
 
+        // Parent links are sent after the creation loop so the parent
+        // handles for this client exist regardless of map iteration
+        // order. Re-sending to the client's pre-existing handles (manager
+        // bound twice) is a harmless duplicate state event.
+        send_parents_to_client(protocol_state, client);
+
         protocol_state.wlr_management_instances.insert(manager);
+    }
+}
+
+/// Initial-state `parent` events for a freshly bound wlr manager: every
+/// tracked toplevel with a (tracked) parent gets the link sent on this
+/// client's v3 handles. Null parents are skipped — that's already the
+/// protocol default for a new handle.
+fn send_parents_to_client(protocol_state: &ForeignToplevelManagerState, client: &Client) {
+    for data in protocol_state.toplevels.values() {
+        let Some(parent) = &data.parent else {
+            continue;
+        };
+        let Some(parent_data) = protocol_state.toplevels.get(parent) else {
+            continue;
+        };
+        let parent_handle = parent_data
+            .wlr_management_instances
+            .keys()
+            .find(|p| p.client().as_ref() == Some(client));
+        let Some(parent_handle) = parent_handle else {
+            continue;
+        };
+
+        for instance in data.wlr_management_instances.keys() {
+            if instance.client().as_ref() != Some(client) {
+                continue;
+            }
+            if instance.version() < zwlr_foreign_toplevel_handle_v1::EVT_PARENT_SINCE {
+                continue;
+            }
+            instance.parent(Some(parent_handle));
+            instance.done();
+        }
     }
 }
 

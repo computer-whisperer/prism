@@ -298,12 +298,6 @@ keyboard grab is scoped to the *focused* output (an exclusive surface on a
 non-focused monitor waits until that monitor is focused); and layer rules are
 inert (see Layout above).
 
-### Foreign-toplevel: parent relationship
-
-`wlr-foreign-toplevel-management`'s `parent` event is never sent (dialogs don't
-group under their parent in taskbar-style clients). Small; needs the xdg parent
-chain exposed to the protocol module.
-
 ### Remaining optional protocols
 
 Still unwired (all graceful-degrade): `tablet_manager` (drawing tablets),
@@ -320,9 +314,8 @@ testing; mpv does — that's a Firefox-side behavior, not prism.)
 
 xwayland-satellite integration is in (on-demand spawn). Remaining: the optional
 game-oriented protocols satellite can use when present (pointer warp,
-fractional-scale-v2 game hints), picking up satellite path changes on config
-reload, and clearing a stale X11 lock file left by a crashed satellite (blocks
-the display number until removed by hand).
+fractional-scale-v2 game hints) and picking up satellite path changes on config
+reload. (Stale X11 locks from dead processes are now reclaimed at startup.)
 
 ## Tracked code debt
 
