@@ -4,73 +4,128 @@ What's built, what's verified, and what's left. Updated as work lands. For *how*
 the pieces fit together see [architecture.md](architecture.md); for the backlog see
 [deferred-work.md](deferred-work.md).
 
-## Snapshot — 2026-05-24
+Verification legend: ✅ = verified on hardware (or user-verified in a live
+session); ☐ = built, compiles, reviewed — but not yet exercised on hardware.
+A ☐ is a claim about code, not about behavior.
 
-prism is a working multi-output, multi-GPU compositor. It brings up every connected
-output across both AMD GPUs with vblank-driven double-buffered scanout, composites
-real clients (alacritty, mpv, Firefox, nautilus), takes keyboard + pointer input,
-decodes YUV video (NV12/P010), drives **HDR output signaling** (config-driven PQ),
-and plays **HDR video end-to-end** — native and cross-GPU-mirrored. Per-display
-color calibration runs through a 3D-LUT encode path driven by `prism-tune`. Protocol
-behavior is gated by a WLCS conformance harness.
+## Snapshot — 2026-06-09
 
-**Most recent work** (the last push): YUV video decode (NV12/P010) and Firefox HDR
-video end-to-end; per-surface primary conversion into BT.2020 (named sRGB /
-Display-P3 / BT.2020); `wp_color_management_output_v1.get_output`; the 3D-LUT encode
-calibration path; compositing fixes (`wp_viewport` source crop, subsurface z-order,
-geometry-less window anchoring); real pointer hit-testing + focus re-evaluation; and
-the WLCS conformance harness.
+prism is a daily-drivable niri-style scrolling-tile compositor on its own
+Vulkan/KMS stack: multi-output multi-GPU bringup, HDR output signaling with
+per-display 3D-LUT calibration, and now full window management — scrolling +
+floating layout, open/close/resize animations, rounded-corner decorations with
+shadows, overview mode, window rules, config hot-reload — plus session
+integration (systemd session units, Xwayland via xwayland-satellite, drag and
+drop), screen capture (wlr-screencopy), and DRM leasing for VR (SteamVR +
+Index). Protocol behavior is gated by a WLCS conformance harness.
+
+**Most recent work**: a 2026-06-09 six-agent deep-dive review filed issues
+#5–#32; 21 are fixed (GPU-resource lifetime via a deferred-destroy queue,
+cross-GPU mirror synchronization, nonblocking IPC, live window transactions,
+animation-snapshot coordinate fixes, null-buffer unmap, live window-rule
+recompute, decoration fade/crop polish). Before that: overview mode, DnD (icon +
+drop-target activation + a smithay fix for data-device-less drop targets), DRM
+lease with runtime headset hotplug, window decorations, window rules, config
+hot-reload, the focus-model rework, wlr-screencopy, ext-workspace +
+foreign-toplevel, the prism-tune GUI, and the SDR drive-domain / measured-gamut
+color reforms. **All 06-09 review fixes are runtime-unverified.**
 
 ## What's built
+
+### Display, scanout, color
 
 | Area | State |
 |---|---|
 | Vulkan instance/device/queue, per-GPU, DRM-node matched | ✅ |
 | DRM enumeration, multi-card open, per-connector CRTC/mode pick | ✅ |
 | Multi-output + multi-GPU bringup, vblank-driven double-buffered scanout | ✅ — verified on 7 outputs across both cards |
-| `wl_output` + xdg-output advertisement, per-output element mapping (`enter`/`leave`) | ✅ |
-| VRR / Freesync enabled at bringup when the connector supports it | ✅ |
-| EDID parsing (`EdidInfo`) → EDID-keyed `output "Make Model Serial"` config + per-output defaults | ✅ |
-| Wayland protocols: compositor, xdg-shell, xdg-decoration, shm, single-pixel-buffer, linux-dmabuf, wl_seat, data-device, viewporter, presentation, fractional-scale, content-type, xdg-activation, drm-syncobj (advertise), wlr-layer-shell, ext-idle-notify, idle-inhibit, wlr-output-power-management | ✅ |
-| dmabuf import → VkImage, modifier-negotiated; per-GPU replication; cross-GPU mirror | ✅ |
-| shm upload, per-GPU | ✅ |
-| Input: libinput via udev, keyboard + pointer capabilities, real dispatch; pointer hit-testing + focus tracking | ✅ |
-| `wlr_layer_shell`: 4 layers color-managed in z-order, anchors/margins/exclusive-zones via `LayerMap`, exclusive-zone work-area, keyboard interactivity (Exclusive/OnDemand/None) | ✅ — user-verified (waybar, swaybg, fuzzel) |
-| Idle / display sleep: `ext-idle-notify-v1` + `zwp_idle_inhibit` (swayidle), `zwlr_output_power_management` DPMS + `PowerOff/OnMonitors` actions; HDR/10-bit survives DPMS cycle | ✅ — user-verified (swayidle, wlopm, mpv inhibit) |
-| Cursor: client `set_cursor` (shm surface cursors) + `wp_cursor_shape` named shapes, themed from `cursor {}` config, hardware cursor plane, scale-matched per output | ✅ — user-verified |
-| Cursor auto-hide: `cursor { hide-when-typing / hide-after-inactive-ms }` (compositor-side, via `PointerVisibility`) | ☐ implemented, not yet hardware-tested |
+| VRR / Freesync at bringup; EDID-keyed per-output config | ✅ |
 | Renderer: decode → fp16 BT.2020 intermediate → synthesized per-output encode | ✅ |
-| RGB decode (8/10-bit, RGBA/BGRA order), YUV decode (NV12/P010) | ✅ |
+| RGB decode (8/10-bit), YUV decode (NV12/P010), premultiplied-alpha handling | ✅ |
 | Per-surface primary conversion (sRGB/Display-P3/BT.2020 → BT.2020) | ✅ |
-| Encode transfers: sRGB, PQ, linear | ✅ |
-| Per-output calibration: 3D LUT (KDL file + EDID-keyed + live IPC reload), CTM, per-channel response gain/gamma | ✅ |
-| KMS HDR signaling — `hdr` config block → `HDR_OUTPUT_METADATA` + `Colorspace=BT2020_RGB` + `max_bpc=10` + fp16 scanout + PQ encode; re-pushed across VT handoff; cleared on shutdown | ✅ |
-| `wp_color_management_v1` output capability (`get_output`) | ✅ |
-| HDR video end-to-end (Firefox P010, native + cross-GPU) | ✅ — user-verified |
-| Color calibration tooling (`prism-tune`) | ✅ |
-| WLCS protocol-conformance harness | ✅ — curated subset, 38 pass / 6 expected-fail |
+| Encode transfers: sRGB, PQ, linear; KMS HDR signaling (PQ metadata, 10-bit, fp16 scanout); survives DPMS + VT handoff | ✅ |
+| HDR video end-to-end (Firefox P010, native + cross-GPU); scRGB HDR swapchains | ✅ |
+| Per-output calibration: 3D LUT (EDID-keyed, live IPC reload), CTM, response curves; measured-gamut hue-preserving bake; SDR drive-domain LUTs | ✅ tooling / ☐ gamut + SDR reforms pending a full recalibration |
+| Render intents (perceptual/relative/absolute) + reference-white anchoring + per-output brightness | ☐ |
+| Cross-GPU mirror: dmabuf replication + copy path, both directions fence-synchronized | ✅ mirror / ☐ sync fixes (33cb4d1, 0cacc63) |
+| Damage tracking: content tokens, per-output region tracker, decode scissor, occlusion culling, zero-damage frame skip, partial shm upload, dmabuf import cache | ✅ |
+| GPU resource lifetime: deferred-destroy retire queue drained by fence serials (every `queue_submit2` must `note_submit` first) | ☐ |
+| DRM lease (`wp_drm_lease_device_v1`) + runtime VR-headset connector hotplug | ✅ — SteamVR + Valve Index, plug/unplug live |
+
+### Window management
+
+| Area | State |
+|---|---|
+| Scrolling layout (niri port): columns, tabbed columns, workspaces per monitor, floating layer, fullscreen/maximize | ✅ |
+| Unmapped-window stage: initial configure sized from the layout, window rules resolved pre-map | ☐ |
+| Window rules: resolution, hot-reload recompute, title/app-id-change recompute, at-startup matcher | ☐ |
+| Window open/close animations | ✅ (coord + z-order fixes 1b099f7 ☐) |
+| Resize animation (size tween + snapshot crossfade); workspace-switch animation | ☐ |
+| Decorations: rounded-corner focus ring/border (SDF), clip-to-geometry, drop shadows | ✅ |
+| Decoration polish: tile fade covers decorations, workspace-band crop covers SDF elements (b7a27ab) | ☐ |
+| Overview mode: render + toggle, pointer interaction, keyboard focus, hot corner | ✅ |
+| Overview: touchpad gestures, spatial-movement grabs + DnD layout feed | ☐ |
+| Window transactions: column co-resizes atomic (300 ms deadline, commit blockers) | ☐ |
+| Focus model: keyboard focus derived from layout per-frame; focus-follows-mouse with niri's guards | ☐ |
+| Interactive move/resize | ✅ |
+| xdg popups: render, grabs, unconstrain; xdg-dialog modal floating | ✅ |
+| Config hot-reload (file watcher + live re-apply; `outputs`/`debug` sections restart-only) | ☐ |
+
+### Input
+
+| Area | State |
+|---|---|
+| libinput via udev, keyboard + pointer, device hotplug, hit-testing | ✅ |
+| Action dispatcher at niri parity (~150 actions); mouse/wheel/touchpad-scroll binds; bind cooldown + repeat | ☐ |
+| `input { touchpad/mouse/… }` libinput device settings applied (device-add + reload) | ☐ |
+| Pointer constraints + relative pointer (locked-cursor games; hint clamped to output) | ✅ |
+| Cursor: client surfaces + `wp_cursor_shape`, themed, hardware plane, auto-hide options | ✅ |
+| VT switching (Ctrl+Alt+Fn) + display/HDR restore on resume | ✅ |
+
+### Protocols, session, capture
+
+| Area | State |
+|---|---|
+| Core + xdg-shell + the optional set: viewporter, presentation, fractional-scale, content-type, xdg-activation, xdg-decoration, single-pixel-buffer, idle-notify/-inhibit, output-power-management, drm-syncobj | ✅ |
+| `wlr_layer_shell`: 4 layers color-managed, exclusive zones, keyboard interactivity | ✅ — waybar, swaybg, fuzzel |
+| Layer-shell popups (`get_popup`) | ☐ |
+| `wp_color_management_v1`: output + surface paths, feedback, `surface_exists`, version-gated events | ✅ output path / ☐ 06-09 fixes |
+| Drag and drop: full data-device, drag-icon rendering, drop-target activation, smithay fork fix for data-device-less targets | ✅ — Firefox tab tear-off |
+| Xwayland: on-demand xwayland-satellite | ✅ |
+| Screen capture: wlr-screencopy, SHM + dmabuf, async from the render loop | ✅ grim / ☐ recording perf (see deferred-work) |
+| ext-workspace-v1 + wlr-foreign-toplevel (+ ext list) for status bars | ☐ — needs a waybar run |
+| `wp_alpha_modifier_v1` | ☐ |
+| IPC: nonblocking per-connection socket; version/outputs/focused-output/output actions, LUT push over memfd | ✅ / ☐ nonblocking rework (aad4323); introspection requests not implemented |
+| Session: `prism-session` (systemd --user units, real user bus), spawn-at-startup + env, child signal-mask reset | ✅ |
+| WLCS protocol-conformance harness (curated subset, 6-entry expected-failures allowlist) | ✅ |
+| Packaging: PKGBUILD + .SRCINFO (AUR push pending release tag) | ☐ |
 
 ## What's not done
 
-Details and triggers in [deferred-work.md](deferred-work.md). The notable gaps:
+Details and triggers in [deferred-work.md](deferred-work.md). Feature-sized gaps
+are tracked as GitHub issues. The notable ones:
 
+- **Session lock** (#25) — no `ext-session-lock-v1`; there is no screen locker.
+- **IME / text-input** (#26) — none.
+- **Clipboard managers** (#27) — no wlr/ext-data-control.
+- **IPC introspection** (#28) — Workspaces/Windows/EventStream unimplemented;
+  `LogicalOutput` hardcodes position, so multi-monitor region capture mis-targets.
+- **Insert hint + tab indicator** (#29) — layout computes them; rendering is stubbed.
+- **Layer rules** — the `layer-rule` config section parses but nothing computes
+  `ResolvedLayerRules`; the section is inert (no issue filed yet).
 - **Tone mapping** — decode (over-bright input) and encode (above-peak) both
-  hard-clip. No EETF/Reinhard/Hable operator yet.
+  hard-clip. No EETF/Reinhard/Hable operator yet. (#32 also covers the sRGB
+  OETF piecewise toe.)
 - **Touch input** — no `wl_touch` (keyboard + pointer are wired).
-- **Output/connector runtime hotplug** — outputs are opened at startup; we don't
-  react to connector add/remove (input-device hotplug *does* work, via udev). CRTC
-  rebinding for already-occupied CRTCs isn't done either.
-- **Encode-side mixed-primaries blending** — a BT.2020 HDR window and a BT.709 SDR
-  window sharing one output blend with wrong chromaticity for the SDR portion (the
-  conversion folds into a calibrated output's LUT but isn't general).
-- **Subpixel FIR + dither encode fragments** — in the `EncodeFragment` enum but
-  emitting either returns `MissingFeature` (needs multi-sample synthesis).
-- **Remaining decode transfer functions** — HLG, BT.1886, parametric gamma are stubs
-  (sRGB, linear, PQ are done).
-- **Scanout bandwidth optimizations** — DCC multi-plane import, `FB_DAMAGE_CLIPS`,
-  atomic test commits, per-output `LINEAR` policy hint.
-- **A few protocols** — linux-dmabuf v4 modifier-aware feedback; idle-inhibit,
-  relative-pointer, pointer-constraints, tablet.
+- **Desktop output hotplug** — desktop outputs are opened at startup; only
+  DRM-lease (VR) connectors hot-plug at runtime. CRTC rebinding isn't done either.
+- **Recording performance** — wlr-screencopy is correct but wf-recorder lags;
+  diagnosis in [screen-capture.md](screen-capture.md). PipeWire/portal capture
+  not started.
+- **Encode-side mixed-primaries blending**, **subpixel FIR + dither fragments**,
+  **HLG/BT.1886 decode**, **scanout bandwidth opts** (DCC import,
+  `FB_DAMAGE_CLIPS`, test commits), **linux-dmabuf v4**, **tablet** — unchanged,
+  see deferred-work.
 
 ## Subcommands
 
@@ -79,9 +134,10 @@ prism                 headless smoke suite: Vulkan probe + DRM enum + tracer sel
 prism scanout [output]              TTY: clear an output to green (vkCmdClearColorImage), hold 5s
 prism gradient [output] [8|10]      TTY: render a gradient through decode→encode, hold 5s
                                       depth defaults to 10 (XR30 + max_bpc=10); pass 8 for XR24
-prism run [output] [8|10]           TTY: integrated mode — wayland server + scanout + vblank
+prism run [output] [8|10] [--session]   TTY: integrated mode — wayland server + scanout + vblank
                                       render on every connected output across every opened card.
-                                      Ctrl-C to exit.
+                                      --session imports the environment into systemd/D-Bus
+                                      (portals, keyring). Ctrl-C to exit.
                                       Env: CARDS (comma-sep DRM paths; default both cards),
                                            PRISM_MAX_RUNTIME_SECS (wall-clock self-shutdown),
                                            PRISM_WATCHDOG_SECS (hard-kill), PRISM_CRUMBS (breadcrumb file),
@@ -89,12 +145,18 @@ prism run [output] [8|10]           TTY: integrated mode — wayland server + sc
 prism wayland         wayland server on wayland-N; logs surface lifecycle, no rendering
 ```
 
-`prism-tune` (separate binary — color calibration, talks to a running compositor):
+For a real session, launch via `resources/prism-session` (systemd --user units;
+wired up as a wayland-session by the package) rather than `prism run` directly.
+
+`prism-tune` (separate binary — color calibration + inspection, talks to a running compositor):
 
 ```
+prism-tune gui                 damascene GUI: IPC control panel, BT.2020 frame inspector,
+                               3D gamut point cloud, effective-LUT lattice inspector
 prism-tune characterize        measure per-channel response (gain/gamma) with the colorimeter
 prism-tune calibrate           derive a correction
 prism-tune calibrate-lut3d     generate a 3D LUT (.lut + .csv) and push it live over IPC
+prism-tune rebake-lut3d        re-derive a .lut offline from saved measurements
 prism-tune validate-lut3d      software validation of the color pipeline against a LUT
 prism-tune msg <version|outputs|focused-output|output ...>   IPC query/command to the compositor
 ```

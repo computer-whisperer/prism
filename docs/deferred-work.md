@@ -4,14 +4,17 @@ The backlog: things we deliberately *did not* do, grouped by subsystem, each wit
 why it's deferred and roughly what triggering it would cost. This is the place to
 look before starting something — it may already be scoped here.
 
+Feature-sized gaps from the 2026-06-09 deep-dive review are also tracked as
+GitHub issues (#25–#32); items below cite their issue number where one exists.
+
 Ordering within each section is rough priority. When an item lands, delete it (and
 update [status.md](status.md)).
 
 ## Color / HDR
 
 KMS HDR signaling, EDID parsing, per-output calibration (3D LUT, CTM, response
-curve), and per-output color config are **done** — see [status.md](status.md). What
-remains:
+curve), the measured-gamut bake, render intents + reference-white anchoring, and
+SDR drive-domain LUTs are **done** — see [status.md](status.md). What remains:
 
 ### Tone mapping
 
@@ -21,6 +24,14 @@ in the encode chain between calibration and the OETF, as per-output config. Wait
 until we have mixed SDR+HDR content to tune against. The cases (HDR→SDR, SDR→HDR,
 HDR→HDR peak mismatch, cross-gamut) are inventoried in
 [color-management.md](color-management.md).
+
+### sRGB OETF piecewise toe (#32, second half)
+
+The synthesized sRGB encode uses the pure 2.4-gamma approximation, not the
+piecewise sRGB curve with its linear toe — near-black output is slightly off on
+SDR panels. The LUT-upload barrier half of #32 landed (d226a07); the toe is the
+remaining half. Cost: swap the encode fragment's transfer to the piecewise form
+and re-anchor the headless gradient self-test.
 
 ### Automatic HDR enablement from EDID
 
@@ -52,6 +63,25 @@ mixed-primaries content on one output looking visibly wrong.
 
 ## Renderer
 
+### Gradient decorations
+
+Focus ring / border render solid colors; the config's gradient variants
+(linear gradients with color-space interpolation, niri-style) are parsed but
+collapse to the corresponding flat color. Needs gradient parameters plumbed to the SDF
+fragment — push-constant space is full, so this wants a small UBO (or SSBO) per
+frame. **Trigger:** wanting niri-parity visuals; bundle with the tab-indicator
+render work (#29) which has the same plumbing shape.
+
+### Remaining damage-tracking increments
+
+Damage tracking landed through the decode path (content tokens, per-output
+region tracker, decode-pass scissor, occlusion culling, zero-damage frame skip).
+Remaining increments, in order of value: **encode-pass scissor with buffer-age**
+(the encode currently re-runs full-screen every presented frame), **per-rect
+scissor** (today damage collapses to one bounding rect per output), and KMS
+`FB_DAMAGE_CLIPS` (see Scanout below). Direct scanout is mostly a non-goal in
+HDR mode — the encode pass has to run anyway on calibrated outputs.
+
 ### Subpixel FIR + dither encode fragments
 
 `SubpixelFir3Horizontal` (per-channel 3-tap horizontal FIR for non-stripe subpixel
@@ -74,6 +104,36 @@ surfaces), the renderer must negotiate the import modifier on those too. **Trigg
 per-plane CRTC color properties becoming usable on Vega 20 / Navi 21 (currently
 DCN2+ only). Not on the roadmap.
 
+## Layout / window management
+
+### Insert hint + tab indicator rendering (#29)
+
+The layout computes both (insert-hint geometry during interactive move, tab
+indicator state per tabbed column) but the render side is stubbed — interactive
+move gives no drop-location feedback and tabbed columns are visually
+indistinguishable. The element vocabulary they need (RoundedBox + gradients)
+mostly exists; see Gradient decorations above for the shared plumbing.
+
+### Layer rules are inert (no issue yet)
+
+`prism-layout` has `ResolvedLayerRules` types and the config parses the
+`layer-rule` section, but nothing ever computes rules for a layer surface — the
+whole section is a no-op (same shape as the window-rule gap fixed in f3b707f).
+Port the resolution call into the layer-surface map path.
+
+### Resize-snapshot anchor displacement
+
+The resize crossfade captures the old frame at the window's *current-frame*
+position rather than the previous-frame one, so a simultaneous move+resize can
+show the old content one frame of motion off (noted in 037f2c7's commit
+message). One-frame visual nit; revisit if it's visible in practice.
+
+### Overview leftovers
+
+Per-card wallpaper backdrops, key-repeat for overview binds, and touch input in
+the overview are deferred (the pointer/gesture/keyboard paths are in). Touch is
+gated on touch support generally — see Input.
+
 ## Scanout / KMS
 
 ### Multi-plane (DCC-compressed) modifier import
@@ -93,14 +153,12 @@ imports — DCC is the single-image-with-metadata-plane variant.)
 ### Per-plane damage clips (`FB_DAMAGE_CLIPS`)
 
 smithay's atomic backend plumbs `FB_DAMAGE_CLIPS` from `PlaneState.damage_clips`;
-we always pass `None`, so every frame is treated as full-screen damage. Telling the
-display engine "only rect (x,y,w,h) changed" lets it skip fetch for unchanged tiles
-(a cursor-blink redraw drops from a 4K full-fetch to a few tile bursts). Cost: track
-per-output damaged rects (finer than today's output-level "needs redraw"; producer
-is wayland surface damage rolled up through the layout's window→output mapping),
-convert to KMS-coordinate `drm_mode_rect[]`, attach to `PlaneState.damage_clips`,
-and reset to `None` on any mode-changing event. **Trigger:** laptop power
-optimization, or measured idle-desktop scanout bandwidth being meaningfully high.
+we always pass `None`, so the display engine treats every flip as full-screen
+damage. The per-output damage tracker now exists renderer-side — remaining cost:
+convert its rects to KMS-coordinate `drm_mode_rect[]`, attach to
+`PlaneState.damage_clips`, reset to `None` on mode-changing events. **Trigger:**
+laptop power optimization, or measured idle-desktop scanout bandwidth being
+meaningfully high.
 
 ### Atomic test commits before mode-changing operations
 
@@ -121,12 +179,14 @@ a virtual/looking-glass output) we'd want to *force* `LINEAR` for one output. Co
 `force_linear_scanout: bool` on `prism_config::OutputConfig.color`, short-circuit
 the picker. ~20 LOC. Cheap insurance; not blocking.
 
-### Output / connector runtime hotplug
+### Desktop output / connector runtime hotplug
 
-Outputs are opened at startup (`DrmEvent` handling covers `VBlank`/`Error` only).
-We don't react to runtime connector add/remove. (Input-device hotplug *does* work —
-libinput runs over udev and `on_device_added` flips seat capabilities.) **Trigger:**
-plugging/unplugging a display on a running session.
+Desktop outputs are opened at startup; we don't react to runtime connector
+add/remove for them. The udev/connector-probe machinery now exists for
+**DRM-lease** connectors (VR headsets plug/unplug live, 5a949df) — extending it
+to desktop outputs means driving full output bringup/teardown (CRTC pick,
+swapchain, wl_output lifecycle, layout reflow) from the hotplug event instead of
+startup. **Trigger:** plugging/unplugging a monitor on a running session.
 
 ### CRTC assignment with rebinding
 
@@ -154,6 +214,12 @@ No `wl_touch` — keyboard and pointer are wired (libinput → seat → focused 
 touch is not. (WLCS touch tests are skipped accordingly.) Add when a touch device
 or touch-driven client is in play.
 
+### Bind gating: allow-when-locked / allow-inhibiting
+
+Both bind flags parse but aren't enforced: `allow-when-locked` is meaningless
+until session lock exists (#25), and `allow-inhibiting` until
+keyboard-shortcuts-inhibit is wired. Land each alongside its protocol.
+
 ### Cursor: hardware-plane constraints
 
 Cursors render only via the hardware cursor plane (`update_output_cursors`). Client
@@ -180,7 +246,55 @@ Not yet chased down — the `debug!(kind, "client set cursor image")` in
 `cursor { hide-when-typing }` option hides compositor-side regardless, so it's the
 practical workaround.
 
+## Screen capture
+
+wlr-screencopy (SHM + dmabuf, async, serviced from the render loop) is done and
+grim-verified — see [screen-capture.md](screen-capture.md) for the subsystem doc.
+
+### Recording performance
+
+wf-recorder recording is laggy; async SHM did *not* fix it. Diagnosis (three
+stacked costs: per-frame 33 MB allocation, single-`AsyncSlot` fence stall, 33 MB
+memcpy) and the fix ladder (cheapest: multi-slot + steer recorders to the dmabuf
+path) live in [screen-capture.md](screen-capture.md). Deliberately deferred.
+
+### PipeWire / portal capture, then ext-image-copy-capture
+
+The planned path for OBS/portal screen sharing: in-process PipeWire stream +
+the Mutter-style D-Bus portal interface, reusing the shared
+`capture_into_dmabuf` primitive; `ext-image-copy-capture-v1` after that.
+Not started.
+
 ## Wayland / protocol
+
+### Session lock (#25)
+
+No `ext-session-lock-v1` — there is no way to lock the screen. The biggest
+user-facing protocol gap. Also gates `allow-when-locked` bind enforcement and a
+real `Quit` confirmation flow.
+
+### Text input / IME (#26)
+
+No `zwp_text_input` / `input_method` — no CJK or on-screen-keyboard input.
+
+### Data control (#27)
+
+No wlr-data-control / ext-data-control — clipboard managers (cliphist et al.)
+silently see nothing (`selection.rs:50`).
+
+### IPC introspection (#28)
+
+`Workspaces`, `Windows`, and `EventStream` IPC requests return "not
+implemented", and `LogicalOutput` hardcodes `x:0, y:0` — so scripting parity
+with niri's `niri msg` doesn't exist yet and multi-monitor region capture
+(slurp-style) mis-targets. The event-stream design should follow niri's
+(initial-state replay + deltas).
+
+### Quit confirmation
+
+`Quit { skip_confirmation: false }` just logs and quits — the confirmation
+dialog needs compositor-drawn overlay UI that doesn't exist yet (same bucket as
+an on-screen-display layer generally).
 
 ### linux-dmabuf-v1 v4 (modifier-aware feedback)
 
@@ -190,26 +304,50 @@ Bundle with direct-scanout / overlay-plane work.
 
 ### Layer-shell remaining gaps
 
-`wlr_layer_shell` is largely done (`crates/prism-protocols/src/layer_shell.rs`):
-all four layers render in z-order through the shared color-managed surface-tree
-walk (bars, wallpapers, notification daemons, launchers — no unmanaged-sRGB blit
-path), anchors/margins/exclusive-zones arrange via smithay's `LayerMap`, exclusive
-zones shrink the tiling work area, and keyboard interactivity is honored
-(Exclusive grabs on map / releases on unmap, OnDemand on click, None never
-focuses). Remaining: layer **popups** and layer **shadows**; exclusive keyboard
-grab is scoped to the *focused* output (an exclusive surface on a non-focused
-monitor waits until that monitor is focused).
+Layer **popups** landed (20bfc36). Remaining: layer **shadows**; exclusive
+keyboard grab is scoped to the *focused* output (an exclusive surface on a
+non-focused monitor waits until that monitor is focused); and layer rules are
+inert (see Layout above).
+
+### Foreign-toplevel: parent relationship
+
+`wlr-foreign-toplevel-management`'s `parent` event is never sent (dialogs don't
+group under their parent in taskbar-style clients). Small; needs the xdg parent
+chain exposed to the protocol module.
 
 ### Remaining optional protocols
 
-`wp_presentation`, `wp_viewporter`, `wp_fractional_scale_manager_v1`,
-`wp_content_type_v1`, `xdg_activation`, `xdg-decoration`, single-pixel-buffer,
-`ext-idle-notify-v1`, `zwp_idle_inhibit`, and `zwlr_output_power_management_v1` are
-wired. Still unwired (all graceful-degrade): `relative_pointer` /
-`pointer_constraints` (games, drawing apps), `tablet_manager`. Add as specific clients
-need them.
+Still unwired (all graceful-degrade): `tablet_manager` (drawing tablets),
+`keyboard-shortcuts-inhibit` (VMs/remote-desktop grabbing all keys; also gates
+`allow-inhibiting`), `security-context` (sandboxed-client tagging). Add as
+specific clients need them.
 
 Idle-inhibit honors an inhibitor while its surface is *alive*, not gated on
 visibility (the protocol's "ignore invisible inhibitors" note) — a backgrounded
 inhibitor still blocks idle. Refine if it bites. (Firefox didn't request inhibition in
 testing; mpv does — that's a Firefox-side behavior, not prism.)
+
+### Xwayland follow-ups
+
+xwayland-satellite integration is in (on-demand spawn). Remaining: the optional
+game-oriented protocols satellite can use when present (pointer warp,
+fractional-scale-v2 game hints), picking up satellite path changes on config
+reload, and clearing a stale X11 lock file left by a crashed satellite (blocks
+the display number until removed by hand).
+
+## Tracked code debt
+
+#30 catalogs the load-bearing `TODO`s in the tree (places where a comment is
+standing in for required behavior, as the transaction system's was) — work
+through it opportunistically when touching the surrounding code.
+
+## Release / tooling
+
+- **AUR push** — PKGBUILD + .SRCINFO are committed and makepkg-validated;
+  publishing waits on a `v0.1.0` tag, the repo going public, and `updpkgsums`.
+- **smithay fork → upstream** — the DnD fix (cancel drops on data-device-less
+  clients) lives on our fork branch; upstream PR still to be filed. Until it
+  merges we track the fork, which adds a rebase cost to smithay bumps.
+- **prism-tune calibration GUI** — the GUI has the control panel + inspectors;
+  driving an actual calibration run (characterize/calibrate-lut3d) from the GUI
+  is deferred, CLI remains the path.
