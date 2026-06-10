@@ -22,6 +22,7 @@ pub mod rlimit;
 pub mod screencopy;
 pub mod selection;
 pub mod server;
+pub mod session_lock;
 pub mod state;
 pub mod surface_tex;
 pub mod xwayland;

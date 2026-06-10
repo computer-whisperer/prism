@@ -2465,6 +2465,13 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
         Err(e) => {
             tracing::warn!("render_output_now({output_id}) failed: {e:#}");
             breadcrumb(&format!("render_output_now({output_id}) ERROR: {e:#}"));
+            // A failed render while the session is locking means this
+            // output may still be showing desktop content — abort the
+            // lock rather than confirm one the screen doesn't reflect
+            // (niri parity). No-op when not mid-lock.
+            if state.is_locked() {
+                state.note_lock_render(output_id, false);
+            }
             if let Some(entry) = state.output_redraw.get_mut(output_id) {
                 entry.redraw = RedrawState::Idle;
             }
@@ -2886,89 +2893,136 @@ fn render_output_now(
             }
         }
     };
-    // Overview backdrop: a solid color at the very back, below the
-    // wallpaper layers. Prism renders the wallpaper unscaled on the
-    // backdrop (niri's `place-within-backdrop` look), so the color only
-    // shows where no Background/Bottom layer covers — and it's emitted
-    // at all only when workspace cards can actually expose it (overview
-    // zoom, or the gap during a workspace switch), keeping the static
-    // frame free of a permanent fullscreen quad.
-    if let Some(monitor) = state.layout.monitor_for_output(&smithay_output) {
-        if monitor.backdrop_visible() {
-            static BACKDROP_ID: std::sync::OnceLock<prism_frame::ElementId> =
-                std::sync::OnceLock::new();
-            let rgba = state
-                .config
-                .borrow()
-                .overview
-                .backdrop_color
-                .to_array_unpremul();
-            let color_bt2020_nits =
-                prism_renderer::srgb_to_bt2020_nits(rgba[0], rgba[1], rgba[2], rgba[3], 80.0);
-            render_els.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
-                id: *BACKDROP_ID.get_or_init(prism_frame::ElementId::alloc),
-                geometry: smithay::utils::Rectangle::from_size(view_size),
-                color_bt2020_nits,
-                clip: None,
-            }));
-        }
-    }
-
-    push_layers(&[Layer::Background, Layer::Bottom], &mut render_els);
-
-    let monitor_found = if let Some(monitor) = state.layout.monitor_for_output(&smithay_output) {
-        // Overview workspace-card shadows go under the cards, over the
-        // backdrop/wallpaper. No-op outside the overview.
-        monitor.render_workspace_shadows(&mut render_els);
-        // focus_ring: this is the focused monitor's render — for
-        // single-monitor configs it always is; multi-monitor focus
-        // tracking lands when input dispatch does.
-        monitor.render_workspaces(true, &ctx, &mut render_els);
-        true
-    } else {
-        false
-    };
-
-    // During an interactive move, the moving tile is detached from its
-    // workspace's normal layout — `render_workspaces` above does NOT
-    // include it. The layout exposes the moving tile separately;
-    // `render_interactive_move_for_output` early-returns unless the
-    // tile is currently assigned to *this* output (the layout transfers
-    // the assignment as the cursor crosses output boundaries during
-    // the drag). Append after the workspace pass so the moving window
-    // draws on top of normal tiles.
-    state
-        .layout
-        .render_interactive_move_for_output(&smithay_output, &ctx, &mut render_els);
-
-    // Top + Overlay layers: above the workspace walk and the interactive-move
-    // tile. Same color-managed walk as Background/Bottom. Done before the
-    // demand-materialize pass below so a layer surface missing a texture this
-    // frame is caught + retried exactly like a window.
-    push_layers(&[Layer::Top, Layer::Overlay], &mut render_els);
-
-    // DnD drag icon: topmost, riding the cursor position, drawn only on
-    // the output under the pointer (niri renders it alongside the pointer
-    // sprite, niri.rs:3752 — prism's cursor is on a HW plane, so the icon
-    // composites alone). `offset` accumulates the icon's wl_surface.offset
-    // deltas from commits. Not a layout window — if its texture hasn't
-    // materialized on this GPU yet, the demand pass below catches it.
-    if let Some(icon) = state.dnd_icon.as_ref() {
-        let under =
-            state.output_containing((state.pointer_pos.x as i32, state.pointer_pos.y as i32));
-        if under.as_deref() == Some(output_id) {
-            let origin = smithay_output.current_location();
-            let pos = smithay::utils::Point::<f64, smithay::utils::Logical>::from((
-                state.pointer_pos.x - origin.x as f64 + icon.offset.x as f64,
-                state.pointer_pos.y - origin.y as f64 + icon.offset.y as f64,
-            ));
+    // Session lock: while locked (Locking or Locked), the frame is ONLY
+    // the locked backdrop + this output's lock surface (+ its popups).
+    // Nothing else — wallpaper, layer chrome, workspaces, the moving
+    // tile, the DnD icon — may reach a locked screen; that's the
+    // protocol's whole point. Mirrors niri.rs render gating. The
+    // backdrop also covers the no-surface case (lock client crashed:
+    // the session stays locked, solid dark red).
+    let session_locked = state.is_locked();
+    let monitor_found;
+    if session_locked {
+        static LOCK_BACKDROP_ID: std::sync::OnceLock<prism_frame::ElementId> =
+            std::sync::OnceLock::new();
+        let c = prism_protocols::session_lock::CLEAR_COLOR_LOCKED;
+        let color_bt2020_nits = prism_renderer::srgb_to_bt2020_nits(c[0], c[1], c[2], c[3], 80.0);
+        render_els.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
+            id: *LOCK_BACKDROP_ID.get_or_init(prism_frame::ElementId::alloc),
+            geometry: smithay::utils::Rectangle::from_size(view_size),
+            color_bt2020_nits,
+            clip: None,
+        }));
+        if let Some(ls) = state.lock_surfaces.get(output_id).filter(|ls| ls.alive()) {
             prism_layout::layout::element::push_surface_tree_elements(
-                &icon.surface,
-                pos,
+                ls.wl_surface(),
+                smithay::utils::Point::from((0.0, 0.0)),
                 1.0,
                 &ctx,
                 &mut render_els,
             );
+            // xdg_popups parented to the lock surface (a locker's
+            // virtual-keyboard / message popups). Same placement math
+            // as the layer-shell popups above.
+            for (popup, popup_offset) in
+                smithay::desktop::PopupManager::popups_for_surface(ls.wl_surface())
+            {
+                let popup_buf_origin = (popup_offset - popup.geometry().loc).to_f64();
+                prism_layout::layout::element::push_surface_tree_elements(
+                    popup.wl_surface(),
+                    popup_buf_origin,
+                    1.0,
+                    &ctx,
+                    &mut render_els,
+                );
+            }
+        }
+        monitor_found = true;
+    } else {
+        // Overview backdrop: a solid color at the very back, below the
+        // wallpaper layers. Prism renders the wallpaper unscaled on the
+        // backdrop (niri's `place-within-backdrop` look), so the color only
+        // shows where no Background/Bottom layer covers — and it's emitted
+        // at all only when workspace cards can actually expose it (overview
+        // zoom, or the gap during a workspace switch), keeping the static
+        // frame free of a permanent fullscreen quad.
+        if let Some(monitor) = state.layout.monitor_for_output(&smithay_output) {
+            if monitor.backdrop_visible() {
+                static BACKDROP_ID: std::sync::OnceLock<prism_frame::ElementId> =
+                    std::sync::OnceLock::new();
+                let rgba = state
+                    .config
+                    .borrow()
+                    .overview
+                    .backdrop_color
+                    .to_array_unpremul();
+                let color_bt2020_nits =
+                    prism_renderer::srgb_to_bt2020_nits(rgba[0], rgba[1], rgba[2], rgba[3], 80.0);
+                render_els.push(RenderEl::SolidColor(prism_renderer::SolidColorEl {
+                    id: *BACKDROP_ID.get_or_init(prism_frame::ElementId::alloc),
+                    geometry: smithay::utils::Rectangle::from_size(view_size),
+                    color_bt2020_nits,
+                    clip: None,
+                }));
+            }
+        }
+
+        push_layers(&[Layer::Background, Layer::Bottom], &mut render_els);
+
+        monitor_found = if let Some(monitor) = state.layout.monitor_for_output(&smithay_output) {
+            // Overview workspace-card shadows go under the cards, over the
+            // backdrop/wallpaper. No-op outside the overview.
+            monitor.render_workspace_shadows(&mut render_els);
+            // focus_ring: this is the focused monitor's render — for
+            // single-monitor configs it always is; multi-monitor focus
+            // tracking lands when input dispatch does.
+            monitor.render_workspaces(true, &ctx, &mut render_els);
+            true
+        } else {
+            false
+        };
+
+        // During an interactive move, the moving tile is detached from its
+        // workspace's normal layout — `render_workspaces` above does NOT
+        // include it. The layout exposes the moving tile separately;
+        // `render_interactive_move_for_output` early-returns unless the
+        // tile is currently assigned to *this* output (the layout transfers
+        // the assignment as the cursor crosses output boundaries during
+        // the drag). Append after the workspace pass so the moving window
+        // draws on top of normal tiles.
+        state
+            .layout
+            .render_interactive_move_for_output(&smithay_output, &ctx, &mut render_els);
+
+        // Top + Overlay layers: above the workspace walk and the interactive-move
+        // tile. Same color-managed walk as Background/Bottom. Done before the
+        // demand-materialize pass below so a layer surface missing a texture this
+        // frame is caught + retried exactly like a window.
+        push_layers(&[Layer::Top, Layer::Overlay], &mut render_els);
+
+        // DnD drag icon: topmost, riding the cursor position, drawn only on
+        // the output under the pointer (niri renders it alongside the pointer
+        // sprite, niri.rs:3752 — prism's cursor is on a HW plane, so the icon
+        // composites alone). `offset` accumulates the icon's wl_surface.offset
+        // deltas from commits. Not a layout window — if its texture hasn't
+        // materialized on this GPU yet, the demand pass below catches it.
+        if let Some(icon) = state.dnd_icon.as_ref() {
+            let under =
+                state.output_containing((state.pointer_pos.x as i32, state.pointer_pos.y as i32));
+            if under.as_deref() == Some(output_id) {
+                let origin = smithay_output.current_location();
+                let pos = smithay::utils::Point::<f64, smithay::utils::Logical>::from((
+                    state.pointer_pos.x - origin.x as f64 + icon.offset.x as f64,
+                    state.pointer_pos.y - origin.y as f64 + icon.offset.y as f64,
+                ));
+                prism_layout::layout::element::push_surface_tree_elements(
+                    &icon.surface,
+                    pos,
+                    1.0,
+                    &ctx,
+                    &mut render_els,
+                );
+            }
         }
     }
 
@@ -3246,6 +3300,14 @@ fn render_output_now(
         drop(release_trackers);
         drop(present_sync_fd);
     }
+
+    // Session-lock bookkeeping: this output's frame (locked or not) is
+    // submitted and will reach the panel. While `Locking`, the lock is
+    // confirmed to the client once every powered output has presented a
+    // locked frame. The zero-damage skip path deliberately does NOT
+    // call this — a skip means the previous (already accounted) frame
+    // is still showing.
+    state.note_lock_render(output_id, session_locked);
 
     Ok(RenderOutcome::Presented {
         pending: PendingFeedback {

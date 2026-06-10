@@ -397,6 +397,22 @@ pub struct PrismState {
         OutputId,
         smithay::reexports::wayland_protocols_wlr::output_power_management::v1::server::zwlr_output_power_v1::ZwlrOutputPowerV1,
     )>,
+    /// `ext-session-lock-v1` global state (screen locking). The actual
+    /// lock machinery lives in [`Self::lock_state`]; see
+    /// [`crate::session_lock`].
+    pub session_lock_state: smithay::wayland::session_lock::SessionLockManagerState,
+    /// The session-lock state machine. Render + input paths consult
+    /// [`PrismState::is_locked`]; the render path must show ONLY
+    /// [`Self::lock_surfaces`] + the locked backdrop while it's true.
+    pub lock_state: crate::session_lock::LockState,
+    /// Per-output lock surface (keyed like `wl_outputs`). Populated by
+    /// `get_lock_surface`, cleared on unlock. An output without an
+    /// entry renders the bare locked backdrop.
+    pub lock_surfaces: HashMap<OutputId, smithay::wayland::session_lock::LockSurface>,
+    /// What the last presented frame on each output showed. The lock is
+    /// confirmed to the client only once every powered output is
+    /// `Locked` here — see [`PrismState::note_lock_render`].
+    pub lock_render_state: HashMap<OutputId, crate::session_lock::LockRenderState>,
     /// Queued screencopy captures (dmabuf or SHM) awaiting their output's next
     /// frame. Drained by [`PrismState::submit_pending_screencopy`] from the
     /// render loop right after `present()`. See [`crate::screencopy`].
@@ -786,6 +802,14 @@ impl PrismState {
         // event loop for its timers).
         let idle_inhibit_manager = IdleInhibitManagerState::new::<PrismState>(&dh);
 
+        // ext-session-lock-v1 — screen locking (swaylock). All clients
+        // may bind (no security-context filtering yet, matching every
+        // other prism global). See crate::session_lock.
+        let session_lock_state = smithay::wayland::session_lock::SessionLockManagerState::new::<
+            PrismState,
+            _,
+        >(&dh, |_| true);
+
         // zwlr_output_power_management_v1 — DPMS control for wlopm/swayidle.
         // Hand-rolled (smithay has none); see crate::output_power. The global
         // is kept alive by the display; nothing else to store.
@@ -917,6 +941,10 @@ impl PrismState {
             idle_inhibit_manager,
             idle_inhibitors: std::collections::HashSet::new(),
             output_power_objects: Vec::new(),
+            session_lock_state,
+            lock_state: crate::session_lock::LockState::default(),
+            lock_surfaces: HashMap::new(),
+            lock_render_state: HashMap::new(),
             screencopy_pending: Vec::new(),
             screencopy_inflight: Vec::new(),
             pointer_visibility: PointerVisibility::default(),
@@ -2630,6 +2658,14 @@ impl CompositorHandler for PrismState {
         // role so subsurface commits of a layer don't re-trigger it.
         if let Some("zwlr_layer_surface_v1") = role {
             self.layer_shell_commit(surface);
+        }
+
+        // Session-lock surfaces: while WaitingForSurfaces, a newly
+        // mapped lock surface may complete the per-output set and
+        // advance the lock; afterwards a commit repaints that output's
+        // lock screen.
+        if let Some("ext_session_lock_surface_v1") = role {
+            self.session_lock_surface_commit(surface);
         }
 
         // If this commit is on the current cursor surface (the client updated
