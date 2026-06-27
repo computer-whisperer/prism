@@ -93,6 +93,12 @@ pub struct FrameElementMeta {
     /// tracker re-damages the element's geometry when this differs from the
     /// stored value.
     pub content_token: u64,
+    /// Opaque sub-regions in logical pixels (from [`RenderEl::push_opaque_regions`]).
+    /// The damage tracker subtracts these — for elements stacked *in front* — from
+    /// lower elements' damage, so an animating surface fully covered by opaque
+    /// windows only damages the visible remainder (e.g. a thin border ring) rather
+    /// than the whole output every frame. Empty ⇒ occludes nothing.
+    pub opaque: Vec<Rectangle<f64, Logical>>,
 }
 
 /// One frame lowered for one output: the flat draw stream `render_frame`
@@ -128,11 +134,15 @@ pub fn lower_elements(
     let mut meta = Vec::with_capacity(elements.len());
     for (i, el) in elements.iter().enumerate() {
         // Metadata covers every element (visible or culled) so the damage diff
-        // tracks occluded elements too.
+        // tracks occluded elements too. Its opaque regions let the tracker
+        // subtract this element from the damage of anything behind it.
+        let mut opaque = Vec::new();
+        el.push_opaque_regions(&mut opaque);
         meta.push(FrameElementMeta {
             id: el.id(),
             geometry: el.geometry(),
             content_token: el.content_token(),
+            opaque,
         });
         if visible[i] {
             let start = draws.len();

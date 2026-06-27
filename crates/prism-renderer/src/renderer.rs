@@ -46,6 +46,12 @@ pub const FRAMES_IN_FLIGHT: usize = 2;
 /// after encode. `decode = t1 - t0`, `encode = t2 - t1`.
 const PROFILE_TIMESTAMP_COUNT: u32 = 3;
 
+/// Cap on the number of separate scissored encode passes per frame. Beyond this,
+/// the encode falls back to a single bounding-box pass — the per-pass overhead
+/// (begin/end rendering) stops being worth the saved fragment work. Sized for the
+/// common cases (a window region, a 4-rect border ring) with headroom.
+const MAX_ENCODE_PASSES: usize = 8;
+
 /// Per-frame GPU time for the two compositing passes, in microseconds.
 /// Produced by the timestamp-query profiler when the `PRISM_GPU_PROFILE`
 /// environment variable is set; `None` everywhere otherwise (no query pools
@@ -637,18 +643,29 @@ impl Renderer {
         } else {
             damage_bbox(damage, extent)
         };
-        // Encode scissor region for this BO. The full-screen triangle writes
-        // every pixel of the render area, so a sub-area encode needs no LOAD:
-        // pixels outside it keep the BO's prior content, preserved by the
-        // GENERAL→COLOR_ATTACHMENT transition (vs. discard-from-UNDEFINED) in
-        // the mid-barrier below. Empty `encode_damage` (or anything offscreen),
-        // a realloc, or a forced repaint ⇒ full-output encode.
-        let encode_bbox = damage_bbox(encode_damage, extent);
-        let encode_full = force_full || force_full_repaint || encode_bbox.is_none();
-        let encode_area = if encode_full {
-            full_area
+        // Encode scissor regions for this BO. The encode is scissored per damage
+        // rect so disjoint regions (e.g. a border ring around an opaque window)
+        // each cost only their own area, not their bounding box. A realloc, a
+        // forced repaint, or empty/offscreen `encode_damage` ⇒ full-output encode;
+        // beyond `MAX_ENCODE_PASSES` rects we fall back to one bounding-box pass to
+        // bound per-pass overhead. `encode_full` (no sub-region) selects the
+        // discard-from-UNDEFINED mid-barrier below; a partial encode preserves the
+        // BO's prior content (GENERAL→COLOR_ATTACHMENT) outside the passes.
+        let encode_clamped: Vec<vk::Rect2D> = if force_full || force_full_repaint {
+            Vec::new()
         } else {
-            encode_bbox.unwrap()
+            encode_damage
+                .iter()
+                .filter_map(|r| clamp_rect_to_extent(r, extent))
+                .collect()
+        };
+        let encode_full = encode_clamped.is_empty();
+        let encode_passes: Vec<vk::Rect2D> = if encode_full {
+            vec![full_area]
+        } else if encode_clamped.len() > MAX_ENCODE_PASSES {
+            vec![damage_bbox(encode_damage, extent).unwrap_or(full_area)]
+        } else {
+            encode_clamped
         };
         let intermediate = self.intermediate.as_ref().unwrap();
 
@@ -1103,57 +1120,49 @@ impl Renderer {
         }
 
         // ── Encode pass ───────────────────────────────────────────────────
+        // One small render pass per `encode_passes` rect (disjoint damage regions
+        // — e.g. a border ring around an opaque window — so each pays only for its
+        // own area, not their bounding box). The pipeline / descriptors / push
+        // constants / viewport are command-buffer state that persists across
+        // `cmd_begin_rendering` boundaries, so bind them once and loop the passes.
+        // Each pass's full-screen triangle covers its render area entirely → no
+        // LOAD needed; areas outside every pass keep the BO's prior content.
         let encode_color_attach = [vk::RenderingAttachmentInfo::default()
             .image_view(scanout.view())
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::DONT_CARE)
             .store_op(vk::AttachmentStoreOp::STORE)];
-        // Render area + scissor confine the encode to `encode_area`; the
-        // full-screen triangle covers it entirely, so every pixel in the area is
-        // written. Pixels outside it retain the BO's prior content (the area is
-        // the whole output on a full encode).
-        let encode_render_info = vk::RenderingInfo::default()
-            .render_area(encode_area)
-            .layer_count(1)
-            .color_attachments(&encode_color_attach);
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: extent.width as f32,
+            height: extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let intermediate_info = [vk::DescriptorImageInfo::default()
+            .sampler(self.encode.sampler)
+            .image_view(intermediate.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        // Binding 1 (LUT) is conditional on the encode chain including
+        // `EncodeFragment::Lut3d`. We stage the LUT descriptor info outside the
+        // optional so its lifetime covers the push_descriptor call.
+        let lut_info = self.lut3d.as_ref().map(|lut| {
+            [vk::DescriptorImageInfo::default()
+                .sampler(self.encode.sampler)
+                .image_view(lut.view())
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
+        });
+        let mut writes = vec![self.encode.write_intermediate_binding(&intermediate_info)];
+        if let Some(ref info) = lut_info {
+            writes.push(self.encode.write_lut3d_binding(info));
+        }
         unsafe {
-            self.device.raw.cmd_begin_rendering(cb, &encode_render_info);
-            // Viewport spans the whole output (the triangle is in full-framebuffer
-            // clip space); the scissor confines written fragments to `encode_area`.
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: extent.width as f32,
-                height: extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            self.device.raw.cmd_set_viewport(cb, 0, &[viewport]);
-            self.device.raw.cmd_set_scissor(cb, 0, &[encode_area]);
             self.device.raw.cmd_bind_pipeline(
                 cb,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.encode.pipeline,
             );
-
-            let intermediate_info = [vk::DescriptorImageInfo::default()
-                .sampler(self.encode.sampler)
-                .image_view(intermediate.view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            // Binding 1 (LUT) is conditional on the encode chain
-            // including `EncodeFragment::Lut3d`. We stage the LUT
-            // descriptor info outside the optional so its lifetime
-            // covers the push_descriptor call.
-            let lut_info = self.lut3d.as_ref().map(|lut| {
-                [vk::DescriptorImageInfo::default()
-                    .sampler(self.encode.sampler)
-                    .image_view(lut.view())
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
-            });
-            let mut writes = vec![self.encode.write_intermediate_binding(&intermediate_info)];
-            if let Some(ref info) = lut_info {
-                writes.push(self.encode.write_lut3d_binding(info));
-            }
             self.encode.push_loader.cmd_push_descriptor_set(
                 cb,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -1168,8 +1177,19 @@ impl Renderer {
                 0,
                 bytemuck::bytes_of(encode_push),
             );
-            self.device.raw.cmd_draw(cb, 3, 1, 0, 0);
-            self.device.raw.cmd_end_rendering(cb);
+            // Viewport spans the whole output (the triangle is in full-framebuffer
+            // clip space); each pass's scissor confines fragments to its rect.
+            self.device.raw.cmd_set_viewport(cb, 0, &[viewport]);
+            for pass in &encode_passes {
+                let encode_render_info = vk::RenderingInfo::default()
+                    .render_area(*pass)
+                    .layer_count(1)
+                    .color_attachments(&encode_color_attach);
+                self.device.raw.cmd_begin_rendering(cb, &encode_render_info);
+                self.device.raw.cmd_set_scissor(cb, 0, &[*pass]);
+                self.device.raw.cmd_draw(cb, 3, 1, 0, 0);
+                self.device.raw.cmd_end_rendering(cb);
+            }
         }
 
         // GPU profile t2: encode done. decode = t1-t0, encode = t2-t1.
@@ -1300,6 +1320,25 @@ fn damage_bbox(damage: &[Rectangle<i32, Physical>], extent: vk::Extent2D) -> Opt
     let y0 = min_y.max(0);
     let x1 = max_x.min(extent.width as i32);
     let y1 = max_y.min(extent.height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        },
+    })
+}
+
+/// Clamp a physical-pixel damage rect to the output extent, as a `vk::Rect2D`.
+/// `None` if it lies entirely outside the output (or is empty).
+fn clamp_rect_to_extent(r: &Rectangle<i32, Physical>, extent: vk::Extent2D) -> Option<vk::Rect2D> {
+    let x0 = r.loc.x.max(0);
+    let y0 = r.loc.y.max(0);
+    let x1 = (r.loc.x + r.size.w).min(extent.width as i32);
+    let y1 = (r.loc.y + r.size.h).min(extent.height as i32);
     if x1 <= x0 || y1 <= y0 {
         return None;
     }

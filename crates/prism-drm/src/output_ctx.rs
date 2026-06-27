@@ -33,7 +33,7 @@ use smithay::backend::drm::{DrmDevice, DrmSurface, PlaneConfig, PlaneState};
 use smithay::reexports::drm::control::{connector, crtc, framebuffer, Mode};
 
 use crate::frame_clock::FrameClock;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Logical, Physical, Rectangle, Scale, Size, Transform};
 
 /// Headroom multiplier on the derived per-channel BT.2020 decode clamp.
 /// The clamp's purpose is to keep the BT.2020 fp16 intermediate honest
@@ -376,7 +376,7 @@ impl OutputContext {
             renderer,
             damage_tracker: DamageTracker::new(),
             // Both BOs start undefined → full encode on first use.
-            damage_carry: [DamageCarry::Full; 2],
+            damage_carry: [DamageCarry::Full, DamageCarry::Full],
             extent,
             mode: pick.mode,
             connector_name: pick.connector_name,
@@ -917,23 +917,22 @@ impl OutputContext {
         }
 
         let back_index = self.back_index;
-        // Buffer-age encode region for this BO: the region it's been missing
-        // since it was last rendered (its carry) ∪ this frame's damage. The
-        // encode pass scissors to the bounding box of this; passing it empty
-        // requests a full-output encode. `content_full` marks frames whose
-        // output changed *everywhere* (recolor via force_present, close-anim
-        // repaint, or the first frame) — captured here, before force_present /
-        // mode_set_done are mutated below, and used to roll the carry forward.
+        // Buffer-age encode regions for this BO: the regions it's been missing
+        // since it was last rendered (its carry) ∪ this frame's damage. Passed to
+        // the renderer's per-rect encode; empty ⇒ full-output encode. `content_full`
+        // marks frames whose output changed *everywhere* (recolor via force_present,
+        // close-anim repaint, or the first frame) — captured here, before
+        // force_present / mode_set_done are mutated below, and used to roll the
+        // carry forward.
         let content_full = self.force_present || force_full_repaint || !self.mode_set_done;
-        let frame_bbox = rects_bbox(&damage, self.extent);
-        let encode_rects: Vec<Rectangle<i32, Physical>> = match self.damage_carry[back_index] {
+        let encode_rects: Vec<Rectangle<i32, Physical>> = match &self.damage_carry[back_index] {
             // BO never rendered / fully stale, or whole-output change ⇒ full.
             DamageCarry::Full => Vec::new(),
             DamageCarry::Region(_) if content_full => Vec::new(),
-            // Re-encode the BO's missing region ∪ this frame's damage.
+            // Re-encode the BO's missing regions ∪ this frame's damage.
             DamageCarry::Region(carry) => {
-                let mut v = Vec::with_capacity(carry.is_some() as usize + damage.len());
-                v.extend(carry);
+                let mut v = Vec::with_capacity(carry.len() + damage.len());
+                v.extend_from_slice(carry);
                 v.extend_from_slice(&damage);
                 v
             }
@@ -1064,7 +1063,7 @@ impl OutputContext {
         // Roll the per-BO damage carry forward on the same successful-flip gate.
         // The BO we just rendered is now current; every *other* BO falls further
         // behind by this frame's content change (the whole output if the change
-        // was global, else this frame's damage bbox added to what it already
+        // was global, else this frame's damage rects added to what it already
         // missed). Keying the other BO off `content_full` — not off whether *this*
         // BO did a full encode — is what stops two BOs ping-ponging full encodes
         // when one merely needed a refresh for being stale.
@@ -1072,9 +1071,10 @@ impl OutputContext {
         self.damage_carry[other] = if content_full {
             DamageCarry::Full
         } else {
-            self.damage_carry[other].extended(frame_bbox)
+            // `clone()` avoids moving out of the array; the carry is small.
+            self.damage_carry[other].clone().extended(&damage)
         };
-        self.damage_carry[back_index] = DamageCarry::Region(None);
+        self.damage_carry[back_index] = DamageCarry::Region(Vec::new());
         // Consume the one-shot force flag only now that the flip actually
         // succeeded — clearing it earlier would drop a forced cursor/recolor
         // present on a transient page-flip error (the `?`s above), with nothing
@@ -1132,75 +1132,36 @@ fn apply_color_signaling(
 /// alternating BOs, each is ~2 presents stale when we next render it; this
 /// records the region it's missing so the encode pass can repaint just that
 /// instead of the whole output every frame.
-#[derive(Clone, Copy)]
+/// Max damage rects a BO carries before collapsing to `Full`. The renderer
+/// already caps the number of separate encode passes (falling back to a bbox);
+/// this just keeps the carry from growing unbounded across skipped/failed flips.
+const DAMAGE_CARRY_CAP: usize = 16;
+
+#[derive(Clone)]
 enum DamageCarry {
     /// The BO needs a full-output encode: never rendered, or the output content
     /// changed everywhere since it last saw a frame.
     Full,
-    /// The BO is missing (at most) this bounding box of physical-pixel regions.
-    /// `None` ⇒ nothing missing (the BO is current). Stored as a single
-    /// bounding box because the encode pass collapses its scissor region to one
-    /// anyway; per-rect scissoring is a later refinement.
-    Region(Option<Rectangle<i32, Physical>>),
+    /// The BO is missing these physical-pixel regions (empty ⇒ current). Kept as
+    /// individual rects (not a bounding box) so a disjoint region like a border
+    /// ring survives buffer age and reaches the renderer's per-rect encode.
+    Region(Vec<Rectangle<i32, Physical>>),
 }
 
 impl DamageCarry {
-    /// Add `rect` to what this BO is missing. `Full` absorbs everything; a
-    /// `Region` grows to the bounding box enclosing its current contents and
-    /// `rect`.
-    fn extended(self, rect: Option<Rectangle<i32, Physical>>) -> Self {
+    /// Add `rects` to what this BO is missing. `Full` absorbs everything; a
+    /// `Region` appends, collapsing to `Full` past [`DAMAGE_CARRY_CAP`].
+    fn extended(self, rects: &[Rectangle<i32, Physical>]) -> Self {
         match self {
             DamageCarry::Full => DamageCarry::Full,
-            DamageCarry::Region(existing) => DamageCarry::Region(union_bbox(existing, rect)),
-        }
-    }
-}
-
-/// Bounding box of `rects`, clipped to `extent`. `None` if empty or entirely
-/// offscreen. Mirrors the renderer's `damage_bbox`, in `smithay` `Rectangle`s.
-fn rects_bbox(
-    rects: &[Rectangle<i32, Physical>],
-    extent: vk::Extent2D,
-) -> Option<Rectangle<i32, Physical>> {
-    let mut min_x = i32::MAX;
-    let mut min_y = i32::MAX;
-    let mut max_x = i32::MIN;
-    let mut max_y = i32::MIN;
-    for r in rects {
-        min_x = min_x.min(r.loc.x);
-        min_y = min_y.min(r.loc.y);
-        max_x = max_x.max(r.loc.x + r.size.w);
-        max_y = max_y.max(r.loc.y + r.size.h);
-    }
-    let x0 = min_x.max(0);
-    let y0 = min_y.max(0);
-    let x1 = max_x.min(extent.width as i32);
-    let y1 = max_y.min(extent.height as i32);
-    if x1 <= x0 || y1 <= y0 {
-        return None;
-    }
-    Some(Rectangle::new(
-        Point::from((x0, y0)),
-        Size::from((x1 - x0, y1 - y0)),
-    ))
-}
-
-/// Bounding box enclosing two optional rectangles.
-fn union_bbox(
-    a: Option<Rectangle<i32, Physical>>,
-    b: Option<Rectangle<i32, Physical>>,
-) -> Option<Rectangle<i32, Physical>> {
-    match (a, b) {
-        (None, x) | (x, None) => x,
-        (Some(a), Some(b)) => {
-            let x0 = a.loc.x.min(b.loc.x);
-            let y0 = a.loc.y.min(b.loc.y);
-            let x1 = (a.loc.x + a.size.w).max(b.loc.x + b.size.w);
-            let y1 = (a.loc.y + a.size.h).max(b.loc.y + b.size.h);
-            Some(Rectangle::new(
-                Point::from((x0, y0)),
-                Size::from((x1 - x0, y1 - y0)),
-            ))
+            DamageCarry::Region(mut v) => {
+                v.extend_from_slice(rects);
+                if v.len() > DAMAGE_CARRY_CAP {
+                    DamageCarry::Full
+                } else {
+                    DamageCarry::Region(v)
+                }
+            }
         }
     }
 }
@@ -1408,68 +1369,36 @@ pub fn derive_bt2020_decode_clamp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smithay::utils::Point;
 
     fn r(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Physical> {
         Rectangle::new(Point::from((x, y)), Size::from((w, h)))
-    }
-    fn ext(w: u32, h: u32) -> vk::Extent2D {
-        vk::Extent2D {
-            width: w,
-            height: h,
-        }
-    }
-
-    #[test]
-    fn rects_bbox_empty_is_none() {
-        assert!(rects_bbox(&[], ext(100, 100)).is_none());
-    }
-
-    #[test]
-    fn rects_bbox_encloses_and_clips() {
-        // Two disjoint rects → enclosing box; the right one overhangs the
-        // 100×100 output and is clipped to the edge.
-        let got = rects_bbox(&[r(10, 10, 5, 5), r(80, 80, 40, 40)], ext(100, 100));
-        assert_eq!(got, Some(r(10, 10, 90, 90)));
-    }
-
-    #[test]
-    fn rects_bbox_fully_offscreen_is_none() {
-        assert!(rects_bbox(&[r(200, 200, 10, 10)], ext(100, 100)).is_none());
-    }
-
-    #[test]
-    fn union_bbox_handles_none_and_encloses() {
-        assert_eq!(union_bbox(None, Some(r(1, 2, 3, 4))), Some(r(1, 2, 3, 4)));
-        assert_eq!(union_bbox(Some(r(1, 2, 3, 4)), None), Some(r(1, 2, 3, 4)));
-        assert_eq!(union_bbox(None, None), None);
-        // (0,0,10,10) ∪ (20,20,10,10) → (0,0,30,30).
-        assert_eq!(
-            union_bbox(Some(r(0, 0, 10, 10)), Some(r(20, 20, 10, 10))),
-            Some(r(0, 0, 30, 30))
-        );
     }
 
     #[test]
     fn damage_carry_extended() {
         // Full absorbs anything.
         assert!(matches!(
-            DamageCarry::Full.extended(Some(r(0, 0, 5, 5))),
+            DamageCarry::Full.extended(&[r(0, 0, 5, 5)]),
             DamageCarry::Full
         ));
-        // Empty region picks up the first rect.
+        // Empty region picks up the rects (kept individually, not merged).
         assert!(matches!(
-            DamageCarry::Region(None).extended(Some(r(1, 1, 2, 2))),
-            DamageCarry::Region(Some(g)) if g == r(1, 1, 2, 2)
+            DamageCarry::Region(Vec::new()).extended(&[r(1, 1, 2, 2), r(9, 9, 2, 2)]),
+            DamageCarry::Region(v) if v == vec![r(1, 1, 2, 2), r(9, 9, 2, 2)]
         ));
-        // Existing region grows to the enclosing box.
+        // Existing region appends.
         assert!(matches!(
-            DamageCarry::Region(Some(r(0, 0, 4, 4))).extended(Some(r(10, 10, 4, 4))),
-            DamageCarry::Region(Some(g)) if g == r(0, 0, 14, 14)
+            DamageCarry::Region(vec![r(0, 0, 4, 4)]).extended(&[r(10, 10, 4, 4)]),
+            DamageCarry::Region(v) if v == vec![r(0, 0, 4, 4), r(10, 10, 4, 4)]
         ));
-        // Extending by nothing is a no-op.
+        // Past the cap, collapse to Full.
+        let many: Vec<_> = (0..DAMAGE_CARRY_CAP as i32 + 1)
+            .map(|i| r(i, 0, 1, 1))
+            .collect();
         assert!(matches!(
-            DamageCarry::Region(Some(r(0, 0, 4, 4))).extended(None),
-            DamageCarry::Region(Some(g)) if g == r(0, 0, 4, 4)
+            DamageCarry::Region(Vec::new()).extended(&many),
+            DamageCarry::Full
         ));
     }
 
