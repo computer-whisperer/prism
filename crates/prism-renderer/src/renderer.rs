@@ -57,6 +57,17 @@ pub struct GpuFrameTiming {
     pub encode_us: f32,
 }
 
+/// Outcome of [`Renderer::render_frame`].
+pub struct RenderedFrame {
+    /// Present-completion sync as a Linux SYNC_FD — the caller hands this to
+    /// the DRM atomic commit as `IN_FENCE_FD`.
+    pub present_sync: OwnedFd,
+    /// Whether the encode pass covered the full output this frame (vs a
+    /// buffer-age sub-region). Lets the caller keep its per-BO damage carry
+    /// exact: a full encode makes every *other* scanout BO fully stale.
+    pub encoded_full: bool,
+}
+
 /// Timestamp-query GPU profiler. Brackets the decode and encode passes with
 /// `vkCmdWriteTimestamp2` into a per-slot query pool, reads the prior frame's
 /// result back once the slot's fence proves completion (no GPU stall), and
@@ -580,6 +591,14 @@ impl Renderer {
         // composite). Ignored on the first frame / after a realloc, where the
         // intermediate is uninitialized and must be painted in full.
         damage: &[Rectangle<i32, Physical>],
+        // Regions of *this scanout BO* to re-encode, in physical pixels. The BO
+        // is buffer-age stale (the caller renders into alternating BOs, so each
+        // is ~2 presents behind), so this is the caller's per-BO accumulated
+        // damage union — what this particular BO is missing. The encode pass
+        // scissors to its bounding box; the rest of the BO keeps its prior
+        // content. Empty ⇒ full-output encode (first use of the BO, or the
+        // caller forcing a full repaint). `force_full*` also force full.
+        encode_damage: &[Rectangle<i32, Physical>],
         encode_push: &EncodePush,
         // Binary semaphores the render must wait on before sampling — used
         // for cross-GPU mirror copies (a home GPU's copy into the shared
@@ -601,7 +620,7 @@ impl Renderer {
         // clear it on radv (partial fast-clear / DCC). A full-frame decode
         // clears reliably; the cost is bounded (close animations are brief).
         force_full_repaint: bool,
-    ) -> Result<OwnedFd> {
+    ) -> Result<RenderedFrame> {
         let extent = scanout.extent();
         // `force_full`: the intermediate was just (re)allocated, so its contents
         // are undefined and the whole frame must be painted regardless of damage.
@@ -617,6 +636,19 @@ impl Renderer {
             Some(full_area)
         } else {
             damage_bbox(damage, extent)
+        };
+        // Encode scissor region for this BO. The full-screen triangle writes
+        // every pixel of the render area, so a sub-area encode needs no LOAD:
+        // pixels outside it keep the BO's prior content, preserved by the
+        // GENERAL→COLOR_ATTACHMENT transition (vs. discard-from-UNDEFINED) in
+        // the mid-barrier below. Empty `encode_damage` (or anything offscreen),
+        // a realloc, or a forced repaint ⇒ full-output encode.
+        let encode_bbox = damage_bbox(encode_damage, extent);
+        let encode_full = force_full || force_full_repaint || encode_bbox.is_none();
+        let encode_area = if encode_full {
+            full_area
+        } else {
+            encode_bbox.unwrap()
         };
         let intermediate = self.intermediate.as_ref().unwrap();
 
@@ -1026,12 +1058,29 @@ impl Renderer {
         // needs the COLOR→SHADER_READ transition when we actually decoded into
         // it this frame; when the decode was skipped it is still in SHADER_READ
         // from the previous frame.
+        // Full encode discards the BO's prior contents (UNDEFINED→COLOR — every
+        // pixel is overwritten). Partial encode preserves the unrendered
+        // remainder (GENERAL→COLOR): the previous frame's final barrier left the
+        // BO in GENERAL, and only an UNDEFINED old-layout would discard it.
+        let (scan_old_layout, scan_src_stage, scan_src_access) = if encode_full {
+            (
+                vk::ImageLayout::UNDEFINED,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                vk::AccessFlags2::empty(),
+            )
+        } else {
+            (
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::MEMORY_READ,
+            )
+        };
         let mut mid_barriers = vec![barrier_image(
             scanout.image(),
-            vk::ImageLayout::UNDEFINED,
+            scan_old_layout,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::PipelineStageFlags2::TOP_OF_PIPE,
-            vk::AccessFlags2::empty(),
+            scan_src_stage,
+            scan_src_access,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         )];
@@ -1059,15 +1108,18 @@ impl Renderer {
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::DONT_CARE)
             .store_op(vk::AttachmentStoreOp::STORE)];
+        // Render area + scissor confine the encode to `encode_area`; the
+        // full-screen triangle covers it entirely, so every pixel in the area is
+        // written. Pixels outside it retain the BO's prior content (the area is
+        // the whole output on a full encode).
         let encode_render_info = vk::RenderingInfo::default()
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent,
-            })
+            .render_area(encode_area)
             .layer_count(1)
             .color_attachments(&encode_color_attach);
         unsafe {
             self.device.raw.cmd_begin_rendering(cb, &encode_render_info);
+            // Viewport spans the whole output (the triangle is in full-framebuffer
+            // clip space); the scissor confines written fragments to `encode_area`.
             let viewport = vk::Viewport {
                 x: 0.0,
                 y: 0.0,
@@ -1076,12 +1128,8 @@ impl Renderer {
                 min_depth: 0.0,
                 max_depth: 1.0,
             };
-            let scissor = vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent,
-            };
             self.device.raw.cmd_set_viewport(cb, 0, &[viewport]);
-            self.device.raw.cmd_set_scissor(cb, 0, &[scissor]);
+            self.device.raw.cmd_set_scissor(cb, 0, &[encode_area]);
             self.device.raw.cmd_bind_pipeline(
                 cb,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -1206,7 +1254,10 @@ impl Renderer {
         // Advance to the next slot. No GPU wait — the next call to
         // render_frame will wait on its slot's fence as needed.
         self.next_slot = (slot_idx + 1) % FRAMES_IN_FLIGHT;
-        Ok(present_sync_fd)
+        Ok(RenderedFrame {
+            present_sync: present_sync_fd,
+            encoded_full: encode_full,
+        })
     }
 }
 

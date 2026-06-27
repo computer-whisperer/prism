@@ -586,9 +586,18 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
     // dropped, and we device_wait_idle for completeness. (One-shot test
     // doesn't use the page-flip path the fd is meant for.)
     // Damage `&[]`: a freshly built Renderer forces a full first-frame paint
-    // regardless, so the empty damage list is moot here.
-    let _present_sync =
-        renderer.render_frame(&scanout, &[element], &[], &encode_push, &[], &[], false)?;
+    // regardless, so the empty damage list is moot here. Encode damage `&[]`
+    // likewise requests a full-output encode.
+    let _rendered = renderer.render_frame(
+        &scanout,
+        &[element],
+        &[],
+        &[],
+        &encode_push,
+        &[],
+        &[],
+        false,
+    )?;
     unsafe {
         let _ = device.raw.device_wait_idle();
     }
@@ -3619,9 +3628,11 @@ fn run_gradient_scanout(output_name: Option<&str>, depth: prism_drm::ScanoutDept
     // returned SYNC_FD is dropped (we don't use the IN_FENCE_FD path
     // here, the synchronous wait is simpler for a one-shot test).
     // Damage `&[]`: fresh Renderer → forced full first-frame paint anyway.
-    let _present_sync = renderer.render_frame(
+    // Encode damage `&[]` → full-output encode.
+    let _rendered = renderer.render_frame(
         &scanout_image,
         &[element],
+        &[],
         &[],
         &encode_push,
         &[],

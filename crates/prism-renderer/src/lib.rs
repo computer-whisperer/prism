@@ -47,7 +47,7 @@ pub use lut3d::{
 pub use oneshot::OneshotPool;
 pub use pipeline::decode::{DecodePipeline, DecodePush};
 pub use pipeline::encode::{EncodePipeline, EncodePush};
-pub use renderer::{ElementDraw, GpuFrameTiming, Renderer, SnapshotCopy};
+pub use renderer::{ElementDraw, GpuFrameTiming, RenderedFrame, Renderer, SnapshotCopy};
 pub use snapshot::SnapshotTexture;
 pub use upload::ShmTexture;
 

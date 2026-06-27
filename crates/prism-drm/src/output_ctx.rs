@@ -918,15 +918,19 @@ impl OutputContext {
         // below for the duration of the atomic commit; after the
         // commit ioctl returns, the kernel holds its own dup and
         // the `OwnedFd` is free to be returned to the caller.
-        let present_sync = self.renderer.render_frame(
+        let rendered = self.renderer.render_frame(
             &back.image,
             &frame.draws,
             &damage,
+            // Encode damage: empty ⇒ full-output encode. Buffer-age scissoring
+            // wires the per-BO accumulated region here in a follow-up.
+            &[],
             encode_push,
             wait_semaphores,
             snapshots,
             force_full_repaint,
         )?;
+        let present_sync = rendered.present_sync;
 
         // GPU profiling (PRISM_GPU_PROFILE): prism's own per-output compositing
         // cost, isolated from app load. Throttled to ≤1 Hz inside the renderer.
