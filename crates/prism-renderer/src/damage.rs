@@ -345,6 +345,30 @@ mod tests {
     }
 
     #[test]
+    fn rounded_corner_window_leaves_corners_damaged() {
+        // A full-screen opaque window with ROUNDED corners exposes its opaque
+        // region as the corner-free cross (what push_rounded_box_bands produces),
+        // so the wallpaper behind shows through at the corners and must keep
+        // repainting there even though the window covers everything else.
+        let mut t = DamageTracker::new();
+        let wallpaper = |tok| meta(1, 0., 0., 100., 100., tok);
+        let mut window = meta(2, 0., 0., 100., 100., 7);
+        let lr = |x, y, w, h| Rectangle::new(Point::from((x, y)), Size::from((w, h)));
+        // Cross excluding the four 10×10 corners: horizontal + vertical band.
+        window.opaque = vec![lr(0., 10., 100., 80.), lr(10., 0., 80., 100.)];
+        t.compute(&[wallpaper(0), window.clone()], scale1());
+        t.commit();
+        let d = t.compute(&[wallpaper(1), window], scale1());
+        let expected =
+            rect(0, 0, 100, 100).subtract_rects([rect(0, 10, 100, 80), rect(10, 0, 80, 100)]);
+        assert_eq!(d, expected);
+        // The corners are damaged; the covered center is not.
+        assert!(d.iter().any(|r| r.contains(Point::from((2, 2)))));
+        assert!(d.iter().any(|r| r.contains(Point::from((97, 97)))));
+        assert!(!d.iter().any(|r| r.contains(Point::from((50, 50)))));
+    }
+
+    #[test]
     fn opaque_to_physical_rounds_inward() {
         let s = scale1();
         let rf = |x, y, w, h| Rectangle::new(Point::from((x, y)), Size::from((w, h)));
