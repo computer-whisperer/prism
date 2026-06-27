@@ -928,6 +928,18 @@ impl OutputContext {
             force_full_repaint,
         )?;
 
+        // GPU profiling (PRISM_GPU_PROFILE): prism's own per-output compositing
+        // cost, isolated from app load. Throttled to ≤1 Hz inside the renderer.
+        if let Some(t) = self.renderer.take_gpu_profile_report() {
+            tracing::info!(
+                output = %self.connector_name,
+                decode_us = t.decode_us,
+                encode_us = t.encode_us,
+                total_us = t.decode_us + t.encode_us,
+                "gpu profile (1s ewma)"
+            );
+        }
+
         let src =
             Rectangle::from_size((self.extent.width as i32, self.extent.height as i32).into())
                 .to_f64();

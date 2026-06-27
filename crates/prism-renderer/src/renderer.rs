@@ -42,6 +42,97 @@ const DEFAULT_LUT_CUBE_EDGE: u32 = LUT_CUBE_EDGE;
 /// resources is the right size.
 pub const FRAMES_IN_FLIGHT: usize = 2;
 
+/// Timestamps written per frame by the GPU profiler: start, after decode,
+/// after encode. `decode = t1 - t0`, `encode = t2 - t1`.
+const PROFILE_TIMESTAMP_COUNT: u32 = 3;
+
+/// Per-frame GPU time for the two compositing passes, in microseconds.
+/// Produced by the timestamp-query profiler when the `PRISM_GPU_PROFILE`
+/// environment variable is set; `None` everywhere otherwise (no query pools
+/// are even allocated). This is prism's *own* per-output cost — what it adds
+/// on top of whatever the client rendered — isolated from app GPU load.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuFrameTiming {
+    pub decode_us: f32,
+    pub encode_us: f32,
+}
+
+/// Timestamp-query GPU profiler. Brackets the decode and encode passes with
+/// `vkCmdWriteTimestamp2` into a per-slot query pool, reads the prior frame's
+/// result back once the slot's fence proves completion (no GPU stall), and
+/// exposes a 1 Hz EWMA report. Fully disabled — zero commands, no pools —
+/// unless `PRISM_GPU_PROFILE` is set, so production paths pay nothing.
+struct GpuProfiler {
+    enabled: bool,
+    /// Nanoseconds per timestamp tick (`limits.timestampPeriod`).
+    period_ns: f32,
+    /// Valid-bit mask for timestamp values on the graphics queue family.
+    mask: u64,
+    /// Smoothed (decode_us, encode_us); `None` until the first sample.
+    ewma: Option<(f32, f32)>,
+    last_log: std::time::Instant,
+    /// Throttled report, set at most once per second; drained by the caller.
+    report: Option<GpuFrameTiming>,
+}
+
+impl GpuProfiler {
+    fn new(device: &Device) -> Self {
+        let want = std::env::var_os("PRISM_GPU_PROFILE").is_some();
+        let period_ns = device.physical.properties.limits.timestamp_period;
+        // Timestamp validity is per queue family.
+        let valid_bits = unsafe {
+            device
+                .instance_raw()
+                .get_physical_device_queue_family_properties(device.physical.raw)
+        }
+        .get(device.physical.graphics_queue_family as usize)
+        .map(|q| q.timestamp_valid_bits)
+        .unwrap_or(0);
+        let enabled = want && period_ns > 0.0 && valid_bits > 0;
+        if want && !enabled {
+            tracing::warn!(
+                "PRISM_GPU_PROFILE set but the graphics queue lacks timestamp support; \
+                 GPU profiling disabled"
+            );
+        }
+        let mask = if valid_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << valid_bits) - 1
+        };
+        GpuProfiler {
+            enabled,
+            period_ns,
+            mask,
+            ewma: None,
+            last_log: std::time::Instant::now(),
+            report: None,
+        }
+    }
+
+    /// Fold one frame's three timestamps into the EWMA and, at most once per
+    /// second, stage a report for the caller to log.
+    fn ingest(&mut self, ts: [u64; PROFILE_TIMESTAMP_COUNT as usize]) {
+        let dec = (ts[1] & self.mask).wrapping_sub(ts[0] & self.mask);
+        let enc = (ts[2] & self.mask).wrapping_sub(ts[1] & self.mask);
+        let to_us = |ticks: u64| (ticks as f32 * self.period_ns) / 1000.0;
+        let (d, e) = (to_us(dec), to_us(enc));
+        const ALPHA: f32 = 0.1;
+        let (ed, ee) = match self.ewma {
+            Some((pd, pe)) => (pd + ALPHA * (d - pd), pe + ALPHA * (e - pe)),
+            None => (d, e),
+        };
+        self.ewma = Some((ed, ee));
+        if self.last_log.elapsed() >= std::time::Duration::from_secs(1) {
+            self.report = Some(GpuFrameTiming {
+                decode_us: ed,
+                encode_us: ee,
+            });
+            self.last_log = std::time::Instant::now();
+        }
+    }
+}
+
 /// One element to draw in the decode pass.
 pub struct ElementDraw {
     /// Sampled texture (must be in SHADER_READ_ONLY_OPTIMAL layout). For YUV
@@ -88,6 +179,10 @@ struct FrameSlot {
     /// serial is reported to [`Device::note_completed`], driving the
     /// deferred-destroy queue. 0 = never submitted (note_completed no-op).
     submit_serial: u64,
+    /// Timestamp query pool ([`PROFILE_TIMESTAMP_COUNT`] queries) for this
+    /// slot, or `None` when GPU profiling is off. Each slot owns its own pool
+    /// so reset/write/read never races another in-flight frame.
+    timing_pool: Option<vk::QueryPool>,
 }
 
 pub struct Renderer {
@@ -121,6 +216,8 @@ pub struct Renderer {
     slots: [FrameSlot; FRAMES_IN_FLIGHT],
     /// Index into `slots` for the *next* frame.
     next_slot: usize,
+    /// GPU timestamp profiler (no-op unless `PRISM_GPU_PROFILE` is set).
+    profiler: GpuProfiler,
     /// Loader for VK_KHR_external_semaphore_fd — exports the per-slot
     /// `present_semaphore` as a Linux sync_file fd for KMS.
     semaphore_fd_loader: external_semaphore_fd::Device,
@@ -160,17 +257,30 @@ impl Renderer {
         let mut export_info = vk::ExportSemaphoreCreateInfo::default()
             .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
         let sem_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+        let profiler = GpuProfiler::new(&device);
         let mut slots = Vec::with_capacity(FRAMES_IN_FLIGHT);
         for cb in cbs {
             let fence = unsafe { device.raw.create_fence(&fence_info, None) }
                 .vk_ctx("create_fence (renderer slot)")?;
             let present_semaphore = unsafe { device.raw.create_semaphore(&sem_info, None) }
                 .vk_ctx("create_semaphore (renderer slot, exportable SYNC_FD)")?;
+            let timing_pool = if profiler.enabled {
+                let info = vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(PROFILE_TIMESTAMP_COUNT);
+                Some(
+                    unsafe { device.raw.create_query_pool(&info, None) }
+                        .vk_ctx("create_query_pool (gpu profile)")?,
+                )
+            } else {
+                None
+            };
             slots.push(FrameSlot {
                 cmd_buffer: cb,
                 fence,
                 present_semaphore,
                 submit_serial: 0,
+                timing_pool,
             });
         }
         let slots: [FrameSlot; FRAMES_IN_FLIGHT] = slots
@@ -230,6 +340,7 @@ impl Renderer {
             command_pool,
             slots,
             next_slot: 0,
+            profiler,
             semaphore_fd_loader,
         })
     }
@@ -404,6 +515,13 @@ impl Renderer {
         self.intermediate_format
     }
 
+    /// Take the throttled (≤1 Hz) GPU-timing report, if one is pending. Always
+    /// `None` unless `PRISM_GPU_PROFILE` is set. The caller logs it with the
+    /// output's identity — this is prism's own per-output decode/encode cost.
+    pub fn take_gpu_profile_report(&mut self) -> Option<GpuFrameTiming> {
+        self.profiler.report.take()
+    }
+
     /// The renderer's device handle — lets the integrator allocate
     /// `SnapshotTexture`s for the close animation without holding the renderer.
     pub fn device(&self) -> Arc<Device> {
@@ -528,6 +646,24 @@ impl Renderer {
         // textures, wait semaphores, … that no in-flight frame references).
         self.device.note_completed(slot_prev_serial);
 
+        // The fence above proves this slot's prior frame (incl. its timestamp
+        // writes) finished, so the query results are available without a GPU
+        // stall. Read them back before we reset the pool for this frame.
+        if let (Some(pool), true) = (self.slots[slot_idx].timing_pool, slot_prev_serial != 0) {
+            let mut ts = [0u64; PROFILE_TIMESTAMP_COUNT as usize];
+            let got = unsafe {
+                self.device.raw.get_query_pool_results(
+                    pool,
+                    0,
+                    &mut ts,
+                    vk::QueryResultFlags::TYPE_64,
+                )
+            };
+            if got.is_ok() {
+                self.profiler.ingest(ts);
+            }
+        }
+
         let cb = slot_cb;
         unsafe {
             self.device
@@ -540,6 +676,19 @@ impl Renderer {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { self.device.raw.begin_command_buffer(cb, &begin_info) }
             .vk_ctx("begin_command_buffer (renderer)")?;
+
+        // GPU profiling: reset this slot's timestamp pool up front (must be
+        // outside any render pass). `t0` is written just before the decode
+        // pass below, `t1` after it, `t2` after encode — so snapshot copies
+        // are excluded and we measure the two compositing passes proper.
+        let timing_pool = self.slots[slot_idx].timing_pool;
+        if let Some(pool) = timing_pool {
+            unsafe {
+                self.device
+                    .raw
+                    .cmd_reset_query_pool(cb, pool, 0, PROFILE_TIMESTAMP_COUNT);
+            }
+        }
 
         // ── Snapshot capture (window close) ─────────────────────────────────
         // Copy each requested region out of the intermediate *before* the decode
@@ -720,6 +869,18 @@ impl Renderer {
             }
         }
 
+        // GPU profile t0: start of the decode pass.
+        if let Some(pool) = timing_pool {
+            unsafe {
+                self.device.raw.cmd_write_timestamp2(
+                    cb,
+                    vk::PipelineStageFlags2::TOP_OF_PIPE,
+                    pool,
+                    0,
+                );
+            }
+        }
+
         // ── Decode pass (scissored to damage) ───────────────────────────────
         // Repaint only `decode_area` of the persistent intermediate, preserving
         // the rest (last frame's composite is still valid outside the damage).
@@ -848,6 +1009,18 @@ impl Renderer {
             }
         }
 
+        // GPU profile t1: decode done (or skipped → t1 ≈ t0).
+        if let Some(pool) = timing_pool {
+            unsafe {
+                self.device.raw.cmd_write_timestamp2(
+                    cb,
+                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                    pool,
+                    1,
+                );
+            }
+        }
+
         // ── Barrier: scanout → COLOR_ATTACHMENT; intermediate → SHADER_READ ──
         // The scanout always becomes the encode target. The intermediate only
         // needs the COLOR→SHADER_READ transition when we actually decoded into
@@ -951,6 +1124,18 @@ impl Renderer {
             self.device.raw.cmd_end_rendering(cb);
         }
 
+        // GPU profile t2: encode done. decode = t1-t0, encode = t2-t1.
+        if let Some(pool) = timing_pool {
+            unsafe {
+                self.device.raw.cmd_write_timestamp2(
+                    cb,
+                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                    pool,
+                    2,
+                );
+            }
+        }
+
         // ── Final: scanout → GENERAL for KMS handoff ──────────────────────
         let final_barrier = [barrier_image(
             scanout.image(),
@@ -1035,6 +1220,9 @@ impl Drop for Renderer {
                 self.device
                     .raw
                     .destroy_semaphore(slot.present_semaphore, None);
+                if let Some(pool) = slot.timing_pool {
+                    self.device.raw.destroy_query_pool(pool, None);
+                }
             }
             self.device
                 .raw
