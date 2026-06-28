@@ -4,7 +4,8 @@
 //! displays want different effects in different orders:
 //!   - Standard SDR: `[Lut3d, OutputTransferSrgb]`
 //!   - HDR PQ:       `[Lut3d, OutputTransferPq]`
-//!   - QD-OLED text: `[Lut3d, OutputTransferSrgb, SubpixelFir3Horizontal]`
+//!   - QD-OLED text: `[SubpixelFir3Vertical, Lut3d, OutputTransferSrgb]`
+//!     (the FIR is a multi-tap input stage, so it leads the chain)
 //!   - 8-bit panel:  `[..., InterleavedGradientNoiseDither]`
 //!
 //! The LUT output domain is chain-dependent and absolute in both modes:
@@ -36,7 +37,11 @@ pub struct EncodeConfig {
 /// One step in the encode chain. Each variant maps to a `fragment::emit_*`
 /// function that produces a block of SPIR-V instructions threading a vec3
 /// color through.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Not `Eq`: [`SubpixelFir3Vertical`](Self::SubpixelFir3Vertical) carries
+/// `f32` kernel weights, so only `PartialEq` is available. Nothing in the
+/// codebase needs `Eq` on this enum (it is only ever `match`ed).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EncodeFragment {
     /// `out = mat3(push.cal_matrix) * in`. Identity by default.
     CalibrationMatrix,
@@ -65,12 +70,25 @@ pub enum EncodeFragment {
     /// terminal fragment: linear nits for PQ/linear chains, linear drive
     /// `[0, 1]` for sRGB chains.
     Lut3d,
-    /// Per-channel 3-tap horizontal FIR filter for non-stripe subpixel
-    /// layouts (QD-OLED triangular). Requires multi-sample handling that
-    /// the synthesizer doesn't implement yet — emitting this currently
-    /// returns `MissingFeature`. See progress doc for the multi-sample
-    /// fan-out plan.
-    SubpixelFir3Horizontal,
+    /// Per-channel 3-tap **vertical** FIR filter for non-stripe subpixel
+    /// layouts (QD-OLED triangular triads), correcting the top/bottom color
+    /// fringe text shows on such panels (blue fringe on top, red on bottom).
+    ///
+    /// Implemented as a multi-tap *input* stage: it samples the intermediate
+    /// at the two vertical neighbours (`ConstOffset (0, ∓1)`) in addition to
+    /// the center tap the chain already loaded, then forms a per-channel
+    /// weighted sum. The combine happens in the linear BT.2020 intermediate
+    /// domain, *before* the LUT — so it must precede [`Lut3d`](Self::Lut3d)
+    /// in the chain (the synthesizer debug-asserts this). Weights are baked
+    /// into the SPIR-V as constants (a static per-output panel property), so
+    /// there is no runtime push/UBO cost and outputs without the fragment
+    /// keep their single-tap sample. Kernels are `[top, center, bottom]` and
+    /// should sum to 1 per channel to preserve luminance.
+    SubpixelFir3Vertical {
+        kernel_r: [f32; 3],
+        kernel_g: [f32; 3],
+        kernel_b: [f32; 3],
+    },
     /// Per-pixel ordered dither via interleaved-gradient noise. Hides
     /// 8-bit quantization banding without needing a noise texture.
     /// Not implemented in the first synth cut.
@@ -106,6 +124,27 @@ impl EncodeConfig {
         Self {
             fragments: vec![EncodeFragment::Lut3d, EncodeFragment::OutputTransferLinear],
         }
+    }
+
+    /// Prepend a vertical subpixel-FIR stage to the chain. The FIR combines
+    /// in the linear intermediate domain, so it goes at the very front —
+    /// ahead of the LUT and the output transfer. No-op-safe: identity kernels
+    /// (`[0, 1, 0]` per channel) reproduce the single-tap result exactly.
+    pub fn with_subpixel_fir_vertical(
+        mut self,
+        kernel_r: [f32; 3],
+        kernel_g: [f32; 3],
+        kernel_b: [f32; 3],
+    ) -> Self {
+        self.fragments.insert(
+            0,
+            EncodeFragment::SubpixelFir3Vertical {
+                kernel_r,
+                kernel_g,
+                kernel_b,
+            },
+        );
+        self
     }
 
     /// True if any fragment in this chain references the per-output 3D LUT
@@ -153,6 +192,27 @@ pub enum LutOutputDomain {
 ///
 /// Returns the SPIR-V words (u32 sequence) suitable for `vkCreateShaderModule`.
 pub fn synthesize_fragment_shader(config: &EncodeConfig) -> Result<Vec<u32>> {
+    // The subpixel FIR combines in the linear intermediate domain, so it must
+    // run before the LUT (and before any output transfer). The config builders
+    // place it at the front; assert the invariant holds for hand-built chains.
+    debug_assert!(
+        {
+            let fir = config
+                .fragments
+                .iter()
+                .position(|f| matches!(f, EncodeFragment::SubpixelFir3Vertical { .. }));
+            let lut = config
+                .fragments
+                .iter()
+                .position(|f| matches!(f, EncodeFragment::Lut3d));
+            match (fir, lut) {
+                (Some(fir), Some(lut)) => fir < lut,
+                _ => true,
+            }
+        },
+        "SubpixelFir3Vertical must precede Lut3d in the encode chain"
+    );
+
     let mut ctx = builder::ShaderCtx::new(config);
     // Every encode chain starts by sampling the intermediate texture.
     let mut color = fragment::emit_sample_intermediate(&mut ctx);
@@ -171,11 +231,13 @@ pub fn synthesize_fragment_shader(config: &EncodeConfig) -> Result<Vec<u32>> {
                 fragment::emit_per_channel_response_gain_gamma(&mut ctx, color)
             }
             EncodeFragment::Lut3d => fragment::emit_lut3d(&mut ctx, color),
-            EncodeFragment::SubpixelFir3Horizontal => {
-                return Err(RendererError::MissingFeature(
-                    "SubpixelFir3Horizontal: multi-sample synthesis not implemented yet",
-                ));
-            }
+            EncodeFragment::SubpixelFir3Vertical {
+                kernel_r,
+                kernel_g,
+                kernel_b,
+            } => fragment::emit_subpixel_fir_vertical(
+                &mut ctx, color, *kernel_r, *kernel_g, *kernel_b,
+            ),
             EncodeFragment::InterleavedGradientNoiseDither => {
                 return Err(RendererError::MissingFeature(
                     "InterleavedGradientNoiseDither: not implemented in first synthesis cut",
@@ -227,6 +289,40 @@ mod tests {
         let spv = synthesize_fragment_shader(&EncodeConfig::default_srgb()).expect("synthesize");
         assert!(!spv.is_empty(), "empty SPIR-V");
         assert_eq!(spv[0], 0x07230203, "missing SPIR-V magic");
+    }
+
+    /// A vertical subpixel-FIR chain synthesizes a well-formed module —
+    /// exercises the multi-tap `ConstOffset` sample path + the per-channel
+    /// weighted combine in `emit_subpixel_fir_vertical`.
+    #[test]
+    fn subpixel_fir_chain_synthesizes() {
+        let config = EncodeConfig::default_srgb().with_subpixel_fir_vertical(
+            [0.25, 0.75, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.75, 0.25],
+        );
+        // The builder prepends FIR, ahead of the LUT.
+        assert!(matches!(
+            config.fragments[0],
+            EncodeFragment::SubpixelFir3Vertical { .. }
+        ));
+        let spv = synthesize_fragment_shader(&config).expect("synthesize");
+        assert!(!spv.is_empty(), "empty SPIR-V");
+        assert_eq!(spv[0], 0x07230203, "missing SPIR-V magic");
+    }
+
+    /// Identity kernels (`[0,1,0]` per channel) are a legal pass-through —
+    /// the chain still synthesizes (output should match the no-FIR chain, but
+    /// here we only assert well-formedness; numeric equivalence is a HW check).
+    #[test]
+    fn subpixel_fir_identity_synthesizes() {
+        let config = EncodeConfig::default_pq().with_subpixel_fir_vertical(
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        );
+        let spv = synthesize_fragment_shader(&config).expect("synthesize");
+        assert_eq!(spv[0], 0x07230203);
     }
 
     /// Synthetic chain that omits Lut3d still synthesizes — exercises the

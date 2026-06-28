@@ -127,6 +127,10 @@ pub struct TuneConfig {
     /// Sub-LSB debanding of 8-bit SDR content. See [`Deband`].
     #[knuffel(child)]
     pub deband: Option<Deband>,
+    /// Per-channel vertical subpixel FIR for QD-OLED triads. See
+    /// [`SubpixelFir`].
+    #[knuffel(child)]
+    pub subpixel_fir: Option<SubpixelFir>,
 }
 
 /// Quantization-constrained debanding of 8-bit SDR content. Before the
@@ -161,6 +165,102 @@ impl Default for Deband {
             strength: 1.0,
             downsample: 1,
         }
+    }
+}
+
+/// Per-channel **vertical** 3-tap FIR for non-stripe subpixel layouts
+/// (QD-OLED triangular triads). Text on such panels shows a vertical color
+/// fringe — typically blue along the top edge and red along the bottom —
+/// because anti-aliasing assumes vertical RGB stripes while the physical
+/// subpixels sit in little triads. A small per-channel vertical filter
+/// redistributes each channel's energy to line its centroid back up.
+///
+/// Each channel is `[top, center, bottom]` weights, applied at the pixel
+/// directly above, the pixel itself, and the pixel directly below. The
+/// filter runs in the encode pass, in the linear working space before the
+/// LUT, and the weights are baked into the synthesized shader (a static
+/// per-output property — changing them re-synthesizes on config reload).
+///
+/// Weights **should sum to 1 per channel** to preserve luminance; the
+/// consumer warns and normalizes otherwise. An omitted channel defaults to
+/// identity `[0, 1, 0]` (pass-through). The whole block absent ⇒ feature off
+/// (single-tap sampling, no cost).
+///
+/// The exact weights are panel-specific and tuned by eye. A starting point
+/// that counters blue-top / red-bottom fringe pulls red up and blue down:
+/// ```kdl
+/// subpixel-fir {
+///     red    0.25 0.75 0.0
+///     green  0.0  1.0  0.0
+///     blue   0.0  0.75 0.25
+/// }
+/// ```
+#[derive(knuffel::Decode, Debug, Clone, PartialEq, Default)]
+pub struct SubpixelFir {
+    #[knuffel(child)]
+    pub red: Option<FirChannel>,
+    #[knuffel(child)]
+    pub green: Option<FirChannel>,
+    #[knuffel(child)]
+    pub blue: Option<FirChannel>,
+}
+
+/// One channel's vertical FIR weights: `[top, center, bottom]`. Exactly three
+/// arguments are expected; the consumer validates the count.
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+pub struct FirChannel {
+    #[knuffel(arguments)]
+    pub weights: Vec<f64>,
+}
+
+/// Resolved per-channel vertical FIR kernels: `(red, green, blue)`, each a
+/// `[top, center, bottom]` weight triple normalized to sum 1.
+pub type FirKernels = ([f32; 3], [f32; 3], [f32; 3]);
+
+impl SubpixelFir {
+    /// Resolve to per-channel `[top, center, bottom]` f32 kernels, defaulting
+    /// absent channels to identity. Each channel is validated to have exactly
+    /// three weights and is normalized to sum 1 (with a warning) so luminance
+    /// is preserved. Returns `Err` only if a channel is malformed (wrong
+    /// argument count), in which case the caller should skip the filter.
+    pub fn resolve_kernels(&self) -> Result<FirKernels, String> {
+        fn channel(name: &str, c: &Option<FirChannel>) -> Result<[f32; 3], String> {
+            let Some(c) = c else {
+                return Ok([0.0, 1.0, 0.0]);
+            };
+            if c.weights.len() != 3 {
+                return Err(format!(
+                    "subpixel-fir {name}: expected 3 weights [top center bottom], got {}",
+                    c.weights.len()
+                ));
+            }
+            let mut k = [
+                c.weights[0] as f32,
+                c.weights[1] as f32,
+                c.weights[2] as f32,
+            ];
+            let sum = k[0] + k[1] + k[2];
+            if sum.abs() < 1e-6 {
+                return Err(format!(
+                    "subpixel-fir {name}: weights sum to ~0, cannot normalize"
+                ));
+            }
+            if (sum - 1.0).abs() > 1e-3 {
+                tracing::warn!(
+                    "subpixel-fir {name}: weights sum to {sum:.4}, normalizing to 1 \
+                     (luminance preservation)"
+                );
+                for w in &mut k {
+                    *w /= sum;
+                }
+            }
+            Ok(k)
+        }
+        Ok((
+            channel("red", &self.red)?,
+            channel("green", &self.green)?,
+            channel("blue", &self.blue)?,
+        ))
     }
 }
 
@@ -927,6 +1027,80 @@ output "DP-4" {
 
         // no tune block ⇒ None.
         assert!(parse(r#"output "DP-4""#).is_none());
+    }
+
+    #[test]
+    fn parse_tune_subpixel_fir_block() {
+        fn parse(text: &str) -> Option<TuneConfig> {
+            let outputs: Vec<Output> = knuffel::parse("test.kdl", text).unwrap();
+            outputs[0].tune.clone()
+        }
+
+        let tune = parse(
+            r#"
+output "DP-4" {
+    tune {
+        subpixel-fir {
+            red    0.25 0.75 0.0
+            green  0.0  1.0  0.0
+            blue   0.0  0.75 0.25
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let fir = tune.subpixel_fir.expect("fir present");
+        assert_eq!(
+            fir.red.as_ref().map(|c| c.weights.clone()),
+            Some(vec![0.25, 0.75, 0.0])
+        );
+        // Resolves to f32 kernels; sums are 1.0 so no normalization.
+        let (kr, kg, kb) = fir.resolve_kernels().unwrap();
+        assert_eq!(kr, [0.25, 0.75, 0.0]);
+        assert_eq!(kg, [0.0, 1.0, 0.0]);
+        assert_eq!(kb, [0.0, 0.75, 0.25]);
+
+        // Omitted channel ⇒ identity [0,1,0].
+        let tune = parse(
+            r#"
+output "DP-4" {
+    tune {
+        subpixel-fir {
+            red 0.2 0.8 0.0
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let (kr, kg, kb) = tune.subpixel_fir.unwrap().resolve_kernels().unwrap();
+        assert_eq!(kr, [0.2, 0.8, 0.0]);
+        assert_eq!(kg, [0.0, 1.0, 0.0]);
+        assert_eq!(kb, [0.0, 1.0, 0.0]);
+
+        // Off-sum weights normalize to sum 1.
+        let fir = SubpixelFir {
+            red: Some(FirChannel {
+                weights: vec![1.0, 2.0, 1.0],
+            }),
+            green: None,
+            blue: None,
+        };
+        let (kr, _, _) = fir.resolve_kernels().unwrap();
+        let sum: f32 = kr.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "normalized sum {sum}");
+        assert_eq!(kr, [0.25, 0.5, 0.25]);
+
+        // Wrong argument count ⇒ error (caller skips the filter).
+        let fir = SubpixelFir {
+            red: Some(FirChannel {
+                weights: vec![0.5, 0.5],
+            }),
+            green: None,
+            blue: None,
+        };
+        assert!(fir.resolve_kernels().is_err());
     }
 
     #[test]

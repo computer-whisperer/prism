@@ -1346,6 +1346,31 @@ fn run_integrated(
                         "per-output response correction set from KDL"
                     );
                 }
+                // Per-output vertical subpixel FIR (QD-OLED triad fringe
+                // correction). Prepended to whichever base encode chain was
+                // chosen above so it runs in the linear intermediate domain,
+                // ahead of the LUT. Static per-output — baked into the
+                // synthesized shader, no per-frame cost.
+                if let Some(fir) = cfg.tune.as_ref().and_then(|t| t.subpixel_fir.as_ref()) {
+                    match fir.resolve_kernels() {
+                        Ok((kr, kg, kb)) => {
+                            output_config.encode_config = output_config
+                                .encode_config
+                                .clone()
+                                .with_subpixel_fir_vertical(kr, kg, kb);
+                            tracing::info!(
+                                connector = %name,
+                                red = ?kr,
+                                green = ?kg,
+                                blue = ?kb,
+                                "per-output vertical subpixel FIR enabled"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(connector = %name, "{e}; subpixel-fir ignored");
+                        }
+                    }
+                }
                 // Vrr always-on → wire through; on-demand currently
                 // treated as off (needs content_type signaling).
                 output_config.vrr = cfg.is_vrr_always_on();

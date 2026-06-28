@@ -22,6 +22,8 @@ pub struct TypeIds {
     pub vec2: spirv::Word,
     pub vec3: spirv::Word,
     pub vec4: spirv::Word,
+    /// `ivec2` — used for `ConstOffset` texel offsets (subpixel FIR taps).
+    pub ivec2: spirv::Word,
     pub mat4: spirv::Word,
     /// `OpTypeImage %f32 2D 0 0 0 1 Unknown`.
     pub image: spirv::Word,
@@ -115,6 +117,7 @@ impl ShaderCtx {
         let vec2 = b.type_vector(f32_t, 2);
         let vec3 = b.type_vector(f32_t, 3);
         let vec4 = b.type_vector(f32_t, 4);
+        let ivec2 = b.type_vector(i32_t, 2);
         let mat4 = b.type_matrix(vec4, 4);
         // Sampled 2D color image — depth=0, arrayed=0, MS=0, sampled=1.
         let image = b.type_image(
@@ -152,6 +155,7 @@ impl ShaderCtx {
             vec2,
             vec3,
             vec4,
+            ivec2,
             mat4,
             image,
             sampled_image,

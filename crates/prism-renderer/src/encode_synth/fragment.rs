@@ -61,6 +61,131 @@ pub fn emit_sample_intermediate(ctx: &mut ShaderCtx) -> spirv::Word {
         .expect("composite_construct rgb")
 }
 
+/// Sample `u_intermediate` at `v_uv` with a compile-time `ConstOffset` texel
+/// offset and return the `.rgb`. The offset is an `ivec2` constant; integer
+/// texel offsets land exactly on neighbouring texel centers (the intermediate
+/// is 1:1 with output pixels), and CLAMP_TO_EDGE addressing makes off-screen
+/// taps read the edge texel.
+fn sample_rgb_at_offset(
+    ctx: &mut ShaderCtx,
+    sampler: spirv::Word,
+    uv: spirv::Word,
+    offset: spirv::Word,
+) -> spirv::Word {
+    let vec4_t = ctx.types.vec4;
+    let f32_t = ctx.types.f32_t;
+    let vec3_t = ctx.types.vec3;
+
+    let sampled = ctx
+        .b
+        .image_sample_implicit_lod(
+            vec4_t,
+            None,
+            sampler,
+            uv,
+            Some(spirv::ImageOperands::CONST_OFFSET),
+            [rspirv::dr::Operand::IdRef(offset)],
+        )
+        .expect("fir offset sample");
+    let r = ctx
+        .b
+        .composite_extract(f32_t, None, sampled, [0])
+        .expect("extract r");
+    let g = ctx
+        .b
+        .composite_extract(f32_t, None, sampled, [1])
+        .expect("extract g");
+    let b = ctx
+        .b
+        .composite_extract(f32_t, None, sampled, [2])
+        .expect("extract b");
+    ctx.b
+        .composite_construct(vec3_t, None, [r, g, b])
+        .expect("composite_construct rgb")
+}
+
+/// Build a `vec3` constant from three f32 weights (one tap's per-channel
+/// weight: `[w_r, w_g, w_b]`).
+fn const_vec3(ctx: &mut ShaderCtx, x: f32, y: f32, z: f32) -> spirv::Word {
+    let vec3_t = ctx.types.vec3;
+    let cx = ctx.const_f32(x);
+    let cy = ctx.const_f32(y);
+    let cz = ctx.const_f32(z);
+    ctx.b
+        .composite_construct(vec3_t, None, [cx, cy, cz])
+        .expect("composite_construct weight vec3")
+}
+
+/// Vertical 3-tap per-channel subpixel FIR. `center_rgb` is the already-loaded
+/// center tap from [`emit_sample_intermediate`]; this samples the two vertical
+/// neighbours (`ConstOffset (0, ∓1)`) and forms the component-wise weighted sum
+/// `top·tap₋ + center·tapₒ + bottom·tap₊`. Kernels are `[top, center, bottom]`
+/// per channel and are baked into the SPIR-V as constants — a static per-output
+/// panel property, so there is no runtime push/UBO cost.
+///
+/// The combine is in the linear BT.2020 intermediate domain (luminance-
+/// preserving), upstream of the LUT. It corrects the vertical color fringe
+/// (blue-on-top / red-on-bottom) that QD-OLED subpixel triads give text.
+pub fn emit_subpixel_fir_vertical(
+    ctx: &mut ShaderCtx,
+    center_rgb: spirv::Word,
+    kernel_r: [f32; 3],
+    kernel_g: [f32; 3],
+    kernel_b: [f32; 3],
+) -> spirv::Word {
+    let vec2_t = ctx.types.vec2;
+    let vec3_t = ctx.types.vec3;
+    let ivec2_t = ctx.types.ivec2;
+    let i32_t = ctx.types.i32_t;
+    let sampled_image_t = ctx.types.sampled_image;
+    let v_uv_ptr = ctx.iface.v_uv_ptr;
+    let u_intermediate_ptr = ctx.iface.u_intermediate_ptr;
+
+    let uv = ctx
+        .b
+        .load(vec2_t, None, v_uv_ptr, None, [])
+        .expect("load v_uv");
+    let sampler = ctx
+        .b
+        .load(sampled_image_t, None, u_intermediate_ptr, None, [])
+        .expect("load sampled image");
+
+    // ConstOffset taps: (0, -1) above, (0, +1) below.
+    let zero_i = ctx.b.constant_bit32(i32_t, 0);
+    let neg1_i = ctx.b.constant_bit32(i32_t, (-1i32) as u32);
+    let pos1_i = ctx.b.constant_bit32(i32_t, 1i32 as u32);
+    let off_top = ctx.b.constant_composite(ivec2_t, [zero_i, neg1_i]);
+    let off_bottom = ctx.b.constant_composite(ivec2_t, [zero_i, pos1_i]);
+
+    let top_rgb = sample_rgb_at_offset(ctx, sampler, uv, off_top);
+    let bottom_rgb = sample_rgb_at_offset(ctx, sampler, uv, off_bottom);
+
+    // Per-tap weight vectors: gather the same tap index across channels.
+    let w_top = const_vec3(ctx, kernel_r[0], kernel_g[0], kernel_b[0]);
+    let w_center = const_vec3(ctx, kernel_r[1], kernel_g[1], kernel_b[1]);
+    let w_bottom = const_vec3(ctx, kernel_r[2], kernel_g[2], kernel_b[2]);
+
+    let t_top = ctx
+        .b
+        .f_mul(vec3_t, None, top_rgb, w_top)
+        .expect("top * w_top");
+    let t_center = ctx
+        .b
+        .f_mul(vec3_t, None, center_rgb, w_center)
+        .expect("center * w_center");
+    let t_bottom = ctx
+        .b
+        .f_mul(vec3_t, None, bottom_rgb, w_bottom)
+        .expect("bottom * w_bottom");
+    let sum_tc = ctx
+        .b
+        .f_add(vec3_t, None, t_top, t_center)
+        .expect("top + center");
+    ctx.b
+        .f_add(vec3_t, None, sum_tc, t_bottom)
+        .expect("+ bottom")
+}
+
 /// Apply the 3×3 portion of `push.cal_matrix` to `in_rgb`.
 ///
 /// Storage is mat4; we extend the input to vec4(in.xyz, 0), multiply by

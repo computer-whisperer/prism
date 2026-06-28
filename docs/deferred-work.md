@@ -76,16 +76,24 @@ HDR mode — the encode pass has to run anyway on calibrated outputs.
 
 ### Subpixel FIR + dither encode fragments
 
-`SubpixelFir3Horizontal` (per-channel 3-tap horizontal FIR for non-stripe subpixel
-layouts, e.g. QD-OLED triangular) and `InterleavedGradientNoiseDither` (hide 8-bit
-banding without a noise texture) are in the `EncodeFragment` enum but emitting
-either returns `MissingFeature`. The FIR needs multi-sample synthesis: detect FIR
-in the chain, sample the intermediate at 3 positions, run the pre-FIR pipeline on
-each, weight-sum (kernel weights are already in the `fir_kernel_r/g/b` push slots),
-then run the post-FIR pipeline — loop-unrolled at synthesis time. Dither is
-simpler: `(interleaved_gradient_noise(gl_FragCoord.xy) - 0.5) * dither_strength /
-255.0` added before write. **Trigger:** when we drive the QD-OLED (FIR) or an 8-bit
-panel shows visible banding (dither).
+`SubpixelFir3Vertical` (per-channel 3-tap **vertical** FIR for non-stripe subpixel
+layouts, e.g. QD-OLED triads — corrects the blue-on-top / red-on-bottom text fringe)
+is **implemented**. It runs as a multi-tap *input* stage: the chain already samples
+the center tap, the FIR fragment samples the two vertical neighbours via `ConstOffset
+(0, ∓1)` and forms the per-channel weighted sum in the linear intermediate domain,
+*before* the LUT (so the LUT+OETF run once). Kernels are baked into the synthesized
+SPIR-V as constants — a static per-output panel property, no push/UBO cost, and
+outputs without the fragment keep their single-tap sample. Config is `tune {
+subpixel-fir { red/green/blue <top> <center> <bottom> } }`; weights normalize to sum 1
+(luminance). Encode damage is dilated vertically by the tap radius so a content change
+repaints the rows the filter shifts. (Horizontal FIR was the original sketch but the
+fringe is vertical on QD-OLED; the machinery generalizes to an axis if ever needed.)
+
+`InterleavedGradientNoiseDither` (hide 8-bit banding without a noise texture) is still
+a stub returning `MissingFeature`. It's simpler than the FIR:
+`(interleaved_gradient_noise(gl_FragCoord.xy) - 0.5) * dither_strength / 255.0` added
+before write (the `dither_strength` push slot already exists). **Trigger:** an 8-bit
+panel showing visible banding.
 
 ### Renderer-side intermediate-buffer modifier negotiation
 

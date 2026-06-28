@@ -267,6 +267,13 @@ pub struct Renderer {
     capture: Option<crate::capture::CaptureEncoder>,
     scanout_format: vk::Format,
     intermediate_format: vk::Format,
+    /// Vertical padding (in pixels) the encode pass reads beyond each output
+    /// pixel. Nonzero when the chain contains a vertical subpixel FIR, which
+    /// samples ±1 row of the intermediate — so a content change at row `y`
+    /// shifts the encoded output at rows `y±radius` too. Encode-damage rects
+    /// are grown vertically by this amount so those neighbours are repainted
+    /// (otherwise their stale encode seams at the damage edge). 0 = no FIR.
+    encode_vpad: i32,
     command_pool: vk::CommandPool,
     slots: [FrameSlot; FRAMES_IN_FLIGHT],
     /// Index into `slots` for the *next* frame.
@@ -288,6 +295,18 @@ impl Renderer {
         let decode = DecodePipeline::new(device.clone(), intermediate_format)?;
         let deband = DebandPipeline::new(device.clone(), FRAMES_IN_FLIGHT)?;
         let encode = EncodePipeline::new(device.clone(), scanout_format, encode_config)?;
+        // The vertical subpixel FIR reads ±1 row; grow encode damage by that
+        // radius so a content change repaints the neighbours it shifts.
+        let encode_vpad = if encode_config.fragments.iter().any(|f| {
+            matches!(
+                f,
+                crate::encode_synth::EncodeFragment::SubpixelFir3Vertical { .. }
+            )
+        }) {
+            1
+        } else {
+            0
+        };
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(device.physical.graphics_queue_family)
@@ -394,6 +413,7 @@ impl Renderer {
             capture: None,
             scanout_format,
             intermediate_format,
+            encode_vpad,
             command_pool,
             slots,
             next_slot: 0,
@@ -694,6 +714,14 @@ impl Renderer {
 
         let encode_planned: Vec<vk::Rect2D> = if force_full || force_full_repaint {
             Vec::new()
+        } else if self.encode_vpad > 0 {
+            // Subpixel FIR reads vertical neighbours: repaint the rows the
+            // filter support reaches beyond each damage rect.
+            plan_passes(
+                &dilate_vertical(encode_damage, self.encode_vpad),
+                extent,
+                MAX_ENCODE_PASSES,
+            )
         } else {
             plan_passes(encode_damage, extent, MAX_ENCODE_PASSES)
         };
@@ -1481,6 +1509,23 @@ fn plan_passes(
     } else {
         clamped
     }
+}
+
+/// Grow each rect vertically by `vpad` pixels above and below (horizontal extent
+/// unchanged). Used when the encode chain reads vertical neighbours (the subpixel
+/// FIR): a content change at row `y` shifts the encoded output at `y ± radius`, so
+/// those rows must be repainted too. Off-output overgrowth is harmless —
+/// [`plan_passes`] clamps to the extent afterwards.
+fn dilate_vertical(rects: &[Rectangle<i32, Physical>], vpad: i32) -> Vec<Rectangle<i32, Physical>> {
+    rects
+        .iter()
+        .map(|r| {
+            Rectangle::new(
+                (r.loc.x, r.loc.y - vpad).into(),
+                (r.size.w, r.size.h + 2 * vpad).into(),
+            )
+        })
+        .collect()
 }
 
 /// Whether an element's clip-space quad (`dst_rect_clip`, `[x0,y0,x1,y1]` in
