@@ -383,6 +383,75 @@ impl ResponseGrid {
             self.axis_cmds[2][n],
         ]
     }
+
+    /// Return a copy of this grid with an explicit `cmd = 0` anchor
+    /// prepended to every axis, so `forward`/`jacobian` interpolate from
+    /// the measured black floor up to the lowest measured command rather
+    /// than clamping flat below it.
+    ///
+    /// Without the anchor, each per-axis list starts at `min_cmd`
+    /// (~1 cd/m² for HDR). `bracket_axis` then maps any command below
+    /// that to the degenerate `(0, 0, 0.0)` cell: `forward` returns the
+    /// flat `min_cmd` corner and `jacobian` returns zero. The inversion
+    /// can't reach sub-`min_cmd` targets — neutral cells between the
+    /// floor and ~1 nit all collapse onto the `min_cmd` plateau (banding,
+    /// seed-dependent non-monotonic wobble), and the hard sub-floor
+    /// cutoff crushes a wide band to pure black. Anchoring at the floor
+    /// gives the whole `0..min_cmd` region a real, monotone gradient.
+    ///
+    /// The new `(cmd = 0, …)` boundary is synthesized additively: the
+    /// nearest measured corner minus each zeroed channel's isolated
+    /// above-floor emission (`channel_anchor[c]`, from the phase-1
+    /// per-primary sweep), clamped at the floor. This is exact at the
+    /// measured `min_cmd` corner (no channel zeroed → unchanged) and
+    /// yields the floor at the `(0, 0, 0)` vertex. The additive removal
+    /// is only used in the sub-`min_cmd` region, where cross-channel
+    /// interaction is negligible — the measured cube (now at indices
+    /// `≥ 1`) is preserved unchanged.
+    fn with_floor_anchor(&self, floor: [f64; 3], channel_anchor: [Xyz; 3]) -> ResponseGrid {
+        let n = self.cube_edge;
+        let nn = n + 1;
+        let axis_cmds: [Vec<f64>; 3] = std::array::from_fn(|c| {
+            let mut v = Vec::with_capacity(nn);
+            v.push(0.0);
+            v.extend_from_slice(&self.axis_cmds[c]);
+            v
+        });
+        let mut xyz = Vec::with_capacity(nn * nn * nn);
+        for k in 0..nn {
+            for j in 0..nn {
+                for i in 0..nn {
+                    // Base = nearest measured corner (a new 0-index reads
+                    // the measured `min_cmd` slice for that axis).
+                    let mut e = self.lookup(
+                        i.saturating_sub(1),
+                        j.saturating_sub(1),
+                        k.saturating_sub(1),
+                    );
+                    // Remove each zeroed channel's isolated contribution.
+                    if i == 0 {
+                        e = sub_xyz_scaled(e, channel_anchor[0], 1.0);
+                    }
+                    if j == 0 {
+                        e = sub_xyz_scaled(e, channel_anchor[1], 1.0);
+                    }
+                    if k == 0 {
+                        e = sub_xyz_scaled(e, channel_anchor[2], 1.0);
+                    }
+                    // Never dip below the measured panel black.
+                    e.x = e.x.max(floor[0]);
+                    e.y = e.y.max(floor[1]);
+                    e.z = e.z.max(floor[2]);
+                    xyz.push(e);
+                }
+            }
+        }
+        ResponseGrid {
+            cube_edge: nn,
+            axis_cmds,
+            xyz,
+        }
+    }
 }
 
 /// Locate the segment in `axis` (sorted ascending) bracketing `value`.
@@ -423,6 +492,34 @@ fn lerp_xyz(a: Xyz, b: Xyz, t: f64) -> Xyz {
         y: a.y + t * (b.y - a.y),
         z: a.z + t * (b.z - a.z),
     }
+}
+
+/// Linear-interpolate a per-channel sweep's above-floor emission at a
+/// given diagnosed scanout coordinate. Used to estimate one primary's
+/// isolated contribution at the grid's lowest measured command when
+/// synthesizing the `cmd = 0` floor anchor (see
+/// [`ResponseGrid::with_floor_anchor`]). The sweep `xyz` are already
+/// black-subtracted, so this returns emission *above* the floor.
+fn channel_emission_at(samples: &[ChannelSample], scanout: f64) -> Xyz {
+    let Some(first) = samples.first() else {
+        return Xyz {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+    };
+    if scanout <= first.scanout {
+        return first.xyz;
+    }
+    for w in samples.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if scanout <= b.scanout {
+            let span = (b.scanout - a.scanout).max(1e-12);
+            let t = ((scanout - a.scanout) / span).clamp(0.0, 1.0);
+            return lerp_xyz(a.xyz, b.xyz, t);
+        }
+    }
+    samples.last().unwrap().xyz
 }
 
 fn bilinear_xyz(c00: Xyz, c10: Xyz, c01: Xyz, c11: Xyz, t0: f64, t1: f64) -> Xyz {
@@ -1046,6 +1143,17 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         .black()
         .map(|b| [b.x, b.y, b.z])
         .unwrap_or(black_floor_xyz);
+    // Anchor the forward grid at `cmd = 0` = measured black floor so the
+    // sub-`min_cmd` band inverts with a real gradient (see
+    // `with_floor_anchor`). Capture the pre-anchor min emission first so
+    // the neutral health check keeps gating on the measured range only.
+    let neutral_lo_y = grid.min_emission().y;
+    let channel_anchor = [
+        channel_emission_at(&responses[0].samples, grid.axis_cmds[0][0]),
+        channel_emission_at(&responses[1].samples, grid.axis_cmds[1][0]),
+        channel_emission_at(&responses[2].samples, grid.axis_cmds[2][0]),
+    ];
+    let grid = grid.with_floor_anchor(bake_floor, channel_anchor);
     let (entries, residuals) =
         build_inverse_lut(args.cube_edge, &grid, bake_white, bake_floor, seed_gain);
     // Bake health — computed unconditionally and surfaced on stderr.
@@ -1058,7 +1166,7 @@ pub fn run(args: CalibrateLut3dArgs) -> Result<()> {
         &residuals,
         panel_total_peak,
         bake_white[1],
-        grid.min_emission().y,
+        neutral_lo_y,
     );
     health.report(panel_total_peak);
     if let Some((_, w)) = log.as_mut() {
@@ -2888,6 +2996,16 @@ pub fn run_rebake(args: RebakeLut3dArgs) -> Result<()> {
         "\n--- rebake: invert {}³ forward grid → {}³ inverse LUT ---",
         parsed.cube_edge_cmd, args.cube_edge,
     );
+    // Anchor the forward grid at `cmd = 0` = measured black floor (see
+    // `with_floor_anchor`); capture the pre-anchor min emission first so
+    // the neutral health check keeps gating on the measured range only.
+    let neutral_lo_y = grid.min_emission().y;
+    let channel_anchor = [
+        channel_emission_at(&responses[0].samples, grid.axis_cmds[0][0]),
+        channel_emission_at(&responses[1].samples, grid.axis_cmds[1][0]),
+        channel_emission_at(&responses[2].samples, grid.axis_cmds[2][0]),
+    ];
+    let grid = grid.with_floor_anchor(bake_floor, channel_anchor);
     let (entries, residuals) =
         build_inverse_lut(args.cube_edge, &grid, bake_white, bake_floor, seed_gain);
     let panel_total_peak: f64 = responses.iter().map(|r| r.peak_y).sum();
@@ -2896,7 +3014,7 @@ pub fn run_rebake(args: RebakeLut3dArgs) -> Result<()> {
         &residuals,
         panel_total_peak,
         bake_white[1],
-        grid.min_emission().y,
+        neutral_lo_y,
     );
     health.report(panel_total_peak);
 
@@ -3158,6 +3276,78 @@ mod tests {
         let max_corner = grid.lookup(n - 1, n - 1, n - 1);
         assert!((above.x - max_corner.x).abs() < 1e-9);
         assert!((above.y - max_corner.y).abs() < 1e-9);
+    }
+
+    /// The `cmd = 0` floor anchor replaces the flat, zero-gradient clamp
+    /// below `min_cmd` with a real interpolation from the measured black
+    /// floor up to the lowest measured command. Without it, every
+    /// sub-`min_cmd` query returns the `min_cmd` corner with a zero
+    /// Jacobian (the dead-zone + non-monotonic-wobble bug). For a linear
+    /// additive panel the anchored band recovers ground truth exactly,
+    /// the measured corner is preserved, and the `(0,0,0)` vertex reads
+    /// the floor.
+    #[test]
+    fn floor_anchor_gives_subfloor_gradient() {
+        let r_pri = [1.0, 0.5, 0.0];
+        let g_pri = [0.0, 1.0, 0.2];
+        let b_pri = [0.1, 0.05, 1.0];
+        let grid = synth_grid(5, r_pri, g_pri, b_pri, 100.0);
+        // Isolated channel emission at the lowest measured cmd (= 1.0) is
+        // the primary itself for this linear panel; floor at true black.
+        let anchor = [
+            Xyz {
+                x: r_pri[0],
+                y: r_pri[1],
+                z: r_pri[2],
+            },
+            Xyz {
+                x: g_pri[0],
+                y: g_pri[1],
+                z: g_pri[2],
+            },
+            Xyz {
+                x: b_pri[0],
+                y: b_pri[1],
+                z: b_pri[2],
+            },
+        ];
+        let anchored = grid.with_floor_anchor([0.0, 0.0, 0.0], anchor);
+
+        // New bottom vertex reads the floor.
+        let z = anchored.forward([0.0, 0.0, 0.0]);
+        assert!(z.x.abs() < 1e-9 && z.y.abs() < 1e-9, "vertex {z:?}");
+
+        // The measured `min_cmd` corner is preserved exactly.
+        let corner = anchored.forward([1.0, 1.0, 1.0]);
+        let want = grid.lookup(0, 0, 0);
+        assert!(
+            (corner.y - want.y).abs() < 1e-9,
+            "corner Y {} vs {}",
+            corner.y,
+            want.y
+        );
+
+        // Across the previously-dead band, forward now interpolates with
+        // a real gradient: linear panel → exact ground truth, strictly
+        // increasing (was a flat plateau).
+        let mut prev = -1.0;
+        for step in 0..=10 {
+            let c = step as f64 / 10.0; // 0 .. 1
+            let y = anchored.forward([c, c, c]).y;
+            let truth = c * (r_pri[1] + g_pri[1] + b_pri[1]);
+            assert!((y - truth).abs() < 1e-9, "c={c}: y={y} truth={truth}");
+            assert!(y > prev - 1e-12, "non-monotone at c={c}: {y} <= {prev}");
+            prev = y;
+        }
+
+        // Jacobian is non-zero in the band, so Newton can descend (it was
+        // zero under the old clamp).
+        let jac = anchored.jacobian([0.5, 0.5, 0.5]);
+        let y_row = jac[1][0].abs() + jac[1][1].abs() + jac[1][2].abs();
+        assert!(
+            y_row > 1e-6,
+            "Jacobian Y-row should be non-zero, got {y_row}"
+        );
     }
 
     /// Build a hard-clipping panel: linear response up to `knee` nits
