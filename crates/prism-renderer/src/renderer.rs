@@ -52,6 +52,11 @@ const PROFILE_TIMESTAMP_COUNT: u32 = 3;
 /// common cases (a window region, a 4-rect border ring) with headroom.
 const MAX_ENCODE_PASSES: usize = 8;
 
+/// Cap on the number of separate scissored decode passes per frame. As
+/// [`MAX_ENCODE_PASSES`], but decode passes are heavier (a per-element draw loop +
+/// an inter-pass barrier each), so the bbox fallback matters more for busy frames.
+const MAX_DECODE_PASSES: usize = 8;
+
 /// Per-frame GPU time for the two compositing passes, in microseconds.
 /// Produced by the timestamp-query profiler when the `PRISM_GPU_PROFILE`
 /// environment variable is set; `None` everywhere otherwise (no query pools
@@ -635,37 +640,33 @@ impl Renderer {
             offset: vk::Offset2D::default(),
             extent,
         };
-        // The region the decode pass repaints this frame. `None` ⇒ skip decode
-        // (no damage and the intermediate is already valid). `force_full_repaint`
-        // (closing window animating) forces the whole frame — see the param doc.
-        let decode_area: Option<vk::Rect2D> = if force_full || force_full_repaint {
-            Some(full_area)
+        // Per-rect render-pass plans. Both passes scissor to the individual damage
+        // rects (disjoint regions like a border ring around an opaque window each
+        // cost only their own area, not their bounding box); past the cap they
+        // collapse to one bbox pass to bound per-pass overhead. `force_full*` /
+        // realloc force the whole output.
+        //
+        // Decode repaints the persistent intermediate; an empty plan ⇒ skip decode
+        // (no damage, intermediate already valid). Encode targets the scanout BO;
+        // an empty plan ⇒ full encode (first use / forced), which also selects the
+        // discard-from-UNDEFINED mid-barrier below.
+        let decode_passes: Vec<vk::Rect2D> = if force_full || force_full_repaint {
+            vec![full_area]
         } else {
-            damage_bbox(damage, extent)
+            plan_passes(damage, extent, MAX_DECODE_PASSES)
         };
-        // Encode scissor regions for this BO. The encode is scissored per damage
-        // rect so disjoint regions (e.g. a border ring around an opaque window)
-        // each cost only their own area, not their bounding box. A realloc, a
-        // forced repaint, or empty/offscreen `encode_damage` ⇒ full-output encode;
-        // beyond `MAX_ENCODE_PASSES` rects we fall back to one bounding-box pass to
-        // bound per-pass overhead. `encode_full` (no sub-region) selects the
-        // discard-from-UNDEFINED mid-barrier below; a partial encode preserves the
-        // BO's prior content (GENERAL→COLOR_ATTACHMENT) outside the passes.
-        let encode_clamped: Vec<vk::Rect2D> = if force_full || force_full_repaint {
+        let decoded = !decode_passes.is_empty();
+
+        let encode_planned: Vec<vk::Rect2D> = if force_full || force_full_repaint {
             Vec::new()
         } else {
-            encode_damage
-                .iter()
-                .filter_map(|r| clamp_rect_to_extent(r, extent))
-                .collect()
+            plan_passes(encode_damage, extent, MAX_ENCODE_PASSES)
         };
-        let encode_full = encode_clamped.is_empty();
+        let encode_full = encode_planned.is_empty();
         let encode_passes: Vec<vk::Rect2D> = if encode_full {
             vec![full_area]
-        } else if encode_clamped.len() > MAX_ENCODE_PASSES {
-            vec![damage_bbox(encode_damage, extent).unwrap_or(full_area)]
         } else {
-            encode_clamped
+            encode_planned
         };
         let intermediate = self.intermediate.as_ref().unwrap();
 
@@ -930,15 +931,17 @@ impl Renderer {
             }
         }
 
-        // ── Decode pass (scissored to damage) ───────────────────────────────
-        // Repaint only `decode_area` of the persistent intermediate, preserving
-        // the rest (last frame's composite is still valid outside the damage).
-        // Skipped entirely when there's no damage and the intermediate is valid.
-        if let Some(area) = decode_area {
-            // Bring the intermediate to COLOR_ATTACHMENT. On the full-paint
+        // ── Decode pass (per damage rect) ───────────────────────────────────
+        // Repaint only the damaged regions of the persistent intermediate,
+        // preserving the rest (last frame's composite stays valid). One render
+        // pass per `decode_passes` rect, so a border ring around an opaque window
+        // repaints only the ring, not its bounding box. Skipped entirely when
+        // there's no damage and the intermediate is valid.
+        if decoded {
+            // Bring the intermediate to COLOR_ATTACHMENT once. On the full-paint
             // frame its prior contents are undefined (discard from UNDEFINED);
             // otherwise preserve them — the previous frame's encode left it in
-            // SHADER_READ_ONLY_OPTIMAL, and we only overwrite `area`.
+            // SHADER_READ_ONLY_OPTIMAL, and we only overwrite the damaged rects.
             let (old_layout, src_stage, src_access) = if force_full {
                 (
                     vk::ImageLayout::UNDEFINED,
@@ -983,8 +986,8 @@ impl Renderer {
                 );
             }
 
-            // CLEAR scopes to `render_area`, so only the damaged box is cleared;
-            // pixels outside it keep last frame's composite.
+            // CLEAR scopes to each pass's render_area, so only the damaged rect is
+            // cleared; pixels outside it keep last frame's composite.
             let color_attach = [vk::RenderingAttachmentInfo::default()
                 .image_view(intermediate.view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -995,66 +998,92 @@ impl Renderer {
                         float32: [0.0, 0.0, 0.0, 0.0],
                     },
                 })];
-            let render_info = vk::RenderingInfo::default()
-                .render_area(area)
-                .layer_count(1)
-                .color_attachments(&color_attach);
+            // Viewport spans the whole output (element vertices are in clip space
+            // for the full framebuffer); each pass's scissor confines fragments to
+            // its rect. Pipeline + viewport are command-buffer state that persists
+            // across the per-pass render passes, so bind them once.
+            let viewport = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent.width as f32,
+                height: extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
             unsafe {
-                self.device.raw.cmd_begin_rendering(cb, &render_info);
-
-                // Viewport spans the whole output (element vertices are in clip
-                // space for the full framebuffer); the scissor confines written
-                // fragments to the damaged box.
-                let viewport = vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: extent.width as f32,
-                    height: extent.height as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                };
-                self.device.raw.cmd_set_viewport(cb, 0, &[viewport]);
-                self.device.raw.cmd_set_scissor(cb, 0, &[area]);
-
                 self.device.raw.cmd_bind_pipeline(
                     cb,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.decode.pipeline,
                 );
+                self.device.raw.cmd_set_viewport(cb, 0, &[viewport]);
 
-                for el in elements {
-                    let luma_info = [vk::DescriptorImageInfo::default()
-                        .sampler(self.decode.sampler)
-                        .image_view(el.texture_view)
-                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-                    // Binding 1 = chroma for YUV; for RGB bind the same view as
-                    // binding 0 so the statically-referenced sampler stays valid.
-                    let chroma_info = [vk::DescriptorImageInfo::default()
-                        .sampler(self.decode.sampler)
-                        .image_view(el.chroma_view.unwrap_or(el.texture_view))
-                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-                    let writes = [
-                        self.decode.write_texture_binding(0, &luma_info),
-                        self.decode.write_texture_binding(1, &chroma_info),
-                    ];
-                    self.decode.push_loader.cmd_push_descriptor_set(
-                        cb,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.decode.pipeline_layout,
-                        0,
-                        &writes,
-                    );
-                    self.device.raw.cmd_push_constants(
-                        cb,
-                        self.decode.pipeline_layout,
-                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                        0,
-                        bytemuck::bytes_of(&el.push),
-                    );
-                    self.device.raw.cmd_draw(cb, 4, 1, 0, 0);
+                for (pass_idx, area) in decode_passes.iter().enumerate() {
+                    // Damage rects may overlap (e.g. two translucent windows both
+                    // changing); each pass CLEARs + recomposites its rect, so a
+                    // write-after-write barrier orders overlapping passes. (Cheap;
+                    // disjoint passes pay only a serialization point.)
+                    if pass_idx > 0 {
+                        let waw = [vk::MemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                            .dst_access_mask(
+                                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+                                    | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+                            )];
+                        self.device.raw.cmd_pipeline_barrier2(
+                            cb,
+                            &vk::DependencyInfo::default().memory_barriers(&waw),
+                        );
+                    }
+                    let render_info = vk::RenderingInfo::default()
+                        .render_area(*area)
+                        .layer_count(1)
+                        .color_attachments(&color_attach);
+                    self.device.raw.cmd_begin_rendering(cb, &render_info);
+                    self.device.raw.cmd_set_scissor(cb, 0, &[*area]);
+
+                    for el in elements {
+                        // Skip elements whose quad doesn't touch this rect — they
+                        // would be scissored to zero fragments anyway, so this just
+                        // drops the wasted descriptor push + draw call.
+                        if !clip_rect_overlaps(el.push.dst_rect_clip, *area, extent) {
+                            continue;
+                        }
+                        let luma_info = [vk::DescriptorImageInfo::default()
+                            .sampler(self.decode.sampler)
+                            .image_view(el.texture_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                        // Binding 1 = chroma for YUV; for RGB bind the same view as
+                        // binding 0 so the statically-referenced sampler stays valid.
+                        let chroma_info = [vk::DescriptorImageInfo::default()
+                            .sampler(self.decode.sampler)
+                            .image_view(el.chroma_view.unwrap_or(el.texture_view))
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                        let writes = [
+                            self.decode.write_texture_binding(0, &luma_info),
+                            self.decode.write_texture_binding(1, &chroma_info),
+                        ];
+                        self.decode.push_loader.cmd_push_descriptor_set(
+                            cb,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.decode.pipeline_layout,
+                            0,
+                            &writes,
+                        );
+                        self.device.raw.cmd_push_constants(
+                            cb,
+                            self.decode.pipeline_layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            bytemuck::bytes_of(&el.push),
+                        );
+                        self.device.raw.cmd_draw(cb, 4, 1, 0, 0);
+                    }
+
+                    self.device.raw.cmd_end_rendering(cb);
                 }
-
-                self.device.raw.cmd_end_rendering(cb);
             }
         }
 
@@ -1101,7 +1130,7 @@ impl Renderer {
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         )];
-        if decode_area.is_some() {
+        if decoded {
             mid_barriers.push(barrier_image(
                 intermediate.image,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -1332,6 +1361,52 @@ fn damage_bbox(damage: &[Rectangle<i32, Physical>], extent: vk::Extent2D) -> Opt
     })
 }
 
+/// Plan the per-rect render passes for a set of physical damage rects: clamp each
+/// to `extent`, and if more than `max` survive, collapse to a single bounding-box
+/// pass (bounding the per-pass overhead). An empty result means no on-screen
+/// damage — the caller decides whether that skips the pass or forces a full one.
+fn plan_passes(
+    rects: &[Rectangle<i32, Physical>],
+    extent: vk::Extent2D,
+    max: usize,
+) -> Vec<vk::Rect2D> {
+    let clamped: Vec<vk::Rect2D> = rects
+        .iter()
+        .filter_map(|r| clamp_rect_to_extent(r, extent))
+        .collect();
+    if clamped.len() > max {
+        match damage_bbox(rects, extent) {
+            Some(b) => vec![b],
+            None => Vec::new(),
+        }
+    } else {
+        clamped
+    }
+}
+
+/// Whether an element's clip-space quad (`dst_rect_clip`, `[x0,y0,x1,y1]` in
+/// `[-1,1]` over the full framebuffer) touches the physical-pixel `area`. Used to
+/// skip decode draws that a pass's scissor would discard anyway. The quad is
+/// converted to pixels and rounded *outward*, so a touching element is never
+/// dropped (over-inclusion only costs a redundant, fully-scissored draw).
+fn clip_rect_overlaps(dst_rect_clip: [f32; 4], area: vk::Rect2D, extent: vk::Extent2D) -> bool {
+    let to_px = |c: f32, dim: u32| (c + 1.0) * 0.5 * dim as f32;
+    let xa = to_px(dst_rect_clip[0], extent.width);
+    let xb = to_px(dst_rect_clip[2], extent.width);
+    let ya = to_px(dst_rect_clip[1], extent.height);
+    let yb = to_px(dst_rect_clip[3], extent.height);
+    let x0 = xa.min(xb).floor().max(0.0) as i32;
+    let x1 = (xa.max(xb).ceil() as i32).min(extent.width as i32);
+    let y0 = ya.min(yb).floor().max(0.0) as i32;
+    let y1 = (ya.max(yb).ceil() as i32).min(extent.height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return false; // degenerate / fully offscreen quad — contributes nothing
+    }
+    let ax1 = area.offset.x + area.extent.width as i32;
+    let ay1 = area.offset.y + area.extent.height as i32;
+    x0 < ax1 && area.offset.x < x1 && y0 < ay1 && area.offset.y < y1
+}
+
 /// Clamp a physical-pixel damage rect to the output extent, as a `vk::Rect2D`.
 /// `None` if it lies entirely outside the output (or is empty).
 fn clamp_rect_to_extent(r: &Rectangle<i32, Physical>, extent: vk::Extent2D) -> Option<vk::Rect2D> {
@@ -1377,4 +1452,84 @@ fn barrier_image(
             base_array_layer: 0,
             layer_count: 1,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prism_frame::{Point, Size};
+
+    fn ext(w: u32, h: u32) -> vk::Extent2D {
+        vk::Extent2D {
+            width: w,
+            height: h,
+        }
+    }
+    fn area(x: i32, y: i32, w: u32, h: u32) -> vk::Rect2D {
+        vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D {
+                width: w,
+                height: h,
+            },
+        }
+    }
+    fn pr(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Physical> {
+        Rectangle::new(Point::from((x, y)), Size::from((w, h)))
+    }
+
+    #[test]
+    fn clip_rect_overlaps_basic() {
+        let e = ext(100, 100);
+        // Full-screen quad touches any on-screen rect.
+        assert!(clip_rect_overlaps(
+            [-1., -1., 1., 1.],
+            area(90, 90, 10, 10),
+            e
+        ));
+        // Left-half quad ([-1,0] clip x → [0,50] px) overlaps a left rect only.
+        assert!(clip_rect_overlaps(
+            [-1., -1., 0., 1.],
+            area(0, 0, 10, 100),
+            e
+        ));
+        assert!(!clip_rect_overlaps(
+            [-1., -1., 0., 1.],
+            area(60, 0, 10, 100),
+            e
+        ));
+        // Edge-adjacent (no pixel overlap) → not counted.
+        assert!(!clip_rect_overlaps(
+            [-1., -1., 0., 1.],
+            area(50, 0, 10, 100),
+            e
+        ));
+    }
+
+    #[test]
+    fn clamp_rect_to_extent_clips_and_rejects() {
+        let e = ext(100, 100);
+        let inside = clamp_rect_to_extent(&pr(10, 10, 20, 20), e).unwrap();
+        assert_eq!((inside.offset.x, inside.offset.y), (10, 10));
+        assert_eq!((inside.extent.width, inside.extent.height), (20, 20));
+        let overhang = clamp_rect_to_extent(&pr(90, 90, 20, 20), e).unwrap();
+        assert_eq!((overhang.extent.width, overhang.extent.height), (10, 10));
+        assert!(clamp_rect_to_extent(&pr(200, 0, 10, 10), e).is_none());
+    }
+
+    #[test]
+    fn plan_passes_caps_and_filters() {
+        let e = ext(100, 100);
+        assert!(plan_passes(&[], e, 8).is_empty());
+        // Two on-screen rects → two passes.
+        assert_eq!(
+            plan_passes(&[pr(0, 0, 10, 10), pr(50, 50, 10, 10)], e, 8).len(),
+            2
+        );
+        // Offscreen rects are dropped.
+        assert!(plan_passes(&[pr(200, 200, 10, 10)], e, 8).is_empty());
+        // Past the cap → a single bounding-box pass.
+        let many: Vec<_> = (0..10).map(|i| pr(i * 5, 0, 4, 4)).collect();
+        assert_eq!(plan_passes(&many, e, 8).len(), 1);
+    }
 }
