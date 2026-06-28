@@ -286,6 +286,20 @@ impl SurfaceTexture {
             AlphaMode::Opaque
         }
     }
+
+    /// Whether the source buffer is 8-bit-per-component RGB — the precondition
+    /// for debanding (the decode pass's ±0.5 LSB clamp is defined on 8-bit
+    /// codes; a 10-bit/fp16 buffer carries no 8-bit banding and must not be
+    /// clamped against a 1/255 LSB). Derived from the source `vk::Format`;
+    /// `SolidColor` has no sampled texture so it reports `false`.
+    pub fn is_8bit(&self) -> bool {
+        match &self.source {
+            TexSource::Dmabuf { format, .. } | TexSource::Shm { format, .. } => {
+                prism_renderer::format_is_8bit_rgb(*format)
+            }
+            TexSource::SolidColor { .. } => false,
+        }
+    }
 }
 
 /// Per-surface slot inserted into `SurfaceData::data_map`. Wrapped in

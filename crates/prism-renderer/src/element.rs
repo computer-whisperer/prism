@@ -399,6 +399,13 @@ pub struct SurfaceEl {
     /// UV). Zero ⇒ unknown/irrelevant (e.g. intermediate-space snapshots),
     /// which disables debanding for this element regardless of config.
     pub source_extent: vk::Extent2D,
+    /// Whether the source buffer is 8-bit-per-component (see
+    /// [`format_is_8bit_rgb`]). Debanding's ±0.5 LSB clamp is defined on 8-bit
+    /// codes, so only 8bpc buffers qualify; higher-precision sources (10-bit,
+    /// fp16) report `false` and are never debanded. Snapshots/tests set
+    /// `false` — they're passthrough intermediate-space content, not a client
+    /// buffer.
+    pub source_8bit: bool,
     /// Output rect in logical pixels; projected to clip space at lowering.
     pub geometry: Rectangle<f64, Logical>,
     /// Content version: the surface's buffer commit count. The damage tracker
@@ -443,17 +450,41 @@ pub struct SurfaceEl {
 /// worth a pair of wide blur passes.
 const DEBAND_MIN_SOURCE_DIM: u32 = 256;
 
+/// Whether `format` is an 8-bit-per-component RGB/BGR buffer — the precondition
+/// for debanding. The decode pass clamps the blurred copy to ±0.5/255 (one
+/// 8-bit LSB), so the source *must* actually be 8-bit: a 10-bit or fp16 buffer
+/// has no 8-bit banding to fix and would be over-smoothed by a 4×-too-wide
+/// envelope. Conservative whitelist — anything not known to be 8bpc (packed
+/// 10-bit, fp16, …) returns false and is left untouched.
+pub fn format_is_8bit_rgb(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::R8G8B8A8_UNORM
+            | vk::Format::R8G8B8A8_SRGB
+            | vk::Format::B8G8R8A8_UNORM
+            | vk::Format::B8G8R8A8_SRGB
+            | vk::Format::A8B8G8R8_UNORM_PACK32
+            | vk::Format::A8B8G8R8_SRGB_PACK32
+            | vk::Format::R8G8B8_UNORM
+            | vk::Format::R8G8B8_SRGB
+            | vk::Format::B8G8R8_UNORM
+            | vk::Format::B8G8R8_SRGB
+    )
+}
+
 impl SurfaceEl {
     /// Whether this element is a candidate for debanding: 8-bit SDR RGB
     /// content, large enough to matter. `yuv == 0` excludes video; the
-    /// sRGB/gamma/BT.1886 transfers are the SDR encodings (PQ is excluded,
-    /// and 10-bit RGB is only ever used with PQ, so transfer doubles as the
-    /// bit-depth gate). `source_extent` zero (snapshots) never qualifies.
+    /// sRGB/gamma/BT.1886 transfers are the SDR encodings (PQ excluded);
+    /// `source_8bit` is the *actual* buffer bit-depth (from the source
+    /// fourcc), so a higher-precision buffer tagged with an SDR transfer is
+    /// correctly skipped rather than over-smoothed by the 8-bit clamp.
+    /// `source_extent` zero (snapshots) never qualifies.
     fn debandable(&self) -> bool {
         let big = self.source_extent.width >= DEBAND_MIN_SOURCE_DIM
             && self.source_extent.height >= DEBAND_MIN_SOURCE_DIM;
         let sdr_rgb = self.yuv == 0 && matches!(self.color.transfer, 1 | 4 | 5);
-        big && sdr_rgb
+        big && sdr_rgb && self.source_8bit
     }
 
     /// Build the deband request for this element on an output with the given
@@ -1308,6 +1339,7 @@ mod tests {
             chroma_view: None,
             yuv: 0,
             source_extent: vk::Extent2D::default(),
+            source_8bit: false,
             geometry: geo,
             content_commit: 0,
             opaque,

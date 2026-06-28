@@ -126,6 +126,7 @@ impl ClosingWindow {
             // Intermediate-space snapshot (passthrough transfer): never
             // debanded, so the source extent is irrelevant.
             source_extent: prism_renderer::vk::Extent2D::default(),
+            source_8bit: false,
             geometry,
             content_commit: 0,
             opaque: Vec::new(),

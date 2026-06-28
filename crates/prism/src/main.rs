@@ -2785,6 +2785,16 @@ fn render_output_now(
                 .and_then(|s| s.0.lock().unwrap().as_ref().map(|t| t.alpha_mode()))
                 .unwrap_or_default()
         };
+    // Whether the surface's buffer is 8-bit-per-component — the debanding
+    // precondition. Same texture-slot lookup as `alpha_mode_lookup`; absent
+    // slot ⇒ false (no deband).
+    let is_8bit_lookup = |states: &smithay::wayland::compositor::SurfaceData| -> bool {
+        states
+            .data_map
+            .get::<prism_protocols::SurfaceTexSlot>()
+            .and_then(|s| s.0.lock().unwrap().as_ref().map(|t| t.is_8bit()))
+            .unwrap_or(false)
+    };
     // Per-surface decode params from wp_color_management_v1. Falls
     // through to RenderCtx::color_for's default (sRGB + the output's
     // sdr_reference_nits) for surfaces with no description set —
@@ -2857,6 +2867,7 @@ fn render_output_now(
         texture_lookup: &texture_lookup,
         yuv_lookup: &yuv_lookup,
         alpha_mode_lookup: &alpha_mode_lookup,
+        is_8bit_lookup: &is_8bit_lookup,
         color_lookup: &color_lookup,
         sdr_reference_nits: output_sdr_reference_nits,
         report_missing_texture: &report_missing,

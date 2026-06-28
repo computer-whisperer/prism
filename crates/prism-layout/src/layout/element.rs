@@ -67,6 +67,12 @@ pub struct RenderCtx<'a> {
     /// `Argb`. Same `&SurfaceData` contract as the other lookups; defaults to
     /// `Opaque` when there's no texture slot.
     pub alpha_mode_lookup: &'a dyn Fn(&SurfaceData) -> AlphaMode,
+    /// Look up whether the surface's buffer is 8-bit-per-component — the
+    /// debanding precondition (the decode clamp is defined on 8-bit codes, so
+    /// a 10-bit/fp16 buffer must not be debanded). A buffer-format property
+    /// like `alpha_mode_lookup`; defaults to `false` (no deband) when there's
+    /// no texture slot.
+    pub is_8bit_lookup: &'a dyn Fn(&SurfaceData) -> bool,
     /// Look up the surface's color-decoding parameters (TF +
     /// reference white) from its `wp_color_management_v1` image
     /// description. Same shape as `texture_lookup`: closure over
@@ -122,6 +128,10 @@ impl<'a> RenderCtx<'a> {
     /// Sampled-alpha interpretation for `states`. See [`RenderCtx::alpha_mode_lookup`].
     pub fn alpha_mode_for(&self, states: &SurfaceData) -> AlphaMode {
         (self.alpha_mode_lookup)(states)
+    }
+    /// Whether `states`' buffer is 8-bit-per-component. See [`RenderCtx::is_8bit_lookup`].
+    pub fn source_8bit_for(&self, states: &SurfaceData) -> bool {
+        (self.is_8bit_lookup)(states)
     }
     pub fn color_for(&self, states: &SurfaceData) -> SurfaceColorParams {
         (self.color_lookup)(states).unwrap_or(SurfaceColorParams {
@@ -368,6 +378,7 @@ pub fn push_surface_tree_elements(
                     width: s.w.max(0) as u32,
                     height: s.h.max(0) as u32,
                 }),
+                source_8bit: ctx.source_8bit_for(states),
                 geometry: dst,
                 content_commit,
                 opaque,
