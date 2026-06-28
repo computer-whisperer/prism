@@ -1019,10 +1019,10 @@ impl Renderer {
                 self.device.raw.cmd_set_viewport(cb, 0, &[viewport]);
 
                 for (pass_idx, area) in decode_passes.iter().enumerate() {
-                    // Damage rects may overlap (e.g. two translucent windows both
-                    // changing); each pass CLEARs + recomposites its rect, so a
-                    // write-after-write barrier orders overlapping passes. (Cheap;
-                    // disjoint passes pay only a serialization point.)
+                    // `plan_passes` returns a disjoint cover, so the passes don't
+                    // actually overlap; this write-after-write barrier is cheap
+                    // insurance that keeps each pass's CLEAR + recomposite correct
+                    // even if that invariant ever changes. (≤8 small passes.)
                     if pass_idx > 0 {
                         let waw = [vk::MemoryBarrier2::default()
                             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -1361,16 +1361,34 @@ fn damage_bbox(damage: &[Rectangle<i32, Physical>], extent: vk::Extent2D) -> Opt
     })
 }
 
-/// Plan the per-rect render passes for a set of physical damage rects: clamp each
-/// to `extent`, and if more than `max` survive, collapse to a single bounding-box
-/// pass (bounding the per-pass overhead). An empty result means no on-screen
-/// damage — the caller decides whether that skips the pass or forces a full one.
+/// Plan the per-rect render passes for a set of physical damage rects: reduce the
+/// input to a *disjoint* cover of its union, clamp each piece to `extent`, and if
+/// more than `max` survive, collapse to a single bounding-box pass (bounding the
+/// per-pass overhead). An empty result means no on-screen damage — the caller
+/// decides whether that skips the pass or forces a full one.
+///
+/// Making the cover disjoint matters even though both passes are idempotent under
+/// overlap: an overlapping pass *redoes* the work. The buffer-age encode region is
+/// `carry ∪ this-frame-damage`, and on a steady region (a bare wallpaper, or a
+/// border ring that changes the same way each frame) those are identical — so
+/// without this, the encode would run the whole region twice every frame.
 fn plan_passes(
     rects: &[Rectangle<i32, Physical>],
     extent: vk::Extent2D,
     max: usize,
 ) -> Vec<vk::Rect2D> {
-    let clamped: Vec<vk::Rect2D> = rects
+    // Accumulate a disjoint set: each rect contributes only the part not already
+    // covered. `subtract_rects` can split a rect into several pieces; the `max`
+    // fallback below bounds any blow-up.
+    let mut disjoint: Vec<Rectangle<i32, Physical>> = Vec::new();
+    for &r in rects {
+        if disjoint.is_empty() {
+            disjoint.push(r);
+        } else {
+            disjoint.extend(r.subtract_rects(disjoint.iter().copied()));
+        }
+    }
+    let clamped: Vec<vk::Rect2D> = disjoint
         .iter()
         .filter_map(|r| clamp_rect_to_extent(r, extent))
         .collect();
@@ -1531,5 +1549,25 @@ mod tests {
         // Past the cap → a single bounding-box pass.
         let many: Vec<_> = (0..10).map(|i| pr(i * 5, 0, 4, 4)).collect();
         assert_eq!(plan_passes(&many, e, 8).len(), 1);
+    }
+
+    #[test]
+    fn plan_passes_dedups_overlap() {
+        let e = ext(100, 100);
+        // Duplicate full-output rects (carry ∪ damage on a bare wallpaper) collapse
+        // to a single pass — not two — so the encode runs once, not twice.
+        let full = pr(0, 0, 100, 100);
+        let passes = plan_passes(&[full, full], e, 8);
+        assert_eq!(passes.len(), 1);
+        assert_eq!(passes[0].extent, ext(100, 100));
+        // Identical sub-rects likewise collapse.
+        let r = pr(10, 10, 20, 20);
+        assert_eq!(plan_passes(&[r, r], e, 8).len(), 1);
+        // A disjoint cover never double-counts area: total ≤ the output.
+        let area: i64 = plan_passes(&[full, pr(20, 20, 30, 30)], e, 8)
+            .iter()
+            .map(|p| p.extent.width as i64 * p.extent.height as i64)
+            .sum();
+        assert_eq!(area, 100 * 100);
     }
 }
