@@ -123,6 +123,9 @@ impl ClosingWindow {
             texture_view: snapshot.view(),
             chroma_view: None,
             yuv: 0,
+            // Intermediate-space snapshot (passthrough transfer): never
+            // debanded, so the source extent is irrelevant.
+            source_extent: prism_renderer::vk::Extent2D::default(),
             geometry,
             content_commit: 0,
             opaque: Vec::new(),

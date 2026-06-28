@@ -173,4 +173,13 @@ pub struct OutputConfig {
     /// works against panel-native input. `None` = identity (no gamut
     /// correction, panel emits its native primaries directly).
     pub ctm: Option<[[f32; 3]; 3]>,
+    /// Sub-LSB deband strength for 8-bit SDR content on this output, from
+    /// `output { tune { deband strength=… } }`. `None` = debanding off.
+    /// Lowered into a per-surface blur request at render time (see
+    /// `prism_renderer::lower_elements`); σ scales with source resolution.
+    pub deband_strength: Option<f32>,
+    /// Deband blur resolution divisor from `tune { deband downsample=… }`
+    /// (rounded down to a power of two). `1` = full-res; higher is cheaper.
+    /// Ignored when `deband_strength` is `None`.
+    pub deband_downsample: u32,
 }

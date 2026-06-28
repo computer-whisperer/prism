@@ -17,6 +17,8 @@ const SHADERS: &[(&str, &str)] = &[
     ("decode.vert", "vert"),
     ("decode.frag", "frag"),
     ("encode.vert", "vert"),
+    ("deband_blur.vert", "vert"),
+    ("deband_blur.frag", "frag"),
 ];
 
 fn main() {

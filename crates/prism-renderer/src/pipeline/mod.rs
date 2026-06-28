@@ -10,6 +10,7 @@
 //! ordering and types in sync. The shaders use `mat4` for the matrix even
 //! though we logically only need mat3, to avoid std430 alignment pitfalls.
 
+pub mod deband;
 pub mod decode;
 pub mod encode;
 

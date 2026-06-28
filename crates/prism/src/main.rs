@@ -579,6 +579,7 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
         texture_view: texture.view,
         chroma_view: None,
         push: DecodePush::identity_srgb([-1.0, -1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
+        deband: None,
     };
     let encode_push = EncodePush::sdr_identity();
 
@@ -1163,6 +1164,9 @@ fn run_integrated(
         panel_peak_nits_rgb: [80.0, 80.0, 80.0],
         response_curve: None,
         ctm: None,
+        // Debanding off by default; set per-output below from `tune { deband }`.
+        deband_strength: None,
+        deband_downsample: 1,
     };
 
     // ── Pick connectors + bring up OutputContexts on every card ────────────
@@ -1219,6 +1223,11 @@ fn run_integrated(
             let edid = prism_drm::EdidInfo::read(&card.drm, pick.connector);
             let mut output_config = default_output_config.clone();
             if let Some(cfg) = find_connector_config(&name, &edid, &config.outputs.0) {
+                // Per-output deband settings (independent of the color block).
+                if let Some(deband) = cfg.tune.as_ref().and_then(|t| t.deband) {
+                    output_config.deband_strength = Some(deband.strength as f32);
+                    output_config.deband_downsample = deband.downsample.max(1);
+                }
                 if let Some(color) = cfg.color.as_ref() {
                     // HDR-on flips depth to fp16 + the encode chain to
                     // PQ; fp16 depth implies connector max-bpc 10 via
@@ -3076,11 +3085,24 @@ fn render_output_now(
     // `view_size`); SolidColor/Border elements bind the white texel, Surface
     // elements bind the per-surface view. The per-output panel peak is threaded
     // through so the decoder's display-referred clamp lands at the right value.
+    // Per-output deband settings, resolved at bringup from
+    // `output { tune { deband … } }`. `None` leaves debanding off; the
+    // renderer lowers it into a blur request on each qualifying 8-bit SDR
+    // surface.
+    let deband = state.outputs.get(output_id).and_then(|o| {
+        o.config
+            .deband_strength
+            .map(|strength| prism_renderer::DebandParams {
+                strength,
+                downsample: o.config.deband_downsample,
+            })
+    });
     let frame = prism_renderer::lower_elements(
         &render_els,
         view_size,
         white_view,
         output_decode_clamp_bt2020_rgb,
+        deband,
     );
 
     // Once per output, the first present that actually carries tiles —
@@ -3621,6 +3643,7 @@ fn run_gradient_scanout(output_name: Option<&str>, depth: prism_drm::ScanoutDept
         texture_view: texture.view,
         chroma_view: None,
         push: DecodePush::identity_srgb([-1.0, -1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
+        deband: None,
     };
     let encode_push = EncodePush::sdr_identity();
     // One-shot TTY test: device_wait_idle below ensures the GPU work

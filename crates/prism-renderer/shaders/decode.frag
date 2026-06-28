@@ -27,6 +27,11 @@ layout(set = 0, binding = 0) uniform sampler2D u_texture;
 // binding 1 = chroma plane for YUV (half-res, interleaved Cb/Cr). For RGB
 // draws this is bound to the same view as binding 0 and never sampled.
 layout(set = 0, binding = 1) uniform sampler2D u_chroma;
+// binding 2 = deband pre-blurred copy of the source (fp16, possibly at a
+// lower resolution when downsampled — the LINEAR sampler upsamples it),
+// sampled with the same v_uv as binding 0. Used only when `deband != 0`;
+// otherwise bound to the binding-0 view and never sampled.
+layout(set = 0, binding = 2) uniform sampler2D u_deband;
 
 layout(push_constant) uniform Push {
     vec4 dst_rect_clip;
@@ -98,6 +103,9 @@ layout(push_constant) uniform Push {
     // convention: softness / 2). Below 0.1 the shadow degenerates to a
     // crisp rounded rect, matching niri.
     float sdf_sigma;
+    // Deband: 0 = off, 1 = clamp the binding-2 pre-blurred source to
+    // ±0.5 LSB of the original code before the transfer decode.
+    int deband;
 } push;
 
 layout(location = 0) in vec2 v_uv;
@@ -273,6 +281,18 @@ void main() {
     vec4 sampled = push.yuv != 0
         ? vec4(ycbcr_to_nonlinear_rgb(), 1.0)
         : texture(u_texture, v_uv);
+
+    // Debanding (8-bit SDR RGB only — the integrator gates `deband` on
+    // that). Replace the source codes with the wide-Gaussian-blurred copy
+    // at binding 2, clamped to ±0.5 LSB of the original so re-rounding to
+    // 8-bit is unchanged: the value the panel sees is never wrong, but
+    // smooth gradients gain sub-LSB precision the panel can resolve. Runs
+    // before alpha/transfer so the rest of the pipeline is untouched.
+    if (push.deband != 0) {
+        const float lsb = 0.5 / 255.0;
+        vec3 blurred = texture(u_deband, v_uv).rgb;
+        sampled.rgb = clamp(blurred, sampled.rgb - lsb, sampled.rgb + lsb);
+    }
 
     // Alpha handling — BEFORE the transfer decode, which must operate on
     // straight (non-premultiplied) color. Opaque buffers (X-formats, YUV)

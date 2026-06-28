@@ -24,6 +24,7 @@ use crate::encode_synth::EncodeConfig;
 use crate::error::{RendererError, Result, VkResultExt};
 use crate::intermediate::Intermediate;
 use crate::lut3d::{identity_lut, Lut3dTexture, LUT_CUBE_EDGE};
+use crate::pipeline::deband::DebandPipeline;
 use crate::pipeline::decode::{DecodePipeline, DecodePush};
 use crate::pipeline::encode::{EncodePipeline, EncodePush};
 use crate::snapshot::SnapshotTexture;
@@ -165,6 +166,37 @@ pub struct ElementDraw {
     /// shader references it statically but ignores it when `yuv == 0`).
     pub chroma_view: Option<vk::ImageView>,
     pub push: DecodePush,
+    /// Debanding request. `Some` ⇒ the renderer runs the separable-blur
+    /// pre-pass on `texture_view` before the decode pass and sets
+    /// `push.deband` so the decode shader clamps to it. The integrator only
+    /// populates this for 8-bit SDR RGB content on deband-enabled outputs.
+    pub deband: Option<DebandRequest>,
+}
+
+/// Per-output deband settings the integrator threads into
+/// [`lower_elements`](crate::lower_elements). Resolved from
+/// `output { tune { deband … } }` at bringup.
+#[derive(Clone, Copy, Debug)]
+pub struct DebandParams {
+    /// Strength multiplier; σ = `strength × source_height / 90`.
+    pub strength: f32,
+    /// Blur resolution divisor (rounded down to a power of two). The wide
+    /// Gaussian runs on a `1/downsample` copy and is bilinearly upsampled by
+    /// the decode sampler at clamp time — ~`downsample²` cheaper.
+    pub downsample: u32,
+}
+
+/// Parameters for an element's deband pre-pass. See [`ElementDraw::deband`].
+#[derive(Clone, Copy, Debug)]
+pub struct DebandRequest {
+    /// Source texture extent in texels — sizes the blur scratch and viewport.
+    pub source_extent: vk::Extent2D,
+    /// Gaussian σ in source pixels. The integrator derives it from the
+    /// output's configured strength and resolution.
+    pub sigma: f32,
+    /// Blur resolution divisor (rounded down to a power of two; `1` = full
+    /// res). The blur runs at `source_extent / downsample`.
+    pub downsample: u32,
 }
 
 /// A request to capture a region of the intermediate into a [`SnapshotTexture`]
@@ -210,6 +242,7 @@ struct FrameSlot {
 pub struct Renderer {
     device: Arc<Device>,
     decode: DecodePipeline,
+    deband: DebandPipeline,
     encode: EncodePipeline,
     intermediate: Option<Intermediate>,
     /// 1×1 RGBA8 white texture used as the texture binding for solid-color
@@ -253,6 +286,7 @@ impl Renderer {
         encode_config: &EncodeConfig,
     ) -> Result<Self> {
         let decode = DecodePipeline::new(device.clone(), intermediate_format)?;
+        let deband = DebandPipeline::new(device.clone(), FRAMES_IN_FLIGHT)?;
         let encode = EncodePipeline::new(device.clone(), scanout_format, encode_config)?;
 
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -351,6 +385,7 @@ impl Renderer {
         Ok(Self {
             device,
             decode,
+            deband,
             encode,
             intermediate: None,
             white_tex,
@@ -986,6 +1021,39 @@ impl Renderer {
                 );
             }
 
+            // Deband pre-pass. Blur each requested element's source into an
+            // fp16 scratch copy, recorded here (before the decode rendering)
+            // so each scratch is SHADER_READ_ONLY by the time the decode pass
+            // samples it. `producer_sync` above already made client writes
+            // visible to the fragment-shader sampling the blur does.
+            //
+            // Damage gate: only blur an element that overlaps a decode pass
+            // this frame — the decode loop below skips drawing (and thus
+            // sampling the scratch of) elements outside every damage rect, so
+            // blurring them would be wasted. This is the *element*-granularity
+            // damage fix; sub-rect blurring of a partially-damaged element
+            // (e.g. video in a static browser window) is the next step.
+            // `deband_views[i]` pairs with `elements[i]`.
+            self.deband.begin_frame(slot_idx);
+            let mut deband_views: Vec<Option<vk::ImageView>> = Vec::with_capacity(elements.len());
+            for el in elements {
+                let redrawn = decode_passes
+                    .iter()
+                    .any(|area| clip_rect_overlaps(el.push.dst_rect_clip, *area, extent));
+                let view = match &el.deband {
+                    Some(req) if redrawn => Some(self.deband.blur(
+                        cb,
+                        slot_idx,
+                        el.texture_view,
+                        req.source_extent,
+                        req.sigma,
+                        req.downsample,
+                    )?),
+                    _ => None,
+                };
+                deband_views.push(view);
+            }
+
             // CLEAR scopes to each pass's render_area, so only the damaged rect is
             // cleared; pixels outside it keep last frame's composite.
             let color_attach = [vk::RenderingAttachmentInfo::default()
@@ -1044,7 +1112,7 @@ impl Renderer {
                     self.device.raw.cmd_begin_rendering(cb, &render_info);
                     self.device.raw.cmd_set_scissor(cb, 0, &[*area]);
 
-                    for el in elements {
+                    for (el_idx, el) in elements.iter().enumerate() {
                         // Skip elements whose quad doesn't touch this rect — they
                         // would be scissored to zero fragments anyway, so this just
                         // drops the wasted descriptor push + draw call.
@@ -1061,9 +1129,18 @@ impl Renderer {
                             .sampler(self.decode.sampler)
                             .image_view(el.chroma_view.unwrap_or(el.texture_view))
                             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                        // Binding 2 = deband pre-blurred copy when this element was
+                        // debanded; otherwise the binding-0 view (never sampled, but
+                        // keeps the descriptor valid). `push.deband` gates the read.
+                        let deband_view = deband_views[el_idx].unwrap_or(el.texture_view);
+                        let deband_info = [vk::DescriptorImageInfo::default()
+                            .sampler(self.decode.sampler)
+                            .image_view(deband_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
                         let writes = [
                             self.decode.write_texture_binding(0, &luma_info),
                             self.decode.write_texture_binding(1, &chroma_info),
+                            self.decode.write_texture_binding(2, &deband_info),
                         ];
                         self.decode.push_loader.cmd_push_descriptor_set(
                             cb,
@@ -1072,12 +1149,16 @@ impl Renderer {
                             0,
                             &writes,
                         );
+                        // Set the deband flag for this draw: on iff the renderer
+                        // produced a blurred copy for this element above.
+                        let mut push = el.push;
+                        push.deband = deband_views[el_idx].is_some() as i32;
                         self.device.raw.cmd_push_constants(
                             cb,
                             self.decode.pipeline_layout,
                             vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                             0,
-                            bytemuck::bytes_of(&el.push),
+                            bytemuck::bytes_of(&push),
                         );
                         self.device.raw.cmd_draw(cb, 4, 1, 0, 0);
                     }

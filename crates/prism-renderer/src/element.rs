@@ -20,7 +20,7 @@
 //! output-space geometry it needs for damage tracking.
 
 use crate::pipeline::decode::DecodePush;
-use crate::renderer::ElementDraw;
+use crate::renderer::{DebandParams, DebandRequest, ElementDraw};
 use ash::vk;
 use prism_frame::{ElementId, Logical, Point, Rectangle, Size};
 
@@ -126,6 +126,9 @@ pub fn lower_elements(
     view_size: Size<f64, Logical>,
     white_view: vk::ImageView,
     output_peak_nits_rgb: [f32; 3],
+    // Per-output deband settings (`None` = debanding off for this output).
+    // Lowered into a [`DebandRequest`] on each qualifying surface element.
+    deband: Option<DebandParams>,
 ) -> LoweredFrame {
     let project = make_projector(view_size);
     let view_size_log = [view_size.w as f32, view_size.h as f32];
@@ -146,7 +149,13 @@ pub fn lower_elements(
         });
         if visible[i] {
             let start = draws.len();
-            el.lower(&project, white_view, output_peak_nits_rgb, &mut draws);
+            el.lower(
+                &project,
+                white_view,
+                output_peak_nits_rgb,
+                deband,
+                &mut draws,
+            );
             // The vertex shader inverts the projection to recover logical
             // pixel positions for the rounded-corner SDF; thread the view
             // size into every draw here rather than through each `to_draw`.
@@ -385,6 +394,11 @@ pub struct SurfaceEl {
     /// Set from the imported texture's `YuvKind`; lowered into
     /// `DecodePush::yuv`.
     pub yuv: i32,
+    /// Source buffer extent in texels. Sizes the deband blur scratch (a
+    /// full-buffer blurred copy the decode pass samples with this element's
+    /// UV). Zero ⇒ unknown/irrelevant (e.g. intermediate-space snapshots),
+    /// which disables debanding for this element regardless of config.
+    pub source_extent: vk::Extent2D,
     /// Output rect in logical pixels; projected to clip space at lowering.
     pub geometry: Rectangle<f64, Logical>,
     /// Content version: the surface's buffer commit count. The damage tracker
@@ -424,11 +438,46 @@ pub struct SurfaceEl {
     pub clip: Option<SurfaceClip>,
 }
 
+/// Minimum source dimension (texels) for debanding to engage. Small
+/// surfaces (icons, popups, cursors) don't show gradient banding and aren't
+/// worth a pair of wide blur passes.
+const DEBAND_MIN_SOURCE_DIM: u32 = 256;
+
 impl SurfaceEl {
+    /// Whether this element is a candidate for debanding: 8-bit SDR RGB
+    /// content, large enough to matter. `yuv == 0` excludes video; the
+    /// sRGB/gamma/BT.1886 transfers are the SDR encodings (PQ is excluded,
+    /// and 10-bit RGB is only ever used with PQ, so transfer doubles as the
+    /// bit-depth gate). `source_extent` zero (snapshots) never qualifies.
+    fn debandable(&self) -> bool {
+        let big = self.source_extent.width >= DEBAND_MIN_SOURCE_DIM
+            && self.source_extent.height >= DEBAND_MIN_SOURCE_DIM;
+        let sdr_rgb = self.yuv == 0 && matches!(self.color.transfer, 1 | 4 | 5);
+        big && sdr_rgb
+    }
+
+    /// Build the deband request for this element on an output with the given
+    /// params, or `None` if debanding is off or the element doesn't qualify.
+    /// σ scales with source height (`strength × height / 90` ≈ the measured
+    /// per-resolution knee), clamped to the blur kernel's supported range.
+    fn deband_request(&self, params: Option<DebandParams>) -> Option<DebandRequest> {
+        let params = params?;
+        if params.strength <= 0.0 || !self.debandable() {
+            return None;
+        }
+        let sigma = (params.strength * self.source_extent.height as f32 / 90.0).clamp(1.0, 32.0);
+        Some(DebandRequest {
+            source_extent: self.source_extent,
+            sigma,
+            downsample: params.downsample,
+        })
+    }
+
     pub fn to_draw(
         &self,
         project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
         output_peak_nits_rgb: [f32; 3],
+        deband: Option<DebandParams>,
     ) -> ElementDraw {
         let mut push = DecodePush::identity_srgb(project(self.geometry), self.src_rect_uv);
         push.transfer = self.color.transfer;
@@ -452,6 +501,7 @@ impl SurfaceEl {
             texture_view: self.texture_view,
             chroma_view: self.chroma_view,
             push,
+            deband: self.deband_request(deband),
         }
     }
 }
@@ -522,6 +572,7 @@ fn solid_color_draw(
         texture_view: white_view,
         chroma_view: None,
         push,
+        deband: None,
     }
 }
 
@@ -1191,10 +1242,11 @@ impl RenderEl {
         project: &dyn Fn(Rectangle<f64, Logical>) -> [f32; 4],
         white_view: vk::ImageView,
         output_peak_nits_rgb: [f32; 3],
+        deband: Option<DebandParams>,
         out: &mut Vec<ElementDraw>,
     ) {
         match self {
-            Self::Surface(s) => out.push(s.to_draw(project, output_peak_nits_rgb)),
+            Self::Surface(s) => out.push(s.to_draw(project, output_peak_nits_rgb, deband)),
             Self::SolidColor(s) => out.push(s.to_draw(project, white_view, output_peak_nits_rgb)),
             Self::Border(b) => b.push_draws(project, white_view, output_peak_nits_rgb, out),
             Self::RoundedBox(r) => out.push(r.to_draw(project, white_view, output_peak_nits_rgb)),
@@ -1255,6 +1307,7 @@ mod tests {
             texture_view: vk::ImageView::null(),
             chroma_view: None,
             yuv: 0,
+            source_extent: vk::Extent2D::default(),
             geometry: geo,
             content_commit: 0,
             opaque,
@@ -1541,7 +1594,7 @@ mod tests {
             unreachable!()
         };
         s.clip = Some(clip(12.0, 22.0, 60.0, 30.0, 8.0));
-        let draw = s.to_draw(&project, [1000.0; 3]);
+        let draw = s.to_draw(&project, [1000.0; 3], None);
         assert_eq!(draw.push.sdf_mode, 1);
         assert_eq!(draw.push.sdf_box, [12.0, 22.0, 72.0, 52.0]);
         assert_eq!(draw.push.sdf_radii, [8.0; 4]);

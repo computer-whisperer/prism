@@ -1193,6 +1193,7 @@ mod tests {
                         ),
                         layout: None,
                         color: None,
+                        tune: None,
                     },
                     Output {
                         off: false,
@@ -1220,6 +1221,7 @@ mod tests {
                         hot_corners: None,
                         layout: None,
                         color: None,
+                        tune: None,
                     },
                     Output {
                         off: false,
@@ -1250,6 +1252,7 @@ mod tests {
                         hot_corners: None,
                         layout: None,
                         color: None,
+                        tune: None,
                     },
                 ],
             ),

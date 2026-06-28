@@ -364,6 +364,10 @@ pub fn push_surface_tree_elements(
                 texture_view,
                 chroma_view,
                 yuv,
+                source_extent: buffer_size.map_or(vk::Extent2D::default(), |s| vk::Extent2D {
+                    width: s.w.max(0) as u32,
+                    height: s.h.max(0) as u32,
+                }),
                 geometry: dst,
                 content_commit,
                 opaque,

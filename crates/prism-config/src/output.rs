@@ -78,6 +78,8 @@ pub struct Output {
     pub layout: Option<LayoutPart>,
     #[knuffel(child)]
     pub color: Option<ColorConfig>,
+    #[knuffel(child)]
+    pub tune: Option<TuneConfig>,
 }
 
 impl Output {
@@ -111,6 +113,53 @@ impl Default for Output {
             hot_corners: None,
             layout: None,
             color: None,
+            tune: None,
+        }
+    }
+}
+
+/// Per-output rendering tunables — output-specific spatial/precision
+/// transforms applied in the render pipeline, independent of the color
+/// calibration in [`ColorConfig`]. A growth point: debanding lives here
+/// now; per-output sharpening, dither, etc. would join as sibling nodes.
+#[derive(knuffel::Decode, Debug, Clone, PartialEq, Default)]
+pub struct TuneConfig {
+    /// Sub-LSB debanding of 8-bit SDR content. See [`Deband`].
+    #[knuffel(child)]
+    pub deband: Option<Deband>,
+}
+
+/// Quantization-constrained debanding of 8-bit SDR content. Before the
+/// decode pass's EOTF, the source codes are smoothed with a wide Gaussian
+/// and clamped to ±0.5 LSB of the original code — so the 8-bit value is
+/// never changed (re-rounding reproduces it exactly), but smooth gradients
+/// gain sub-LSB precision the panel can show, reducing visible banding.
+///
+/// Only applies to 8-bit RGB sRGB/gamma content; PQ, YUV video, and
+/// 10-bit surfaces are left untouched.
+#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+pub struct Deband {
+    /// Strength. `0` disables. The Gaussian σ auto-scales with output
+    /// resolution (`σ = strength × height / 90`, ≈24 at 2160p and ≈12 at
+    /// 1080p — the measured diminishing-returns point), so one value
+    /// behaves consistently across panels. Default `1.0`.
+    #[knuffel(property, default = 1.0)]
+    pub strength: f64,
+    /// Resolution divisor for the blur. The wide Gaussian is computed on a
+    /// `1/downsample`-scale copy of the source and bilinearly upsampled by
+    /// the decode sampler — the blur is low-frequency, so this is nearly
+    /// free in quality but cuts cost by ~`downsample²`. Rounded down to a
+    /// power of two; `1` = full-resolution (most expensive). `4` is a good
+    /// default for 4K panels. Default `1`.
+    #[knuffel(property, default = 1)]
+    pub downsample: u32,
+}
+
+impl Default for Deband {
+    fn default() -> Self {
+        Self {
+            strength: 1.0,
+            downsample: 1,
         }
     }
 }
@@ -839,6 +888,45 @@ output "DP-4" {
 "#,
         );
         assert_eq!(hdr.advertised_peak_nits, None);
+    }
+
+    #[test]
+    fn parse_tune_deband_block() {
+        fn parse(text: &str) -> Option<TuneConfig> {
+            let outputs: Vec<Output> = knuffel::parse("test.kdl", text).unwrap();
+            outputs[0].tune.clone()
+        }
+
+        // strength + downsample properties.
+        let tune = parse(
+            r#"
+output "DP-4" {
+    tune {
+        deband strength=1.5 downsample=4
+    }
+}
+"#,
+        )
+        .unwrap();
+        assert_eq!(tune.deband.map(|d| d.strength), Some(1.5));
+        assert_eq!(tune.deband.map(|d| d.downsample), Some(4));
+
+        // bare `deband` ⇒ defaults (strength 1.0, downsample 1).
+        let tune = parse(
+            r#"
+output "DP-4" {
+    tune {
+        deband
+    }
+}
+"#,
+        )
+        .unwrap();
+        assert_eq!(tune.deband.map(|d| d.strength), Some(1.0));
+        assert_eq!(tune.deband.map(|d| d.downsample), Some(1));
+
+        // no tune block ⇒ None.
+        assert!(parse(r#"output "DP-4""#).is_none());
     }
 
     #[test]

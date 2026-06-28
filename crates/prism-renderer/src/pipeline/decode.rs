@@ -90,6 +90,12 @@ pub struct DecodePush {
     /// Shadow mode only: Gaussian sigma in logical px (softness / 2, the
     /// CSS box-shadow convention). Below 0.1 → crisp rounded rect.
     pub sdf_sigma: f32,
+    /// Debanding: `0` = off (binding 2 ignored), `1` = on (sample the
+    /// pre-blurred source copy at binding 2 and clamp it to ±0.5 LSB of the
+    /// original code before the EOTF). Set by the renderer at draw time for
+    /// elements carrying a [`ElementDraw::deband`](crate::ElementDraw)
+    /// request; the integrator decides which elements qualify.
+    pub deband: i32,
 }
 
 /// The GLSL `Push` block lays out to exactly this size under std430 rules;
@@ -97,7 +103,7 @@ pub struct DecodePush {
 /// silently corrupt every per-element parameter, so pin it. 244 bytes is
 /// within the 256-byte `maxPushConstantsSize` of all desktop drivers
 /// (RADV / NVIDIA / ANV / llvmpipe).
-const _: () = assert!(std::mem::size_of::<DecodePush>() == 244);
+const _: () = assert!(std::mem::size_of::<DecodePush>() == 248);
 
 impl DecodePush {
     pub fn identity_srgb(dst: [f32; 4], src: [f32; 4]) -> Self {
@@ -125,6 +131,7 @@ impl DecodePush {
             sdf_box2: [0.0; 4],
             sdf_radii2: [0.0; 4],
             sdf_sigma: 0.0,
+            deband: 0,
         }
     }
 
@@ -153,6 +160,7 @@ impl DecodePush {
             sdf_box2: [0.0; 4],
             sdf_radii2: [0.0; 4],
             sdf_sigma: 0.0,
+            deband: 0,
         }
     }
 }
@@ -189,6 +197,14 @@ impl DecodePipeline {
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Binding 2 = the deband pre-blurred source copy. Sampled only
+            // when `push.deband != 0`; otherwise bound to the same view as
+            // binding 0 so the statically-referenced sampler stays valid.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
