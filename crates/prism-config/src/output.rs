@@ -181,18 +181,24 @@ impl Default for Deband {
 /// LUT, and the weights are baked into the synthesized shader (a static
 /// per-output property — changing them re-synthesizes on config reload).
 ///
+/// Direction: each subpixel should show the image at *its own* physical
+/// position, so a channel samples *toward* where its subpixel sits in the
+/// triad. A blue fringe on top means the blue subpixel sits high, so blue
+/// is top-weighted; red on the bottom means red sits low, so red is
+/// bottom-weighted. (Weighting *away* from the fringe would amplify it.)
+///
 /// Weights **should sum to 1 per channel** to preserve luminance; the
 /// consumer warns and normalizes otherwise. An omitted channel defaults to
 /// identity `[0, 1, 0]` (pass-through). The whole block absent ⇒ feature off
 /// (single-tap sampling, no cost).
 ///
 /// The exact weights are panel-specific and tuned by eye. A starting point
-/// that counters blue-top / red-bottom fringe pulls red up and blue down:
+/// for blue-top / red-bottom fringe:
 /// ```kdl
 /// subpixel-fir {
-///     red    0.25 0.75 0.0
-///     green  0.0  1.0  0.0
-///     blue   0.0  0.75 0.25
+///     red    0.0 0.8 0.2
+///     green  0.0 1.0 0.0
+///     blue   0.2 0.8 0.0
 /// }
 /// ```
 #[derive(knuffel::Decode, Debug, Clone, PartialEq, Default)]
