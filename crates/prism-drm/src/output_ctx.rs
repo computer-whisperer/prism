@@ -888,15 +888,14 @@ impl OutputContext {
             self.extent.height as f64 / view_size.h.max(1.0),
         ));
         let damage = self.damage_tracker.compute(&frame.meta, scale);
-        let damage_area: i64 = damage
-            .iter()
-            .map(|r| r.size.w as i64 * r.size.h as i64)
-            .sum();
+        // `area_px` summed inside the macro so it's only computed when the
+        // `damage` target is actually enabled — off by default, and this
+        // runs per-output-per-frame.
         tracing::debug!(
             target: "damage",
             output = %self.connector_name,
             rects = damage.len(),
-            area_px = damage_area,
+            area_px = damage.iter().map(|r| r.size.w as i64 * r.size.h as i64).sum::<i64>(),
             full_px = self.extent.width as i64 * self.extent.height as i64,
             "frame damage",
         );
