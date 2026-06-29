@@ -891,12 +891,28 @@ fn pick_memory(
 /// we own DRM master (the text console can't refresh), and any in-flight
 /// stdio is lost when the kernel wedges.
 ///
+/// Opt-in: nothing is written unless `$PRISM_CRUMBS` (the output path) or
+/// `$PRISM_FLIP_TRACE` is set — otherwise this is a no-op, so normal
+/// operation doesn't leak a `prism.crumbs` into the cwd of every session.
+///
 /// Path: `$PRISM_CRUMBS` if set, otherwise `./prism.crumbs` (relative to
 /// the cwd at process start). NOT `/tmp` — that's tmpfs on most distros
 /// and gets wiped at the reboot we're specifically trying to debug.
 fn breadcrumb(msg: &str) {
     use std::io::Write;
     use std::sync::OnceLock;
+    static CRUMBS_ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = *CRUMBS_ENABLED.get_or_init(|| {
+        let set = |var| {
+            std::env::var(var)
+                .ok()
+                .is_some_and(|v: String| !v.is_empty() && v != "0")
+        };
+        set("PRISM_CRUMBS") || set("PRISM_FLIP_TRACE")
+    });
+    if !enabled {
+        return;
+    }
     static CRUMBS_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
     let path = CRUMBS_PATH.get_or_init(|| {
         if let Ok(p) = std::env::var("PRISM_CRUMBS") {
@@ -1011,8 +1027,9 @@ fn notify_systemd_ready() {
     }
 }
 
-/// Breadcrumbs are appended to ./prism.crumbs (override with $PRISM_CRUMBS)
-/// with fsync per line, so they survive a system lockup.
+/// Breadcrumbs (fsync per line, so they survive a system lockup) are
+/// opt-in: set $PRISM_CRUMBS (output path) or $PRISM_FLIP_TRACE to enable;
+/// otherwise [`breadcrumb`] is a no-op and no file is written.
 ///
 /// `session_mode` (the `--session` flag): when true, prism is the login
 /// session, so it imports its environment into the systemd `--user` manager
