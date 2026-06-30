@@ -19,6 +19,7 @@ pub mod intermediate_capture;
 pub mod lut3d;
 pub mod oneshot;
 pub mod pipeline;
+pub mod profile;
 pub mod renderer;
 pub mod snapshot;
 pub mod upload;
@@ -47,6 +48,7 @@ pub use lut3d::{
 pub use oneshot::OneshotPool;
 pub use pipeline::decode::{DecodePipeline, DecodePush};
 pub use pipeline::encode::{EncodePipeline, EncodePush};
+pub use profile::{FrameProfile, ProfileRing, ProfileSummary, Span, SpanStat, N_SPANS, SPAN_NAMES};
 pub use renderer::{
     DebandParams, ElementDraw, GpuFrameTiming, RenderedFrame, Renderer, SnapshotCopy,
 };

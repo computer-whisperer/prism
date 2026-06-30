@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use drm_fourcc::DrmModifier;
 use prism_renderer::{
     synthesize_lut_from_matrix_curve, vk, DamageTracker, Device, DrmDevId, EncodePush,
-    ImportedImage, LoweredFrame, Renderer, SnapshotCopy,
+    FrameProfile, ImportedImage, LoweredFrame, Renderer, SnapshotCopy, Span,
 };
 use smithay::backend::drm::{DrmDevice, DrmSurface, PlaneConfig, PlaneState};
 use smithay::reexports::drm::control::{connector, crtc, framebuffer, Mode};
@@ -855,6 +855,10 @@ impl OutputContext {
     ///     `IN_FENCE_FD` (kernel dup'd internally), and is returned so the caller
     ///     can also time post-submit work — e.g. signaling `wp_linux_drm_syncobj`
     ///     release points on the input dmabufs. Caller may drop it if not needed.
+    // The render inputs are genuinely distinct per-frame values (geometry, color
+    // push, sync waits, snapshots, profile sink); bundling them into a struct
+    // would just move the same fields behind one more indirection.
+    #[allow(clippy::too_many_arguments)]
     pub fn present(
         &mut self,
         frame: &LoweredFrame,
@@ -873,6 +877,12 @@ impl OutputContext {
         // Set while a closing window animates — see `render_frame` /
         // `Layout::ensure_close_snapshots`.
         force_full_repaint: bool,
+        // Per-frame phase profile to complete, when profiling is enabled. The
+        // caller has already filled the CPU phases it owns (walk/lower/encpush)
+        // and the element count; this fn fills the damage + submit spans and the
+        // damage counters, then pushes the finished record into the renderer's
+        // ring. `None` (or an early-out before render) leaves it unrecorded.
+        mut profile: Option<&mut FrameProfile>,
     ) -> Result<PresentOutcome> {
         if self.frame_pending {
             return Ok(PresentOutcome::FlipPending);
@@ -887,7 +897,9 @@ impl OutputContext {
             self.extent.width as f64 / view_size.w.max(1.0),
             self.extent.height as f64 / view_size.h.max(1.0),
         ));
+        let t_damage = std::time::Instant::now();
         let damage = self.damage_tracker.compute(&frame.meta, scale);
+        let damage_elapsed = t_damage.elapsed();
         // `area_px` summed inside the macro so it's only computed when the
         // `damage` target is actually enabled — off by default, and this
         // runs per-output-per-frame.
@@ -913,6 +925,18 @@ impl OutputContext {
         if damage.is_empty() && self.mode_set_done && !self.force_present && snapshots.is_empty() {
             tracing::debug!(target: "damage", output = %self.connector_name, "skip: no damage");
             return Ok(PresentOutcome::SkippedNoDamage);
+        }
+
+        // Real render path: fill the profile's damage span + counters (the
+        // caller already filled the walk/lower/encpush spans and element count).
+        if let Some(p) = profile.as_mut() {
+            p.set(Span::Damage, damage_elapsed);
+            p.damage_rects = damage.len() as u32;
+            p.damage_area_px = damage
+                .iter()
+                .map(|r| r.size.w as u64 * r.size.h as u64)
+                .sum();
+            p.full_area_px = self.extent.width as u64 * self.extent.height as u64;
         }
 
         let back_index = self.back_index;
@@ -947,6 +971,7 @@ impl OutputContext {
         // below for the duration of the atomic commit; after the
         // commit ioctl returns, the kernel holds its own dup and
         // the `OwnedFd` is free to be returned to the caller.
+        let t_submit = std::time::Instant::now();
         let rendered = self.renderer.render_frame(
             &back.image,
             &frame.draws,
@@ -957,7 +982,25 @@ impl OutputContext {
             snapshots,
             force_full_repaint,
         )?;
+        let submit_elapsed = t_submit.elapsed();
         let present_sync = rendered.present_sync;
+
+        // Finish and record the per-frame profile. The submit span is the CPU
+        // cost of recording + queueing the command buffer (the GPU work itself
+        // runs async and is captured by the timestamp profiler). Pushing here —
+        // before the page-flip submit — is fine: the render work is done, and a
+        // later flip failure doesn't change the cost we measured.
+        if let Some(p) = profile {
+            p.set(Span::Submit, submit_elapsed);
+            self.renderer.record_frame_profile(*p);
+        }
+        if let Some(sum) = self.renderer.profile_summary_due() {
+            tracing::info!(
+                output = %self.connector_name,
+                "frame profile: {}",
+                sum.format_line(),
+            );
+        }
         tracing::trace!(
             target: "damage",
             output = %self.connector_name,

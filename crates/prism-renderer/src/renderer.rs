@@ -280,6 +280,14 @@ pub struct Renderer {
     next_slot: usize,
     /// GPU timestamp profiler (no-op unless `PRISM_GPU_PROFILE` is set).
     profiler: GpuProfiler,
+    /// Per-frame phase profiling. `profile_enabled` gates whether the
+    /// compositor takes the per-phase timings at all (default off → zero cost);
+    /// when set, completed [`FrameProfile`]s are pushed into `profile_ring`,
+    /// which backs the throttled summary log and (later) the IPC readout for
+    /// prism-tune. Enabled at construction by `PRISM_PROFILE`; an IPC toggle
+    /// will flip it live in a later increment.
+    profile_enabled: bool,
+    profile_ring: crate::profile::ProfileRing,
     /// Loader for VK_KHR_external_semaphore_fd — exports the per-slot
     /// `present_semaphore` as a Linux sync_file fd for KMS.
     semaphore_fd_loader: external_semaphore_fd::Device,
@@ -418,6 +426,8 @@ impl Renderer {
             slots,
             next_slot: 0,
             profiler,
+            profile_enabled: std::env::var_os("PRISM_PROFILE").is_some(),
+            profile_ring: crate::profile::ProfileRing::new(),
             semaphore_fd_loader,
         })
     }
@@ -597,6 +607,33 @@ impl Renderer {
     /// output's identity — this is prism's own per-output decode/encode cost.
     pub fn take_gpu_profile_report(&mut self) -> Option<GpuFrameTiming> {
         self.profiler.report.take()
+    }
+
+    /// Whether per-frame phase profiling is on for this output. When false the
+    /// compositor skips taking the per-phase timings entirely (zero cost). Set
+    /// by `PRISM_PROFILE` at construction; an IPC toggle will flip it live.
+    pub fn profile_enabled(&self) -> bool {
+        self.profile_enabled
+    }
+
+    /// Set the per-frame profiling enable (the IPC toggle's landing point).
+    pub fn set_profile_enabled(&mut self, on: bool) {
+        self.profile_enabled = on;
+    }
+
+    /// Push one completed [`FrameProfile`] into the ring. No-op semantics are
+    /// the caller's: only call this for frames that actually rendered.
+    pub fn record_frame_profile(&mut self, p: crate::profile::FrameProfile) {
+        self.profile_ring.push(p);
+    }
+
+    /// Take the throttled (≤1 Hz) profiling summary, if one is due. `None` when
+    /// profiling is off or the ring hasn't accumulated a second of frames.
+    pub fn profile_summary_due(&mut self) -> Option<crate::profile::ProfileSummary> {
+        if !self.profile_enabled {
+            return None;
+        }
+        self.profile_ring.summary_due()
     }
 
     /// The renderer's device handle — lets the integrator allocate

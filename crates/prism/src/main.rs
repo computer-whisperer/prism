@@ -2686,6 +2686,7 @@ fn render_output_now(
         target_time,
         output_sdr_reference_nits,
         output_decode_clamp_bt2020_rgb,
+        profile_enabled,
     ) = {
         let output = state
             .outputs
@@ -2697,8 +2698,15 @@ fn render_output_now(
             output.frame_clock.next_presentation_time(),
             output.effective_sdr_reference_nits(),
             output.effective_decode_clamp_bt2020_rgb(),
+            output.renderer.profile_enabled(),
         )
     };
+
+    // Per-frame phase profile, accumulated as we build the frame. `None` (the
+    // default) means profiling is off and we skip taking the per-phase timings
+    // entirely. The CPU spans owned here (walk/lower/encpush) are filled inline;
+    // present() fills the damage + submit spans and records the finished frame.
+    let mut profile = profile_enabled.then(prism_renderer::FrameProfile::default);
 
     // The smithay Output is the key the layout uses to find its
     // Monitor. wl_outputs is populated by advertise_output().
@@ -2917,6 +2925,11 @@ fn render_output_now(
         solid_color_lookup: &solid_color_lookup,
     };
 
+    // Profile span: the layout walk (cache refresh + surface-tree traversal
+    // building the RenderEl stream), bracketed up to the demand-materialize
+    // safety net below.
+    let t_walk = profile.is_some().then(std::time::Instant::now);
+
     // Refresh per-tile cached render elements (focus ring / border /
     // shadow geometry). Without this, the FocusRing's `cached` is
     // never populated and `render` early-returns — the ring is
@@ -3109,6 +3122,10 @@ fn render_output_now(
         }
     }
 
+    if let (Some(p), Some(t)) = (profile.as_mut(), t_walk) {
+        p.set(prism_renderer::Span::Walk, t.elapsed());
+    }
+
     // Render-demand safety net: materialize any surfaces the walk drew on
     // this output but had no texture for its GPU (spanning windows,
     // surfaces committed before placement, layer surfaces). They render
@@ -3150,6 +3167,7 @@ fn render_output_now(
                 downsample: o.config.deband_downsample,
             })
     });
+    let t_lower = profile.is_some().then(std::time::Instant::now);
     let frame = prism_renderer::lower_elements(
         &render_els,
         view_size,
@@ -3157,6 +3175,10 @@ fn render_output_now(
         output_decode_clamp_bt2020_rgb,
         deband,
     );
+    if let (Some(p), Some(t)) = (profile.as_mut(), t_lower) {
+        p.set(prism_renderer::Span::Lower, t.elapsed());
+        p.elements = frame.draws.len() as u32;
+    }
 
     // Once per output, the first present that actually carries tiles —
     // a single tracing line we use as a regression sentinel for
@@ -3191,6 +3213,7 @@ fn render_output_now(
     // (if configured) gets its push-constant slots filled. The sRGB
     // transfer is parameter-free — SDR calibration meaning lives in the
     // drive-domain LUT, immune to runtime reference-white policy.
+    let t_encpush = profile.is_some().then(std::time::Instant::now);
     let encode_push = {
         let output = state
             .outputs
@@ -3212,6 +3235,9 @@ fn render_output_now(
         }
         p
     };
+    if let (Some(p), Some(t)) = (profile.as_mut(), t_encpush) {
+        p.set(prism_renderer::Span::EncodePush, t.elapsed());
+    }
     // Pre-present GPU-sync waits the render submit blocks on (GPU-side, not on
     // the event loop). Computed before the mutable borrow of state.outputs:
     //   - cross-GPU mirror: submit home→scratch copies async, wait on them;
@@ -3240,6 +3266,7 @@ fn render_output_now(
             &render_waits,
             &snapshot_copies,
             force_full_decode,
+            profile.as_mut(),
         )?
     };
     // The render submit has been queued with the waits in its dependency list
