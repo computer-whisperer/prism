@@ -8,13 +8,13 @@
 //! area). A per-output [`ProfileRing`] keeps the last [`RING_CAPACITY`] frames
 //! so the readout is tail-aware (p50/p95/p99), not just a smoothed mean.
 //!
-//! The whole thing is off by default and costs nothing: the compositor only
-//! takes the per-phase `Instant`s when [`Renderer::profile_enabled`] is set
-//! (via the `PRISM_PROFILE` env var, and later an IPC toggle from prism-tune).
-//!
-//! GPU phases (`snapshot`/`decode`/`deband`/`encode`) are not yet wired — they
-//! read 0 — and are filled in the next increment, where the timestamp-query
-//! profiler folds its results into the same record one frame late.
+//! Collection runs **always-on in the background**: the per-frame cost is a
+//! handful of `Instant`s plus fire-and-forget GPU timestamp writes, negligible
+//! enough to leave on through days-long sessions so prism-tune can read the
+//! breakdown the moment something feels laggy — no restart to "turn profiling
+//! on". `PRISM_NO_PROFILE` opts out (to measure profiling's own overhead).
+//! Nothing is logged periodically; `PRISM_PROFILE_LOG` adds a throttled debug
+//! line for bring-up only. See [`Renderer::profile_enabled`].
 //!
 //! [`Renderer::profile_enabled`]: crate::renderer::Renderer::profile_enabled
 

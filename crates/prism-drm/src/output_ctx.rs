@@ -988,9 +988,10 @@ impl OutputContext {
         )?;
         let present_sync = rendered.present_sync;
 
-        // Throttled (≤1 Hz) profiling summary — per-span p50/p95/p99 plus median
-        // damage% and element count over the recent-frame ring.
-        if let Some(sum) = self.renderer.profile_summary_due() {
+        // Debug-only (`PRISM_PROFILE_LOG`) throttled summary line. Off by default
+        // — collection runs in the background and prism-tune reads it on demand;
+        // this just lets bring-up eyeball the breakdown without a GUI.
+        if let Some(sum) = self.renderer.profile_log_due() {
             tracing::info!(
                 output = %self.connector_name,
                 "frame profile: {}",

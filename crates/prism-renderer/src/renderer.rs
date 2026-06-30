@@ -271,14 +271,16 @@ pub struct Renderer {
     /// Device timestamp parameters for the GPU spans (probed once).
     gpu_ts: GpuTimestamps,
     /// Per-frame phase profiling. `profile_enabled` gates whether the per-phase
-    /// timings are taken at all (default off → zero cost): the compositor skips
-    /// the CPU `Instant`s and the renderer skips the GPU timestamp writes /
-    /// readback. When set, each frame's CPU profile is buffered per slot until
-    /// its GPU timestamps complete, then the merged record is pushed into
-    /// `profile_ring`, which backs the throttled summary log and (later) the IPC
-    /// readout for prism-tune. Enabled at construction by `PRISM_PROFILE`; an IPC
-    /// toggle will flip it live in a later increment.
+    /// timings are taken at all: when set, each frame's CPU profile is buffered
+    /// per slot until its GPU timestamps complete, then the merged record is
+    /// pushed into `profile_ring` for prism-tune to read on demand. On by
+    /// default — the cost is negligible (a handful of `Instant`s + fire-and-
+    /// forget GPU timestamps per frame) so it runs in the background of
+    /// days-long sessions; `PRISM_NO_PROFILE` opts out to measure that overhead.
+    /// `profile_log` additionally emits a throttled summary line, for bring-up
+    /// debugging only (`PRISM_PROFILE_LOG`); off by default so logs stay quiet.
     profile_enabled: bool,
+    profile_log: bool,
     profile_ring: crate::profile::ProfileRing,
     /// Loader for VK_KHR_external_semaphore_fd — exports the per-slot
     /// `present_semaphore` as a Linux sync_file fd for KMS.
@@ -423,7 +425,8 @@ impl Renderer {
             slots,
             next_slot: 0,
             gpu_ts,
-            profile_enabled: std::env::var_os("PRISM_PROFILE").is_some(),
+            profile_enabled: std::env::var_os("PRISM_NO_PROFILE").is_none(),
+            profile_log: std::env::var_os("PRISM_PROFILE_LOG").is_some(),
             profile_ring: crate::profile::ProfileRing::new(),
             semaphore_fd_loader,
         })
@@ -599,22 +602,29 @@ impl Renderer {
         self.intermediate_format
     }
 
-    /// Whether per-frame phase profiling is on for this output. When false the
-    /// compositor skips taking the per-phase timings entirely (zero cost). Set
-    /// by `PRISM_PROFILE` at construction; an IPC toggle will flip it live.
+    /// Whether per-frame phase profiling is collecting for this output. On by
+    /// default (the cost is negligible and prism-tune reads the ring live);
+    /// `PRISM_NO_PROFILE` opts out for measuring profiling's own overhead. When
+    /// false the compositor skips taking the per-phase timings entirely.
     pub fn profile_enabled(&self) -> bool {
         self.profile_enabled
     }
 
-    /// Set the per-frame profiling enable (the IPC toggle's landing point).
-    pub fn set_profile_enabled(&mut self, on: bool) {
-        self.profile_enabled = on;
+    /// Snapshot the current profiling aggregate (per-span p50/p95/p99 + medians)
+    /// over the recent-frame ring, for an on-demand readout (the IPC path /
+    /// prism-tune). `None` when profiling is off or the ring is empty.
+    pub fn profile_summary(&self) -> Option<crate::profile::ProfileSummary> {
+        if !self.profile_enabled || self.profile_ring.is_empty() {
+            return None;
+        }
+        Some(self.profile_ring.summary())
     }
 
-    /// Take the throttled (≤1 Hz) profiling summary, if one is due. `None` when
-    /// profiling is off or the ring hasn't accumulated a second of frames.
-    pub fn profile_summary_due(&mut self) -> Option<crate::profile::ProfileSummary> {
-        if !self.profile_enabled {
+    /// Take the throttled (≤1 Hz) profiling summary for the *debug log only* —
+    /// `None` unless `PRISM_PROFILE_LOG` is set. Collection itself is always on;
+    /// this just gates the periodic log line so days-long runs stay quiet.
+    pub fn profile_log_due(&mut self) -> Option<crate::profile::ProfileSummary> {
+        if !self.profile_enabled || !self.profile_log {
             return None;
         }
         self.profile_ring.summary_due()
