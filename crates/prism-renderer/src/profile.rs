@@ -13,6 +13,13 @@
 //! enough to leave on through days-long sessions so prism-tune can read the
 //! breakdown the moment something feels laggy — no restart to "turn profiling
 //! on". `PRISM_NO_PROFILE` opts out (to measure profiling's own overhead).
+//!
+//! The CPU spans rely on `Instant::now()` being cheap, which it is here: on
+//! x86-64 Linux with the `tsc` clocksource it resolves through the vDSO (a
+//! userspace TSC read, ~22 ns, no syscall), so the ~5 spans/frame cost ~200 ns
+//! — under 0.01% of a 144 Hz frame. The escape hatch covers the pathological
+//! case where the kernel demotes off `tsc` and `clock_gettime` becomes a real
+//! syscall (won't happen on `constant_tsc`/`nonstop_tsc` hardware).
 //! Nothing is logged periodically; `PRISM_PROFILE_LOG` adds a throttled debug
 //! line for bring-up only. See [`Renderer::profile_enabled`].
 //!
@@ -118,8 +125,19 @@ pub struct SpanStat {
     pub p99: f32,
 }
 
+/// A full profiling readout for the IPC path: the aggregate plus the raw
+/// per-frame timeline (each frame's span array, oldest → newest) that backs
+/// prism-tune's scrolling view. Built in one pass over the ring.
+#[derive(Clone, Debug)]
+pub struct ProfileReadout {
+    pub summary: ProfileSummary,
+    /// Per-frame span times (µs), oldest → newest — one `[f32; N_SPANS]` per
+    /// recent frame. Length ≤ ring capacity.
+    pub timeline: Vec<[f32; N_SPANS]>,
+}
+
 /// Aggregate of a [`ProfileRing`] over its current window. This is the shape
-/// the IPC layer will serialize for prism-tune; for now it backs the 1 Hz log.
+/// the IPC layer serializes for prism-tune; it also backs the debug log line.
 #[derive(Clone, Debug)]
 pub struct ProfileSummary {
     /// Number of frames the aggregate covers.
@@ -238,6 +256,14 @@ impl ProfileRing {
         }
     }
 
+    /// Aggregate + raw per-frame timeline in one pass, for the IPC readout.
+    pub fn readout(&self) -> ProfileReadout {
+        ProfileReadout {
+            summary: self.summary(),
+            timeline: self.iter().map(|p| p.spans).collect(),
+        }
+    }
+
     /// Return a fresh summary at most once per second; `None` otherwise (or when
     /// the ring is empty). Resets the throttle when it fires.
     pub fn summary_due(&mut self) -> Option<ProfileSummary> {
@@ -324,5 +350,22 @@ mod tests {
     #[test]
     fn damage_ratio_guards_zero_area() {
         assert_eq!(FrameProfile::default().damage_ratio(), 0.0);
+    }
+
+    #[test]
+    fn readout_timeline_is_oldest_to_newest_and_matches_summary() {
+        let mut ring = ProfileRing::with_capacity(4);
+        for i in 1..=6u32 {
+            ring.push(prof(i as f32));
+        }
+        let r = ring.readout();
+        // Capacity 4, pushed 1..=6 → newest four: 3,4,5,6, oldest→newest.
+        let walks: Vec<f32> = r
+            .timeline
+            .iter()
+            .map(|s| s[Span::Walk as usize])
+            .collect();
+        assert_eq!(walks, vec![3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(r.summary.frames, 4);
     }
 }

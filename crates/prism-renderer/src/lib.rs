@@ -48,7 +48,9 @@ pub use lut3d::{
 pub use oneshot::OneshotPool;
 pub use pipeline::decode::{DecodePipeline, DecodePush};
 pub use pipeline::encode::{EncodePipeline, EncodePush};
-pub use profile::{FrameProfile, ProfileRing, ProfileSummary, Span, SpanStat, N_SPANS, SPAN_NAMES};
+pub use profile::{
+    FrameProfile, ProfileReadout, ProfileRing, ProfileSummary, Span, SpanStat, N_SPANS, SPAN_NAMES,
+};
 pub use renderer::{DebandParams, ElementDraw, RenderedFrame, Renderer, SnapshotCopy};
 pub use snapshot::SnapshotTexture;
 pub use upload::ShmTexture;

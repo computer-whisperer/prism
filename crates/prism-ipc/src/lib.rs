@@ -160,6 +160,19 @@ pub enum Request {
         /// Output connector name (e.g. `DisplayPort-4`).
         output: String,
     },
+    /// Fetch this output's live render-profiling readout — the per-phase cost
+    /// breakdown the compositor collects every frame in the background. The
+    /// compositor replies with `Response::ProfilingStats(stats)` **plus a memfd
+    /// passed as an out-of-band file descriptor** (`SCM_RIGHTS`), received via
+    /// [`socket::Socket::send_recv_fd`]. The inline stats carry the per-span
+    /// percentiles; the memfd carries the raw per-frame timeline (see
+    /// [`ProfilingStats`]). Pull-based — prism-tune polls it while its profiling
+    /// panel is open. Errors if profiling is off (`PRISM_NO_PROFILE`) or no
+    /// frames have been recorded yet.
+    ProfilingStats {
+        /// Output connector name (e.g. `DisplayPort-4`).
+        output: String,
+    },
 }
 
 /// Reply from niri to client.
@@ -225,6 +238,10 @@ pub enum Response {
     /// travels out-of-band as a memfd file descriptor (see
     /// [`socket::Socket::send_recv_fd`]); this describes how to read it.
     Lut3d(Lut3dMeta),
+    /// Live render-profiling readout for a `Request::ProfilingStats`. The
+    /// percentile aggregate is inline; the raw per-frame timeline travels
+    /// out-of-band as a memfd (see [`ProfilingStats`]).
+    ProfilingStats(ProfilingStats),
 }
 
 /// Describes the memfd payload of a `Response::FrameCaptured`. The fd's
@@ -275,6 +292,35 @@ pub struct Lut3dMeta {
     pub out_space: Lut3dDomain,
     /// Which precedence level produced the effective LUT.
     pub source: Lut3dSource,
+}
+
+/// Live render-profiling readout for a `Request::ProfilingStats`.
+///
+/// The percentile aggregate (`span_names` / `percentiles_us`, plus the medians
+/// and frame count) is inline. The raw per-frame timeline travels out-of-band
+/// as a memfd file descriptor (see [`socket::Socket::send_recv_fd`]): its first
+/// `byte_len` bytes are `timeline_frames` records of `span_names.len()`
+/// little-endian `f32`s each — one frame's per-span microseconds, oldest →
+/// newest. `span_names` indexes both the percentiles and each timeline record.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ProfilingStats {
+    /// Phase span display names (e.g. `walk`, `decode`), in a stable order that
+    /// indexes both `percentiles_us` and every timeline record.
+    pub span_names: Vec<String>,
+    /// Per-span `[p50, p95, p99]` in microseconds, parallel to `span_names`.
+    pub percentiles_us: Vec<[f32; 3]>,
+    /// Frames the aggregate covers (the ring's current depth).
+    pub frames: u32,
+    /// Median damaged fraction of the output, [0, 1].
+    pub damage_ratio_p50: f32,
+    /// Median element (draw) count per frame.
+    pub elements_p50: f32,
+    /// Number of per-frame records in the memfd timeline.
+    pub timeline_frames: u32,
+    /// Total timeline payload length in the memfd, in bytes
+    /// (`timeline_frames × span_names.len() × 4`).
+    pub byte_len: u64,
 }
 
 /// Output domain of a 3D LUT's entries — what the numbers mean.

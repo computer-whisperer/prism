@@ -90,6 +90,16 @@ enum TopCommand {
     /// driven off-neutral (the "bright whites tint" class of bug) and,
     /// with `--lut`, whether the GPU matches the LUT file's own prediction.
     ValidateLut3d(validate_lut3d::ValidateLut3dArgs),
+    /// Print this output's live render-profiling breakdown — the per-phase
+    /// cost (walk / damage / lower / encode-push / submit + GPU
+    /// snapshot/decode/deband/encode) prism collects every frame in the
+    /// background. Shows per-span p50/p95/p99 plus a sparkline of recent
+    /// per-frame totals. On-demand pull; no effect on the compositor.
+    Profiling {
+        /// Output connector name (e.g. `DisplayPort-4`). Defaults to the
+        /// focused output.
+        output: Option<String>,
+    },
     /// Launch the damascene GUI control panel. First cut: an
     /// interactive front-end over the per-output color IPC — list
     /// outputs, view live `ColorState`, and apply the runtime color
@@ -143,6 +153,7 @@ fn main() -> Result<()> {
         TopCommand::RebakeLut3d(args) => calibrate_lut3d::run_rebake(args),
         TopCommand::Characterize(args) => characterize::run(args),
         TopCommand::ValidateLut3d(args) => validate_lut3d::run(args),
+        TopCommand::Profiling { output } => run_profiling(output),
         TopCommand::Gui => gui::run(),
         TopCommand::GuiBundle { out, width, height } => gui::dump_bundle(&out, width, height),
     }
@@ -161,6 +172,111 @@ fn run_msg(cmd: MsgCommand) -> Result<()> {
     let reply = socket.send(request).context("send request / read reply")?;
 
     print_reply(reply)
+}
+
+fn run_profiling(output: Option<String>) -> Result<()> {
+    use anyhow::bail;
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+
+    // Resolve the output name (focused output when not given). The server is
+    // one-request-per-connection, so each request gets its own socket.
+    let output = match output {
+        Some(o) => o,
+        None => {
+            let mut socket = Socket::connect()
+                .context("connect to PRISM_SOCKET (is prism running, and are you in its env?)")?;
+            match socket
+                .send(Request::FocusedOutput)
+                .context("query focused output")?
+            {
+                Ok(Response::FocusedOutput(Some(o))) => o.name,
+                Ok(Response::FocusedOutput(None)) => {
+                    bail!("no focused output; pass an output name explicitly")
+                }
+                Ok(other) => bail!("unexpected reply to FocusedOutput: {other:?}"),
+                Err(e) => bail!("prism returned an error: {e}"),
+            }
+        }
+    };
+
+    let mut socket = Socket::connect()
+        .context("connect to PRISM_SOCKET (is prism running, and are you in its env?)")?;
+    let (reply, fd) = socket
+        .send_recv_fd(Request::ProfilingStats {
+            output: output.clone(),
+        })
+        .context("send ProfilingStats request")?;
+    let stats = match reply {
+        Ok(Response::ProfilingStats(s)) => s,
+        Ok(other) => bail!("unexpected reply to ProfilingStats: {other:?}"),
+        Err(e) => bail!("prism returned an error: {e}"),
+    };
+    let fd = fd.ok_or_else(|| anyhow::anyhow!("server replied ProfilingStats without an fd"))?;
+
+    // Raw timeline: timeline_frames × span_names.len() LE f32; sum each frame's
+    // spans into a per-frame total for the sparkline.
+    let n_spans = stats.span_names.len().max(1);
+    let mut data = vec![0u8; stats.byte_len as usize];
+    File::from(fd)
+        .read_exact_at(&mut data, 0)
+        .context("read timeline from memfd")?;
+    let totals: Vec<f32> = data
+        .chunks_exact(n_spans * 4)
+        .map(|frame| {
+            frame
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .sum()
+        })
+        .collect();
+
+    println!("output {output} — {} frames", stats.frames);
+    println!(
+        "  {:<10} {:>7} {:>7} {:>7}   (µs)",
+        "span", "p50", "p95", "p99"
+    );
+    for (name, p) in stats.span_names.iter().zip(&stats.percentiles_us) {
+        // Hide spans that never fire (e.g. snapshot with no close-anim, deband
+        // when off) so the table is about what's actually happening.
+        if p[0] == 0.0 && p[2] == 0.0 {
+            continue;
+        }
+        println!("  {name:<10} {:>7.0} {:>7.0} {:>7.0}", p[0], p[1], p[2]);
+    }
+    println!(
+        "  damage {:.0}%   elems {:.0}",
+        stats.damage_ratio_p50 * 100.0,
+        stats.elements_p50
+    );
+    if !totals.is_empty() {
+        let recent = &totals[totals.len().saturating_sub(100)..];
+        let peak = recent.iter().copied().fold(0.0f32, f32::max);
+        println!(
+            "  timeline (last {}): last {:.0}µs, peak {:.0}µs",
+            recent.len(),
+            recent.last().copied().unwrap_or(0.0),
+            peak,
+        );
+        println!("  {}", sparkline(recent));
+    }
+    Ok(())
+}
+
+/// Render values as a unicode bar sparkline, scaled to the local max.
+fn sparkline(values: &[f32]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = values.iter().copied().fold(0.0f32, f32::max);
+    if max <= 0.0 {
+        return BARS[0].to_string().repeat(values.len());
+    }
+    values
+        .iter()
+        .map(|&v| {
+            let idx = ((v / max) * (BARS.len() - 1) as f32).round() as usize;
+            BARS[idx.min(BARS.len() - 1)]
+        })
+        .collect()
 }
 
 fn print_reply(reply: Reply) -> Result<()> {

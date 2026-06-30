@@ -610,14 +610,14 @@ impl Renderer {
         self.profile_enabled
     }
 
-    /// Snapshot the current profiling aggregate (per-span p50/p95/p99 + medians)
-    /// over the recent-frame ring, for an on-demand readout (the IPC path /
-    /// prism-tune). `None` when profiling is off or the ring is empty.
-    pub fn profile_summary(&self) -> Option<crate::profile::ProfileSummary> {
+    /// Snapshot the current profiling readout — per-span p50/p95/p99 + medians
+    /// plus the raw per-frame timeline — over the recent-frame ring, for the IPC
+    /// path / prism-tune. `None` when profiling is off or the ring is empty.
+    pub fn profile_readout(&self) -> Option<crate::profile::ProfileReadout> {
         if !self.profile_enabled || self.profile_ring.is_empty() {
             return None;
         }
-        Some(self.profile_ring.summary())
+        Some(self.profile_ring.readout())
     }
 
     /// Take the throttled (≤1 Hz) profiling summary for the *debug log only* —

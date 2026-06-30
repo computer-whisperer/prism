@@ -365,6 +365,7 @@ fn dispatch(state: &mut PrismState, req: Request) -> (Reply, Option<OwnedFd>) {
         Request::CaptureFrame { output } => handle_capture_frame(state, &output),
         Request::GamutMesh { output } => (handle_gamut_mesh(state, &output), None),
         Request::Lut3d { output } => handle_lut3d(state, &output),
+        Request::ProfilingStats { output } => handle_profiling_stats(state, &output),
         other => (
             Err(format!(
                 "request {other:?} is not implemented in this build"
@@ -451,6 +452,55 @@ fn handle_lut3d(state: &mut PrismState, name: &str) -> (Reply, Option<OwnedFd>) 
         },
     };
     (Ok(Response::Lut3d(meta)), Some(fd))
+}
+
+/// Snapshot an output's live render-profiling readout: the per-span percentile
+/// aggregate inline, and the raw per-frame timeline out-of-band in a memfd
+/// (`timeline_frames × N_SPANS` LE `f32`, oldest → newest — see
+/// [`prism_ipc::ProfilingStats`]). Pull-based; prism-tune polls it while its
+/// profiling panel is open.
+fn handle_profiling_stats(state: &mut PrismState, name: &str) -> (Reply, Option<OwnedFd>) {
+    let Some(ctx) = state
+        .outputs
+        .values()
+        .find(|ctx| ctx.connector_name == name)
+    else {
+        return (Err(format!("profiling: output {name:?} not found")), None);
+    };
+    let Some(readout) = ctx.renderer.profile_readout() else {
+        return (
+            Err(format!(
+                "profiling: output {name:?} has no profile data yet \
+                 (just started, or PRISM_NO_PROFILE set)"
+            )),
+            None,
+        );
+    };
+    // Timeline payload: one record of N_SPANS LE f32 per frame, oldest → newest.
+    let mut bytes = Vec::with_capacity(readout.timeline.len() * prism_renderer::N_SPANS * 4);
+    for frame in &readout.timeline {
+        for v in frame {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    let fd = match prism_ipc::socket::memfd_from_bytes("prism-profiling", &bytes) {
+        Ok(fd) => fd,
+        Err(e) => return (Err(format!("profiling: memfd: {e}")), None),
+    };
+    let s = &readout.summary;
+    let stats = prism_ipc::ProfilingStats {
+        span_names: prism_renderer::SPAN_NAMES
+            .iter()
+            .map(|n| n.to_string())
+            .collect(),
+        percentiles_us: s.spans.iter().map(|st| [st.p50, st.p95, st.p99]).collect(),
+        frames: s.frames as u32,
+        damage_ratio_p50: s.damage_ratio_p50,
+        elements_p50: s.elements_p50,
+        timeline_frames: readout.timeline.len() as u32,
+        byte_len: bytes.len() as u64,
+    };
+    (Ok(Response::ProfilingStats(stats)), Some(fd))
 }
 
 /// Load + return the measured gamut-surface mesh configured for `name`
