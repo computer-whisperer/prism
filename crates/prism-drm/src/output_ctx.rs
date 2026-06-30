@@ -879,10 +879,11 @@ impl OutputContext {
         force_full_repaint: bool,
         // Per-frame phase profile to complete, when profiling is enabled. The
         // caller has already filled the CPU phases it owns (walk/lower/encpush)
-        // and the element count; this fn fills the damage + submit spans and the
-        // damage counters, then pushes the finished record into the renderer's
-        // ring. `None` (or an early-out before render) leaves it unrecorded.
-        mut profile: Option<&mut FrameProfile>,
+        // and the element count; this fn fills the damage span + damage counters
+        // and hands it to render_frame, which times the submit span and (one slot
+        // reuse later) merges the GPU spans and rings the record. `None` (or an
+        // early-out before render) leaves it unrecorded.
+        mut profile: Option<FrameProfile>,
     ) -> Result<PresentOutcome> {
         if self.frame_pending {
             return Ok(PresentOutcome::FlipPending);
@@ -971,7 +972,9 @@ impl OutputContext {
         // below for the duration of the atomic commit; after the
         // commit ioctl returns, the kernel holds its own dup and
         // the `OwnedFd` is free to be returned to the caller.
-        let t_submit = std::time::Instant::now();
+        // Hand the (already CPU-filled) profile into render_frame, which times
+        // its own submit span, buffers the record per slot, and — one slot reuse
+        // later — fills the GPU spans and pushes the finished frame to the ring.
         let rendered = self.renderer.render_frame(
             &back.image,
             &frame.draws,
@@ -981,19 +984,12 @@ impl OutputContext {
             wait_semaphores,
             snapshots,
             force_full_repaint,
+            profile,
         )?;
-        let submit_elapsed = t_submit.elapsed();
         let present_sync = rendered.present_sync;
 
-        // Finish and record the per-frame profile. The submit span is the CPU
-        // cost of recording + queueing the command buffer (the GPU work itself
-        // runs async and is captured by the timestamp profiler). Pushing here —
-        // before the page-flip submit — is fine: the render work is done, and a
-        // later flip failure doesn't change the cost we measured.
-        if let Some(p) = profile {
-            p.set(Span::Submit, submit_elapsed);
-            self.renderer.record_frame_profile(*p);
-        }
+        // Throttled (≤1 Hz) profiling summary — per-span p50/p95/p99 plus median
+        // damage% and element count over the recent-frame ring.
         if let Some(sum) = self.renderer.profile_summary_due() {
             tracing::info!(
                 output = %self.connector_name,
@@ -1008,18 +1004,6 @@ impl OutputContext {
             encoded_full = rendered.encoded_full,
             "encode region",
         );
-
-        // GPU profiling (PRISM_GPU_PROFILE): prism's own per-output compositing
-        // cost, isolated from app load. Throttled to ≤1 Hz inside the renderer.
-        if let Some(t) = self.renderer.take_gpu_profile_report() {
-            tracing::info!(
-                output = %self.connector_name,
-                decode_us = t.decode_us,
-                encode_us = t.encode_us,
-                total_us = t.decode_us + t.encode_us,
-                "gpu profile (1s ewma)"
-            );
-        }
 
         let src =
             Rectangle::from_size((self.extent.width as i32, self.extent.height as i32).into())

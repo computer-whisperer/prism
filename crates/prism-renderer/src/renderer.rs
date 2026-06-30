@@ -43,9 +43,13 @@ const DEFAULT_LUT_CUBE_EDGE: u32 = LUT_CUBE_EDGE;
 /// resources is the right size.
 pub const FRAMES_IN_FLIGHT: usize = 2;
 
-/// Timestamps written per frame by the GPU profiler: start, after decode,
-/// after encode. `decode = t1 - t0`, `encode = t2 - t1`.
-const PROFILE_TIMESTAMP_COUNT: u32 = 3;
+/// Timestamps written per frame to bracket the GPU sub-passes, in command
+/// order: `[before-snapshot, after-snapshot, after-deband, after-decode,
+/// after-encode]`. The four [`Span`] GPU phases are the successive differences
+/// (snapshot = t1−t0, deband = t2−t1, decode = t3−t2, encode = t4−t3).
+///
+/// [`Span`]: crate::profile::Span
+const PROFILE_TIMESTAMP_COUNT: u32 = 5;
 
 /// Cap on the number of separate scissored encode passes per frame. Beyond this,
 /// the encode falls back to a single bounding-box pass — the per-pass overhead
@@ -58,17 +62,6 @@ const MAX_ENCODE_PASSES: usize = 8;
 /// an inter-pass barrier each), so the bbox fallback matters more for busy frames.
 const MAX_DECODE_PASSES: usize = 8;
 
-/// Per-frame GPU time for the two compositing passes, in microseconds.
-/// Produced by the timestamp-query profiler when the `PRISM_GPU_PROFILE`
-/// environment variable is set; `None` everywhere otherwise (no query pools
-/// are even allocated). This is prism's *own* per-output cost — what it adds
-/// on top of whatever the client rendered — isolated from app GPU load.
-#[derive(Clone, Copy, Debug)]
-pub struct GpuFrameTiming {
-    pub decode_us: f32,
-    pub encode_us: f32,
-}
-
 /// Outcome of [`Renderer::render_frame`].
 pub struct RenderedFrame {
     /// Present-completion sync as a Linux SYNC_FD — the caller hands this to
@@ -80,27 +73,29 @@ pub struct RenderedFrame {
     pub encoded_full: bool,
 }
 
-/// Timestamp-query GPU profiler. Brackets the decode and encode passes with
-/// `vkCmdWriteTimestamp2` into a per-slot query pool, reads the prior frame's
-/// result back once the slot's fence proves completion (no GPU stall), and
-/// exposes a 1 Hz EWMA report. Fully disabled — zero commands, no pools —
-/// unless `PRISM_GPU_PROFILE` is set, so production paths pay nothing.
-struct GpuProfiler {
-    enabled: bool,
+/// Device timestamp parameters for converting query ticks into the
+/// [`FrameProfile`]'s GPU spans. Probed once at renderer construction. When the
+/// graphics queue lacks timestamp support (`supported == false`) no query pools
+/// are allocated and the GPU spans stay 0 — the CPU profile still works.
+///
+/// The query pools themselves are tiny ([`PROFILE_TIMESTAMP_COUNT`] queries per
+/// slot) and always allocated when supported, independent of whether profiling
+/// is currently enabled — so an IPC toggle can turn the writes on and off live
+/// without reallocating. Only the per-frame timestamp *writes* and readback are
+/// gated on the enable flag, so a disabled renderer pays nothing.
+///
+/// [`FrameProfile`]: crate::profile::FrameProfile
+struct GpuTimestamps {
+    /// Whether the graphics queue supports timestamps (pools were allocated).
+    supported: bool,
     /// Nanoseconds per timestamp tick (`limits.timestampPeriod`).
     period_ns: f32,
     /// Valid-bit mask for timestamp values on the graphics queue family.
     mask: u64,
-    /// Smoothed (decode_us, encode_us); `None` until the first sample.
-    ewma: Option<(f32, f32)>,
-    last_log: std::time::Instant,
-    /// Throttled report, set at most once per second; drained by the caller.
-    report: Option<GpuFrameTiming>,
 }
 
-impl GpuProfiler {
+impl GpuTimestamps {
     fn new(device: &Device) -> Self {
-        let want = std::env::var_os("PRISM_GPU_PROFILE").is_some();
         let period_ns = device.physical.properties.limits.timestamp_period;
         // Timestamp validity is per queue family.
         let valid_bits = unsafe {
@@ -111,48 +106,36 @@ impl GpuProfiler {
         .get(device.physical.graphics_queue_family as usize)
         .map(|q| q.timestamp_valid_bits)
         .unwrap_or(0);
-        let enabled = want && period_ns > 0.0 && valid_bits > 0;
-        if want && !enabled {
-            tracing::warn!(
-                "PRISM_GPU_PROFILE set but the graphics queue lacks timestamp support; \
-                 GPU profiling disabled"
-            );
-        }
+        let supported = period_ns > 0.0 && valid_bits > 0;
         let mask = if valid_bits >= 64 {
             u64::MAX
         } else {
             (1u64 << valid_bits) - 1
         };
-        GpuProfiler {
-            enabled,
+        GpuTimestamps {
+            supported,
             period_ns,
             mask,
-            ewma: None,
-            last_log: std::time::Instant::now(),
-            report: None,
         }
     }
 
-    /// Fold one frame's three timestamps into the EWMA and, at most once per
-    /// second, stage a report for the caller to log.
-    fn ingest(&mut self, ts: [u64; PROFILE_TIMESTAMP_COUNT as usize]) {
-        let dec = (ts[1] & self.mask).wrapping_sub(ts[0] & self.mask);
-        let enc = (ts[2] & self.mask).wrapping_sub(ts[1] & self.mask);
-        let to_us = |ticks: u64| (ticks as f32 * self.period_ns) / 1000.0;
-        let (d, e) = (to_us(dec), to_us(enc));
-        const ALPHA: f32 = 0.1;
-        let (ed, ee) = match self.ewma {
-            Some((pd, pe)) => (pd + ALPHA * (d - pd), pe + ALPHA * (e - pe)),
-            None => (d, e),
+    /// Convert one frame's raw timestamps into the four GPU spans (µs) and write
+    /// them into `p`. The timestamps are in command order — see
+    /// [`PROFILE_TIMESTAMP_COUNT`].
+    fn fill(
+        &self,
+        ts: [u64; PROFILE_TIMESTAMP_COUNT as usize],
+        p: &mut crate::profile::FrameProfile,
+    ) {
+        use crate::profile::Span;
+        let span_us = |a: usize, b: usize| -> f32 {
+            let ticks = (ts[b] & self.mask).wrapping_sub(ts[a] & self.mask);
+            (ticks as f32 * self.period_ns) / 1000.0
         };
-        self.ewma = Some((ed, ee));
-        if self.last_log.elapsed() >= std::time::Duration::from_secs(1) {
-            self.report = Some(GpuFrameTiming {
-                decode_us: ed,
-                encode_us: ee,
-            });
-            self.last_log = std::time::Instant::now();
-        }
+        p.spans[Span::Snapshot as usize] = span_us(0, 1);
+        p.spans[Span::Deband as usize] = span_us(1, 2);
+        p.spans[Span::Decode as usize] = span_us(2, 3);
+        p.spans[Span::Encode as usize] = span_us(3, 4);
     }
 }
 
@@ -234,9 +217,16 @@ struct FrameSlot {
     /// deferred-destroy queue. 0 = never submitted (note_completed no-op).
     submit_serial: u64,
     /// Timestamp query pool ([`PROFILE_TIMESTAMP_COUNT`] queries) for this
-    /// slot, or `None` when GPU profiling is off. Each slot owns its own pool
-    /// so reset/write/read never races another in-flight frame.
+    /// slot, or `None` when the device lacks timestamp support. Each slot owns
+    /// its own pool so reset/write/read never races another in-flight frame.
     timing_pool: Option<vk::QueryPool>,
+    /// The CPU-side [`FrameProfile`] of the frame currently rendering in this
+    /// slot, held until the slot's GPU timestamps read back (one reuse later) —
+    /// at which point its GPU spans are filled and the complete record is pushed
+    /// into the ring. `None` when profiling was off for that frame.
+    ///
+    /// [`FrameProfile`]: crate::profile::FrameProfile
+    pending_profile: Option<crate::profile::FrameProfile>,
 }
 
 pub struct Renderer {
@@ -278,14 +268,16 @@ pub struct Renderer {
     slots: [FrameSlot; FRAMES_IN_FLIGHT],
     /// Index into `slots` for the *next* frame.
     next_slot: usize,
-    /// GPU timestamp profiler (no-op unless `PRISM_GPU_PROFILE` is set).
-    profiler: GpuProfiler,
-    /// Per-frame phase profiling. `profile_enabled` gates whether the
-    /// compositor takes the per-phase timings at all (default off → zero cost);
-    /// when set, completed [`FrameProfile`]s are pushed into `profile_ring`,
-    /// which backs the throttled summary log and (later) the IPC readout for
-    /// prism-tune. Enabled at construction by `PRISM_PROFILE`; an IPC toggle
-    /// will flip it live in a later increment.
+    /// Device timestamp parameters for the GPU spans (probed once).
+    gpu_ts: GpuTimestamps,
+    /// Per-frame phase profiling. `profile_enabled` gates whether the per-phase
+    /// timings are taken at all (default off → zero cost): the compositor skips
+    /// the CPU `Instant`s and the renderer skips the GPU timestamp writes /
+    /// readback. When set, each frame's CPU profile is buffered per slot until
+    /// its GPU timestamps complete, then the merged record is pushed into
+    /// `profile_ring`, which backs the throttled summary log and (later) the IPC
+    /// readout for prism-tune. Enabled at construction by `PRISM_PROFILE`; an IPC
+    /// toggle will flip it live in a later increment.
     profile_enabled: bool,
     profile_ring: crate::profile::ProfileRing,
     /// Loader for VK_KHR_external_semaphore_fd — exports the per-slot
@@ -340,14 +332,18 @@ impl Renderer {
         let mut export_info = vk::ExportSemaphoreCreateInfo::default()
             .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
         let sem_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
-        let profiler = GpuProfiler::new(&device);
+        let gpu_ts = GpuTimestamps::new(&device);
         let mut slots = Vec::with_capacity(FRAMES_IN_FLIGHT);
         for cb in cbs {
             let fence = unsafe { device.raw.create_fence(&fence_info, None) }
                 .vk_ctx("create_fence (renderer slot)")?;
             let present_semaphore = unsafe { device.raw.create_semaphore(&sem_info, None) }
                 .vk_ctx("create_semaphore (renderer slot, exportable SYNC_FD)")?;
-            let timing_pool = if profiler.enabled {
+            // Allocate the (tiny) timestamp pool whenever the device supports
+            // timestamps, independent of the enable flag — so the IPC toggle can
+            // start the writes live without reallocating. No support ⇒ None and
+            // the GPU spans stay 0.
+            let timing_pool = if gpu_ts.supported {
                 let info = vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
                     .query_count(PROFILE_TIMESTAMP_COUNT);
@@ -364,6 +360,7 @@ impl Renderer {
                 present_semaphore,
                 submit_serial: 0,
                 timing_pool,
+                pending_profile: None,
             });
         }
         let slots: [FrameSlot; FRAMES_IN_FLIGHT] = slots
@@ -425,7 +422,7 @@ impl Renderer {
             command_pool,
             slots,
             next_slot: 0,
-            profiler,
+            gpu_ts,
             profile_enabled: std::env::var_os("PRISM_PROFILE").is_some(),
             profile_ring: crate::profile::ProfileRing::new(),
             semaphore_fd_loader,
@@ -602,13 +599,6 @@ impl Renderer {
         self.intermediate_format
     }
 
-    /// Take the throttled (≤1 Hz) GPU-timing report, if one is pending. Always
-    /// `None` unless `PRISM_GPU_PROFILE` is set. The caller logs it with the
-    /// output's identity — this is prism's own per-output decode/encode cost.
-    pub fn take_gpu_profile_report(&mut self) -> Option<GpuFrameTiming> {
-        self.profiler.report.take()
-    }
-
     /// Whether per-frame phase profiling is on for this output. When false the
     /// compositor skips taking the per-phase timings entirely (zero cost). Set
     /// by `PRISM_PROFILE` at construction; an IPC toggle will flip it live.
@@ -619,12 +609,6 @@ impl Renderer {
     /// Set the per-frame profiling enable (the IPC toggle's landing point).
     pub fn set_profile_enabled(&mut self, on: bool) {
         self.profile_enabled = on;
-    }
-
-    /// Push one completed [`FrameProfile`] into the ring. No-op semantics are
-    /// the caller's: only call this for frames that actually rendered.
-    pub fn record_frame_profile(&mut self, p: crate::profile::FrameProfile) {
-        self.profile_ring.push(p);
     }
 
     /// Take the throttled (≤1 Hz) profiling summary, if one is due. `None` when
@@ -723,6 +707,12 @@ impl Renderer {
         // clear it on radv (partial fast-clear / DCC). A full-frame decode
         // clears reliably; the cost is bounded (close animations are brief).
         force_full_repaint: bool,
+        // CPU-side phase profile for this frame, when profiling is on — already
+        // carrying the walk/damage/lower/encpush spans and counters. This fn
+        // fills the submit span, buffers it in the slot it renders into, and
+        // (one reuse later, when the slot's GPU timestamps complete) merges the
+        // GPU spans and pushes the finished record into the ring. `None` ⇒ off.
+        frame_profile: Option<crate::profile::FrameProfile>,
     ) -> Result<RenderedFrame> {
         let extent = scanout.extent();
         // `force_full`: the intermediate was just (re)allocated, so its contents
@@ -798,21 +788,34 @@ impl Renderer {
 
         // The fence above proves this slot's prior frame (incl. its timestamp
         // writes) finished, so the query results are available without a GPU
-        // stall. Read them back before we reset the pool for this frame.
-        if let (Some(pool), true) = (self.slots[slot_idx].timing_pool, slot_prev_serial != 0) {
-            let mut ts = [0u64; PROFILE_TIMESTAMP_COUNT as usize];
-            let got = unsafe {
-                self.device.raw.get_query_pool_results(
-                    pool,
-                    0,
-                    &mut ts,
-                    vk::QueryResultFlags::TYPE_64,
-                )
-            };
-            if got.is_ok() {
-                self.profiler.ingest(ts);
+        // stall. Complete that frame's profile: take its buffered CPU record,
+        // fill the GPU spans from the now-readable timestamps, and ring it. The
+        // CPU record was buffered when that frame rendered (one slot reuse —
+        // `FRAMES_IN_FLIGHT` frames — ago), so the GPU spans land on the right
+        // frame regardless of the in-flight depth.
+        if let Some(mut prof) = self.slots[slot_idx].pending_profile.take() {
+            if let (Some(pool), true) = (self.slots[slot_idx].timing_pool, slot_prev_serial != 0) {
+                let mut ts = [0u64; PROFILE_TIMESTAMP_COUNT as usize];
+                let got = unsafe {
+                    self.device.raw.get_query_pool_results(
+                        pool,
+                        0,
+                        &mut ts,
+                        vk::QueryResultFlags::TYPE_64,
+                    )
+                };
+                if got.is_ok() {
+                    self.gpu_ts.fill(ts, &mut prof);
+                }
             }
+            // Ring it even if the GPU readback failed — the CPU spans are still
+            // worth having; the GPU spans just stay 0 for that frame.
+            self.profile_ring.push(prof);
         }
+
+        // CPU submit-span clock: from here (command record) through the queue
+        // submit below. Only taken when this frame is being profiled.
+        let t_submit = frame_profile.as_ref().map(|_| std::time::Instant::now());
 
         let cb = slot_cb;
         unsafe {
@@ -827,16 +830,34 @@ impl Renderer {
         unsafe { self.device.raw.begin_command_buffer(cb, &begin_info) }
             .vk_ctx("begin_command_buffer (renderer)")?;
 
-        // GPU profiling: reset this slot's timestamp pool up front (must be
-        // outside any render pass). `t0` is written just before the decode
-        // pass below, `t1` after it, `t2` after encode — so snapshot copies
-        // are excluded and we measure the two compositing passes proper.
-        let timing_pool = self.slots[slot_idx].timing_pool;
+        // GPU profiling: when this frame is being profiled, reset its timestamp
+        // pool up front (must be outside any render pass). The five timestamps
+        // bracket the GPU sub-passes in command order — t0 before snapshot
+        // capture, t1 after it, t2 after the deband blur, t3 after the decode
+        // pass, t4 after encode (see `PROFILE_TIMESTAMP_COUNT`). `None` ⇒ this
+        // frame isn't profiled (or the device lacks timestamps), so no writes.
+        let timing_pool = if frame_profile.is_some() {
+            self.slots[slot_idx].timing_pool
+        } else {
+            None
+        };
         if let Some(pool) = timing_pool {
             unsafe {
                 self.device
                     .raw
                     .cmd_reset_query_pool(cb, pool, 0, PROFILE_TIMESTAMP_COUNT);
+            }
+        }
+
+        // GPU profile t0: frame start, before snapshot capture.
+        if let Some(pool) = timing_pool {
+            unsafe {
+                self.device.raw.cmd_write_timestamp2(
+                    cb,
+                    vk::PipelineStageFlags2::TOP_OF_PIPE,
+                    pool,
+                    0,
+                );
             }
         }
 
@@ -1019,14 +1040,14 @@ impl Renderer {
             }
         }
 
-        // GPU profile t0: start of the decode pass.
+        // GPU profile t1: snapshot capture done (≈ t0 when no snapshots).
         if let Some(pool) = timing_pool {
             unsafe {
                 self.device.raw.cmd_write_timestamp2(
                     cb,
-                    vk::PipelineStageFlags2::TOP_OF_PIPE,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
                     pool,
-                    0,
+                    1,
                 );
             }
         }
@@ -1117,6 +1138,18 @@ impl Renderer {
                     _ => None,
                 };
                 deband_views.push(view);
+            }
+
+            // GPU profile t2: deband blur done, decode draws about to begin.
+            if let Some(pool) = timing_pool {
+                unsafe {
+                    self.device.raw.cmd_write_timestamp2(
+                        cb,
+                        vk::PipelineStageFlags2::ALL_COMMANDS,
+                        pool,
+                        2,
+                    );
+                }
             }
 
             // CLEAR scopes to each pass's render_area, so only the damaged rect is
@@ -1231,16 +1264,27 @@ impl Renderer {
                     self.device.raw.cmd_end_rendering(cb);
                 }
             }
+        } else if let Some(pool) = timing_pool {
+            // No decode this frame: stamp t2 here so the deband and decode spans
+            // read ~0 rather than differencing an unwritten query.
+            unsafe {
+                self.device.raw.cmd_write_timestamp2(
+                    cb,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    pool,
+                    2,
+                );
+            }
         }
 
-        // GPU profile t1: decode done (or skipped → t1 ≈ t0).
+        // GPU profile t3: decode done (≈ t2 when the decode was skipped).
         if let Some(pool) = timing_pool {
             unsafe {
                 self.device.raw.cmd_write_timestamp2(
                     cb,
-                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
                     pool,
-                    1,
+                    3,
                 );
             }
         }
@@ -1367,14 +1411,15 @@ impl Renderer {
             }
         }
 
-        // GPU profile t2: encode done. decode = t1-t0, encode = t2-t1.
+        // GPU profile t4: encode done. The four GPU spans are the successive
+        // differences t1−t0 … t4−t3 (snapshot, deband, decode, encode).
         if let Some(pool) = timing_pool {
             unsafe {
                 self.device.raw.cmd_write_timestamp2(
                     cb,
-                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
                     pool,
-                    2,
+                    4,
                 );
             }
         }
@@ -1428,6 +1473,15 @@ impl Renderer {
         }
         .vk_ctx("queue_submit2 (renderer)")?;
         self.slots[slot_idx].submit_serial = serial;
+
+        // Buffer this frame's CPU profile in the slot it rendered into. The
+        // submit span is the CPU cost of recording + queueing, measured from
+        // `t_submit`. The GPU spans get filled — and the record pushed to the
+        // ring — when this slot is next reused and its timestamps read back.
+        if let (Some(mut prof), Some(t)) = (frame_profile, t_submit) {
+            prof.set(crate::profile::Span::Submit, t.elapsed());
+            self.slots[slot_idx].pending_profile = Some(prof);
+        }
 
         // Export the just-signalled semaphore as a Linux sync_file fd.
         // Per VK_KHR_external_semaphore_fd spec, the export transfers

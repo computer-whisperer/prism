@@ -598,6 +598,7 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
         &[],
         &[],
         false,
+        None,
     )?;
     unsafe {
         let _ = device.raw.device_wait_idle();
@@ -3266,7 +3267,7 @@ fn render_output_now(
             &render_waits,
             &snapshot_copies,
             force_full_decode,
-            profile.as_mut(),
+            profile,
         )?
     };
     // The render submit has been queued with the waits in its dependency list
@@ -3741,6 +3742,7 @@ fn run_gradient_scanout(output_name: Option<&str>, depth: prism_drm::ScanoutDept
         &[],
         &[],
         false,
+        None,
     )?;
     unsafe {
         let _ = device.raw.device_wait_idle();
