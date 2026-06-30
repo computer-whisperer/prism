@@ -47,6 +47,12 @@ pub struct PhysicalDeviceInfo {
     /// DRM render node major/minor, ditto.
     pub drm_render: Option<DrmDevId>,
     pub graphics_queue_family: u32,
+    /// A COMPUTE+TRANSFER queue family that is *not* the graphics family — the
+    /// async-compute engines (ACEs) on AMD. Used for transfer work that should
+    /// overlap graphics (the cross-GPU mirror copy; see
+    /// `docs/async-render-rework.md`). `None` on GPUs that expose no such
+    /// family (then the graphics queue does double duty).
+    pub transfer_queue_family: Option<u32>,
     /// Extensions we enabled on this device (intersection of requested set
     /// with what's actually present — required exts always present; optional
     /// exts may or may not be).
@@ -63,6 +69,17 @@ pub struct Device {
     pub physical: PhysicalDeviceInfo,
     pub raw: ash::Device,
     pub graphics_queue: vk::Queue,
+    /// Async-compute (ACE) queue for transfer work that should overlap
+    /// graphics — the cross-GPU mirror copy (see `docs/async-render-rework.md`).
+    /// Equals `graphics_queue` when the GPU exposes no dedicated ACE family, so
+    /// callers can always submit here without a capability branch.
+    ///
+    /// NOTE: a distinct `VkQueue` still needs external synchronization — only
+    /// one thread may submit to it at a time, same as `graphics_queue`.
+    pub transfer_queue: vk::Queue,
+    /// Queue family `transfer_queue` belongs to (for command-pool creation).
+    /// Equals `physical.graphics_queue_family` in the fallback case.
+    pub transfer_queue_family: u32,
     /// Deferred-destroy queue — see [`Device::retire`].
     deferred: std::sync::Mutex<DeferredDestroy>,
 }
@@ -316,10 +333,19 @@ impl Device {
 
         let ext_ptrs: Vec<*const i8> = info.enabled_extensions.iter().map(|e| e.as_ptr()).collect();
         let queue_priorities = [1.0_f32];
-        let queue_info = vk::DeviceQueueCreateInfo::default()
+        // Always request the graphics queue; additionally request one ACE queue
+        // when the GPU exposes a dedicated async-compute family, for transfer
+        // work that overlaps graphics (see `docs/async-render-rework.md`).
+        let mut queue_infos = vec![vk::DeviceQueueCreateInfo::default()
             .queue_family_index(info.graphics_queue_family)
-            .queue_priorities(&queue_priorities);
-        let queue_infos = [queue_info];
+            .queue_priorities(&queue_priorities)];
+        if let Some(tqf) = info.transfer_queue_family {
+            queue_infos.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(tqf)
+                    .queue_priorities(&queue_priorities),
+            );
+        }
 
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
             .timeline_semaphore(true)
@@ -338,12 +364,30 @@ impl Device {
             .vk_ctx("create_device")?;
 
         let graphics_queue = unsafe { raw.get_device_queue(info.graphics_queue_family, 0) };
+        // ACE queue when present, else the graphics queue does double duty so
+        // callers never need a capability branch.
+        let transfer_queue_family = info
+            .transfer_queue_family
+            .unwrap_or(info.graphics_queue_family);
+        let transfer_queue = unsafe { raw.get_device_queue(transfer_queue_family, 0) };
+        info!(
+            "queues: graphics family {}, transfer family {} ({})",
+            info.graphics_queue_family,
+            transfer_queue_family,
+            if info.transfer_queue_family.is_some() {
+                "dedicated ACE"
+            } else {
+                "shared with graphics"
+            },
+        );
 
         Ok(Arc::new(Self {
             instance,
             physical: info,
             raw,
             graphics_queue,
+            transfer_queue,
+            transfer_queue_family,
             deferred: std::sync::Mutex::new(DeferredDestroy::default()),
         }))
     }
@@ -419,6 +463,19 @@ fn probe_physical_device(
         .map(|(i, _)| i as u32)
         .ok_or(RendererError::MissingFeature("graphics queue family"))?;
 
+    // A dedicated async-compute family (COMPUTE+TRANSFER, no GRAPHICS) — the
+    // ACE queues on AMD. Used for transfer work meant to overlap graphics.
+    // `None` ⇒ no such family; callers fall back to the graphics queue.
+    let transfer_queue_family = qfp
+        .iter()
+        .enumerate()
+        .find(|(_, p)| {
+            p.queue_flags
+                .contains(vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER)
+                && !p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        })
+        .map(|(i, _)| i as u32);
+
     let (drm_primary, drm_render) = if has_ext(physical_device_drm::NAME) {
         let mut drm_props = vk::PhysicalDeviceDrmPropertiesEXT::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm_props);
@@ -447,6 +504,7 @@ fn probe_physical_device(
         drm_primary,
         drm_render,
         graphics_queue_family,
+        transfer_queue_family,
         enabled_extensions,
     })
 }
