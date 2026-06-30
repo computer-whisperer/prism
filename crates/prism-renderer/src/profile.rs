@@ -38,7 +38,7 @@ pub const N_SPANS: usize = 9;
 pub const SPAN_NAMES: [&str; N_SPANS] = [
     // CPU phases (filled by the compositor as it builds the frame).
     "walk", "damage", "lower", "encpush", "submit",
-    // GPU phases (filled by the renderer's timestamp queries; 0 until wired).
+    // GPU phases (filled from the renderer's timestamp queries, one frame late).
     "snapshot", "decode", "deband", "encode",
 ];
 
@@ -70,7 +70,8 @@ pub enum Span {
 /// One composited frame's phase breakdown and counters. Microseconds throughout.
 ///
 /// Assembled across the frame: the compositor fills the CPU spans and counters
-/// inline as it works; the renderer fills the GPU spans (currently left at 0).
+/// inline as it works; the renderer fills the GPU spans one slot-reuse later,
+/// when the frame's timestamp queries read back.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameProfile {
     /// Per-phase time in microseconds, indexed by [`Span`].
@@ -156,8 +157,8 @@ impl ProfileSummary {
     pub fn format_line(&self) -> String {
         let mut s = String::with_capacity(256);
         for (i, st) in self.spans.iter().enumerate() {
-            // Skip GPU spans entirely while they read 0 (not yet wired), so the
-            // line stays about what's actually measured.
+            // Hide GPU spans that are idle this window (snapshot with no
+            // close-anim, deband when off) so the line stays about live cost.
             if i >= Span::Snapshot as usize && st.p50 == 0.0 && st.p99 == 0.0 {
                 continue;
             }
@@ -360,11 +361,7 @@ mod tests {
         }
         let r = ring.readout();
         // Capacity 4, pushed 1..=6 → newest four: 3,4,5,6, oldest→newest.
-        let walks: Vec<f32> = r
-            .timeline
-            .iter()
-            .map(|s| s[Span::Walk as usize])
-            .collect();
+        let walks: Vec<f32> = r.timeline.iter().map(|s| s[Span::Walk as usize]).collect();
         assert_eq!(walks, vec![3.0, 4.0, 5.0, 6.0]);
         assert_eq!(r.summary.frames, 4);
     }

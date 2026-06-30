@@ -74,12 +74,14 @@ impl FetchedLut {
 }
 
 /// Which detail pane is visible in the narrow (tabbed) layout. The
-/// wide layout shows all three at once and ignores this.
+/// wide layout shows the visualization panes at once and ignores this
+/// (except for `profiling_visible` bookkeeping).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
     Controls,
     Preview,
     Gamut,
+    Profiling,
 }
 
 impl Pane {
@@ -88,6 +90,7 @@ impl Pane {
             "controls" => Some(Pane::Controls),
             "preview" => Some(Pane::Preview),
             "gamut" => Some(Pane::Gamut),
+            "profiling" => Some(Pane::Profiling),
             _ => None,
         }
     }
@@ -99,6 +102,7 @@ impl std::fmt::Display for Pane {
             Pane::Controls => "controls",
             Pane::Preview => "preview",
             Pane::Gamut => "gamut",
+            Pane::Profiling => "profiling",
         })
     }
 }
@@ -189,6 +193,37 @@ impl Fields {
     }
 }
 
+/// The selected output's live render-profiling readout: the inline percentile
+/// aggregate plus the decoded per-frame timeline, pre-split into (cpu_us,
+/// gpu_us) per frame for the stacked timeline bars.
+struct ProfilingView {
+    stats: prism_ipc::ProfilingStats,
+    /// Per-frame `(cpu_us, gpu_us)`, oldest → newest. GPU is the last four
+    /// spans (snapshot/decode/deband/encode); CPU is the rest.
+    bars: Vec<(f32, f32)>,
+}
+
+impl ProfilingView {
+    /// Decode the wire stats + raw timeline memfd into a panel-ready view.
+    fn from_wire(stats: prism_ipc::ProfilingStats, timeline: &[u8]) -> Self {
+        let n = stats.span_names.len().max(1);
+        let gpu_start = n.saturating_sub(4);
+        let bars = timeline
+            .chunks_exact(n * 4)
+            .map(|frame| {
+                let vals: Vec<f32> = frame
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let cpu: f32 = vals[..gpu_start].iter().sum();
+                let gpu: f32 = vals[gpu_start..].iter().sum();
+                (cpu, gpu)
+            })
+            .collect();
+        ProfilingView { stats, bars }
+    }
+}
+
 struct TuneGui {
     outputs: Vec<Output>,
     /// Index into `outputs`, or `None` when the list is empty.
@@ -226,6 +261,15 @@ struct TuneGui {
     show_lut: bool,
     /// Active detail tab in the narrow layout.
     pane: Pane,
+    /// The selected output's live profiling readout, refreshed by polling
+    /// while the profiling pane is on screen. `None` until first fetched.
+    profiling: Option<ProfilingView>,
+    /// Whether the profiling card was in the tree last frame — gates the
+    /// background poll in `before_build` so we only hit IPC while it's visible
+    /// (set during `build`, which only has `&self`). One-frame lag is harmless.
+    profiling_visible: std::cell::Cell<bool>,
+    /// Last profiling poll, for the ~8 Hz refresh throttle.
+    last_poll: Option<std::time::Instant>,
     selection: Selection,
 }
 
@@ -246,6 +290,9 @@ impl TuneGui {
             lut: None,
             show_lut: false,
             pane: Pane::Controls,
+            profiling: None,
+            profiling_visible: std::cell::Cell::new(false),
+            last_poll: None,
             selection: Selection::default(),
         };
         gui.reload(None);
@@ -315,6 +362,9 @@ impl TuneGui {
             lut: None,
             show_lut: false,
             pane: Pane::Controls,
+            profiling: Some(mock_profiling()),
+            profiling_visible: std::cell::Cell::new(false),
+            last_poll: None,
             selection: Selection::default(),
         };
         gui.sync_fields();
@@ -491,6 +541,26 @@ impl TuneGui {
                 self.status = format!("Fetched LUT from {output} · {desc} · {placement}.");
             }
             Err(e) => self.status = format!("LUT fetch failed: {e:#}"),
+        }
+    }
+
+    /// Poll the selected output's live profiling readout (one IPC round-trip +
+    /// a memfd read). Called from `before_build` while the profiling pane is on
+    /// screen; on error the last good view is kept and the message banner shows
+    /// why (e.g. "no frames yet" right after a fresh start).
+    fn fetch_profiling(&mut self) {
+        let Some(output) = self.current().map(|o| o.name.clone()) else {
+            return;
+        };
+        match fetch_profiling_stats(&output) {
+            Ok(view) => {
+                self.profiling = Some(view);
+                // Clear only a prior profiling error, not other status text.
+                if self.status.starts_with("Profiling") {
+                    self.status.clear();
+                }
+            }
+            Err(e) => self.status = format!("Profiling: {e:#}"),
         }
     }
 
@@ -976,6 +1046,22 @@ impl TuneGui {
             .surface_role(SurfaceRole::Sunken)
     }
 
+    /// Live render-profiling card: per-span percentile table + a stacked
+    /// per-frame timeline (CPU below, GPU above). Self-refreshes ~8 Hz while
+    /// visible via `redraw_within` + the `before_build` poll.
+    fn profiling_card(&self) -> El {
+        let body: El = match &self.profiling {
+            Some(view) if !view.bars.is_empty() => profiling_body(view),
+            _ => column([text("Collecting frames…").muted().small()])
+                .height(Size::Fill(1.0))
+                .justify(Justify::Center),
+        };
+        // Off-screen `redraw_within` is ignored by the runtime, so this only
+        // drives the poll cadence while the card is actually on screen.
+        fill_card("Render profile · live", [body])
+            .redraw_within(std::time::Duration::from_millis(120))
+    }
+
     /// Wide (≥ [`WIDE_BREAKPOINT`]) detail: a fixed-width controls
     /// rail next to a visualization column with the preview and gamut
     /// plot stacked — everything visible at once, charts sized by the
@@ -996,6 +1082,7 @@ impl TuneGui {
         let viz = column([
             self.preview_card().height(Size::Fill(2.0)),
             self.gamut_card().height(Size::Fill(3.0)),
+            self.profiling_card().height(Size::Fill(2.0)),
         ])
         .gap(tokens::SPACE_4)
         .padding(tokens::SPACE_5)
@@ -1021,6 +1108,7 @@ impl TuneGui {
                 (Pane::Controls, "Controls"),
                 (Pane::Preview, "Preview"),
                 (Pane::Gamut, "Gamut"),
+                (Pane::Profiling, "Profile"),
             ],
         ));
         children.push(match self.pane {
@@ -1032,6 +1120,7 @@ impl TuneGui {
             .height(Size::Fill(1.0)),
             Pane::Preview => self.preview_card().height(Size::Fill(1.0)),
             Pane::Gamut => self.gamut_card().height(Size::Fill(1.0)),
+            Pane::Profiling => self.profiling_card().height(Size::Fill(1.0)),
         });
         column(children)
             .gap(tokens::SPACE_4)
@@ -1042,10 +1131,32 @@ impl TuneGui {
 }
 
 impl App for TuneGui {
+    /// Poll the live profiling readout right before a frame is built, but only
+    /// while the profiling card is on screen (the flag is set in `build`) and at
+    /// most ~8 Hz. The card's `redraw_within` is what drives these frames while
+    /// it's visible; off-screen it requests no redraws, so this stays idle.
+    fn before_build(&mut self) {
+        if !self.profiling_visible.get() {
+            return;
+        }
+        let due = self
+            .last_poll
+            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(110));
+        if due {
+            self.last_poll = Some(std::time::Instant::now());
+            self.fetch_profiling();
+        }
+    }
+
     fn build(&self, cx: &BuildCx) -> El {
         // Tabbed below WIDE_BREAKPOINT (and when the host reports no
-        // viewport), three-pane split above it.
+        // viewport), multi-pane split above it.
         let wide = cx.viewport_width().is_some_and(|w| w >= WIDE_BREAKPOINT);
+        // Record whether the profiling card is in this frame's tree, so the
+        // next `before_build` knows whether to poll. Wide shows it always;
+        // narrow only on its tab.
+        self.profiling_visible
+            .set(self.current().is_some() && (wide || self.pane == Pane::Profiling));
         let detail: El = match self.current() {
             Some(output) if wide => self.wide_detail(output),
             Some(output) => self.narrow_detail(output),
@@ -1066,6 +1177,12 @@ impl App for TuneGui {
 
     fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         if tabs::apply_event(&mut self.pane, &event, "pane", Pane::parse) {
+            // Switching to the profiling tab: fetch immediately so the panel
+            // shows data right away instead of after the first poll tick.
+            if self.pane == Pane::Profiling {
+                self.fetch_profiling();
+                self.last_poll = Some(std::time::Instant::now());
+            }
             return;
         }
         if let Some(route) = event
@@ -1278,6 +1395,209 @@ fn fetch_lut3d(output: &str) -> Result<FetchedLut> {
         })
         .collect();
     Ok(FetchedLut { meta, entries })
+}
+
+/// One IPC round-trip for the live profiling readout: the inline percentile
+/// aggregate plus the raw per-frame timeline read out of the reply's memfd.
+fn fetch_profiling_stats(output: &str) -> Result<ProfilingView> {
+    let mut socket = Socket::connect()
+        .context("connect to PRISM_SOCKET (is prism running, and are you in its env?)")?;
+    let (reply, fd) = socket
+        .send_recv_fd(Request::ProfilingStats {
+            output: output.to_string(),
+        })
+        .context("send ProfilingStats request")?;
+    let stats = match reply {
+        Ok(Response::ProfilingStats(s)) => s,
+        Ok(other) => bail!("unexpected reply to ProfilingStats: {other:?}"),
+        Err(e) => bail!("{e}"),
+    };
+    let fd = fd.ok_or_else(|| anyhow::anyhow!("server replied ProfilingStats without an fd"))?;
+    let mut timeline = vec![0u8; stats.byte_len as usize];
+    File::from(fd)
+        .read_exact_at(&mut timeline, 0)
+        .context("read profiling timeline from memfd")?;
+    Ok(ProfilingView::from_wire(stats, &timeline))
+}
+
+/// Synthetic profiling readout for the headless `gui-bundle` layout dump and
+/// the mock GUI — realistic span values so the card lays out at full size.
+fn mock_profiling() -> ProfilingView {
+    let span_names = [
+        "walk", "damage", "lower", "encpush", "submit", "snapshot", "decode", "deband", "encode",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let percentiles_us = vec![
+        [120.0, 340.0, 900.0],  // walk
+        [8.0, 20.0, 55.0],      // damage
+        [15.0, 40.0, 110.0],    // lower
+        [1.0, 2.0, 4.0],        // encpush
+        [30.0, 70.0, 180.0],    // submit
+        [0.0, 0.0, 0.0],        // snapshot (idle — hidden)
+        [500.0, 600.0, 1800.0], // decode
+        [0.0, 0.0, 0.0],        // deband (off — hidden)
+        [500.0, 520.0, 640.0],  // encode
+    ];
+    let bars = (0..64)
+        .map(|i| {
+            let f = i as f32;
+            let cpu = 200.0 + 80.0 * (f * 0.5).sin().abs();
+            let gpu = 1000.0 + 600.0 * (f * 0.27).cos().abs();
+            (cpu, gpu)
+        })
+        .collect();
+    ProfilingView {
+        stats: prism_ipc::ProfilingStats {
+            span_names,
+            percentiles_us,
+            frames: 256,
+            damage_ratio_p50: 0.12,
+            elements_p50: 47.0,
+            timeline_frames: 64,
+            byte_len: 0,
+        },
+        bars,
+    }
+}
+
+/// Track height (logical px) of the timeline bars.
+const TIMELINE_TRACK_H: f32 = 120.0;
+/// Max timeline columns; longer rings are bucketed (per-bucket max, to keep
+/// spikes visible) down to this.
+const TIMELINE_MAX_COLS: usize = 128;
+
+/// The profiling card's content: a stats line, the per-span percentile table,
+/// the medians, and the stacked per-frame timeline.
+fn profiling_body(view: &ProfilingView) -> El {
+    let s = &view.stats;
+    let mut rows: Vec<El> = vec![profile_row(
+        text("span").small().muted(),
+        ["p50", "p95", "p99"].map(|h| text(h).small().muted()),
+    )];
+    for (name, p) in s.span_names.iter().zip(&s.percentiles_us) {
+        // Hide spans that never fire (snapshot with no close-anim, deband off).
+        if p[0] == 0.0 && p[2] == 0.0 {
+            continue;
+        }
+        rows.push(profile_row(
+            text(name.clone()),
+            [p[0], p[1], p[2]].map(|v| mono(format!("{v:.0}"))),
+        ));
+    }
+    // Timeline first so the live view stays visible without scrolling when the
+    // card is short (e.g. stacked in the wide layout); the table scrolls below.
+    scroll([column([
+        text("timeline — per-frame total, CPU (blue) + GPU (amber)")
+            .small()
+            .muted(),
+        timeline_bars(&view.bars),
+        text(format!("{} frames · µs (p50 / p95 / p99)", s.frames))
+            .small()
+            .muted(),
+        column(rows).gap(tokens::SPACE_1).width(Size::Fill(1.0)),
+        row([
+            text(format!("damage {:.0}%", s.damage_ratio_p50 * 100.0))
+                .small()
+                .muted(),
+            text(format!("elems {:.0}", s.elements_p50)).small().muted(),
+        ])
+        .gap(tokens::SPACE_4),
+    ])
+    .gap(tokens::SPACE_3)
+    .width(Size::Fill(1.0))
+    .padding(tokens::RING_WIDTH)])
+    .height(Size::Fill(1.0))
+}
+
+/// One percentile-table row: a flexible name cell + three right-aligned numeric
+/// cells.
+fn profile_row(name: El, vals: [El; 3]) -> El {
+    let mut cells = vec![name.width(Size::Fill(1.0))];
+    for v in vals {
+        cells.push(v.width(Size::Fixed(56.0)).text_align(TextAlign::End));
+    }
+    row(cells).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+}
+
+/// Stacked per-frame timeline: one column per (bucketed) frame, CPU segment at
+/// the bottom and GPU on top, heights scaled to the window's max total.
+fn timeline_bars(bars: &[(f32, f32)]) -> El {
+    let buckets = bucket_bars(bars, TIMELINE_MAX_COLS);
+    let max = buckets
+        .iter()
+        .map(|(c, g)| c + g)
+        .fold(0.0f32, f32::max)
+        .max(1.0);
+    let cols: Vec<El> = buckets
+        .iter()
+        .map(|&(cpu, gpu)| {
+            let cpu_px = (cpu / max) * TIMELINE_TRACK_H;
+            let gpu_px = (gpu / max) * TIMELINE_TRACK_H;
+            let mut segs: Vec<El> = Vec::new();
+            if gpu_px >= 0.5 {
+                segs.push(
+                    spacer()
+                        .width(Size::Fill(1.0))
+                        .height(Size::Fixed(gpu_px))
+                        .background(tokens::WARNING),
+                );
+            }
+            if cpu_px >= 0.5 {
+                segs.push(
+                    spacer()
+                        .width(Size::Fill(1.0))
+                        .height(Size::Fixed(cpu_px))
+                        .background(tokens::INFO),
+                );
+            }
+            if segs.is_empty() {
+                // A frame with ~0 total: a 1px tick so the column isn't empty.
+                segs.push(
+                    spacer()
+                        .width(Size::Fill(1.0))
+                        .height(Size::Fixed(1.0))
+                        .background(tokens::MUTED_FOREGROUND),
+                );
+            }
+            column(segs)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0))
+                .justify(Justify::End)
+        })
+        .collect();
+    row(cols)
+        .width(Size::Fill(1.0))
+        .height(Size::Fixed(TIMELINE_TRACK_H))
+        .gap(1.0)
+}
+
+/// Downsample `bars` to at most `max_cols` columns, taking each bucket's
+/// highest-total frame so spikes survive the reduction.
+fn bucket_bars(bars: &[(f32, f32)], max_cols: usize) -> Vec<(f32, f32)> {
+    if bars.len() <= max_cols {
+        return bars.to_vec();
+    }
+    let per = bars.len() as f32 / max_cols as f32;
+    (0..max_cols)
+        .map(|i| {
+            let lo = (i as f32 * per) as usize;
+            let hi = (((i + 1) as f32 * per) as usize)
+                .max(lo + 1)
+                .min(bars.len());
+            bars[lo..hi]
+                .iter()
+                .copied()
+                .fold((0.0f32, 0.0f32), |acc, b| {
+                    if b.0 + b.1 > acc.0 + acc.1 {
+                        b
+                    } else {
+                        acc
+                    }
+                })
+        })
+        .collect()
 }
 
 /// Read a captured BT.2020 intermediate frame once and derive two views:
