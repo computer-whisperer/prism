@@ -869,6 +869,10 @@ impl OutputContext {
         // Cross-GPU mirror copy-done semaphores the render must wait on
         // before sampling. Empty for outputs with no mirrored surfaces.
         wait_semaphores: &[vk::Semaphore],
+        // Cross-GPU mirror GTT→local copies to record at the start of the
+        // render command buffer (see `Renderer::render_frame`). Empty for the
+        // common case (no mirrored surfaces on this output).
+        local_copies: &[prism_renderer::LocalMirrorCopy],
         // Window-close snapshots to capture from the intermediate this frame
         // (before the decode pass repaints over the region). Empty in the
         // common case.
@@ -982,6 +986,7 @@ impl OutputContext {
             &encode_rects,
             encode_push,
             wait_semaphores,
+            local_copies,
             snapshots,
             force_full_repaint,
             profile,

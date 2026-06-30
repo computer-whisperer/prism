@@ -4843,6 +4843,33 @@ pub fn prepare_mirror_waits(
     waits
 }
 
+/// Gather the GTT→local mirror copies the target render must record before
+/// sampling, for every mirrored surface drawn on `target_gpu` this frame (the
+/// luma plane plus an optional chroma plane each). Handed to `present()` →
+/// `render_frame`, which records them at the start of the command buffer; the
+/// copies' source reads are gated by the same home→GTT copy-done semaphores
+/// that [`prepare_mirror_waits`] returns. Empty when no surface on this output
+/// is mirrored.
+pub fn mirror_local_copies(
+    surfaces: &[WlSurface],
+    target_gpu: DrmDevId,
+) -> Vec<prism_renderer::LocalMirrorCopy> {
+    let mut out = Vec::new();
+    for surface in surfaces {
+        with_states(surface, |states| {
+            let Some(slot) = states.data_map.get::<SurfaceTexSlot>() else {
+                return;
+            };
+            let guard = slot.0.lock().unwrap();
+            let Some(tex) = guard.as_ref() else { return };
+            if let Some(gt) = tex.by_gpu.get(&target_gpu) {
+                out.extend(gt.mirror_copies());
+            }
+        });
+    }
+    out
+}
+
 /// Record the present-completion `sync_file` of a confirmed `Presented`
 /// outcome on `target_gpu` whose render sampled mirror scratches. The next
 /// home→scratch copy for that GPU waits a dup of it (see
@@ -5057,6 +5084,7 @@ fn materialize_dmabuf_for_gpu(
      -> Result<(
         prism_renderer::ExportableImage,
         Arc<prism_renderer::ImportedImage>,
+        Arc<prism_renderer::LocalImage>,
     )> {
         if !gpu_supports_dmabuf(&device_g, vk_fmt, DRM_FORMAT_MOD_LINEAR) {
             anyhow::bail!("consumer GPU can't sample LINEAR for {vk_fmt:?}; no mirror");
@@ -5064,17 +5092,22 @@ fn materialize_dmabuf_for_gpu(
         let scratch =
             prism_renderer::ExportableImage::new(device_home.clone(), plane_extent, vk_fmt, fourcc)
                 .context("ExportableImage::new (mirror scratch)")?;
+        // `target` is a copy SOURCE now (blitted into `target_local`), not
+        // sampled directly — leave it in GENERAL (a valid copy-src layout).
         let target = prism_renderer::ImportedImage::import(
             device_g.clone(),
             scratch.exported_dmabuf(),
             vk_fmt,
-            vk::ImageUsageFlags::SAMPLED,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC,
         )
         .context("import mirror scratch on consumer GPU")?;
         target
-            .transition_for_sampling()
-            .context("transition mirror scratch for sampling")?;
-        Ok((scratch, Arc::new(target)))
+            .transition_to_general()
+            .context("transition mirror scratch to general")?;
+        // The local OPTIMAL copy the decode/deband passes actually sample.
+        let target_local = prism_renderer::LocalImage::new(device_g.clone(), plane_extent, vk_fmt)
+            .context("LocalImage::new (mirror target_local)")?;
+        Ok((scratch, Arc::new(target), Arc::new(target_local)))
     };
 
     let yuv = yuv_kind_for(dmabuf.format);
@@ -5086,7 +5119,7 @@ fn materialize_dmabuf_for_gpu(
         Some(prism_renderer::YuvKind::P010) => DrmFourcc::R16,
         None => dmabuf.format,
     };
-    let (scratch, target) = make_plane(extent, format, luma_fourcc)?;
+    let (scratch, target, target_local) = make_plane(extent, format, luma_fourcc)?;
 
     // Chroma plane for YUV: interleaved Cb/Cr at half res in both axes
     // (4:2:0), recombined with luma by the consumer's decode shader.
@@ -5101,10 +5134,12 @@ fn materialize_dmabuf_for_gpu(
                 width: extent.width.div_ceil(2),
                 height: extent.height.div_ceil(2),
             };
-            let (scratch, target) = make_plane(chroma_extent, chroma_fmt, chroma_fourcc)?;
+            let (scratch, target, target_local) =
+                make_plane(chroma_extent, chroma_fmt, chroma_fourcc)?;
             Some(MirrorChroma {
                 scratch,
                 target,
+                target_local,
                 kind,
             })
         }
@@ -5127,6 +5162,7 @@ fn materialize_dmabuf_for_gpu(
             home_src_buffer: buffer_id,
             scratch,
             target,
+            target_local,
             chroma,
         },
     );

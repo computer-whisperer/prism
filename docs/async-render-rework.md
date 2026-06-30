@@ -188,6 +188,21 @@ last frame — skip the copy and reuse the same `target_local_idx`. Ties into
 the existing per-commit `acquire_waited` tracking (`state.rs:4777`). Without
 this, a static mirrored window re-copies every frame for nothing.
 
+### 1.5b Status — GFX-first sub-step DONE (build/clippy/tests clean, runtime-unverified)
+
+The locality half of Phase 1 is implemented with the copy on the **graphics**
+queue (recorded at the start of `render_frame`'s cb), deferring the ACE-queue
+move and double-buffering. Provably correct via the *existing* render-done gate
+(the copy now lives inside the render cb, so `note_mirror_render_done` already
+covers the GTT-scratch overwrite race). `target_local` is **single-buffered**,
+i.e. exactly the same write-then-read-per-frame profile as the persistent
+intermediate — no new hazard class; double-buffering (next-next step) makes it
+strictly safer + enables cross-frame pipelining. Remaining for full Phase 1:
+move the copy to the ACE `transfer_queue` (separate submit + `local_done` sem,
+the gate re-point in 1.4) for GFX/ACE overlap, then double-buffer. Also TODO: a
+dedicated profile span for the copy (currently recorded before t0, so it lands
+in total frame time but not in any per-span bucket).
+
 ### 1.6 Touch list
 
 - `device.rs` — ACE queue family probe + queue.

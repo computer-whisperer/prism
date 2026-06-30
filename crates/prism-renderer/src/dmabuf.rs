@@ -249,6 +249,32 @@ impl ImportedImage {
     /// For sampled dmabuf imports only. Color-attachment scanout images
     /// don't need this — they're transitioned per-frame in render_frame.
     pub fn transition_for_sampling(&self) -> Result<()> {
+        self.transition_to(
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+        )
+    }
+
+    /// As [`transition_for_sampling`](Self::transition_for_sampling) but to
+    /// `GENERAL` — for a mirror import that is read as a **copy source** (into
+    /// the target-local image) rather than sampled directly. `GENERAL` is a
+    /// valid `vkCmdCopyImage` source layout and lets the per-frame copy use a
+    /// fixed source layout with no stateful re-transition.
+    pub fn transition_to_general(&self) -> Result<()> {
+        self.transition_to(
+            vk::ImageLayout::GENERAL,
+            vk::PipelineStageFlags2::ALL_TRANSFER,
+            vk::AccessFlags2::TRANSFER_READ,
+        )
+    }
+
+    fn transition_to(
+        &self,
+        new_layout: vk::ImageLayout,
+        dst_stage: vk::PipelineStageFlags2,
+        dst_access: vk::AccessFlags2,
+    ) -> Result<()> {
         let device = &self.device.raw;
         let queue_family = self.device.physical.graphics_queue_family;
 
@@ -276,11 +302,11 @@ impl ImportedImage {
                 vk::ImageMemoryBarrier2::default()
                     .image(image)
                     .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .new_layout(new_layout)
                     .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
                     .src_access_mask(vk::AccessFlags2::empty())
-                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .dst_stage_mask(dst_stage)
+                    .dst_access_mask(dst_access)
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,

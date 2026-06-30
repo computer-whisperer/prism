@@ -706,6 +706,13 @@ impl Renderer {
         // it completes execution — the deferred-destroy queue holds them
         // until this submission's slot fence proves that).
         wait_semaphores: &[vk::Semaphore],
+        // Cross-GPU mirror GTT→local copies to record at the very start of the
+        // command buffer: each blits a LINEAR host-visible (GTT) mirror import
+        // into an OPTIMAL device-local image the decode/deband passes then
+        // sample, replacing two untiled PCIe scans with one streaming copy (see
+        // `docs/async-render-rework.md`). Gated by `wait_semaphores` (the
+        // home→GTT copy-done) at submit. Empty for the common case (no mirror).
+        local_copies: &[crate::local_mirror::LocalMirrorCopy],
         // Window-close snapshots to capture from the intermediate this frame,
         // recorded before the decode pass (which would otherwise repaint over
         // the region). Empty in the common case.
@@ -839,6 +846,71 @@ impl Renderer {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { self.device.raw.begin_command_buffer(cb, &begin_info) }
             .vk_ctx("begin_command_buffer (renderer)")?;
+
+        // ── Cross-GPU mirror: GTT→local copies ──────────────────────────────
+        // Recorded before everything else so the decode/deband passes sample a
+        // local OPTIMAL image instead of the LINEAR GTT import. The submit's
+        // `wait_semaphores` (home→GTT copy-done) gate the whole buffer, so the
+        // source is fully written before this reads it; the source stays in
+        // GENERAL (set once at import via `transition_to_general`). NOTE: this
+        // runs before the t0 timestamp, so its cost is not yet attributed to a
+        // profile span — only to total frame time (a dedicated span is a TODO).
+        let copy_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let copy_layers = vk::ImageSubresourceLayers::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .layer_count(1);
+        for c in local_copies {
+            let to_dst = [vk::ImageMemoryBarrier2::default()
+                .image(c.dst)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .src_access_mask(vk::AccessFlags2::empty())
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .subresource_range(copy_range)];
+            let region = [vk::ImageCopy::default()
+                .src_subresource(copy_layers)
+                .dst_subresource(copy_layers)
+                .extent(vk::Extent3D {
+                    width: c.extent.width,
+                    height: c.extent.height,
+                    depth: 1,
+                })];
+            let to_sample = [vk::ImageMemoryBarrier2::default()
+                .image(c.dst)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .subresource_range(copy_range)];
+            unsafe {
+                self.device.raw.cmd_pipeline_barrier2(
+                    cb,
+                    &vk::DependencyInfo::default().image_memory_barriers(&to_dst),
+                );
+                self.device.raw.cmd_copy_image(
+                    cb,
+                    c.src,
+                    vk::ImageLayout::GENERAL,
+                    c.dst,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region,
+                );
+                self.device.raw.cmd_pipeline_barrier2(
+                    cb,
+                    &vk::DependencyInfo::default().image_memory_barriers(&to_sample),
+                );
+            }
+        }
 
         // GPU profiling: when this frame is being profiled, reset its timestamp
         // pool up front (must be outside any render pass). The five timestamps

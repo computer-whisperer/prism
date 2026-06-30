@@ -597,6 +597,7 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
         &encode_push,
         &[],
         &[],
+        &[],
         false,
         None,
     )?;
@@ -3255,6 +3256,9 @@ fn render_output_now(
         &acquire_surfaces,
         output_gpu_id,
     ));
+    // GTT→local copies the render records up front, so decode/deband sample
+    // local tiled VRAM instead of scanning the LINEAR mirror imports over PCIe.
+    let local_copies = prism_protocols::mirror_local_copies(&mirror_surfaces, output_gpu_id);
     let outcome = {
         let output = state
             .outputs
@@ -3265,6 +3269,7 @@ fn render_output_now(
             view_size,
             &encode_push,
             &render_waits,
+            &local_copies,
             &snapshot_copies,
             force_full_decode,
             profile,
@@ -3739,6 +3744,7 @@ fn run_gradient_scanout(output_name: Option<&str>, depth: prism_drm::ScanoutDept
         &[],
         &[],
         &encode_push,
+        &[],
         &[],
         &[],
         false,

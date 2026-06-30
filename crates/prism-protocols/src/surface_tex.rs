@@ -34,7 +34,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use prism_renderer::{
-    vk, AlphaMode, DrmDevId, ExportableImage, ImportedImage, ShmTexture, YuvKind,
+    vk, AlphaMode, DrmDevId, ExportableImage, ImportedImage, LocalImage, LocalMirrorCopy,
+    ShmTexture, YuvKind,
 };
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::reexports::wayland_server::backend::ObjectId;
@@ -137,6 +138,12 @@ pub enum GpuTex {
         home_src_buffer: ObjectId,
         scratch: ExportableImage,
         target: Arc<ImportedImage>,
+        /// OPTIMAL device-local copy of `target`, in the consumer GPU's own
+        /// VRAM. Filled once per render from `target` (a streaming GTT→VRAM
+        /// blit) and sampled by the decode/deband passes instead of the LINEAR
+        /// `target`, so they read tiled local memory rather than scanning the
+        /// GTT import over PCIe twice. See `docs/async-render-rework.md`.
+        target_local: Arc<LocalImage>,
         /// Chroma plane for a YUV mirror (NV12/P010): a second, half-res
         /// scratch+target carrying the interleaved chroma. `None` for an
         /// RGB mirror. When set, `scratch`/`target` hold the luma plane and
@@ -154,6 +161,8 @@ pub enum GpuTex {
 pub struct MirrorChroma {
     pub scratch: ExportableImage,
     pub target: Arc<ImportedImage>,
+    /// Local OPTIMAL copy of the chroma `target` (see `GpuTex::Mirror`).
+    pub target_local: Arc<LocalImage>,
     pub kind: YuvKind,
 }
 
@@ -161,9 +170,39 @@ impl GpuTex {
     pub fn view(&self) -> vk::ImageView {
         match self {
             Self::Native(img) => img.view(),
-            Self::Mirror { target, .. } => target.view(),
+            // Sample the local OPTIMAL copy, not the LINEAR GTT import — the
+            // per-frame GTT→local copy (recorded in render_frame) fills it.
+            Self::Mirror { target_local, .. } => target_local.view(),
             Self::Shm(t) => t.view(),
         }
+    }
+
+    /// Cross-GPU mirror GTT→local copies this texture needs recorded before
+    /// sampling (luma + optional chroma plane). Empty for non-mirror textures.
+    /// Handed to `render_frame` via the per-output present path.
+    pub fn mirror_copies(&self) -> Vec<LocalMirrorCopy> {
+        let Self::Mirror {
+            target,
+            target_local,
+            chroma,
+            ..
+        } = self
+        else {
+            return Vec::new();
+        };
+        let mut out = vec![LocalMirrorCopy {
+            src: target.image(),
+            dst: target_local.image(),
+            extent: target_local.extent(),
+        }];
+        if let Some(c) = chroma {
+            out.push(LocalMirrorCopy {
+                src: c.target.image(),
+                dst: c.target_local.image(),
+                extent: c.target_local.extent(),
+            });
+        }
+        out
     }
 
     /// Chroma plane view + YUV kind code (matching `DecodePush::yuv`:
@@ -182,7 +221,7 @@ impl GpuTex {
             },
             Self::Mirror {
                 chroma: Some(c), ..
-            } => (Some(c.target.view()), code(c.kind)),
+            } => (Some(c.target_local.view()), code(c.kind)),
             _ => (None, 0),
         }
     }
