@@ -2667,13 +2667,17 @@ fn on_estimated_vblank(state: &mut prism_protocols::PrismState, output_id: &str)
 /// `FrameSubmission` because `prism_renderer::LoweredFrame` is the draw-list
 /// type it wraps.
 ///
-/// NOT yet lifetime-bearing: the raw `vk::ImageView`s in `frame` point into
-/// textures owned by each surface's `SurfaceTexSlot`, kept alive today by
-/// lower → execute running back-to-back on one thread. Before B1 this needs
-/// a `keepalive` of strong refs to those textures — blocked on
-/// `GpuTex::Shm` holding its `ShmTexture` by value (see the doc's
-/// A-increments for the Arc-ification step).
+/// Lifetime-bearing for surface textures: `_keepalive` owns strong refs to
+/// every GPU object the drawn surfaces' raw `vk::ImageView`s / mirror copy
+/// ops point into, so a surface dying while the frame is in flight can't
+/// stamp its texture's deferred-destroy retirement before the frame's
+/// submit. NOT yet covered: close-animation / resize-crossfade ghost
+/// elements, whose views come from layout-owned `Arc<SnapshotTexture>`s —
+/// a B1 prerequisite (needs a small layout API to clone those Arcs into
+/// the frame; see the doc's A-increments).
 struct FrameSubmission {
+    /// RAII only — never read. See above.
+    _keepalive: Vec<prism_protocols::GpuKeepalive>,
     frame: prism_renderer::LoweredFrame,
     view_size: smithay::utils::Size<f64, smithay::utils::Logical>,
     encode_push: prism_renderer::EncodePush,
@@ -2996,6 +3000,12 @@ fn lower_output_frame(
     let acquire_surfaces: std::cell::RefCell<
         Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
     > = std::cell::RefCell::new(Vec::new());
+    // Strong refs to every GPU object the drawn surfaces' views point into.
+    // Moved into the FrameSubmission so the frame owns them across the B1
+    // render-thread hop (a surface dying mid-flight can't retire its texture
+    // before the frame's submit) — see `docs/async-render-rework.md` §2.4.
+    let keepalive: std::cell::RefCell<Vec<prism_protocols::GpuKeepalive>> =
+        std::cell::RefCell::new(Vec::new());
     let report_drawn_surface =
         |s: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
          states: &smithay::wayland::compositor::SurfaceData| {
@@ -3004,6 +3014,7 @@ fn lower_output_frame(
             };
             let guard = slot.0.lock().unwrap();
             let Some(tex) = guard.as_ref() else { return };
+            tex.keepalive_for(output_gpu_id, &mut keepalive.borrow_mut());
             if tex.is_mirror_for(output_gpu_id) {
                 mirror_surfaces.borrow_mut().push(s.clone());
             } else if tex.is_native_dmabuf_for(output_gpu_id)
@@ -3371,6 +3382,7 @@ fn lower_output_frame(
 
     Ok(Some((
         FrameSubmission {
+            _keepalive: keepalive.take(),
             frame,
             view_size,
             encode_push,

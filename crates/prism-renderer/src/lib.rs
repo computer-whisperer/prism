@@ -55,7 +55,7 @@ pub use profile::{
 };
 pub use renderer::{DebandParams, ElementDraw, RenderedFrame, Renderer, SnapshotCopy};
 pub use snapshot::SnapshotTexture;
-pub use upload::ShmTexture;
+pub use upload::{ShmImage, ShmTexture};
 
 // Re-export ash::vk so binary / glue crates don't need a direct ash dep.
 pub use ash::vk;

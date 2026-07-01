@@ -31,6 +31,38 @@ use crate::device::Device;
 use crate::error::{RendererError, Result, VkResultExt};
 use crate::intermediate::create_view;
 
+/// The sampled GPU objects of a [`ShmTexture`] — exactly what a lowered
+/// frame's draws reference (via the raw `vk::ImageView`). Split out and
+/// `Arc`'d so a frame can hold a strong ref across the render-thread hop
+/// (async-render rework B1, `docs/async-render-rework.md` §2.4): if the
+/// surface dies while its frame is in flight, this drop — and thus the
+/// [`Device::retire`] stamp — happens only after the frame releases it.
+/// The upload machinery (staging, command buffer, fence) stays by-value in
+/// `ShmTexture`; no frame references it.
+pub struct ShmImage {
+    device: Arc<Device>,
+    image: vk::Image,
+    view: vk::ImageView,
+    memory: vk::DeviceMemory,
+}
+
+impl ShmImage {
+    pub fn view(&self) -> vk::ImageView {
+        self.view
+    }
+}
+
+impl Drop for ShmImage {
+    fn drop(&mut self) {
+        use crate::device::Retired;
+        self.device.retire(Retired::Image {
+            image: self.image,
+            view: self.view,
+            memory: self.memory,
+        });
+    }
+}
+
 /// A sampled VkImage uploaded from CPU bytes via a persistent staging buffer.
 pub struct ShmTexture {
     device: Arc<Device>,
@@ -50,9 +82,7 @@ pub struct ShmTexture {
     /// UNDEFINED; later uploads acquire from SHADER_READ_ONLY_OPTIMAL.
     initialized: bool,
 
-    image: vk::Image,
-    view: vk::ImageView,
-    image_memory: vk::DeviceMemory,
+    image: Arc<ShmImage>,
 
     staging_buffer: vk::Buffer,
     staging_memory: vk::DeviceMemory,
@@ -73,7 +103,11 @@ unsafe impl Sync for ShmTexture {}
 
 impl ShmTexture {
     pub fn view(&self) -> vk::ImageView {
-        self.view
+        self.image.view
+    }
+    /// The `Arc`'d sampled image, for a lowered frame's keepalive set.
+    pub fn image(&self) -> &Arc<ShmImage> {
+        &self.image
     }
     pub fn extent(&self) -> vk::Extent2D {
         self.extent
@@ -179,6 +213,13 @@ impl ShmTexture {
         let upload_fence = unsafe { device.raw.create_fence(&fence_info, None) }
             .vk_ctx("create_fence (shm upload)")?;
 
+        let image = Arc::new(ShmImage {
+            device: device.clone(),
+            image,
+            view,
+            memory: image_memory,
+        });
+
         Ok(Self {
             device,
             command_pool,
@@ -187,8 +228,6 @@ impl ShmTexture {
             last_submit_serial: 0,
             initialized: false,
             image,
-            view,
-            image_memory,
             staging_buffer,
             staging_memory,
             staging_ptr,
@@ -303,7 +342,7 @@ impl ShmTexture {
         // Record the copy into our reusable command buffer and submit with
         // our fence — no queue idle. See the module doc for why this is
         // race-free on the single main-thread graphics queue.
-        let image = self.image;
+        let image = self.image.image;
         let staging_buffer = self.staging_buffer;
         let extent = self.extent;
         let cb = self.cmd_buffer;
@@ -434,17 +473,14 @@ impl Drop for ShmTexture {
         // `device_wait_idle` (a full-pipeline stall on every shm texture
         // realloc/close). Unmapping is a host-side operation and is safe
         // while the GPU reads the memory; the free is what's deferred.
+        // The sampled image itself is retired by `ShmImage`'s own Drop,
+        // which a lowered frame's keepalive may delay past this one.
         unsafe { self.device.raw.unmap_memory(self.staging_memory) };
         self.device.retire(Retired::Fence(self.upload_fence));
         self.device.retire(Retired::CommandPool(self.command_pool));
         self.device.retire(Retired::Buffer {
             buffer: self.staging_buffer,
             memory: self.staging_memory,
-        });
-        self.device.retire(Retired::Image {
-            image: self.image,
-            view: self.view,
-            memory: self.image_memory,
         });
     }
 }

@@ -38,5 +38,6 @@ pub use state::{
     prepare_mirror_waits, PrismState,
 };
 pub use surface_tex::{
-    GpuTex, SurfacePlacement, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture, TexSource,
+    GpuKeepalive, GpuTex, SurfacePlacement, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture,
+    TexSource,
 };

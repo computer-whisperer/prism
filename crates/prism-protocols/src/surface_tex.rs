@@ -166,6 +166,11 @@ pub struct MirrorChroma {
     pub kind: YuvKind,
 }
 
+/// A type-erased strong ref to a GPU object a lowered frame's raw
+/// `vk::ImageView`s / copy ops point into — see [`GpuTex::keepalive`]. The
+/// frame only holds it (RAII); nothing downcasts it.
+pub type GpuKeepalive = Arc<dyn std::any::Any + Send + Sync>;
+
 impl GpuTex {
     pub fn view(&self) -> vk::ImageView {
         match self {
@@ -203,6 +208,34 @@ impl GpuTex {
             });
         }
         out
+    }
+
+    /// Push strong refs to every GPU object this texture's draws — and its
+    /// mirror copy ops — reference on this GPU. A lowered frame owns these
+    /// across the render-thread hop (async-render rework B1,
+    /// `docs/async-render-rework.md` §2.4): if the surface dies while its
+    /// frame is in flight, the objects' deferred-destroy retirement is
+    /// stamped only after the frame drops them, never before its submit.
+    pub fn keepalive(&self, out: &mut Vec<GpuKeepalive>) {
+        match self {
+            Self::Native(img) => out.push(img.clone()),
+            Self::Mirror {
+                target,
+                target_local,
+                chroma,
+                ..
+            } => {
+                // `target` is the GTT import the frame's LocalMirrorCopy
+                // reads; `target_local` is what the draws sample.
+                out.push(target.clone());
+                out.push(target_local.clone());
+                if let Some(c) = chroma {
+                    out.push(c.target.clone());
+                    out.push(c.target_local.clone());
+                }
+            }
+            Self::Shm(t) => out.push(t.image().clone()),
+        }
     }
 
     /// Chroma plane view + YUV kind code (matching `DecodePush::yuv`:
@@ -267,6 +300,14 @@ impl SurfaceTexture {
     /// no materialization yet (not a consumer, or import/upload pending).
     pub fn view_for(&self, gpu: DrmDevId) -> Option<vk::ImageView> {
         self.by_gpu.get(&gpu).map(|t| t.view())
+    }
+
+    /// Push this surface's keepalive refs on `gpu` into `out` — see
+    /// [`GpuTex::keepalive`]. No-op when `gpu` has no materialization.
+    pub fn keepalive_for(&self, gpu: DrmDevId, out: &mut Vec<GpuKeepalive>) {
+        if let Some(t) = self.by_gpu.get(&gpu) {
+            t.keepalive(out);
+        }
     }
 
     /// Chroma view + YUV kind code for `gpu`, for YUV video surfaces.
