@@ -430,8 +430,8 @@ impl EncodeDiagnoseProbe {
 
 impl Drop for EncodeDiagnoseProbe {
     fn drop(&mut self) {
+        self.device.wait_device_idle();
         unsafe {
-            let _ = self.device.raw.device_wait_idle();
             self.device.raw.unmap_memory(self.upload_memory);
             self.device.raw.unmap_memory(self.readback_memory);
             self.device.raw.destroy_buffer(self.upload_buffer, None);

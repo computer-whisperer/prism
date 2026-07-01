@@ -51,16 +51,12 @@ impl OneshotPool {
 
         let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
-        let serial = self.device.note_submit();
-        unsafe {
+        let serial =
             self.device
-                .raw
-                .queue_submit2(self.device.graphics_queue, &submit, vk::Fence::null())
-        }
-        .vk_ctx("queue_submit2 (oneshot)")?;
+                .submit_graphics(&submit, vk::Fence::null(), "queue_submit2 (oneshot)")?;
 
-        unsafe { self.device.raw.queue_wait_idle(self.device.graphics_queue) }
-            .vk_ctx("queue_wait_idle (oneshot)")?;
+        self.device
+            .wait_graphics_idle("queue_wait_idle (oneshot)")?;
         // Queue idle ⇒ this serial (and everything before it) completed.
         self.device.note_completed(serial);
 
@@ -72,8 +68,8 @@ impl OneshotPool {
 
 impl Drop for OneshotPool {
     fn drop(&mut self) {
+        self.device.wait_device_idle();
         unsafe {
-            let _ = self.device.raw.device_wait_idle();
             self.device.raw.destroy_command_pool(self.pool, None);
         }
     }

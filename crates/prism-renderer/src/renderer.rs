@@ -212,7 +212,7 @@ struct FrameSlot {
     /// the submit then re-export.
     present_semaphore: vk::Semaphore,
     /// Device submission serial of this slot's last submit
-    /// ([`Device::note_submit`]). When the slot's fence wait returns, this
+    /// ([`Device::submit_graphics`]). When the slot's fence wait returns, this
     /// serial is reported to [`Device::note_completed`], driving the
     /// deferred-destroy queue. 0 = never submitted (note_completed no-op).
     submit_serial: u64,
@@ -1547,13 +1547,9 @@ impl Renderer {
             .command_buffer_infos(&cb_infos)
             .wait_semaphore_infos(&wait_sems)
             .signal_semaphore_infos(&signal_sem)];
-        let serial = self.device.note_submit();
-        unsafe {
+        let serial =
             self.device
-                .raw
-                .queue_submit2(self.device.graphics_queue, &submit, slot_fence)
-        }
-        .vk_ctx("queue_submit2 (renderer)")?;
+                .submit_graphics(&submit, slot_fence, "queue_submit2 (renderer)")?;
         self.slots[slot_idx].submit_serial = serial;
 
         // Buffer this frame's CPU profile in the slot it rendered into. The
@@ -1594,9 +1590,9 @@ impl Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
+        // Drain all outstanding work before tearing down the pool / fences.
+        self.device.wait_device_idle();
         unsafe {
-            // Drain all outstanding work before tearing down the pool / fences.
-            let _ = self.device.raw.device_wait_idle();
             for slot in &self.slots {
                 self.device.raw.destroy_fence(slot.fence, None);
                 self.device

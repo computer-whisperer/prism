@@ -601,9 +601,7 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
         false,
         None,
     )?;
-    unsafe {
-        let _ = device.raw.device_wait_idle();
-    }
+    device.wait_device_idle();
 
     // Read back via GBM map and check anchor points.
     bo.map(0, 0, width, 1, |mapped| {
@@ -847,12 +845,9 @@ fn build_gradient_texture(
     }
     let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
     let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cbs)];
-    let serial = device.note_submit();
+    let serial = device.submit_graphics(&submit, vk::Fence::null(), "queue_submit2 (gradient)")?;
+    device.wait_graphics_idle("queue_wait_idle (gradient)")?;
     unsafe {
-        device
-            .raw
-            .queue_submit2(device.graphics_queue, &submit, vk::Fence::null())?;
-        device.raw.queue_wait_idle(device.graphics_queue)?;
         device.raw.destroy_command_pool(pool, None);
         device.raw.destroy_buffer(staging, None);
         device.raw.free_memory(staging_mem, None);
@@ -3750,9 +3745,7 @@ fn run_gradient_scanout(output_name: Option<&str>, depth: prism_drm::ScanoutDept
         false,
         None,
     )?;
-    unsafe {
-        let _ = device.raw.device_wait_idle();
-    }
+    device.wait_device_idle();
     tracing::info!("rendered gradient via decode→encode pipeline");
 
     let fb = scanout::add_framebuffer_for_bo(&drm, &bo)?;

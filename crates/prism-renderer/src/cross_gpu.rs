@@ -507,10 +507,9 @@ impl MirrorCopier {
                 .wait_semaphore_infos(&wait_infos)
                 .command_buffer_infos(&cb_infos)
                 .signal_semaphore_infos(&signal)];
-            let serial = self.device.note_submit();
-            device
-                .queue_submit2(self.device.graphics_queue, &submits, self.fence)
-                .vk_ctx("queue_submit2 (mirror copy)")?;
+            let serial =
+                self.device
+                    .submit_graphics(&submits, self.fence, "queue_submit2 (mirror copy)")?;
             self.last_copy_serial.set(serial);
         }
 
@@ -625,20 +624,14 @@ fn submit_and_wait(device: &Device, cb: vk::CommandBuffer) -> Result<()> {
     .vk_ctx("create_fence (mirror init submit)")?;
     let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
     let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
-    let serial = device.note_submit();
-    let res = unsafe {
-        device
-            .raw
-            .queue_submit2(device.graphics_queue, &submits, fence)
-    }
-    .vk_ctx("queue_submit2 (mirror init)")
-    .and_then(|_| {
-        unsafe { device.raw.wait_for_fences(&[fence], true, u64::MAX) }
-            .vk_ctx("wait_for_fences (mirror init)")
-    });
-    if res.is_ok() {
-        device.note_completed(serial);
-    }
+    let res = device
+        .submit_graphics(&submits, fence, "queue_submit2 (mirror init)")
+        .and_then(|serial| {
+            unsafe { device.raw.wait_for_fences(&[fence], true, u64::MAX) }
+                .vk_ctx("wait_for_fences (mirror init)")?;
+            device.note_completed(serial);
+            Ok(())
+        });
     unsafe { device.raw.destroy_fence(fence, None) };
     res
 }

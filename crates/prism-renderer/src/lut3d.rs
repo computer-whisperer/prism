@@ -314,8 +314,8 @@ impl Lut3dTexture {
 
 impl Drop for Lut3dTexture {
     fn drop(&mut self) {
+        self.device.wait_device_idle();
         unsafe {
-            let _ = self.device.raw.device_wait_idle();
             self.device.raw.unmap_memory(self.staging_memory);
             self.device.raw.destroy_buffer(self.staging_buffer, None);
             self.device.raw.free_memory(self.staging_memory, None);

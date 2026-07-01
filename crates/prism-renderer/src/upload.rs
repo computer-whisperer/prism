@@ -414,13 +414,11 @@ impl ShmTexture {
 
         let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
-        let serial = self.device.note_submit();
-        unsafe {
-            self.device
-                .raw
-                .queue_submit2(self.device.graphics_queue, &submit, self.upload_fence)
-        }
-        .vk_ctx("queue_submit2 (shm upload)")?;
+        let serial = self.device.submit_graphics(
+            &submit,
+            self.upload_fence,
+            "queue_submit2 (shm upload)",
+        )?;
         self.last_submit_serial = serial;
 
         self.initialized = true;

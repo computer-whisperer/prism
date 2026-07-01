@@ -334,16 +334,17 @@ impl ImportedImage {
             let submits = [vk::SubmitInfo2::default().command_buffer_infos(&cb_infos)];
             let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
                 .vk_ctx("create_fence (dmabuf transition)")?;
-            let serial = self.device.note_submit();
-            let submit_result =
-                unsafe { device.queue_submit2(self.device.graphics_queue, &submits, fence) };
-            if let Err(e) = submit_result {
-                unsafe { device.destroy_fence(fence, None) };
-                return Err(RendererError::Vk {
-                    context: "queue_submit2 (dmabuf transition)",
-                    result: e,
-                });
-            }
+            let serial = match self.device.submit_graphics(
+                &submits,
+                fence,
+                "queue_submit2 (dmabuf transition)",
+            ) {
+                Ok(serial) => serial,
+                Err(e) => {
+                    unsafe { device.destroy_fence(fence, None) };
+                    return Err(e);
+                }
+            };
             let wait = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
             unsafe { device.destroy_fence(fence, None) };
             if wait.is_ok() {

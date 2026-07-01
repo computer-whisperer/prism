@@ -398,8 +398,8 @@ impl DebandPipeline {
 
 impl Drop for DebandPipeline {
     fn drop(&mut self) {
+        self.device.wait_device_idle();
         unsafe {
-            let _ = self.device.raw.device_wait_idle();
             for pool in &self.pools {
                 for s in &pool.items {
                     self.device.raw.destroy_image_view(s.view, None);

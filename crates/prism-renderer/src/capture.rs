@@ -495,9 +495,7 @@ impl Drop for CaptureEncoder {
     fn drop(&mut self) {
         // Drain before the fields (target's mapped memory, async slot's pool /
         // fence / semaphore) tear down in their own Drop impls.
-        unsafe {
-            let _ = self.device.raw.device_wait_idle();
-        }
+        self.device.wait_device_idle();
     }
 }
 
@@ -586,13 +584,8 @@ impl AsyncSlot {
         let submit = [vk::SubmitInfo2::default()
             .command_buffer_infos(&cb_infos)
             .signal_semaphore_infos(&signal)];
-        let serial = device.note_submit();
-        unsafe {
-            device
-                .raw
-                .queue_submit2(device.graphics_queue, &submit, self.fence)
-        }
-        .vk_ctx("queue_submit2 (capture async)")?;
+        let serial =
+            device.submit_graphics(&submit, self.fence, "queue_submit2 (capture async)")?;
         self.last_submit_serial.set(serial);
         let get_info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(self.semaphore)

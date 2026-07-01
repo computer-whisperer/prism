@@ -139,8 +139,8 @@ impl EncodePipeline {
 
 impl Drop for EncodePipeline {
     fn drop(&mut self) {
+        self.device.wait_device_idle();
         unsafe {
-            let _ = self.device.raw.device_wait_idle();
             self.device.raw.destroy_pipeline(self.pipeline, None);
             self.device
                 .raw

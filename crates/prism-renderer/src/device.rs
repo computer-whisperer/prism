@@ -68,18 +68,32 @@ pub struct Device {
     pub instance: Arc<Instance>,
     pub physical: PhysicalDeviceInfo,
     pub raw: ash::Device,
-    pub graphics_queue: vk::Queue,
+    /// Graphics queue. Private: all submission/wait goes through the locked
+    /// helpers ([`Self::submit_graphics`], [`Self::wait_graphics_idle`],
+    /// [`Self::wait_device_idle`]) so multiple threads can share the device
+    /// (`VkQueue` requires external synchronization, and correct
+    /// deferred-destroy serials require serial-allocation order == queue
+    /// submission order — the lock provides both).
+    graphics_queue: vk::Queue,
     /// Async-compute (ACE) queue for transfer work that should overlap
     /// graphics — the cross-GPU mirror copy (see `docs/async-render-rework.md`).
     /// Equals `graphics_queue` when the GPU exposes no dedicated ACE family, so
-    /// callers can always submit here without a capability branch.
-    ///
-    /// NOTE: a distinct `VkQueue` still needs external synchronization — only
-    /// one thread may submit to it at a time, same as `graphics_queue`.
-    pub transfer_queue: vk::Queue,
+    /// callers never need a capability branch. Private, same as above. No
+    /// submitter yet — increment C (the ACE mirror copy) adds the locked
+    /// `submit_transfer` helper, which must also answer how transfer
+    /// submissions integrate with the deferred-destroy serial (single-queue
+    /// fence ordering doesn't extend across queues).
+    #[allow(dead_code)]
+    transfer_queue: vk::Queue,
     /// Queue family `transfer_queue` belongs to (for command-pool creation).
     /// Equals `physical.graphics_queue_family` in the fallback case.
     pub transfer_queue_family: u32,
+    /// External-sync guard for `graphics_queue` (submits + queue/device
+    /// idle waits).
+    graphics_lock: std::sync::Mutex<()>,
+    /// Guard for `transfer_queue` when it is a distinct ACE queue; `None` ⇒
+    /// `transfer_queue == graphics_queue` and `graphics_lock` covers it.
+    transfer_lock: Option<std::sync::Mutex<()>>,
     /// Deferred-destroy queue — see [`Device::retire`].
     deferred: std::sync::Mutex<DeferredDestroy>,
 }
@@ -119,8 +133,9 @@ pub enum Retired {
 /// sharing the device.
 #[derive(Default)]
 struct DeferredDestroy {
-    /// Serial of the most recent submission to `graphics_queue`. Bumped via
-    /// [`Device::note_submit`] immediately before each `vkQueueSubmit`.
+    /// Serial of the most recent submission to `graphics_queue`. Bumped by
+    /// [`Device::submit_graphics`] under the queue lock, immediately before
+    /// each `vkQueueSubmit2`.
     submitted: u64,
     /// Highest serial proven complete by a fence/idle wait
     /// ([`Device::note_completed`]).
@@ -131,16 +146,47 @@ struct DeferredDestroy {
 }
 
 impl Device {
-    /// Allocate the serial for a submission about to be enqueued on
-    /// `graphics_queue`. MUST be called (once) before **every**
-    /// `vkQueueSubmit2` on this device, or a [`Self::retire`]d object that
-    /// the unsequenced submission references could be destroyed under it.
-    /// Returns the serial; pass it to [`Self::note_completed`] from
-    /// whichever fence/idle wait later proves that submission finished.
-    pub fn note_submit(&self) -> u64 {
-        let mut d = self.deferred.lock().unwrap();
-        d.submitted += 1;
-        d.submitted
+    /// Submit to the graphics queue. The single entry point for **every**
+    /// graphics `vkQueueSubmit2` on this device: it holds the queue lock
+    /// across serial allocation *and* the submit, so serial order always
+    /// matches queue submission order — the invariant [`Self::retire`]'s
+    /// fence-ordering proof rests on (a serial allocated before but
+    /// enqueued after another submission would break it, which is why the
+    /// old free-standing `note_submit` is gone).
+    ///
+    /// Returns the submission's serial; pass it to [`Self::note_completed`]
+    /// from whichever fence/idle wait later proves the submission finished.
+    pub fn submit_graphics(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+        context: &'static str,
+    ) -> Result<u64> {
+        let _guard = self.graphics_lock.lock().unwrap();
+        let serial = {
+            let mut d = self.deferred.lock().unwrap();
+            d.submitted += 1;
+            d.submitted
+        };
+        unsafe { self.raw.queue_submit2(self.graphics_queue, submits, fence) }.vk_ctx(context)?;
+        Ok(serial)
+    }
+
+    /// `vkQueueWaitIdle` on the graphics queue, under the queue lock (the
+    /// spec requires external sync on the queue for idle waits too).
+    pub fn wait_graphics_idle(&self, context: &'static str) -> Result<()> {
+        let _guard = self.graphics_lock.lock().unwrap();
+        unsafe { self.raw.queue_wait_idle(self.graphics_queue) }.vk_ctx(context)
+    }
+
+    /// `vkDeviceWaitIdle`, holding **both** queue locks — the spec makes it
+    /// equivalent to idle-waiting every queue, so every queue must be
+    /// externally synchronized for the duration. Failure is ignored (the
+    /// callers are Drop paths where nothing better can be done).
+    pub fn wait_device_idle(&self) {
+        let _g = self.graphics_lock.lock().unwrap();
+        let _t = self.transfer_lock.as_ref().map(|l| l.lock().unwrap());
+        let _ = unsafe { self.raw.device_wait_idle() };
     }
 
     /// Record that the submission with `serial` (and, by single-queue fence
@@ -388,6 +434,8 @@ impl Device {
             graphics_queue,
             transfer_queue,
             transfer_queue_family,
+            graphics_lock: std::sync::Mutex::new(()),
+            transfer_lock: (transfer_queue != graphics_queue).then(|| std::sync::Mutex::new(())),
             deferred: std::sync::Mutex::new(DeferredDestroy::default()),
         }))
     }
