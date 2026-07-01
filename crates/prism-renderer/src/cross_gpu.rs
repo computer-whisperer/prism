@@ -359,6 +359,16 @@ impl MirrorCopier {
     /// (target) device that sampled mirror scratches. Call only on a
     /// confirmed `Presented` outcome — that's when the fd provably covers
     /// a queued render submit.
+    ///
+    /// Replace (not accumulate) semantics are sound even when several of
+    /// the target GPU's outputs sample the same scratch: every such render
+    /// is submitted on that GPU's single graphics queue, and Vulkan's
+    /// implicit queue ordering (spec §7.2) makes the *latest* submission's
+    /// signal transitively prove all earlier renders complete. This holds
+    /// under the per-GPU render-thread split (one thread per queue keeps
+    /// submission order) and must be preserved when scratch reads move to
+    /// the ACE queue — all of a target's scratch-reading copies must stay
+    /// on ONE queue, or this needs to become a set of fds.
     pub fn note_render_done(&self, fd: OwnedFd) {
         *self.render_done.borrow_mut() = Some(fd);
     }

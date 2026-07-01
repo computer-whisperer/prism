@@ -406,13 +406,15 @@ serial execution reduce to per-channel FIFO plus one dispatch-order rule:
 - `Vblank(N)` precedes `SubmitFrame(N+1)` on the command channel — the
   thread never sees a present while it still thinks a flip is pending.
 
-**Pre-existing audit (A3):** `note_mirror_render_done` semantics when one
-mirrored surface shows on *two* outputs of the target GPU — does the gate
-accumulate both render-done fds or replace? If it replaces, the next copy
-races the other output's in-flight render. That hazard predates Phase 2
-(serial main calls it twice, second overwrites) — verify and fix
-independent of the threading work (accumulate fds since last copy, or
-merge sync_files).
+**Pre-existing audit (A3) — RESOLVED (2026-07-01), no fix needed:** the
+gate (`MirrorCopier::render_done`) has replace semantics, and that is
+*sound*: every render that samples a target GPU's scratch is submitted on
+that GPU's single graphics queue, so by Vulkan's implicit queue ordering
+(§7.2) the latest present fd transitively proves all earlier renders
+complete. Preserved by Phase 2 (one thread per queue keeps submission
+order) and by increment C **provided** all of a target's scratch-reading
+ACE copies stay on one queue (they do — one `transfer_queue` per Device).
+Reasoning recorded at `cross_gpu.rs` `note_render_done`.
 
 ### 2.4 `LoweredFrame` (the boundary type)
 
