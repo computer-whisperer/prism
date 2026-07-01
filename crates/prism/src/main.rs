@@ -2660,17 +2660,131 @@ fn on_estimated_vblank(state: &mut prism_protocols::PrismState, output_id: &str)
     };
 }
 
+/// Everything `OutputContext::present` consumes for one output's frame — the
+/// GPU-side half of a lowered frame, no Wayland objects. Kept `Send`
+/// (asserted below): increment B1 of the async-render rework sends it to the
+/// owning GPU's render thread (`docs/async-render-rework.md` §2.4). Named
+/// `FrameSubmission` because `prism_renderer::LoweredFrame` is the draw-list
+/// type it wraps.
+///
+/// NOT yet lifetime-bearing: the raw `vk::ImageView`s in `frame` point into
+/// textures owned by each surface's `SurfaceTexSlot`, kept alive today by
+/// lower → execute running back-to-back on one thread. Before B1 this needs
+/// a `keepalive` of strong refs to those textures — blocked on
+/// `GpuTex::Shm` holding its `ShmTexture` by value (see the doc's
+/// A-increments for the Arc-ification step).
+struct FrameSubmission {
+    frame: prism_renderer::LoweredFrame,
+    view_size: smithay::utils::Size<f64, smithay::utils::Logical>,
+    encode_push: prism_renderer::EncodePush,
+    /// Imported cross-GPU copy-done + dmabuf-acquire semaphores the render
+    /// submit waits on; retired via the deferred-destroy queue post-present.
+    render_waits: Vec<vk::Semaphore>,
+    local_copies: Vec<prism_renderer::LocalMirrorCopy>,
+    snapshot_copies: Vec<prism_renderer::SnapshotCopy>,
+    force_full_decode: bool,
+    /// Per-frame phase profile with the lowering-side CPU spans already
+    /// filled; `present` fills damage/submit and rings the record.
+    profile: Option<prism_renderer::FrameProfile>,
+}
+
+// Compile-time assertion: `FrameSubmission` crosses a thread boundary at B1,
+// so it must stay `Send`. (A trivially-false concrete `where` bound is a
+// compile error, which is exactly the check we want.)
+fn _assert_frame_submission_send()
+where
+    FrameSubmission: Send,
+{
+}
+
+/// The main-thread half of a lowered frame: Wayland objects + state keys the
+/// post-present bookkeeping needs. Never crosses a thread (doc §2.4 — no
+/// Wayland object does).
+struct FrameBookkeeping {
+    output_gpu_id: prism_renderer::DrmDevId,
+    smithay_output: smithay::output::Output,
+    /// Surfaces whose texture on this output's GPU is a cross-GPU mirror —
+    /// their home→scratch copies were submitted during lowering; a confirmed
+    /// render's present fd re-arms the scratch overwrite gate.
+    mirror_surfaces: Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    /// Native-dmabuf surfaces whose client write fence was imported as a
+    /// render wait; marked waited only on a confirmed render submit.
+    acquire_surfaces: Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    /// Surfaces were demand-materialized (rendered blank this frame) ⇒ the
+    /// caller must schedule another redraw.
+    redraw_again: bool,
+    session_locked: bool,
+    /// Predicted presentation time, kept for the feedback stash.
+    target_time: Duration,
+}
+
 /// Render one output now and submit the page-flip. Returns a [`RenderOutcome`]:
 /// `Presented` carries the `PendingFeedback` to stash for the matching vblank;
 /// `SkippedNoDamage` if nothing changed (caller arms an estimated vblank);
 /// `FlipPending` if the output's previous flip is still in flight (caller
 /// retries).
+///
+/// Three stages — [`lower_output_frame`] (scene → `FrameSubmission`, all the
+/// `PrismState` reads), [`execute_frame`] (the present: damage diff, record,
+/// submit, flip), [`process_present_outcome`] (Wayland + mirror-gate
+/// bookkeeping keyed on the outcome). Split so increment B1 of the
+/// async-render rework can move `execute` onto the per-GPU render threads
+/// while lower/process stay on main (`docs/async-render-rework.md` §2.8 A2).
 fn render_output_now(
     state: &mut prism_protocols::PrismState,
     output_id: &str,
 ) -> Result<RenderOutcome> {
+    let Some((mut submission, bookkeeping)) = lower_output_frame(state, output_id)? else {
+        // Output not in the layout yet (add_output vs first-vblank race);
+        // leave it Queued and retry next pass.
+        return Ok(RenderOutcome::FlipPending);
+    };
+    let outcome = {
+        let output = state
+            .outputs
+            .get_mut(output_id)
+            .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
+        execute_frame(output, &mut submission)?
+    };
+    process_present_outcome(
+        state,
+        output_id,
+        outcome,
+        submission.render_waits,
+        bookkeeping,
+    )
+}
+
+/// Stage 2 of [`render_output_now`]: the present itself — damage diff,
+/// command-buffer record, queue submit, atomic page-flip. Touches only the
+/// `OutputContext` and the submission (no `PrismState`, no Wayland objects);
+/// B1 moves exactly this call onto the owning GPU's render thread.
+fn execute_frame(
+    output: &mut prism_drm::OutputContext,
+    sub: &mut FrameSubmission,
+) -> Result<prism_drm::PresentOutcome> {
+    output.present(
+        &sub.frame,
+        sub.view_size,
+        &sub.encode_push,
+        &sub.render_waits,
+        &sub.local_copies,
+        &sub.snapshot_copies,
+        sub.force_full_decode,
+        sub.profile.take(),
+    )
+}
+
+/// Stage 1 of [`render_output_now`]: walk the layout + layer/lock/DnD
+/// surfaces into render elements, lower them to the draw stream, and gather
+/// everything the present submit needs (encode push, GPU-sync waits, mirror
+/// copies, snapshots). Returns `None` when the output isn't in the layout
+/// yet (caller treats it as flip-pending and retries).
+fn lower_output_frame(
+    state: &mut prism_protocols::PrismState,
+    output_id: &str,
+) -> Result<Option<(FrameSubmission, FrameBookkeeping)>> {
     use prism_layout::layout::RenderCtx;
-    use prism_protocols::PendingFeedback;
     use prism_renderer::{vk, EncodePush, RenderEl};
 
     // Snapshot identity bits without holding any borrow into
@@ -2723,9 +2837,9 @@ fn render_output_now(
     let view_size = match state.layout.monitor_for_output(&smithay_output) {
         Some(m) => m.view_size(),
         // Output not in the layout yet (race between add_output and the
-        // first vblank). Leave it Queued and retry next pass (as the old
-        // `Ok(None)` did); the next pass will find the monitor.
-        None => return Ok(RenderOutcome::FlipPending),
+        // first vblank). The caller leaves it Queued and retries next pass;
+        // the next pass will find the monitor.
+        None => return Ok(None),
     };
 
     // Capture close-animation snapshots before building this frame's elements,
@@ -3254,22 +3368,47 @@ fn render_output_now(
     // GTT→local copies the render records up front, so decode/deband sample
     // local tiled VRAM instead of scanning the LINEAR mirror imports over PCIe.
     let local_copies = prism_protocols::mirror_local_copies(&mirror_surfaces, output_gpu_id);
-    let outcome = {
-        let output = state
-            .outputs
-            .get_mut(output_id)
-            .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
-        output.present(
-            &frame,
+
+    Ok(Some((
+        FrameSubmission {
+            frame,
             view_size,
-            &encode_push,
-            &render_waits,
-            &local_copies,
-            &snapshot_copies,
+            encode_push,
+            render_waits,
+            local_copies,
+            snapshot_copies,
             force_full_decode,
             profile,
-        )?
-    };
+        },
+        FrameBookkeeping {
+            output_gpu_id,
+            smithay_output,
+            mirror_surfaces,
+            acquire_surfaces,
+            redraw_again: !missing.is_empty(),
+            session_locked,
+            target_time,
+        },
+    )))
+}
+
+/// Stage 3 of [`render_output_now`]: post-present bookkeeping — everything
+/// keyed on the outcome that touches `PrismState` / Wayland objects: retire
+/// the imported wait semaphores, mark acquire-waits + re-arm the mirror
+/// render-done gate, service screencopy, harvest presentation feedback +
+/// syncobj release trackers, session-lock accounting. Stays on main under
+/// B1; its ordering against the *next* frame's lowering is main-thread
+/// serialization + channel FIFO (`docs/async-render-rework.md` §2.3).
+fn process_present_outcome(
+    state: &mut prism_protocols::PrismState,
+    output_id: &str,
+    outcome: prism_drm::PresentOutcome,
+    render_waits: Vec<vk::Semaphore>,
+    bk: FrameBookkeeping,
+) -> Result<RenderOutcome> {
+    use prism_protocols::PendingFeedback;
+
+    let output_gpu_id = bk.output_gpu_id;
     // The render submit has been queued with the waits in its dependency list
     // (or, on skip / flip-pending, never used them); either way hand the
     // imported semaphores to the deferred-destroy queue — the spec forbids
@@ -3284,11 +3423,11 @@ fn render_output_now(
             // On FlipPending/Skipped below the waits went unused and the
             // retry re-exports (clearing at prepare time put the fa62fb9
             // blue-bleed race back on the flip-pending path).
-            prism_protocols::mark_dmabuf_acquire_waited(&acquire_surfaces, output_gpu_id);
+            prism_protocols::mark_dmabuf_acquire_waited(&bk.acquire_surfaces, output_gpu_id);
             // If this render sampled mirror scratches, store its completion
             // fence (a dup of the present SYNC_FD) so the next home→scratch
             // copy waits it instead of overwriting mid-read.
-            if !mirror_surfaces.is_empty() {
+            if !bk.mirror_surfaces.is_empty() {
                 prism_protocols::note_mirror_render_done(state, output_gpu_id, &fd);
             }
             fd
@@ -3299,8 +3438,8 @@ fn render_output_now(
         // let the next copy overwrite a scratch this render is still reading),
         // then propagate the flip error as before.
         prism_drm::PresentOutcome::FlipFailed { render_done, error } => {
-            prism_protocols::mark_dmabuf_acquire_waited(&acquire_surfaces, output_gpu_id);
-            if !mirror_surfaces.is_empty() {
+            prism_protocols::mark_dmabuf_acquire_waited(&bk.acquire_surfaces, output_gpu_id);
+            if !bk.mirror_surfaces.is_empty() {
                 prism_protocols::note_mirror_render_done(state, output_gpu_id, &render_done);
             }
             return Err(error);
@@ -3311,7 +3450,7 @@ fn render_output_now(
         // for a real one. No harvest (no scanout, so no presentation feedback).
         prism_drm::PresentOutcome::SkippedNoDamage => {
             return Ok(RenderOutcome::SkippedNoDamage {
-                redraw_again: !missing.is_empty(),
+                redraw_again: bk.redraw_again,
             })
         }
     };
@@ -3358,7 +3497,7 @@ fn render_output_now(
             .layout
             .find_window_and_output(surface)
             .and_then(|(_, out)| out)
-            .map(|out| out == &smithay_output)
+            .map(|out| out == &bk.smithay_output)
             .unwrap_or(false);
         if !belongs_here {
             continue;
@@ -3385,7 +3524,7 @@ fn render_output_now(
     // subsurface tree itself, so the layer roots are all we pass in — plus
     // each root's popup trees, which (as above) are not subsurfaces.
     {
-        let map = smithay::desktop::layer_map_for_output(&smithay_output);
+        let map = smithay::desktop::layer_map_for_output(&bk.smithay_output);
         for ls in map.layers() {
             prism_protocols::redraw::harvest_surface_feedback(
                 ls.wl_surface(),
@@ -3431,14 +3570,14 @@ fn render_output_now(
     // locked frame. The zero-damage skip path deliberately does NOT
     // call this — a skip means the previous (already accounted) frame
     // is still showing.
-    state.note_lock_render(output_id, session_locked);
+    state.note_lock_render(output_id, bk.session_locked);
 
     Ok(RenderOutcome::Presented {
         pending: PendingFeedback {
             presentation_cbs,
-            target_time,
+            target_time: bk.target_time,
         },
-        redraw_again: !missing.is_empty(),
+        redraw_again: bk.redraw_again,
     })
 }
 
