@@ -396,6 +396,16 @@ impl<W: LayoutElement> Monitor<W> {
         any
     }
 
+    /// Arc clones of every live snapshot texture this monitor's render can
+    /// reference — see `ScrollingSpace::snapshot_keepalives`. Collected from
+    /// every workspace (off-screen ones contribute nothing to the frame, but
+    /// an extra Arc is harmless and the walk is cheap).
+    pub fn snapshot_keepalives(&self, out: &mut Vec<Arc<SnapshotTexture>>) {
+        for ws in &self.workspaces {
+            ws.snapshot_keepalives(out);
+        }
+    }
+
     pub fn into_workspaces(mut self) -> Vec<Workspace<W>> {
         self.workspaces.retain(|ws| ws.has_windows_or_name());
 

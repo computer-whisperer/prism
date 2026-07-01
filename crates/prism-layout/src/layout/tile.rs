@@ -617,6 +617,13 @@ impl<W: LayoutElement> Tile<W> {
         }
     }
 
+    /// The captured pre-resize crossfade frame, while one is replaying. For
+    /// the integrator's frame keepalive set (`docs/async-render-rework.md`
+    /// §2.4 — a frame in flight must outlive an animation ending under it).
+    pub fn resize_snapshot(&self) -> Option<&Arc<SnapshotTexture>> {
+        self.resize_animation.as_ref()?.gpu_snapshot.as_ref()
+    }
+
     /// Drop the resize animation outright. Used when the tile's workspace is
     /// off screen at snapshot-capture time: there is no pre-resize frame in
     /// the intermediate to crossfade from (and leaving `gpu_snapshot` empty

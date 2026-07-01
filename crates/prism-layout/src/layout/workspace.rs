@@ -455,6 +455,13 @@ impl<W: LayoutElement> Workspace<W> {
         scrolling.chain(floating)
     }
 
+    /// Arc clones of every live snapshot texture this workspace's render can
+    /// reference — see `ScrollingSpace::snapshot_keepalives`.
+    pub fn snapshot_keepalives(&self, out: &mut Vec<Arc<SnapshotTexture>>) {
+        self.scrolling.snapshot_keepalives(out);
+        self.floating.snapshot_keepalives(out);
+    }
+
     pub fn tiles_mut(&mut self) -> impl Iterator<Item = &mut Tile<W>> + '_ {
         let scrolling = self.scrolling.tiles_mut();
         let floating = self.floating.tiles_mut();

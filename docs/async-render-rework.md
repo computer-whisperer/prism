@@ -553,20 +553,16 @@ physically required serialization).
    thread-owned state — becomes the `Vblank` message at B1) then Steps 2–4
    = frame callbacks / feedback / state machine, all main-side. No
    refactor required.
-5. **A5** — **MOSTLY DONE**: frame keepalive. `FrameSubmission._keepalive`
-   owns type-erased strong refs (`GpuKeepalive = Arc<dyn Any + Send +
-   Sync>`) to every GPU object the drawn surfaces' views / mirror copy ops
-   reference, collected in the walk's `report_drawn_surface` via
-   `SurfaceTexture::keepalive_for` → `GpuTex::keepalive`. Enabled by
-   splitting `ShmImage` (the Arc'd sampled image, retired by its own Drop)
-   out of `ShmTexture` (staging/cmd/fence stay by-value — no frame
-   references them). **Residual B1 blocker:** close-animation and
-   resize-crossfade ghost `SurfaceEl`s take their views from layout-owned
-   `Arc<SnapshotTexture>`s (`closing_window.rs`); a frame outliving the
-   animation (thread hop) dangles them. Needs a small layout API — clone
-   the live snapshot Arcs into the frame during
-   `ensure_close_snapshots`/`ensure_resize_snapshots` or a dedicated
-   `snapshot_keepalives(output)` — before B1 flips async.
+5. **A5** — **DONE**: frame keepalive. `FrameSubmission._keepalive` owns
+   type-erased strong refs (`GpuKeepalive = Arc<dyn Any + Send + Sync>`)
+   to every GPU object the frame references: the drawn surfaces' textures
+   (collected in the walk's `report_drawn_surface` via
+   `SurfaceTexture::keepalive_for` → `GpuTex::keepalive`) and the layout's
+   snapshot ghosts (`Layout::snapshot_keepalives(output)` — close-replay +
+   resize-crossfade `Arc<SnapshotTexture>` clones, walked
+   monitor→workspace→scrolling/floating). Enabled by splitting `ShmImage`
+   (the Arc'd sampled image, retired by its own Drop) out of `ShmTexture`
+   (staging/cmd/fence stay by-value — no frame references them).
    Note on naming: the doc's "LoweredFrame boundary type" (§2.4) is
    concretely `FrameSubmission` in `main.rs` — `prism_renderer::LoweredFrame`
    was already taken by the draw-list type it wraps.

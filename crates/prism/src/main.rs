@@ -2667,14 +2667,12 @@ fn on_estimated_vblank(state: &mut prism_protocols::PrismState, output_id: &str)
 /// `FrameSubmission` because `prism_renderer::LoweredFrame` is the draw-list
 /// type it wraps.
 ///
-/// Lifetime-bearing for surface textures: `_keepalive` owns strong refs to
-/// every GPU object the drawn surfaces' raw `vk::ImageView`s / mirror copy
-/// ops point into, so a surface dying while the frame is in flight can't
-/// stamp its texture's deferred-destroy retirement before the frame's
-/// submit. NOT yet covered: close-animation / resize-crossfade ghost
-/// elements, whose views come from layout-owned `Arc<SnapshotTexture>`s —
-/// a B1 prerequisite (needs a small layout API to clone those Arcs into
-/// the frame; see the doc's A-increments).
+/// Lifetime-bearing: `_keepalive` owns strong refs to every GPU object the
+/// frame's raw `vk::ImageView`s / mirror copy ops point into — the drawn
+/// surfaces' textures (collected per-surface in the walk) and the layout's
+/// snapshot ghosts (`Layout::snapshot_keepalives`) — so a surface dying or
+/// an animation ending while the frame is in flight can't stamp the
+/// texture's deferred-destroy retirement before the frame's submit.
 struct FrameSubmission {
     /// RAII only — never read. See above.
     _keepalive: Vec<prism_protocols::GpuKeepalive>,
@@ -3006,6 +3004,20 @@ fn lower_output_frame(
     // before the frame's submit) — see `docs/async-render-rework.md` §2.4.
     let keepalive: std::cell::RefCell<Vec<prism_protocols::GpuKeepalive>> =
         std::cell::RefCell::new(Vec::new());
+    // Same for snapshot ghosts (close replays / resize crossfades): their
+    // SurfaceEls sample layout-owned SnapshotTextures, which an animation
+    // ending mid-flight would otherwise retire under the frame.
+    {
+        let mut snaps: Vec<Arc<prism_renderer::SnapshotTexture>> = Vec::new();
+        state
+            .layout
+            .snapshot_keepalives(&smithay_output, &mut snaps);
+        keepalive.borrow_mut().extend(
+            snaps
+                .into_iter()
+                .map(|s| s as prism_protocols::GpuKeepalive),
+        );
+    }
     let report_drawn_surface =
         |s: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
          states: &smithay::wayland::compositor::SurfaceData| {

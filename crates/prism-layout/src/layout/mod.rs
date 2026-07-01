@@ -1657,6 +1657,16 @@ impl<W: LayoutElement> Layout<W> {
         false
     }
 
+    /// Arc clones of every snapshot texture a frame rendered for `output` can
+    /// reference (close-animation replays, resize crossfades). The integrator
+    /// folds them into the frame's keepalive set so a frame in flight outlives
+    /// an animation that ends under it (`docs/async-render-rework.md` §2.4).
+    pub fn snapshot_keepalives(&self, output: &Output, out: &mut Vec<Arc<SnapshotTexture>>) {
+        if let Some(mon) = self.monitor_for_output(output) {
+            mon.snapshot_keepalives(out);
+        }
+    }
+
     pub fn monitor_for_workspace(&self, workspace_name: &str) -> Option<&Monitor<W>> {
         self.monitors().find(|monitor| {
             monitor.workspaces.iter().any(|ws| {

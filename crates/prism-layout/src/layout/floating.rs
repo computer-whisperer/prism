@@ -287,6 +287,18 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.tiles.iter_mut()
     }
 
+    /// Arc clones of every live snapshot texture this space's render can
+    /// reference (closing-window replays + resize crossfades). For the
+    /// integrator's frame keepalive set (`docs/async-render-rework.md` §2.4).
+    pub fn snapshot_keepalives(&self, out: &mut Vec<Arc<SnapshotTexture>>) {
+        out.extend(
+            self.closing_windows
+                .iter()
+                .filter_map(|c| c.snapshot().cloned()),
+        );
+        out.extend(self.tiles().filter_map(|t| t.resize_snapshot().cloned()));
+    }
+
     pub fn tiles_with_offsets(
         &self,
     ) -> impl DoubleEndedIterator<Item = (&Tile<W>, Point<f64, Logical>)> + '_ {

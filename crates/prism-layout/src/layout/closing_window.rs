@@ -82,6 +82,13 @@ impl ClosingWindow {
         self.snapshot = Some(snapshot);
     }
 
+    /// The captured replay frame, once filled. For the integrator's frame
+    /// keepalive set (`docs/async-render-rework.md` §2.4 — a frame in
+    /// flight must outlive an animation ending under it).
+    pub fn snapshot(&self) -> Option<&Arc<SnapshotTexture>> {
+        self.snapshot.as_ref()
+    }
+
     pub fn advance_animations(&mut self) {
         // The clock drives `anim.value()`; nothing to advance by hand. The
         // blocker only gates the owning transaction, not the visual.
