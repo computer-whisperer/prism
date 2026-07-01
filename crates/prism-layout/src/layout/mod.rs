@@ -1665,6 +1665,14 @@ impl<W: LayoutElement> Layout<W> {
         if let Some(mon) = self.monitor_for_output(output) {
             mon.snapshot_keepalives(out);
         }
+        // The interactive-move tile is detached from any workspace but renders
+        // via `render_interactive_move_for_output` — a tile mod-dragged
+        // mid-resize-crossfade carries its ghost snapshot along. Collected
+        // regardless of the move's current output (an extra Arc is harmless;
+        // the assignment can cross outputs between lowering and render).
+        if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
+            out.extend(move_.tile.resize_snapshot().cloned());
+        }
     }
 
     pub fn monitor_for_workspace(&self, workspace_name: &str) -> Option<&Monitor<W>> {
