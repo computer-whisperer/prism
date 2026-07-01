@@ -512,17 +512,47 @@ physically required serialization).
 ### 2.8 Staged increments (each commit-sized, buildable, tested)
 
 **A — groundwork (single-threaded, zero behavior change):**
-1. **A1** `Device` queue locks + submit helpers; route all submit/wait-idle
-   sites. Serial → `AtomicU64`, retire list → `Mutex`.
-2. **A2** `LoweredFrame` type + **split `render_output_now`** into
-   `lower_output_frame(&mut PrismState, id) -> Option<LoweredFrame>` /
-   `execute_frame(&mut OutputContext, LoweredFrame) -> PresentOutcome` /
-   `process_present_outcome(&mut PrismState, id, outcome)` — still called
-   back-to-back synchronously. Assert `LoweredFrame: Send`. This is the
-   big refactor and it's fully testable single-threaded.
-3. **A3** mirror-gate accumulate audit/fix (see 2.3).
-4. **A4** split `on_vblank` into thread-side `mark_vblank` bookkeeping vs
-   main-side state machine + callbacks, callable separately.
+1. **A1** — **DONE** (commit b86140e). `Device` queues are private behind
+   locked helpers: `submit_graphics` holds the queue lock across serial
+   allocation + `vkQueueSubmit2` (serial order == submission order, the
+   invariant the retire proof needs; the free-standing `note_submit` is
+   gone), `wait_graphics_idle`, `wait_device_idle` (takes both queue
+   locks). All 8 submit sites + ~10 bare `device_wait_idle` sites routed.
+   The deferred-destroy state was already Mutex'd — no atomics needed.
+2. **A2** `LoweredFrame` type + **split `render_output_now`**. The seam is
+   already exact: the `output.present(&frame, view_size, &encode_push,
+   &render_waits, &local_copies, &snapshot_copies, force_full_decode,
+   profile)` call (`main.rs:3262`). Split into:
+   - `lower_output_frame(&mut PrismState, id) -> Result<Option<(LoweredFrame,
+     FrameBookkeeping)>>` — everything above the present call (walk, element
+     lowering, encode push, `prepare_mirror_waits`/`prepare_dmabuf_acquire_waits`,
+     `mirror_local_copies`, snapshot/feedback/release harvest).
+   - `LoweredFrame` (GPU-side, must be `Send`): the present params above +
+     `keepalive: Vec<…>` of strong refs to the GPU objects the raw
+     `vk::ImageView`s in the draw list point into. Collect during the walk
+     the same way `missing_textures` already does — a `RefCell<Vec<…>>` the
+     lookup closures push a `GpuTex` clone (or `Arc` field clones) into.
+     Not load-bearing while A2 stays synchronous; it becomes load-bearing
+     at B1, so assert `LoweredFrame: Send` and populate it now.
+   - `FrameBookkeeping` (main-side, holds Wayland objects, never crosses a
+     thread): `mirror_surfaces`, `acquire_surfaces`, `output_gpu_id` — the
+     inputs to the post-present calls.
+   - `execute_frame(&mut OutputContext, &LoweredFrame, profile) ->
+     Result<PresentOutcome>` — the present call itself.
+   - `process_present_outcome(&mut PrismState, id, outcome, FrameBookkeeping)
+     -> Result<RenderOutcome>` — `destroy_render_wait_semaphores`,
+     `mark_dmabuf_acquire_waited` + `note_mirror_render_done` (on
+     Presented *and* FlipFailed — the submit really sampled the scratches),
+     `submit_pending_screencopy`, feedback stash. Still called back-to-back
+     synchronously in `render_one_queued`; the message boundary lands at B1.
+3. **A3** — **DONE, no fix needed** (see 2.3; reasoning at `cross_gpu.rs`
+   `note_render_done`).
+4. **A4** — **ALREADY SATISFIED** by the existing structure: `on_vblank`
+   (`main.rs:2336-2421`) is staged as Step 1 = the single
+   `ctx.mark_vblank(presentation_time)` call (the only part touching
+   thread-owned state — becomes the `Vblank` message at B1) then Steps 2–4
+   = frame callbacks / feedback / state machine, all main-side. No
+   refactor required.
 
 **B — the split:**
 1. **B1** `RenderThread` (spawn per GPU, mpsc loop, backchannel), move
@@ -531,7 +561,14 @@ physically required serialization).
 2. **B2** state machine `AwaitingOutcome` + outcome-driven transitions;
    vblank forwarding; estimated-vblank from `next_present_estimate`.
 3. **B3** cursor/screencopy/syncobj-release/feedback flows per 2.4;
-   profiling-ring sharing.
+   profiling-ring sharing. Screencopy ordering note: `submit_pending_screencopy`
+   must stay sequenced *after* frame N's encode and *before* frame N+1's
+   decode on the target's graphics queue. Running it main-side in
+   `process_present_outcome(N)` preserves this under the split: it
+   happens-before lowering N+1 (main is serial), which happens-before
+   `SubmitFrame(N+1)` reaches the render thread (channel FIFO), which
+   happens-before the N+1 render submit — and A1's queue lock makes the
+   cross-thread submit itself safe. No move into the thread required.
 4. **B4** session pause/activate, hotplug, config `Reconfigure`, teardown
    ordering.
 
