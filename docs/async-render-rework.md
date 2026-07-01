@@ -246,33 +246,343 @@ in total frame time but not in any per-span bucket).
 
 ---
 
-## Phase 2 — per-GPU render threads (sketch, gated on Phase 1)
+## Phase 2 — per-GPU render threads (full design)
 
-Required by the 6-output VRR target: navi ∥ vega true parallelism, and a
-struggling secondary GPU's slot-fence wait (`renderer.rs:787`) must not stall
-the primary GPU or input.
+Status: **designed 2026-07-01, not started.** This section is the
+implementation contract: decisions, ownership split, message protocol,
+staged increments, and the validation plan. Written to be executable by a
+fresh session without the design discussion.
 
-- **Granularity: one render thread per `Device`** (not per output —
-  `VkQueue` needs external sync; outputs on one GPU share queues, so one
-  owning thread serializes submits for free).
-- **Split:** main thread keeps Wayland/smithay/input/layout (inherently
-  single-threaded), produces a self-contained `LoweredFrame` per output and
-  sends it over a channel; the GPU thread does record → submit → atomic
-  flip and runs that GPU's per-output VRR scheduling + DRM vblank/flip
-  events; presentation feedback flows back.
-- **Enabler:** cross-GPU sync is already fd-based (sync_file / dmabuf),
-  thread- and process-agnostic — the home/target handshake works unchanged
-  across threads.
-- **Hardest part:** GPU-resource lifetime across the boundary. Prefer the
-  GPU thread owning *all* of it — main ships client fds + geometry, the GPU
-  thread imports/uploads and runs the deferred-destroy gate locally.
-- **Constraint:** preserve per-CRTC commit staggering (independent threads
-  satisfy it naturally as long as flips aren't batched — the amdgpu
-  atomic-commit ENOMEM ceiling on Vega 20, `main.rs:2466`).
+### 2.0 Goal and evidence
 
-Do Phase 2 only if, after Phase 1, measurement still shows cross-GPU
-contamination (most likely if a Vega output is on a high-refresh VRR panel
-whose budget the GPU can't meet).
+Required by the 6-output VRR target (2 Navi + 4 Vega, independent flip
+cadences): Navi ∥ Vega true parallelism, and a struggling GPU must never
+stall the other GPU or input.
+
+What actually blocks the single main thread today (all inside
+`render_one_queued` → `render_output_now` → `OutputContext::present`):
+
+1. **The FRAMES_IN_FLIGHT slot-fence wait** (`renderer.rs`, `FrameSlot::fence`)
+   — blocks whenever a GPU falls 2 frames behind. This is the killer: a Vega
+   output over budget stalls rendering for *every* output.
+2. **CPU record + `vkQueueSubmit`** — the `submit` span, ~100–200 µs/output
+   today, up to ms with big scenes. Serial across all 6 outputs.
+3. **Atomic commit / page-flip ioctls.**
+
+The scene walk + lower is *cheap* (walk 13–20 µs, lower ~6 µs per the
+profiler) — that informs the split: scene production can stay on main;
+execution must move.
+
+### 2.1 Design decisions
+
+**D1 — one render thread per `Device` (per GPU/card), not per output.**
+`VkQueue` requires external synchronization; all outputs on a GPU share its
+queues, and the single GFX engine time-slices graphics work anyway — a
+thread per output on one GPU buys nothing and forces queue locking on the
+hot path. One thread per GPU serializes that GPU's submits for free and
+makes the two GPUs truly parallel. Cards and GPUs are 1:1 here
+(`DrmDevId` keys both `cards` and `gpus`).
+
+**D2 — scheduling stays on main; execution moves to the render threads.**
+Main keeps the redraw state machine, frame-callback/feedback dispatch, and
+the layout walk; the render thread runs damage-compute → record → submit →
+flip. Frames flow main → render thread as a self-contained `LoweredFrame`;
+vblanks and present outcomes flow back as messages.
+
+*Rejected: full scene-snapshot render threads* (main pushes scene state,
+threads render at their own cadence — the game-engine model). Animations
+are sampled by the layout at a per-frame target time, so main would have to
+produce a per-output-per-frame snapshot anyway; it collapses back into D2
+with more machinery. *Rejected: moving the redraw state machine to the
+render threads.* Frame callbacks, presentation feedback, and animation
+clocks are all main-side; splitting the state machine across threads buys
+~nothing (main's per-frame work is µs) and costs niri-parity — the
+`redraw.rs` semantics survive almost unchanged under D2.
+
+**D3 — queue submits get a lock instead of strict thread-ownership.**
+The pure "only the owning thread touches the queue" model breaks on the
+mirror path: lowering a *target*-GPU frame on main submits the home→GTT
+copy on the **home** GPU's queue (`prepare_mirror_waits` →
+`copy_batch_async`), and shm uploads submit from the commit path on main.
+Rather than marshal every submit to the owning thread, `Device` grows an
+internal per-queue `Mutex` and all submit/wait-idle sites go through
+locked helpers. Contention is negligible (submits are µs and rare from
+main). The render thread remains the *primary* submitter; the lock makes
+the exceptions correct.
+
+**D4 — no Wayland object ever crosses a thread.** All wayland-server /
+smithay object interaction (frame callbacks, presentation feedback,
+screencopy completion, syncobj release trackers) stays on main.
+`LoweredFrame` carries only Vulkan handles + `Arc`s + `OwnedFd`s + plain
+data. This sidesteps every wayland-rs thread-affinity question.
+
+**D5 — `DrmCardContext` (fd, gbm, master/session, leases) stays on main;
+`OutputContext` moves to the render thread.** VT switch, DRM lease
+(SteamVR), and udev handling keep their current shape. `DrmSurface` holds
+its own internal handle to the device fd (`output_ctx.rs:196`), and
+page-flip ioctls are thread-safe — so the render thread can flip while
+main owns the card. DRM events (vblank) keep dispatching on main's
+`DrmDeviceNotifier` and are **forwarded** to the owning render thread as
+messages (the kernel timestamp travels in the message, so `FrameClock`
+precision is unaffected; the forward hop is µs).
+
+**D6 — render threads are plain `std::mpsc` loops, not calloop.** With
+scheduling (and estimated-vblank timers) on main, the render thread needs
+exactly one wait point: blocking `recv()` on its command channel. No
+timers, no sub-sources. The backchannel to main is a `calloop::channel` so
+it wakes the main loop.
+
+### 2.2 Ownership after the split
+
+| Main thread (calloop, `PrismState`) | Render thread (one per GPU) |
+|---|---|
+| Wayland dispatch, input, layout, config, IPC | — |
+| `cards: DrmCardContext` (fd, gbm, master, leases) | — |
+| DRM event dispatch (forwards vblanks) | `mark_vblank` bookkeeping |
+| `gpus: Arc<Device>` (shared; locked queues) | primary submitter |
+| redraw state machine (`OutputRedrawState`) | — |
+| estimated-vblank timers | — |
+| scene walk + lower → `LoweredFrame` | damage compute, record, submit, flip |
+| `SurfaceTexSlot` materialization (commit path) | — |
+| mirror prep (`prepare_mirror_waits`, gates) | ACE copy submit (increment C) |
+| frame callbacks, feedback, screencopy completion | — |
+| `OutputShadow` (identity, geometry, config, redraw) | **`OutputContext`** (DrmSurface, swapchain, `Renderer`, `DamageTracker`, `FrameClock`, `CursorPlane`) |
+
+`PrismState` stays `!Send` (`Rc<RefCell<Config>>` etc.) — it never moves.
+The refactor extracts `outputs: HashMap<OutputId, OutputContext>` out of it;
+main-side readers of `state.outputs` (IPC info queries, cursor logic,
+config, power) are re-pointed at a new lightweight `OutputShadow` map that
+mirrors identity/geometry/config/color/redraw-state. Inventory the readers
+with `grep -n 'state.outputs\|\.outputs\.' crates/prism*/src` during B2 —
+each is either shadow data (keep on main) or execution state (move).
+
+### 2.3 Message protocol
+
+Main → render thread (`std::mpsc::Sender<RenderCmd>`, one per GPU):
+
+- `SubmitFrame { output: OutputId, frame: LoweredFrame }`
+- `Vblank { output: OutputId, crtc, presentation_time }` — forwarded DRM
+  event; runs `mark_vblank` (clears `frame_pending`, flips `back_index`,
+  feeds `frame_clock.presented()`).
+- `CursorUpdate { output, pos, visible, sprite: Option<SpritePixels> }` —
+  sprite pixels only on change (≤256 KB); position rides `SubmitFrame`
+  when a frame is going anyway.
+- `CreateOutput { … } / DestroyOutput { … } / Reconfigure { mode, vrr, color, hdr }`
+  — `OutputContext` is *created on* the render thread (gbm BO allocation
+  and `DrmSurface` creation happen there; see Send-audit in A-increments).
+- `SessionPause / SessionActivate` (ack via backchannel), `Shutdown`.
+
+Render thread → main (`calloop::channel::Sender<RenderEvent>`, shared):
+
+- `PresentOutcome { output, outcome }` where `outcome` mirrors today's
+  `PresentOutcome` plus payloads: `Presented { present_sync_dup: OwnedFd,
+  next_present_estimate }`, `SkippedNoDamage { next_present_estimate }`,
+  `FlipPending`, `FlipFailed { err }`. The fd dup feeds
+  `note_mirror_render_done` and `register_release_after_submit` on main.
+  `next_present_estimate` (from the thread-owned `FrameClock`) lets main
+  arm estimated-vblank timers without owning the clock.
+- `PauseAck`, `Fault { output, err }`.
+
+There is deliberately **no vblank round-trip**: the DRM event lands on main
+(D5), main runs its state-machine/feedback/frame-callback logic directly
+off the kernel event (it carries everything needed — crtc, timestamp,
+sequence) and forwards `Vblank` to the thread purely for `mark_vblank`
+bookkeeping. Command-channel FIFO makes the ack unnecessary: `Vblank` is
+sent before any subsequent `SubmitFrame`, so the thread always clears
+`frame_pending` / flips `back_index` before the next present arrives.
+
+**Ordering argument (the mirror gate).** All hazards that today rely on
+serial execution reduce to per-channel FIFO plus one dispatch-order rule:
+
+- `PresentOutcome(N)` is sent at submit time, milliseconds before frame
+  N's flip retires — so it is on main's backchannel long before the vblank
+  that triggers lowering N+1. The one rule to uphold: main drains the
+  backchannel (a calloop source, dispatched) **before**
+  `redraw_queued_outputs` runs (which is already the loop shape: dispatch,
+  then drain queued redraws). Then the mirror-gate fd from N is stored
+  (`note_mirror_render_done`) before `prepare_mirror_waits` runs for N+1 —
+  no gap where a home→GTT copy could overwrite scratch a still-in-flight
+  render reads.
+- `Vblank(N)` precedes `SubmitFrame(N+1)` on the command channel — the
+  thread never sees a present while it still thinks a flip is pending.
+
+**Pre-existing audit (A3):** `note_mirror_render_done` semantics when one
+mirrored surface shows on *two* outputs of the target GPU — does the gate
+accumulate both render-done fds or replace? If it replaces, the next copy
+races the other output's in-flight render. That hazard predates Phase 2
+(serial main calls it twice, second overwrites) — verify and fix
+independent of the threading work (accumulate fds since last copy, or
+merge sync_files).
+
+### 2.4 `LoweredFrame` (the boundary type)
+
+Everything `OutputContext::present` + `render_frame` consume, made
+self-contained and `Send` (add a `static_assertions`-style
+`fn _assert_send<T: Send>()` check):
+
+- `elements: Vec<ElementDraw>` (raw `vk::ImageView`s + `DecodePush` — plain
+  data) **plus** `keepalive: Vec<Arc<dyn Any + Send + Sync>>` holding strong
+  refs to every GPU object the views/handles point into (`GpuTex` images,
+  `Arc<LocalImage>`, `Arc<SnapshotTexture>`, LUTs if per-frame). Today the
+  borrow of `&mut PrismState` keeps them alive; across a channel the frame
+  must own them. Destruction stays safe via the existing deferred-destroy
+  (`device.retire` gated on submit serials).
+- damage-tracker element states / encode metadata (whatever
+  `DamageTracker::compute` consumes — it moves with the tracker to the
+  thread; the frame carries the per-element commit counters/geometry it
+  diffs).
+- `encode_push`, `force_full_repaint`, profile flag.
+- `wait_semaphores: Vec<vk::Semaphore>` (imported on the target device by
+  main during lowering) + ownership so the thread retires them post-submit
+  (replaces the call-site `destroy_render_wait_semaphores`).
+- `local_copies: Vec<LocalMirrorCopy>` (Phase 1) — in increment C these
+  become the ACE-copy job the thread submits before the render.
+- `snapshots: Vec<SnapshotCopy>`, screencopy jobs (dmabuf targets +
+  completion tokens; the *tokens* are opaque ids — completion fires on main
+  when the outcome message returns them).
+- cursor plane state for this flip (pos/visible; sprite if dirty).
+
+Presentation-feedback and syncobj-release *harvesting* stays in lowering on
+main (it walks Wayland surface trees); the harvested smithay objects stay
+in main-side `OutputRedrawState.pending_feedback` exactly as today and fire
+on the DRM vblank event. They never enter `LoweredFrame`.
+
+### 2.5 Redraw state machine changes (`redraw.rs`)
+
+One new state. Today `render_one_queued` learns the outcome synchronously;
+now it's a message, so `Queued` transitions to:
+
+- `AwaitingOutcome { redraw_needed: bool }` — frame lowered + sent, outcome
+  not yet back. `queue_redraw()` during it sets `redraw_needed`.
+- On `PresentOutcome`: `Presented → WaitingForVBlank { redraw_needed }`;
+  `SkippedNoDamage → WaitingForEstimatedVBlank*` (arm timer from
+  `next_present_estimate`); `FlipPending/FlipFailed → Queued` (retry, as
+  today).
+- `WaitingForVBlank` is cleared by the DRM vblank event on main, exactly as
+  today (`on_vblank`'s main-side half) — no thread involvement.
+
+Everything else (`Idle/Queued/WaitingForVBlank/WaitingForEstimatedVBlank*`,
+`queue_redraw` entry point, frame-callback sequence) is unchanged.
+`redraw_queued_outputs` becomes non-blocking: it lowers + sends every
+queued output back-to-back — outputs on different GPUs then render in
+true parallel; outputs on one GPU queue in that thread's channel (the
+physically required serialization).
+
+### 2.6 Session, hotplug, teardown
+
+- **VT switch:** `PauseSession` → send `SessionPause` to each thread, wait
+  for `PauseAck` (bounded wait + log on timeout), then `card.drm.pause()`.
+  Resume: `drm.activate()`, `SessionActivate`, re-queue all outputs.
+- **Hotplug/config:** connector add → `CreateOutput` (thread builds
+  `OutputContext`); remove → `DestroyOutput` + drop the shadow; mode/VRR/
+  color changes → `Reconfigure`.
+- **Teardown order** (today `main.rs:2196-2230`, needs DRM master):
+  `Shutdown` to each thread → thread drops its `OutputContext`s (clearing
+  scanout state) → join threads → then drop cards/session. Bounded join +
+  abort path if a thread is wedged on a fence.
+- **amdgpu atomic-commit ENOMEM ceiling (Vega, `main.rs:2466`):** per-CRTC
+  staggering is preserved naturally — one thread per card serializes that
+  card's commits.
+
+### 2.7 Cross-cutting audits
+
+- **Send-audit** (compiler-enforced; resolve as hit): `DrmSurface`,
+  `gbm::BufferObject`/`GbmDevice` (if `!Send`, create BOs on the render
+  thread and guard the shared `GbmDevice` with a `Mutex` — allocation is
+  cold-path), `CursorPlane` (mapped BO), `Renderer` internals. Fallbacks
+  in order: restructure so the type never crosses; `Mutex`-wrap;
+  `unsafe impl Send` with a written justification.
+- **`Device` internals:** submit-serial counter → `AtomicU64`; retire list
+  → `Mutex`; queue helpers per D3 (`submit_gfx`, `submit_transfer`,
+  `wait_idle` — audit *every* `queue_submit`/`queue_wait_idle` call site:
+  renderer.rs, cross_gpu.rs, upload.rs, capture.rs, diagnose.rs,
+  lut3d.rs).
+- **Profiling ring:** `prism-tune` IPC (main) reads per-`Renderer` stats
+  that now live on the thread → put the 256-frame ring behind
+  `Arc<Mutex<…>>`, main keeps a clone per output (registered at
+  `CreateOutput`).
+- **Deadlock rule:** a render thread never blocks on main (only channel
+  recv + GPU fences); main never blocks on a render thread except
+  `PauseAck`/`Shutdown` joins, both with timeouts.
+- **Backpressure:** none needed — the state machine caps in-flight frames
+  at one per output by construction.
+
+### 2.8 Staged increments (each commit-sized, buildable, tested)
+
+**A — groundwork (single-threaded, zero behavior change):**
+1. **A1** `Device` queue locks + submit helpers; route all submit/wait-idle
+   sites. Serial → `AtomicU64`, retire list → `Mutex`.
+2. **A2** `LoweredFrame` type + **split `render_output_now`** into
+   `lower_output_frame(&mut PrismState, id) -> Option<LoweredFrame>` /
+   `execute_frame(&mut OutputContext, LoweredFrame) -> PresentOutcome` /
+   `process_present_outcome(&mut PrismState, id, outcome)` — still called
+   back-to-back synchronously. Assert `LoweredFrame: Send`. This is the
+   big refactor and it's fully testable single-threaded.
+3. **A3** mirror-gate accumulate audit/fix (see 2.3).
+4. **A4** split `on_vblank` into thread-side `mark_vblank` bookkeeping vs
+   main-side state machine + callbacks, callable separately.
+
+**B — the split:**
+1. **B1** `RenderThread` (spawn per GPU, mpsc loop, backchannel), move
+   `OutputContext` ownership in, `OutputShadow` on main, re-point
+   `state.outputs` readers. The flip to async happens here.
+2. **B2** state machine `AwaitingOutcome` + outcome-driven transitions;
+   vblank forwarding; estimated-vblank from `next_present_estimate`.
+3. **B3** cursor/screencopy/syncobj-release/feedback flows per 2.4;
+   profiling-ring sharing.
+4. **B4** session pause/activate, hotplug, config `Reconfigure`, teardown
+   ordering.
+
+**C — Phase 1 remainder, on the new structure:** move the GTT→local mirror
+copy from the GFX cb to the ACE `transfer_queue` — now naturally a
+render-thread-side submit before the render (separate cb on the thread's
+transfer pool, `local_done` semaphore into the render's wait list; the
+scratch-overwrite gate re-points to ACE-copy-done per §1.4). Then
+double-buffer `target_local` (skip-copy must not flip the index, §1.8).
+Add a profile span for the copy. *Deliberately re-sequenced after B*: on
+the thread structure the ACE submit needs no cross-thread choreography.
+**Delete the interim path**: the `local_copies` parameter threaded through
+`render_frame`/`present` (added by the GFX-first sub-step e6d9a77) comes
+back out — the copy op list rides `LoweredFrame` into the thread's ACE
+submit instead. Don't leave both mechanisms alive.
+
+**Do not start B until A is committed and the compositor has been
+daily-driven on A** — A carries all the refactor risk with none of the
+concurrency, so regressions surface attributably.
+
+### 2.9 Validation plan (for live testing later)
+
+Parity checklist (all currently-working features, on the real 6-output rig):
+- 6-output bringup, independent VRR rates (video on one output must not
+  change another's flip cadence — verify with `prism-tune profiling` on
+  two outputs simultaneously).
+- Cursor on every output, cross-output motion, auto-hide.
+- VT switch away/back; session lock (swaylock); output power off/on.
+- Hotplug: DP unplug/replug; DRM lease (SteamVR headset).
+- Mirror windows on both GPUs' outputs (Twitch-on-DP-6 case), rapid-scroll
+  tear check (firefox-scroll-blue-bleed class).
+- grim screenshot + wf-recorder on outputs of both GPUs; xwayland;
+  open/close/resize animations; config hot-reload of `tune` sections.
+
+Perf acceptance:
+- The Phase-1 metric: mirror-output decode+deband collapse (§1.7).
+- The Phase-2 metric: with a Vega output deliberately over budget (e.g.
+  4K high-refresh + heavy content), Navi outputs' frame times and input
+  latency stay flat. Before/after with the profiler; the `submit` span on
+  main disappears entirely (it lives on the threads now).
+
+### 2.10 Risks
+
+- Widest blast radius is B1's `state.outputs` re-pointing — mechanical but
+  everywhere. Mitigate: `OutputShadow` first as a pure refactor (A-side if
+  convenient), thread move after.
+- Fence-wedged render thread at teardown/VT-switch → bounded waits +
+  abort logging, never an unbounded join on the main thread.
+- Message-protocol drift vs. reality (e.g. a forgotten `state.outputs`
+  reader) — the compiler finds movers; grep + the parity checklist find
+  readers.
+- Frame-callback throttling regressions under estimated-vblank when a
+  thread reports `SkippedNoDamage` — watch idle CPU wakeups after B2.
 
 ## Open items
 
@@ -280,5 +590,8 @@ whose budget the GPU can't meet).
   see 1.8 (`examples/ace_copy_probe.rs`, PASS both GPUs).
 - Negotiated PCIe link speed (1.7) → copy floor. Needs
   `sudo lspci -vv | grep LnkSta`; non-blocking.
-- Whether the 4 ACE queues should later host compute-shader decode/encode for
-  intra-GPU multi-output overlap (Phase 2+ consideration).
+- Whether the 4 ACE queues should later host compute-shader decode/encode
+  for intra-GPU multi-output overlap (post-Phase-2; the D1 thread already
+  owns the ACE queues to build on).
+- Cursor-only atomic commits (reposition without a full render pass) —
+  cheap on the render thread once B lands; latency win for idle scenes.
