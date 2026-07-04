@@ -1,6 +1,20 @@
 # VkDevice-loss recovery
 
-Status: R1 IN PROGRESS · R2 TODO · R3 TODO · R4 TODO
+Status: ALL INCREMENTS LANDED, RUNTIME-UNVERIFIED —
+R1 quarantine 05c4a0d · R2 staleness purge c12616f · R3 rebuild
+orchestrator cdd1933 · R4 injection drill (this commit).
+Validate live via `prism-tune msg recover-gpu <connector>` (§5), then
+the real thing: overnight DPMS idle → morning wake.
+
+Design deviation from the original §2 sketch, discovered during R2:
+staleness needs **no generation counters** — every materialization
+already holds `Arc<Device>` refs through its images, so stale ⇔ not
+`Arc::ptr_eq` with `state.gpus[id]`. Derived from the resources
+themselves; no insert-time bookkeeping to forget. §2's D2 text below is
+kept as written for the rationale; read "generation" as "Arc identity".
+Scanout re-import (not realloc) also turned out possible via a
+factored-out `gbm export_bo`, so recovery keeps the panel's last frame
+with no FB leak and no blank.
 
 ## 1. Motivation
 

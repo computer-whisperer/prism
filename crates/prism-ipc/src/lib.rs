@@ -173,6 +173,17 @@ pub enum Request {
         /// Output connector name (e.g. `DisplayPort-4`).
         output: String,
     },
+    /// Debug/validation: quarantine the GPU driving this output as if its
+    /// VkDevice were lost, forcing the full device-loss recovery path
+    /// (teardown, fresh VkDevice, rebuild — docs/device-loss-recovery.md)
+    /// on a healthy device. The compositor replies `Handled` immediately;
+    /// recovery runs on the next dispatch-loop pass. Every output on that
+    /// GPU freezes for roughly a frame and resumes.
+    RecoverGpu {
+        /// Output connector name (e.g. `DisplayPort-4`) — selects the GPU
+        /// driving it.
+        output: String,
+    },
 }
 
 /// Reply from niri to client.

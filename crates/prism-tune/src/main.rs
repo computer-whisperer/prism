@@ -142,6 +142,15 @@ enum MsgCommand {
         #[command(subcommand)]
         action: OutputAction,
     },
+    /// Recovery drill: quarantine the GPU driving this output as if its
+    /// VkDevice were lost, forcing the full device-loss recovery path on
+    /// a healthy device (fresh VkDevice, renderers + textures rebuilt).
+    /// Every output on that GPU freezes for roughly a frame, then
+    /// resumes. Debug/validation tool — see docs/device-loss-recovery.md.
+    RecoverGpu {
+        /// Output connector name (e.g. `DisplayPort-4`).
+        output: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -165,6 +174,7 @@ fn run_msg(cmd: MsgCommand) -> Result<()> {
         MsgCommand::Outputs => Request::Outputs,
         MsgCommand::FocusedOutput => Request::FocusedOutput,
         MsgCommand::Output { output, action } => Request::Output { output, action },
+        MsgCommand::RecoverGpu { output } => Request::RecoverGpu { output },
     };
 
     let mut socket = Socket::connect()

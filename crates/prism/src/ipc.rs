@@ -366,6 +366,7 @@ fn dispatch(state: &mut PrismState, req: Request) -> (Reply, Option<OwnedFd>) {
         Request::GamutMesh { output } => (handle_gamut_mesh(state, &output), None),
         Request::Lut3d { output } => handle_lut3d(state, &output),
         Request::ProfilingStats { output } => handle_profiling_stats(state, &output),
+        Request::RecoverGpu { output } => (handle_recover_gpu(state, &output), None),
         other => (
             Err(format!(
                 "request {other:?} is not implemented in this build"
@@ -373,6 +374,30 @@ fn dispatch(state: &mut PrismState, req: Request) -> (Reply, Option<OwnedFd>) {
             None,
         ),
     }
+}
+
+/// Debug/validation injection for device-loss recovery
+/// (docs/device-loss-recovery.md R4): quarantine the GPU driving `name`
+/// exactly as a real `VK_ERROR_DEVICE_LOST` would, so the production
+/// quarantine gates park its outputs this pass and the production
+/// orchestrator replaces the device on the next — end-to-end on a healthy
+/// GPU, on demand, instead of waiting for a 3am kernel EINVAL.
+fn handle_recover_gpu(state: &mut PrismState, name: &str) -> Reply {
+    let Some(gpu) = state
+        .outputs
+        .values()
+        .find(|ctx| ctx.connector_name == name)
+        .map(|ctx| ctx.gpu_id)
+    else {
+        return Err(format!("recover-gpu: output {name:?} not found"));
+    };
+    tracing::warn!(
+        ?gpu,
+        output = name,
+        "IPC-injected GPU loss (recovery drill)"
+    );
+    state.note_gpu_lost(gpu);
+    Ok(Response::Handled)
 }
 
 /// Capture an output's intermediate frame into a memfd and return the
