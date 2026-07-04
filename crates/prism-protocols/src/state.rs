@@ -23,7 +23,7 @@
 //! import) and #48 (shader pipeline) are wired up.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -462,6 +462,27 @@ pub struct PrismState {
     /// timestamp. Keyed by `OutputId` to match `outputs` / `wl_outputs`.
     /// See [`crate::redraw`] for the state-machine shape.
     pub output_redraw: HashMap<OutputId, crate::redraw::OutputRedrawState>,
+
+    // ── GPU loss quarantine (docs/device-loss-recovery.md) ─────────────────
+    /// GPUs whose VkDevice is lost (`VK_ERROR_DEVICE_LOST`, sticky in
+    /// RADV after one rejected submission). While a GPU is in here, every
+    /// render/materialize/mirror/upload path skips it — its outputs park on
+    /// their last scanned-out frame — until recovery replaces the device.
+    /// Interior-mutable because loss is detected on GPU paths that hold
+    /// `&PrismState` (single-threaded calloop, no reentrancy across a
+    /// borrow). Populated by [`PrismState::note_gpu_lost`]; drained by the
+    /// recovery orchestrator in `main`.
+    pub lost_gpus: std::cell::RefCell<HashSet<DrmDevId>>,
+    /// Per-GPU device generation, bumped each time recovery replaces
+    /// `gpus[id]`. Per-surface GPU textures record the generation(s) of the
+    /// device(s) they were built on; a mismatch marks them stale so the
+    /// render/materialize paths purge instead of handing a dead device's
+    /// handles to a live renderer. Absent key == generation 0.
+    pub gpu_generation: HashMap<DrmDevId, u64>,
+    /// Set by `note_gpu_lost`; the main dispatch loop checks-and-clears it
+    /// to kick the recovery orchestrator without scanning `lost_gpus`
+    /// every iteration.
+    pub gpu_recovery_pending: std::cell::Cell<bool>,
 
     // ── DRM stack — declaration order = drop order = outer to inner ────────
     /// Active outputs across all cards. Each `OutputContext` Drop calls
@@ -960,6 +981,9 @@ impl PrismState {
             wl_outputs: HashMap::new(),
             dmabuf_sources: HashMap::new(),
             output_redraw: HashMap::new(),
+            lost_gpus: std::cell::RefCell::new(HashSet::new()),
+            gpu_generation: HashMap::new(),
+            gpu_recovery_pending: std::cell::Cell::new(false),
             keyboard_focus: KeyboardFocus::default(),
             on_demand_layer_focus: None,
             idle_notifier: None,
@@ -1065,6 +1089,42 @@ impl PrismState {
         }
 
         self.loop_handle = Some(handle);
+    }
+
+    /// Whether `gpu`'s VkDevice is quarantined as lost. GPU paths
+    /// (render, materialize, mirror, upload) check this and skip — see
+    /// docs/device-loss-recovery.md.
+    pub fn gpu_is_lost(&self, gpu: DrmDevId) -> bool {
+        self.lost_gpus.borrow().contains(&gpu)
+    }
+
+    /// Quarantine `gpu` after a `VK_ERROR_DEVICE_LOST`: mark it lost and
+    /// flag the main loop to run recovery. Idempotent and warn-once — RADV's
+    /// lost flag is sticky, so every GPU path on the device reports the same
+    /// error until recovery replaces it.
+    pub fn note_gpu_lost(&self, gpu: DrmDevId) {
+        if self.lost_gpus.borrow_mut().insert(gpu) {
+            tracing::error!(
+                ?gpu,
+                "VkDevice lost — quarantining GPU for recovery (outputs on it \
+                 park on their last frame)"
+            );
+            self.gpu_recovery_pending.set(true);
+        }
+    }
+
+    /// Quarantine `gpu` if `err`'s chain bottoms out in
+    /// `VK_ERROR_DEVICE_LOST`. Returns true when it did — callers can then
+    /// downgrade their own logging (the quarantine line already tells the
+    /// story once). `gpu` must be the device the failing call actually ran
+    /// on — multi-device paths (mirrors) attribute at the inner call sites
+    /// where that's unambiguous.
+    pub fn note_gpu_error(&self, gpu: DrmDevId, err: &anyhow::Error) -> bool {
+        let lost = error_is_device_lost(err);
+        if lost {
+            self.note_gpu_lost(gpu);
+        }
+        lost
     }
 
     /// Reset the idle timers on every seat — call on any user input so an
@@ -4569,6 +4629,9 @@ fn consumer_gpus_for_surface(state: &PrismState, surface: &WlSurface) -> Vec<Drm
         .outputs
         .get(&name)
         .map(|o| o.gpu_id)
+        // Quarantined GPUs take no new materializations/uploads; their
+        // entries are rebuilt lazily after recovery.
+        .filter(|g| !state.gpu_is_lost(*g))
         .into_iter()
         .collect()
 }
@@ -4615,7 +4678,11 @@ fn ensure_surface_textures(state: &PrismState, surface: &WlSurface) {
                         continue;
                     }
                     if let Err(e) = materialize_dmabuf_for_gpu(state, tex, g) {
-                        tracing::warn!(gpu = ?g, "dmabuf materialize failed: {e:#}");
+                        // Device-lost is attributed + quarantine-logged at
+                        // the failing call inside; don't spam per commit.
+                        if !error_is_device_lost(&e) {
+                            tracing::warn!(gpu = ?g, "dmabuf materialize failed: {e:#}");
+                        }
                     }
                 }
                 // The client wrote this buffer this commit — on every GPU, the
@@ -4643,7 +4710,11 @@ fn ensure_surface_textures(state: &PrismState, surface: &WlSurface) {
                 }
                 match refresh_shm_uploads(state, tex, &consumer_gpus, &regions) {
                     Ok(()) => tex.shm_upload_commit = current_commit,
-                    Err(e) => tracing::warn!("shm upload failed: {e:#}"),
+                    Err(e) => {
+                        if !error_is_device_lost(&e) {
+                            tracing::warn!("shm upload failed: {e:#}");
+                        }
+                    }
                 }
             }
             // No texture to materialize — the render walk reads the color
@@ -4676,6 +4747,9 @@ pub fn materialize_surface_on_gpu(state: &PrismState, surface: &WlSurface, gpu: 
         if tex.by_gpu.contains_key(&gpu) {
             return;
         }
+        if state.gpu_is_lost(gpu) {
+            return; // quarantined — re-materialized after recovery
+        }
         let result = match &tex.source {
             TexSource::Dmabuf { .. } => materialize_dmabuf_for_gpu(state, tex, gpu),
             // Fresh texture on this GPU (guarded by the contains_key check
@@ -4688,7 +4762,11 @@ pub fn materialize_surface_on_gpu(state: &PrismState, surface: &WlSurface, gpu: 
             Ok(()) => {
                 tracing::debug!(gpu = ?gpu, surface = ?surface.id(), "demand-materialized surface texture")
             }
-            Err(e) => tracing::warn!(gpu = ?gpu, "demand materialize failed: {e:#}"),
+            Err(e) => {
+                if !error_is_device_lost(&e) {
+                    tracing::warn!(gpu = ?gpu, "demand materialize failed: {e:#}");
+                }
+            }
         }
     });
 }
@@ -4794,10 +4872,16 @@ pub fn prepare_mirror_waits(
     let Some(target_copier) = state.mirror_copiers.get(&target_gpu) else {
         return waits;
     };
+    if state.gpu_is_lost(target_gpu) {
+        return waits;
+    }
     for (home, batch) in by_home {
         let Some(home_copier) = state.mirror_copiers.get(&home) else {
             continue;
         };
+        if state.gpu_is_lost(home) {
+            continue; // quarantined — no copies until recovery rebuilds it
+        }
         // Import the copy submit's waits on the home device: one semaphore
         // per producer fence, plus the target's render-done fence. Surfaces
         // whose fence fails to import are left out of the post-submit
@@ -4811,6 +4895,9 @@ pub fn prepare_mirror_waits(
                     fenced_surfaces.push(surface);
                 }
                 Err(e) => {
+                    if e.is_device_lost() {
+                        state.note_gpu_lost(home);
+                    }
                     tracing::debug!(?home, "mirror producer-fence import failed: {e:#}")
                 }
             }
@@ -4818,7 +4905,12 @@ pub fn prepare_mirror_waits(
         if let Some(fd) = target_copier.render_done_dup() {
             match home_copier.import_wait_semaphore(fd) {
                 Ok(sem) => copy_waits.push(sem),
-                Err(e) => tracing::debug!(?home, "mirror render-done import failed: {e:#}"),
+                Err(e) => {
+                    if e.is_device_lost() {
+                        state.note_gpu_lost(home);
+                    }
+                    tracing::debug!(?home, "mirror render-done import failed: {e:#}")
+                }
             }
         }
         match home_copier.copy_batch_async(&batch.ops, &copy_waits) {
@@ -4828,10 +4920,22 @@ pub fn prepare_mirror_waits(
                 mark_dmabuf_acquire_waited(&fenced_surfaces, home);
                 match target_copier.import_wait_semaphore(fd) {
                     Ok(sem) => waits.push(sem),
-                    Err(e) => tracing::warn!(?home, "mirror wait import failed: {e:#}"),
+                    Err(e) => {
+                        if e.is_device_lost() {
+                            state.note_gpu_lost(target_gpu);
+                        } else {
+                            tracing::warn!(?home, "mirror wait import failed: {e:#}");
+                        }
+                    }
                 }
             }
-            Err(e) => tracing::warn!(?home, "mirror copy submit failed: {e:#}"),
+            Err(e) => {
+                if e.is_device_lost() {
+                    state.note_gpu_lost(home);
+                } else {
+                    tracing::warn!(?home, "mirror copy submit failed: {e:#}");
+                }
+            }
         }
         // Queued or failed, the imported copy-wait semaphores are done with;
         // the home device's deferred-destroy queue frees them once its
@@ -4954,7 +5058,12 @@ pub fn prepare_dmabuf_acquire_waits(
         let Some(fence_fd) = fence_fd else { continue };
         match copier.import_wait_semaphore(fence_fd) {
             Ok(sem) => waits.push(sem),
-            Err(e) => tracing::debug!(?target_gpu, "dmabuf acquire-fence import failed: {e:#}"),
+            Err(e) => {
+                if e.is_device_lost() {
+                    state.note_gpu_lost(target_gpu);
+                }
+                tracing::debug!(?target_gpu, "dmabuf acquire-fence import failed: {e:#}")
+            }
         }
     }
     // Quiet unless a drawn native surface had no exportable write fence — the
@@ -4996,6 +5105,15 @@ pub fn mark_dmabuf_acquire_waited(surfaces: &[WlSurface], target_gpu: DrmDevId) 
 /// Materialize a dmabuf-backed surface on GPU `g`: a zero-copy native
 /// import if `g`'s driver supports the modifier, else a cross-GPU mirror
 /// (home import + LINEAR exportable scratch copied and re-imported on `g`).
+/// Whether an anyhow chain bottoms out in `VK_ERROR_DEVICE_LOST` (see
+/// [`PrismState::note_gpu_error`]).
+pub fn error_is_device_lost(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        matches!(c.downcast_ref::<prism_renderer::RendererError>(),
+                          Some(r) if r.is_device_lost())
+    })
+}
+
 fn materialize_dmabuf_for_gpu(
     state: &PrismState,
     tex: &mut SurfaceTexture,
@@ -5036,7 +5154,10 @@ fn materialize_dmabuf_for_gpu(
                     None => {
                         let img = Arc::new(
                             import_dmabuf(&device_g, &dmabuf, true)
-                                .context("native import on consumer GPU")?,
+                                .context("native import on consumer GPU")
+                                .inspect_err(|e| {
+                                    state.note_gpu_error(g, e);
+                                })?,
                         );
                         cache.insert(g, img.clone());
                         img
@@ -5044,7 +5165,11 @@ fn materialize_dmabuf_for_gpu(
                 }
             }
             None => Arc::new(
-                import_dmabuf(&device_g, &dmabuf, true).context("native import on consumer GPU")?,
+                import_dmabuf(&device_g, &dmabuf, true)
+                    .context("native import on consumer GPU")
+                    .inspect_err(|e| {
+                        state.note_gpu_error(g, e);
+                    })?,
             ),
         };
         tex.by_gpu.insert(g, GpuTex::Native(img));
@@ -5091,7 +5216,12 @@ fn materialize_dmabuf_for_gpu(
         }
         let scratch =
             prism_renderer::ExportableImage::new(device_home.clone(), plane_extent, vk_fmt, fourcc)
-                .context("ExportableImage::new (mirror scratch)")?;
+                .context("ExportableImage::new (mirror scratch)")
+                .inspect_err(|e| {
+                    // Runs on the HOME device (incl. its init submit) —
+                    // attribute a device-lost there, not to the consumer.
+                    state.note_gpu_error(home_id, e);
+                })?;
         // `target` is a copy SOURCE now (blitted into `target_local`), not
         // sampled directly — leave it in GENERAL (a valid copy-src layout).
         let target = prism_renderer::ImportedImage::import(
@@ -5100,13 +5230,22 @@ fn materialize_dmabuf_for_gpu(
             vk_fmt,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC,
         )
-        .context("import mirror scratch on consumer GPU")?;
+        .context("import mirror scratch on consumer GPU")
+        .inspect_err(|e| {
+            state.note_gpu_error(g, e);
+        })?;
         target
             .transition_to_general()
-            .context("transition mirror scratch to general")?;
+            .context("transition mirror scratch to general")
+            .inspect_err(|e| {
+                state.note_gpu_error(g, e);
+            })?;
         // The local OPTIMAL copy the decode/deband passes actually sample.
         let target_local = prism_renderer::LocalImage::new(device_g.clone(), plane_extent, vk_fmt)
-            .context("LocalImage::new (mirror target_local)")?;
+            .context("LocalImage::new (mirror target_local)")
+            .inspect_err(|e| {
+                state.note_gpu_error(g, e);
+            })?;
         Ok((scratch, Arc::new(target), Arc::new(target_local)))
     };
 
@@ -5182,7 +5321,7 @@ fn ensure_home_import(
     dmabuf: &Arc<prism_frame::Dmabuf>,
 ) -> Result<(DrmDevId, Arc<prism_renderer::ImportedImage>)> {
     if let Some((&gid, img)) = tex.by_gpu.iter().find_map(|(id, gt)| match gt {
-        GpuTex::Native(img) => Some((id, img.clone())),
+        GpuTex::Native(img) if !state.gpu_is_lost(*id) => Some((id, img.clone())),
         _ => None,
     }) {
         return Ok((gid, img));
@@ -5191,9 +5330,15 @@ fn ensure_home_import(
     let (&home_id, device) = state
         .gpus
         .iter()
-        .find(|(_, d)| gpu_supports_dmabuf(d, format, modifier))
+        .find(|(id, d)| !state.gpu_is_lost(**id) && gpu_supports_dmabuf(d, format, modifier))
         .context("no GPU can import this dmabuf to serve as a mirror home")?;
-    let img = Arc::new(import_dmabuf(device, dmabuf, false).context("home import for mirror")?);
+    let img = Arc::new(
+        import_dmabuf(device, dmabuf, false)
+            .context("home import for mirror")
+            .inspect_err(|e| {
+                state.note_gpu_error(home_id, e);
+            })?,
+    );
     Ok((home_id, img))
 }
 
@@ -5223,13 +5368,20 @@ fn refresh_dmabuf_mirrors(state: &PrismState, tex: &mut SurfaceTexture, _extent:
         if *home_src_buffer == buffer_id {
             continue; // same buffer — home_src still valid (damage re-copied at render)
         }
+        if state.gpu_is_lost(*home) {
+            continue; // quarantined — recovery rebuilds the mirror entirely
+        }
         if let Some(home_dev) = state.gpus.get(home) {
             match import_dmabuf(home_dev, &dmabuf, false) {
                 Ok(img) => {
                     *home_src = Arc::new(img);
                     *home_src_buffer = buffer_id.clone();
                 }
-                Err(e) => tracing::warn!(home = ?home, "mirror home_src re-import failed: {e:#}"),
+                Err(e) => {
+                    if !state.note_gpu_error(*home, &e) {
+                        tracing::warn!(home = ?home, "mirror home_src re-import failed: {e:#}");
+                    }
+                }
             }
         }
     }
@@ -5285,19 +5437,29 @@ fn refresh_shm_uploads(
             let Some(device) = state.gpus.get(&g) else {
                 continue;
             };
+            if state.gpu_is_lost(g) {
+                continue; // quarantined — re-materialized after recovery
+            }
             let reuse = matches!(
                 tex.by_gpu.get(&g),
                 Some(GpuTex::Shm(t)) if t.extent() == extent && t.format() == format
             );
             if !reuse {
                 let t = prism_renderer::ShmTexture::new(device.clone(), extent, format)
-                    .with_context(|| format!("ShmTexture::new on gpu {}:{}", g.major, g.minor))?;
+                    .with_context(|| format!("ShmTexture::new on gpu {}:{}", g.major, g.minor))
+                    .inspect_err(|e| {
+                        state.note_gpu_error(g, e);
+                    })?;
                 tex.by_gpu.insert(g, GpuTex::Shm(t));
             }
             if let Some(GpuTex::Shm(t)) = tex.by_gpu.get_mut(&g) {
-                t.upload_bytes(bytes, stride, regions).with_context(|| {
-                    format!("ShmTexture::upload_bytes on gpu {}:{}", g.major, g.minor)
-                })?;
+                t.upload_bytes(bytes, stride, regions)
+                    .with_context(|| {
+                        format!("ShmTexture::upload_bytes on gpu {}:{}", g.major, g.minor)
+                    })
+                    .inspect_err(|e| {
+                        state.note_gpu_error(g, e);
+                    })?;
             }
         }
         Ok(())

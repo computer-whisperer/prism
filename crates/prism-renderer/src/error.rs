@@ -25,6 +25,23 @@ pub enum RendererError {
     Io(String),
 }
 
+impl RendererError {
+    /// True when the underlying Vulkan error is `VK_ERROR_DEVICE_LOST`.
+    /// RADV sets a sticky per-VkDevice lost flag after one rejected
+    /// submission, so every later call on that device returns this too —
+    /// callers use it to quarantine the GPU for recovery rather than
+    /// retrying.
+    pub fn is_device_lost(&self) -> bool {
+        matches!(
+            self,
+            RendererError::Vk {
+                result: vk::Result::ERROR_DEVICE_LOST,
+                ..
+            }
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, RendererError>;
 
 /// Extension trait to attach call-site context to a raw `vk::Result`.

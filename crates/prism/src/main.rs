@@ -8,6 +8,7 @@ use prism_renderer::vk;
 use tracing_subscriber::EnvFilter;
 
 mod ipc;
+mod recovery;
 mod watcher;
 
 fn main() -> Result<()> {
@@ -2066,6 +2067,13 @@ fn run_integrated(
         // `ColorManagementState::pending_info_done`.
         state.color_management.drain_pending_info_done();
 
+        // A VkDevice loss flagged during dispatch or the last render pass
+        // is serviced here, between passes, with no state borrows
+        // outstanding. See docs/device-loss-recovery.md.
+        if state.gpu_recovery_pending.replace(false) {
+            recovery::recover_lost_gpus(&mut state);
+        }
+
         // Advance every running animation (view-offset scrolls,
         // window movement, opening/closing fades, etc.). Without
         // this, `Layout::add_window` queues a view-offset animation
@@ -2495,6 +2503,29 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
         }
         return;
     }
+    // Quarantined-GPU outputs can't render until recovery replaces the
+    // VkDevice (docs/device-loss-recovery.md); park them exactly like
+    // powered-off — the last scanned-out frame stays up, Idle so nothing
+    // spins, captures fail instead of hanging. Exception: under a session
+    // lock that frozen frame shows DESKTOP content, so blank the output
+    // first (CRTC clear via power_off) — only then does it count as
+    // showing a locked frame.
+    if state
+        .outputs
+        .get(output_id)
+        .is_some_and(|o| state.gpu_is_lost(o.gpu_id))
+    {
+        if state.is_locked() {
+            blank_lost_output_for_lock(state, output_id);
+        }
+        state
+            .output_redraw
+            .entry(output_id.to_owned())
+            .or_default()
+            .redraw = RedrawState::Idle;
+        state.fail_pending_screencopy(output_id);
+        return;
+    }
     match render_output_now(state, output_id) {
         Ok(RenderOutcome::Presented {
             pending,
@@ -2532,14 +2563,29 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
             tracing::debug!(output = %output_id, "render_output_now: flip still pending, retry next pass");
         }
         Err(e) => {
-            tracing::warn!("render_output_now({output_id}) failed: {e:#}");
+            // A device-lost render quarantines the output's GPU for
+            // recovery (docs/device-loss-recovery.md); the quarantine line
+            // is the loud one, so keep the per-render noise down.
+            let device_lost = state
+                .outputs
+                .get(output_id)
+                .is_some_and(|o| state.note_gpu_error(o.gpu_id, &e));
+            if !device_lost {
+                tracing::warn!("render_output_now({output_id}) failed: {e:#}");
+            }
             breadcrumb(&format!("render_output_now({output_id}) ERROR: {e:#}"));
             // A failed render while the session is locking means this
             // output may still be showing desktop content — abort the
             // lock rather than confirm one the screen doesn't reflect
-            // (niri parity). No-op when not mid-lock.
+            // (niri parity). No-op when not mid-lock. Device-lost is the
+            // exception: no render is coming until recovery, so blank the
+            // output and confirm instead of wedging the lock.
             if state.is_locked() {
-                state.note_lock_render(output_id, false);
+                if device_lost {
+                    blank_lost_output_for_lock(state, output_id);
+                } else {
+                    state.note_lock_render(output_id, false);
+                }
             }
             if let Some(entry) = state.output_redraw.get_mut(output_id) {
                 entry.redraw = RedrawState::Idle;
@@ -2551,6 +2597,22 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
             state.fail_pending_screencopy(output_id);
         }
     }
+}
+
+/// Blank a quarantined-GPU output under a session lock and confirm it as
+/// locked. Its last scanned-out frame shows desktop content and no render
+/// can replace it until recovery, so a CRTC clear (`power_off`) is the only
+/// way to honor the lock; a dark panel then counts as a locked frame, same
+/// as the DPMS'd case above.
+fn blank_lost_output_for_lock(state: &mut prism_protocols::PrismState, output_id: &str) {
+    if let Some(o) = state.outputs.get_mut(output_id) {
+        if !o.is_powered_off() {
+            if let Err(e) = o.power_off() {
+                tracing::warn!("blanking lost-GPU output for lock failed: {e:#}");
+            }
+        }
+    }
+    state.note_lock_render(output_id, true);
 }
 
 /// Arm an estimated-vblank timer for an output whose render was skipped for
