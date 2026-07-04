@@ -478,8 +478,17 @@ pub struct PrismState {
     /// every iteration.
     pub gpu_recovery_pending: std::cell::Cell<bool>,
     /// Consecutive failed recovery attempts per lost GPU — drives the
-    /// orchestrator's retry backoff; cleared on successful recovery.
+    /// orchestrator's retry backoff. NOT cleared when a rebuild succeeds
+    /// (that only proves trivial submits work); cleared on the GPU's first
+    /// successful present, so a half-alive GPU that passes rebuild but
+    /// fails real renders keeps climbing the backoff ladder instead of
+    /// churning device creation at dispatch rate.
     pub gpu_recovery_attempts: HashMap<DrmDevId, u32>,
+    /// Outputs the lost-GPU lock path blanked (CRTC clear) so the session
+    /// lock could confirm without desktop content on screen. Recovery
+    /// powers exactly these back on when their GPU comes back — user DPMS
+    /// state is never touched. Keyed like `outputs`.
+    pub lock_blanked_outputs: HashSet<OutputId>,
 
     // ── DRM stack — declaration order = drop order = outer to inner ────────
     /// Active outputs across all cards. Each `OutputContext` Drop calls
@@ -981,6 +990,7 @@ impl PrismState {
             lost_gpus: std::cell::RefCell::new(HashSet::new()),
             gpu_recovery_pending: std::cell::Cell::new(false),
             gpu_recovery_attempts: HashMap::new(),
+            lock_blanked_outputs: HashSet::new(),
             keyboard_focus: KeyboardFocus::default(),
             on_demand_layer_focus: None,
             idle_notifier: None,

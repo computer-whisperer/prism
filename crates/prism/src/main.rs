@@ -2531,6 +2531,14 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
             pending,
             redraw_again,
         }) => {
+            // A real presented frame is the health proof that ends a
+            // recovered GPU's retry-backoff history (see
+            // gpu_recovery_attempts field docs).
+            if !state.gpu_recovery_attempts.is_empty() {
+                if let Some(gpu) = state.outputs.get(output_id).map(|o| o.gpu_id) {
+                    state.gpu_recovery_attempts.remove(&gpu);
+                }
+            }
             let entry = state.output_redraw.entry(output_id.to_owned()).or_default();
             entry.pending_feedback = Some(pending);
             // A redraw requested during the render (demand-materialized
@@ -2603,14 +2611,27 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
 /// locked. Its last scanned-out frame shows desktop content and no render
 /// can replace it until recovery, so a CRTC clear (`power_off`) is the only
 /// way to honor the lock; a dark panel then counts as a locked frame, same
-/// as the DPMS'd case above.
+/// as the DPMS'd case above. If the blank itself FAILS the output is still
+/// showing desktop content — abort the lock (`note_lock_render(false)`)
+/// rather than confirm one the screen doesn't reflect. Outputs blanked
+/// here are recorded so recovery powers exactly them back on (user DPMS
+/// state is never touched).
 fn blank_lost_output_for_lock(state: &mut prism_protocols::PrismState, output_id: &str) {
+    let mut blanked = false;
     if let Some(o) = state.outputs.get_mut(output_id) {
         if !o.is_powered_off() {
-            if let Err(e) = o.power_off() {
-                tracing::warn!("blanking lost-GPU output for lock failed: {e:#}");
+            match o.power_off() {
+                Ok(()) => blanked = true,
+                Err(e) => {
+                    tracing::warn!("blanking lost-GPU output for lock failed: {e:#}");
+                    state.note_lock_render(output_id, false);
+                    return;
+                }
             }
         }
+    }
+    if blanked {
+        state.lock_blanked_outputs.insert(output_id.to_owned());
     }
     state.note_lock_render(output_id, true);
 }

@@ -90,7 +90,7 @@ for observability.
 | `mirror_copiers[X]` | state.rs:457 | drop + rebuild (single-GPU variant of `build_mirror_copiers`) |
 | `OutputContext.renderer` + 2× `ScanoutBuffer.image` for outputs with `gpu_id == X` | output_ctx.rs | rebuild renderer from retained config; re-import GBM BOs (BOs + DRM FBs survive — screen keeps last frame); reload LUT; `mark_for_resume`-style flip reset |
 | `dmabuf_sources[*].native_imports[X]` memos | state.rs:451 | eager clear (map is enumerable) |
-| `screencopy_pending` / `screencopy_inflight` on X's outputs | state.rs:430/434 | fail to client (existing `fail_pending_screencopy` + an inflight fail-drain) |
+| `screencopy_pending` on X's outputs | state.rs:430 | fail to client (existing `fail_pending_screencopy`; runs from the park gate and again at recovery). In-flight captures need NO drain — their sync_fds signal regardless (kernel dma_fence contract), host copies don't touch the device, and held imports retire into the old device's deferred queue |
 | Layout snapshot ghosts (close/resize/interactive-move) on X | prism-layout | purge by device id (`SnapshotTexture` exposes its device); animations degrade to no-crossfade — snapshot-alloc failure is already a tolerated path |
 | Cursor planes | output_ctx | **unaffected** (GBM + DRM FB, no Vulkan) |
 
@@ -116,6 +116,12 @@ teardown uses `wait_device_idle` with ignored results throughout.
   keeps scanning out its last (desktop!) frame. If the session is locked or
   locks while X is lost, `power_off()` X's outputs (CRTC clear → blank →
   safe to `note_lock_render(true)`, matching the powered-off lock path).
+  If the blank itself fails, the lock is ABORTED (`note_lock_render(false)`)
+  — never confirm a lock over visible desktop content. Blanked outputs are
+  recorded in `lock_blanked_outputs`; recovery powers exactly those back on
+  (nothing else ever would — the only other `power_on` caller is user
+  DPMS), and while still locked the re-powered output renders the lock
+  surface, not desktop.
 
 ### D5. Rebuild reuses bringup code
 
@@ -126,9 +132,12 @@ teardown uses `wait_device_idle` with ignored results throughout.
   identity-LUT fallback included) into a function recovery can rerun.
 - Orchestrator in `crates/prism/src/recovery.rs`, driven from the main
   dispatch loop's post-dispatch block (main.rs:2053ff).
-- `Device::new` failure (GPU genuinely dead, e.g. SMU hang persisting):
-  retry with backoff (1s → 30s cap) on a calloop timer; outputs stay
-  parked; other GPUs unaffected. Re-attempt also on config reload.
+- `Device::new` / rebuild failure (GPU genuinely dead, e.g. SMU hang
+  persisting): retry with exponential backoff (2s → 32s cap) on a calloop
+  timer; outputs stay parked; other GPUs unaffected. The attempt counter
+  is cleared only by the GPU's first successful *present* (not by rebuild
+  success — that only proves trivial submits work), so a half-alive GPU
+  keeps climbing the ladder instead of churning device creation.
 - After rebuild: bump generation, queue redraws on X's outputs. Lazy
   re-materialization repopulates content.
 
@@ -193,7 +202,26 @@ playing, one animation mid-flight, screencopy loop (`wf-recorder`) running:
 6. The real thing: overnight DPMS-off idle → morning wake recovers
    automatically (the original bug).
 
-## 6. Non-goals
+## 6. Residual known risks (adversarial review, 2026-07-04 — accepted)
+
+- **Old-device Arc retention**: surfaces that neither commit nor render
+  after recovery (quiet clients on inactive workspaces) keep stale
+  `by_gpu` entries holding the dead `Arc<Device>` until a later purge
+  touches them — the old VkDevice can linger. Memory-shaped, bounded by
+  one device instance per incident.
+- **First post-recovery ghost frame**: a close/resize snapshot captured on
+  the first frame after rebuild copies from the new, undefined
+  intermediate — up to ~150 ms of garbage pixels inside one animation
+  ghost. Cosmetic, rare.
+- **Pending-flip race**: quarantine while `frame_pending`, then recovery +
+  render before the real vblank → modeset-while-flip-pending → EBUSY
+  `FlipFailed`, self-corrects next damage. Same risk class as VT-switch
+  resume; sub-16 ms window on a real loss.
+- **Pre-existing, not introduced here**: a snapshot ghost's baked
+  `vk::ImageView` crossing GPUs if a workspace with a live ghost can move
+  monitors mid-animation — worth an independent look someday.
+
+## 7. Non-goals
 
 - Root cause of the wake EINVAL (separate effort: DPMS-on probe submit +
   `drm.debug` capture — recovery must not end that investigation).

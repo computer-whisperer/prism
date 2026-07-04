@@ -41,7 +41,12 @@ pub fn recover_lost_gpus(state: &mut PrismState) {
         match recover_one(state, gpu) {
             Ok(()) => {
                 state.lost_gpus.borrow_mut().remove(&gpu);
-                state.gpu_recovery_attempts.remove(&gpu);
+                // Deliberately NOT clearing gpu_recovery_attempts here: a
+                // successful rebuild only proves trivial submits work. The
+                // counter clears on this GPU's first successful present
+                // (perform_redraw), so a half-alive GPU that passes rebuild
+                // but fails real renders keeps climbing the backoff ladder
+                // instead of churning device creation at dispatch rate.
                 let outputs: Vec<String> = state
                     .outputs
                     .iter()
@@ -52,6 +57,17 @@ pub fn recover_lost_gpus(state: &mut PrismState) {
                     // Queued captures were imported on the dead device;
                     // fail them rather than submit cross-device work.
                     state.fail_pending_screencopy(id);
+                    // An output the lock path blanked (CRTC clear) has no
+                    // other wake-up: nothing else calls power_on for it,
+                    // so it would stay dark after unlock forever. Re-power
+                    // exactly those — while still locked the next render
+                    // shows the lock surface, not desktop content. User
+                    // DPMS state (not in this set) is untouched.
+                    if state.lock_blanked_outputs.remove(id) {
+                        if let Some(ctx) = state.outputs.get_mut(id) {
+                            ctx.power_on();
+                        }
+                    }
                     state
                         .output_redraw
                         .entry(id.clone())
