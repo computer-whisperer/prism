@@ -825,6 +825,65 @@ impl OutputContext {
         self.frame_pending = false;
     }
 
+    /// Rebuild the Vulkan half of this output on a replacement device
+    /// after device-loss recovery (docs/device-loss-recovery.md): a fresh
+    /// `Renderer` from the same retained config (same encode chain), the
+    /// scanout BOs re-imported onto the new device — the BOs and their DRM
+    /// framebuffers are kernel-side and survive untouched, so the panel
+    /// keeps its last frame throughout — and the color LUT re-synthesized
+    /// from retained state (`kdl_lut3d_entries` / overrides). Everything
+    /// new is constructed before anything is swapped in, so a failure
+    /// leaves the context consistently on the old (dead) device for a
+    /// retry. Flip bookkeeping resets like session resume; damage state
+    /// resets to full (the new renderer's intermediate is undefined).
+    ///
+    /// KMS-side state (connector, CRTC, mode, cursor plane, EDID, HDR
+    /// signaling, frame clock) is untouched — `gpu_id` is unchanged since
+    /// the replacement device sits on the same physical GPU.
+    pub fn rebuild_render_state(&mut self, device: Arc<Device>) -> Result<()> {
+        let renderer = Renderer::new(
+            device.clone(),
+            self.config.vk_format,
+            self.config.intermediate_format,
+            &self.config.encode_config,
+        )
+        .context("Renderer::new (device-loss rebuild)")?;
+        let mut images = Vec::with_capacity(self.buffers.len());
+        for (i, buf) in self.buffers.iter().enumerate() {
+            let dmabuf = crate::gbm_dev::export_bo(&buf._bo)
+                .with_context(|| format!("re-export scanout BO {i}"))?;
+            let image = ImportedImage::import(
+                device.clone(),
+                &dmabuf,
+                self.config.vk_format,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            )
+            .with_context(|| format!("re-import scanout BO {i} on replacement device"))?;
+            images.push(image);
+        }
+        // Commit point — nothing below fails except the LUT upload, which
+        // degrades to identity like at bringup.
+        self.renderer = renderer;
+        for (buf, image) in self.buffers.iter_mut().zip(images) {
+            buf.image = image;
+        }
+        self.damage_tracker = DamageTracker::new();
+        self.damage_carry = [DamageCarry::Full, DamageCarry::Full];
+        self.mark_for_resume();
+        if let Err(e) = self.resynthesize_color_lut() {
+            tracing::warn!(
+                connector = %self.connector_name,
+                "LUT re-synthesis after device rebuild failed: {e:#} (identity LUT)"
+            );
+        }
+        tracing::info!(
+            connector = %self.connector_name,
+            gpu = ?self.gpu_id,
+            "output render state rebuilt on replacement device"
+        );
+        Ok(())
+    }
+
     /// Re-apply this connector's HDR / Colorspace / max-bpc signaling after a
     /// session resume. These are written as plain connector properties (not
     /// through the surface commit), so `DrmDevice::activate(true)`'s state

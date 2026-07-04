@@ -97,32 +97,7 @@ impl GbmDevice {
                 )
             })?;
 
-        let chosen_modifier = bo.modifier();
-        let plane_count = bo.plane_count();
-        if plane_count == 0 {
-            return Err(anyhow!("GBM returned BO with 0 planes"));
-        }
-
-        let mut planes: Vec<DmabufPlane> = Vec::with_capacity(plane_count as usize);
-        for i in 0..plane_count as i32 {
-            let fd: OwnedFd = bo
-                .fd_for_plane(i)
-                .map_err(|_| anyhow!("gbm_bo_get_fd_for_plane({i}) returned -1"))?;
-            planes.push(DmabufPlane {
-                fd,
-                offset: bo.offset(i),
-                stride: bo.stride_for_plane(i),
-            });
-        }
-
-        let dmabuf = Dmabuf {
-            width,
-            height,
-            format,
-            modifier: chosen_modifier,
-            planes,
-        };
-
+        let dmabuf = export_bo(&bo)?;
         Ok((bo, dmabuf))
     }
 
@@ -141,4 +116,34 @@ impl GbmDevice {
             .with_context(|| format!("create_buffer_object cursor {width}x{height}"))?;
         Ok(bo)
     }
+}
+
+/// Export an existing BO's planes as a fresh [`Dmabuf`] (dup'd fds).
+/// Used at allocation and to re-import a surviving scanout BO onto a
+/// replacement VkDevice after device-loss recovery
+/// (docs/device-loss-recovery.md) — the BO and its DRM framebuffer are
+/// kernel-side and outlive any Vulkan device.
+pub fn export_bo(bo: &BufferObject<()>) -> Result<Dmabuf> {
+    let plane_count = bo.plane_count();
+    if plane_count == 0 {
+        return Err(anyhow!("GBM BO has 0 planes"));
+    }
+    let mut planes: Vec<DmabufPlane> = Vec::with_capacity(plane_count as usize);
+    for i in 0..plane_count as i32 {
+        let fd: OwnedFd = bo
+            .fd_for_plane(i)
+            .map_err(|_| anyhow!("gbm_bo_get_fd_for_plane({i}) returned -1"))?;
+        planes.push(DmabufPlane {
+            fd,
+            offset: bo.offset(i),
+            stride: bo.stride_for_plane(i),
+        });
+    }
+    Ok(Dmabuf {
+        width: bo.width(),
+        height: bo.height(),
+        format: bo.format(),
+        modifier: bo.modifier(),
+        planes,
+    })
 }

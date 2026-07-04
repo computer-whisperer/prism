@@ -473,16 +473,13 @@ pub struct PrismState {
     /// borrow). Populated by [`PrismState::note_gpu_lost`]; drained by the
     /// recovery orchestrator in `main`.
     pub lost_gpus: std::cell::RefCell<HashSet<DrmDevId>>,
-    /// Per-GPU device generation, bumped each time recovery replaces
-    /// `gpus[id]`. Per-surface GPU textures record the generation(s) of the
-    /// device(s) they were built on; a mismatch marks them stale so the
-    /// render/materialize paths purge instead of handing a dead device's
-    /// handles to a live renderer. Absent key == generation 0.
-    pub gpu_generation: HashMap<DrmDevId, u64>,
     /// Set by `note_gpu_lost`; the main dispatch loop checks-and-clears it
     /// to kick the recovery orchestrator without scanning `lost_gpus`
     /// every iteration.
     pub gpu_recovery_pending: std::cell::Cell<bool>,
+    /// Consecutive failed recovery attempts per lost GPU — drives the
+    /// orchestrator's retry backoff; cleared on successful recovery.
+    pub gpu_recovery_attempts: HashMap<DrmDevId, u32>,
 
     // ── DRM stack — declaration order = drop order = outer to inner ────────
     /// Active outputs across all cards. Each `OutputContext` Drop calls
@@ -982,8 +979,8 @@ impl PrismState {
             dmabuf_sources: HashMap::new(),
             output_redraw: HashMap::new(),
             lost_gpus: std::cell::RefCell::new(HashSet::new()),
-            gpu_generation: HashMap::new(),
             gpu_recovery_pending: std::cell::Cell::new(false),
+            gpu_recovery_attempts: HashMap::new(),
             keyboard_focus: KeyboardFocus::default(),
             on_demand_layer_focus: None,
             idle_notifier: None,
@@ -1110,6 +1107,16 @@ impl PrismState {
                  park on their last frame)"
             );
             self.gpu_recovery_pending.set(true);
+        }
+    }
+
+    /// Drop every buffer's memoized native import for `gpu`. Recovery
+    /// hygiene: the memo-hit identity check already rejects entries from a
+    /// replaced device, this just frees them now rather than at buffer
+    /// destruction.
+    pub fn drop_native_import_memos(&self, gpu: DrmDevId) {
+        for entry in self.dmabuf_sources.values() {
+            entry.native_imports.lock().unwrap().remove(&gpu);
         }
     }
 
