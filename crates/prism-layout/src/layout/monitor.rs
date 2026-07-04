@@ -406,6 +406,14 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    /// Drop snapshot ghosts stranded on a replaced (lost) VkDevice — see
+    /// `ScrollingSpace::purge_stale_snapshots`.
+    pub fn purge_stale_snapshots(&mut self, stale: &dyn Fn(&SnapshotTexture) -> bool) {
+        for ws in &mut self.workspaces {
+            ws.purge_stale_snapshots(stale);
+        }
+    }
+
     pub fn into_workspaces(mut self) -> Vec<Workspace<W>> {
         self.workspaces.retain(|ws| ws.has_windows_or_name());
 

@@ -4660,6 +4660,9 @@ fn ensure_surface_textures(state: &PrismState, surface: &WlSurface) {
         let Some(tex) = guard.as_mut() else {
             return;
         };
+        // Entries stranded on a replaced (lost) device read as absent so
+        // the materialize/refresh below rebuilds them on the new device.
+        tex.purge_stale(&state.gpus);
         let extent = tex.extent();
         let shm_last_commit = tex.shm_upload_commit;
 
@@ -4744,6 +4747,7 @@ pub fn materialize_surface_on_gpu(state: &PrismState, surface: &WlSurface, gpu: 
         let Some(tex) = guard.as_mut() else {
             return;
         };
+        tex.purge_stale(&state.gpus);
         if tex.by_gpu.contains_key(&gpu) {
             return;
         }
@@ -5149,9 +5153,13 @@ fn materialize_dmabuf_for_gpu(
         let img = match state.dmabuf_sources.get(&buffer_id) {
             Some(entry) => {
                 let mut cache = entry.native_imports.lock().unwrap();
+                // The memo hit must be on the CURRENT device (`Arc`
+                // identity) — after device-loss recovery a stale cached
+                // import would otherwise be resurrected into `by_gpu`,
+                // re-purged by the walk, re-hit here, forever.
                 match cache.get(&g) {
-                    Some(img) => img.clone(),
-                    None => {
+                    Some(img) if Arc::ptr_eq(img.device(), &device_g) => img.clone(),
+                    _ => {
                         let img = Arc::new(
                             import_dmabuf(&device_g, &dmabuf, true)
                                 .context("native import on consumer GPU")

@@ -299,6 +299,16 @@ impl<W: LayoutElement> FloatingSpace<W> {
         out.extend(self.tiles().filter_map(|t| t.resize_snapshot().cloned()));
     }
 
+    /// Drop snapshot ghosts stranded on a replaced (lost) VkDevice — see
+    /// `ScrollingSpace::purge_stale_snapshots`.
+    pub fn purge_stale_snapshots(&mut self, stale: &dyn Fn(&SnapshotTexture) -> bool) {
+        self.closing_windows
+            .retain(|c| !c.snapshot().is_some_and(|s| stale(s)));
+        for tile in self.tiles_mut() {
+            tile.purge_stale_resize_snapshot(stale);
+        }
+    }
+
     pub fn tiles_with_offsets(
         &self,
     ) -> impl DoubleEndedIterator<Item = (&Tile<W>, Point<f64, Logical>)> + '_ {

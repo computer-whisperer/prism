@@ -1675,6 +1675,31 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// Drop every snapshot ghost stranded on a replaced (lost) VkDevice
+    /// (docs/device-loss-recovery.md): all monitors' close/resize ghosts
+    /// plus the detached interactive-move tile's crossfade — the same set
+    /// [`Self::snapshot_keepalives`] walks, across all outputs (staleness
+    /// is a device property, not an output one). Close animations end;
+    /// resize crossfades cancel. Called by GPU recovery once the lost
+    /// device has been replaced in the registry.
+    pub fn purge_stale_snapshots(&mut self, stale: &dyn Fn(&SnapshotTexture) -> bool) {
+        match &mut self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => {
+                for mon in monitors {
+                    mon.purge_stale_snapshots(stale);
+                }
+            }
+            MonitorSet::NoOutputs { workspaces } => {
+                for ws in workspaces {
+                    ws.purge_stale_snapshots(stale);
+                }
+            }
+        }
+        if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
+            move_.tile.purge_stale_resize_snapshot(stale);
+        }
+    }
+
     pub fn monitor_for_workspace(&self, workspace_name: &str) -> Option<&Monitor<W>> {
         self.monitors().find(|monitor| {
             monitor.workspaces.iter().any(|ws| {

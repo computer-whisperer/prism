@@ -636,6 +636,18 @@ impl<W: LayoutElement> Tile<W> {
         self.resize_animation = None;
     }
 
+    /// Cancel a resize crossfade whose captured frame is stranded on a
+    /// replaced (lost) VkDevice (docs/device-loss-recovery.md). Replaying
+    /// it would hand a destroyed device's texture to a live renderer, and
+    /// clearing just `gpu_snapshot` would recapture unrelated pixels (the
+    /// pre-resize frame is gone) — so cancel outright, same rationale as
+    /// [`Self::cancel_resize_animation`].
+    pub fn purge_stale_resize_snapshot(&mut self, stale: &dyn Fn(&SnapshotTexture) -> bool) {
+        if self.resize_snapshot().is_some_and(|s| stale(s)) {
+            self.cancel_resize_animation();
+        }
+    }
+
     pub fn animate_move_from(&mut self, from: Point<f64, Logical>) {
         self.animate_move_x_from(from.x);
         self.animate_move_y_from(from.y);

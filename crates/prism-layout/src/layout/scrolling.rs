@@ -441,6 +441,18 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         out.extend(self.tiles().filter_map(|t| t.resize_snapshot().cloned()));
     }
 
+    /// Drop snapshot ghosts stranded on a replaced (lost) VkDevice
+    /// (docs/device-loss-recovery.md). A closing ghost IS its snapshot —
+    /// recapture is impossible after unmap, so its animation ends; a stale
+    /// resize crossfade cancels (see `Tile::purge_stale_resize_snapshot`).
+    pub fn purge_stale_snapshots(&mut self, stale: &dyn Fn(&SnapshotTexture) -> bool) {
+        self.closing_windows
+            .retain(|c| !c.snapshot().is_some_and(|s| stale(s)));
+        for tile in self.tiles_mut() {
+            tile.purge_stale_resize_snapshot(stale);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
     }

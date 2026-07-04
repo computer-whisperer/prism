@@ -462,6 +462,13 @@ impl<W: LayoutElement> Workspace<W> {
         self.floating.snapshot_keepalives(out);
     }
 
+    /// Drop snapshot ghosts stranded on a replaced (lost) VkDevice — see
+    /// `ScrollingSpace::purge_stale_snapshots`.
+    pub fn purge_stale_snapshots(&mut self, stale: &dyn Fn(&SnapshotTexture) -> bool) {
+        self.scrolling.purge_stale_snapshots(stale);
+        self.floating.purge_stale_snapshots(stale);
+    }
+
     pub fn tiles_mut(&mut self) -> impl Iterator<Item = &mut Tile<W>> + '_ {
         let scrolling = self.scrolling.tiles_mut();
         let floating = self.floating.tiles_mut();

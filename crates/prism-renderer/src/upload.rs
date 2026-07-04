@@ -105,6 +105,12 @@ impl ShmTexture {
     pub fn view(&self) -> vk::ImageView {
         self.image.view
     }
+    /// The device this texture lives on. Compared by `Arc` identity to
+    /// detect textures stranded on a replaced (lost) device — see
+    /// docs/device-loss-recovery.md.
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
     /// The `Arc`'d sampled image, for a lowered frame's keepalive set.
     pub fn image(&self) -> &Arc<ShmImage> {
         &self.image

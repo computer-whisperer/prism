@@ -101,6 +101,13 @@ impl SnapshotTexture {
         self.view
     }
 
+    /// The device this snapshot lives on. Compared by `Arc` identity to
+    /// purge ghosts stranded on a replaced (lost) device — see
+    /// docs/device-loss-recovery.md.
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
     pub fn extent(&self) -> vk::Extent2D {
         self.extent
     }

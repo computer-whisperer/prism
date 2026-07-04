@@ -2973,16 +2973,26 @@ fn lower_output_frame(
         closing || resizing
     };
 
+    // Shared ref for the walk's staleness purge below; closures capture it
+    // by value (it's a & ref), field-disjoint from the walk's
+    // `&mut state.layout` uses.
+    let gpus_registry = &state.gpus;
     let texture_lookup =
         |states: &smithay::wayland::compositor::SurfaceData| -> Option<vk::ImageView> {
             states
                 .data_map
                 .get::<prism_protocols::SurfaceTexSlot>()
                 .and_then(|s| {
-                    s.0.lock()
-                        .unwrap()
-                        .as_ref()
-                        .and_then(|t| t.view_for(output_gpu_id))
+                    let mut guard = s.0.lock().unwrap();
+                    let t = guard.as_mut()?;
+                    // Purge entries stranded on a replaced (lost) device
+                    // BEFORE handing out a view — the walk is the first
+                    // reader after recovery, and a stale entry's view
+                    // belongs to a destroyed VkDevice. Purged-to-absent
+                    // surfaces get demand-materialized after the walk
+                    // (report_missing_texture), on the new device.
+                    t.purge_stale(gpus_registry);
+                    t.view_for(output_gpu_id)
                 })
         };
     // Chroma plane + YUV kind for video surfaces, on this output's GPU.

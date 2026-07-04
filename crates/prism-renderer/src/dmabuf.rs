@@ -108,6 +108,13 @@ impl ImportedImage {
         self.yuv_kind
     }
 
+    /// The device this import lives on. Compared by `Arc` identity to
+    /// detect imports stranded on a replaced (lost) device — see
+    /// docs/device-loss-recovery.md.
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
     /// Import a single-plane dmabuf (RGB) as a `VkImage`.
     ///
     /// `vk_format` must match the dmabuf's `DrmFourcc` byte layout. E.g.

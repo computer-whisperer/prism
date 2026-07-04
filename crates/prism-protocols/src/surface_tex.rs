@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use prism_renderer::{
-    vk, AlphaMode, DrmDevId, ExportableImage, ImportedImage, LocalImage, LocalMirrorCopy,
+    vk, AlphaMode, Device, DrmDevId, ExportableImage, ImportedImage, LocalImage, LocalMirrorCopy,
     ShmTexture, YuvKind,
 };
 use smithay::backend::renderer::utils::CommitCounter;
@@ -238,6 +238,31 @@ impl GpuTex {
         }
     }
 
+    /// Whether every VkDevice this entry's resources live on is still the
+    /// registered device for its GPU (`Arc` identity against `gpus`).
+    /// False after device-loss recovery replaced a device: the entry is
+    /// stale — its images belong to a dead VkDevice — and must be purged,
+    /// never handed to a renderer (docs/device-loss-recovery.md). Derived
+    /// from the resources themselves, so no insert-time bookkeeping can
+    /// forget it. `key` is the consuming GPU this entry is stored under.
+    fn devices_current(&self, key: DrmDevId, gpus: &HashMap<DrmDevId, Arc<Device>>) -> bool {
+        let current =
+            |id: DrmDevId, dev: &Arc<Device>| gpus.get(&id).is_some_and(|d| Arc::ptr_eq(d, dev));
+        match self {
+            Self::Native(img) => current(key, img.device()),
+            // `target`/`target_local`/`scratch`/chroma pair up on the same
+            // two devices as `target` (consumer) and `home_src` (home) —
+            // checking one resource per device covers the entry.
+            Self::Mirror {
+                home,
+                home_src,
+                target,
+                ..
+            } => current(key, target.device()) && current(*home, home_src.device()),
+            Self::Shm(t) => current(key, t.device()),
+        }
+    }
+
     /// Chroma plane view + YUV kind code (matching `DecodePush::yuv`:
     /// 1 = NV12, 2 = P010) for a YUV surface. `(None, 0)` for RGB native
     /// imports, RGB mirrors, and shm. Both the zero-copy native path and
@@ -300,6 +325,17 @@ impl SurfaceTexture {
     /// no materialization yet (not a consumer, or import/upload pending).
     pub fn view_for(&self, gpu: DrmDevId) -> Option<vk::ImageView> {
         self.by_gpu.get(&gpu).map(|t| t.view())
+    }
+
+    /// Drop materializations stranded on a replaced VkDevice (`Arc`
+    /// identity vs the current `gpus` registry) — after device-loss
+    /// recovery their images belong to a destroyed device and must never
+    /// reach a renderer. Called at every read/mutate choke point (render
+    /// walk lookup, commit-time ensure, render-demand materialize); a
+    /// purged entry reads as absent, so the normal lazy-materialization
+    /// paths rebuild it on the new device. No-op in the steady state.
+    pub fn purge_stale(&mut self, gpus: &HashMap<DrmDevId, Arc<Device>>) {
+        self.by_gpu.retain(|&g, t| t.devices_current(g, gpus));
     }
 
     /// Push this surface's keepalive refs on `gpu` into `out` — see
