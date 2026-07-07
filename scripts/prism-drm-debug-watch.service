@@ -1,0 +1,17 @@
+# Root-side diagnostic companion to prism's GPU-loss recovery
+# (docs/device-loss-recovery.md). Install:
+#   sudo cp scripts/prism-drm-debug-watch.sh /usr/local/bin/
+#   sudo chmod +x /usr/local/bin/prism-drm-debug-watch.sh
+#   sudo cp scripts/prism-drm-debug-watch.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now prism-drm-debug-watch.service
+[Unit]
+Description=Crank drm.debug briefly when prism quarantines a GPU
+
+[Service]
+ExecStart=/usr/local/bin/prism-drm-debug-watch.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

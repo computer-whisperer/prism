@@ -202,6 +202,40 @@ playing, one animation mid-flight, screencopy loop (`wf-recorder`) running:
 6. The real thing: overnight DPMS-off idle → morning wake recovers
    automatically (the original bug).
 
+## 5b. Runtime findings (2026-07-05 / 07-07) + diagnostics
+
+Two real episodes: recovery detected/quarantined correctly, but **every
+fresh VkDevice it created was rejected identically** (18 attempts / 8 min
+on 07-07) at its first trivial submit, kernel silent — while a fresh
+*process* succeeded within seconds. The poison is process-scoped; leading
+hypothesis: kernel state anchored by the original dead device's fd, which
+stale per-surface materializations kept open the whole window (the lazy
+purge never visits quiet surfaces on parked outputs).
+
+Diagnostics/experiments landed in response:
+
+- **Quiet quarantined-home skip** — the mirror-home fallback warned ~68/s
+  during the outage; now a silent transient skip (`ensure_home_import` →
+  `Ok(None)`).
+- **`prism gpu-probe <major>:<minor>`** — forked (detached, journald
+  stderr) on recovery-failure attempts 1 and 5: a fresh process runs the
+  exact rejected submit. Child-OK + parent-failing ⇒ process-anchored;
+  child-failing ⇒ device-global.
+- **Submit-free `Renderer::new`** — white-texel + identity-LUT uploads
+  deferred to first use, so replacement renderers can be constructed
+  before the old fd closes.
+- **Ordered teardown (the fd-anchor experiment)** — `recover_one` now:
+  (1) drops every old-device holder, including an exhaustive per-surface
+  purge via the new `tex_surfaces` registry; (2) closes the old fd,
+  logging `Arc::strong_count` as the readout (1 = really closed); (3)
+  only then submits on the replacement (per-output LUT upload; failure
+  fails the attempt). If the fd-anchor hypothesis is right, this ordering
+  IS the fix.
+- **`scripts/prism-drm-debug-watch.{sh,service}`** — root-side journal
+  watcher that sets `drm.debug=0xf` for 60s when the quarantine line
+  appears (retry at +2s lands inside the window), capturing the kernel's
+  actual EINVAL reason. Install instructions in the unit file.
+
 ## 6. Residual known risks (adversarial review, 2026-07-04 — accepted)
 
 - **Old-device Arc retention**: surfaces that neither commit nor render
