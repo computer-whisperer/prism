@@ -5208,8 +5208,11 @@ fn materialize_dmabuf_for_gpu(
 
     // Cross-GPU mirror. Find/establish a home GPU that can read the buffer.
     // home_src is a copy *source* only → imported untransitioned (the async
-    // copy moves it to TRANSFER_SRC itself).
-    let (home_id, home_src) = ensure_home_import(state, tex, format, &dmabuf)?;
+    // copy moves it to TRANSFER_SRC itself). `None` = the capable home is
+    // quarantined; skip quietly, retried next commit/frame.
+    let Some((home_id, home_src)) = ensure_home_import(state, tex, format, &dmabuf)? else {
+        return Ok(());
+    };
     let device_home = state.gpus.get(&home_id).context("home gpu gone")?.clone();
     let extent = vk::Extent2D {
         width: dmabuf.width,
@@ -5339,24 +5342,39 @@ fn materialize_dmabuf_for_gpu(
 /// (e.g. a spanning window with both a native and a mirrored consumer);
 /// otherwise imports on the first capable GPU. Does NOT insert into
 /// `tex.by_gpu` — the import is owned by the mirror's `home_src`.
+///
+/// `Ok(None)` = the only capable home GPU(s) are quarantined (device-loss
+/// recovery in progress): a transient condition, not an error. The caller
+/// skips quietly — the commit/demand paths retry every commit/frame, so a
+/// per-occurrence warn spammed ~68 lines/s during the 07-07 outage.
 fn ensure_home_import(
     state: &PrismState,
     tex: &SurfaceTexture,
     format: vk::Format,
     dmabuf: &Arc<prism_frame::Dmabuf>,
-) -> Result<(DrmDevId, Arc<prism_renderer::ImportedImage>)> {
+) -> Result<Option<(DrmDevId, Arc<prism_renderer::ImportedImage>)>> {
     if let Some((&gid, img)) = tex.by_gpu.iter().find_map(|(id, gt)| match gt {
         GpuTex::Native(img) if !state.gpu_is_lost(*id) => Some((id, img.clone())),
         _ => None,
     }) {
-        return Ok((gid, img));
+        return Ok(Some((gid, img)));
     }
     let modifier = u64::from(dmabuf.modifier);
-    let (&home_id, device) = state
+    let Some((&home_id, device)) = state
         .gpus
         .iter()
         .find(|(id, d)| !state.gpu_is_lost(**id) && gpu_supports_dmabuf(d, format, modifier))
-        .context("no GPU can import this dmabuf to serve as a mirror home")?;
+    else {
+        // Distinguish "capable home exists but is quarantined" (quiet,
+        // transient) from "no GPU can ever host this buffer" (real error).
+        let quarantined_home = state.lost_gpus.borrow().iter().any(
+            |id| matches!(state.gpus.get(id), Some(d) if gpu_supports_dmabuf(d, format, modifier)),
+        );
+        if quarantined_home {
+            return Ok(None);
+        }
+        anyhow::bail!("no GPU can import this dmabuf to serve as a mirror home");
+    };
     let img = Arc::new(
         import_dmabuf(device, dmabuf, false)
             .context("home import for mirror")
@@ -5364,7 +5382,7 @@ fn ensure_home_import(
                 state.note_gpu_error(home_id, e);
             })?,
     );
-    Ok((home_id, img))
+    Ok(Some((home_id, img)))
 }
 
 /// Per-commit refresh of a dmabuf surface's existing cross-GPU mirrors:
