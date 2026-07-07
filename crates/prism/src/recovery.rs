@@ -4,25 +4,24 @@
 //! ([`PrismState::note_gpu_lost`] and the `gpu_is_lost` gates on every
 //! render/materialize/mirror/upload path). This module is the main-loop
 //! side: once per dispatch iteration, if a quarantine was flagged, replace
-//! the lost GPU's `Device` with a fresh one (fresh render-node fd + amdgpu
-//! context — RADV's lost flag is per-VkDevice and sticky) and rebuild
-//! everything that hung off it:
+//! the lost GPU's `Device` with a fresh one and rebuild everything that
+//! hung off it.
 //!
-//! - the `gpus` registry entry — replaced FIRST, so the R2 Arc-identity
-//!   staleness purge flips for every cached per-surface materialization at
-//!   once (they lazily rebuild on the new device at their next read);
-//! - the GPU's `MirrorCopier`;
-//! - each of its outputs' render state (`OutputContext::
-//!   rebuild_render_state`: new `Renderer`, scanout BOs re-imported — the
-//!   BOs/DRM FBs are kernel-side and survive, so panels keep their last
-//!   frame throughout — LUT re-synthesized from retained state);
-//! - layout snapshot ghosts and the dmabuf native-import memos.
+//! The 07-05/07-07 outages showed a fresh device (fresh render-node fd +
+//! amdgpu context) in THIS process being kernel-rejected exactly like the
+//! poisoned one, 18 attempts straight, while a fresh process succeeded
+//! seconds later — so recovery now assumes the poison may be ANCHORED to
+//! the old device's open fd and drops every holder of it (exhaustive
+//! surface sweep, ghosts, memos, copier, per-output render state) BEFORE
+//! the replacement device submits anything (`recover_one` phase ordering;
+//! `Renderer::new` is submit-free for this reason). Whether the old fd
+//! actually closed is logged as the experiment readout, and a `gpu-probe`
+//! child process is forked on failures to discriminate process-anchored
+//! vs device-global rejection.
 //!
 //! Failure (e.g. the GPU is genuinely wedged, like a Vega SMU hang) leaves
 //! the GPU quarantined and retries on an exponential-backoff timer; other
-//! GPUs are unaffected. The old `Device` fades via `Arc`: stale
-//! materializations drop it as they purge, and `Device::drop` drains the
-//! deferred-destroy queue unconditionally.
+//! GPUs are unaffected.
 
 use std::sync::Arc;
 
@@ -113,36 +112,121 @@ pub fn recover_lost_gpus(state: &mut PrismState) {
     }
 }
 
+/// Replace `gpu`'s VkDevice. Ordering is the whole point (07-05/07-07
+/// evidence: fresh devices in this process were rejected while the
+/// original dead device's fd was still open — the leading hypothesis is
+/// kernel state anchored by that fd):
+///
+///   1. drop every holder of the OLD device — registry entry, copier, all
+///      per-surface materializations (exhaustive sweep), snapshot ghosts,
+///      import memos, queued captures, and each output's renderer +
+///      scanout imports (swapped for submit-free replacements);
+///   2. CLOSE the old fd (`drop(old)`) and log whether it actually closed
+///      (`Arc::strong_count == 1`) — the experiment readout;
+///   3. only then perform the first submits on the replacement device
+///      (LUT re-synthesis here; the deferred renderer init at the first
+///      redraw).
+///
+/// On failure the newest device is left in the registry (invariants hold;
+/// every path is still gated by the quarantine) and the next attempt
+/// re-runs the full sequence — `rebuild_render_state` is idempotent.
 fn recover_one(state: &mut PrismState, gpu: DrmDevId) -> Result<()> {
+    // ── Phase 1: tear down every holder of the old device ──────────────
     let old = state
         .gpus
-        .get(&gpu)
-        .cloned()
+        .remove(&gpu)
         .context("lost GPU not in registry")?;
+    let instance = old.instance.clone();
     tracing::info!(
         ?gpu,
         old_device_refs = Arc::strong_count(&old),
-        "GPU recovery: recreating VkDevice"
+        "GPU recovery: tearing down old device"
     );
-    let device = prism_renderer::Device::new(old.instance.clone(), Some(gpu))
-        .context("recreate VkDevice")?;
+    // The old copier waits its fence on drop — on a lost device the wait
+    // returns (error, ignored) rather than blocking.
+    drop(state.mirror_copiers.remove(&gpu));
+    // Exhaustive: with the registry entry removed, the Arc-identity check
+    // fails for every entry touching this GPU (incl. mirrors homed on it),
+    // across ALL registered surfaces — not just ones the walk would visit.
+    state.purge_all_surface_textures();
+    // Snapshot ghosts captured on the old device: close animations end,
+    // resize crossfades cancel (recapture would copy unrelated pixels).
+    {
+        let gpus = &state.gpus;
+        state
+            .layout
+            .purge_stale_snapshots(&|s| !gpus.values().any(|d| Arc::ptr_eq(d, s.device())));
+    }
+    state.drop_native_import_memos(gpu);
+    // Queued captures hold imports on the old device; fail them now.
+    let out_ids: Vec<String> = state
+        .outputs
+        .iter()
+        .filter(|(_, c)| c.gpu_id == gpu)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &out_ids {
+        state.fail_pending_screencopy(id);
+    }
+
+    // ── Phase 2: replacement device + submit-free rebuilds ─────────────
+    // Restore-registry-on-failure keeps invariants (e.g. the
+    // quarantined-home check in ensure_home_import consults the map).
+    let restore = |state: &mut PrismState, dev: Arc<prism_renderer::Device>| {
+        state.gpus.insert(gpu, dev);
+    };
+    let device = match prism_renderer::Device::new(instance, Some(gpu)) {
+        Ok(d) => d,
+        Err(e) => {
+            restore(state, old);
+            return Err(e).context("recreate VkDevice");
+        }
+    };
     // Device::new falls back to any discrete GPU when the preferred DRM
     // node doesn't match (bringup semantics). For recovery that would
     // silently rebuild this GPU's outputs on a *different* card — reject.
     if device.physical.drm_primary != Some(gpu) {
+        let landed = device.physical.drm_primary;
+        restore(state, old);
         anyhow::bail!(
-            "replacement device landed on {:?}, not the lost GPU {:?} (unplugged?)",
-            device.physical.drm_primary,
-            gpu
+            "replacement device landed on {landed:?}, not the lost GPU {gpu:?} (unplugged?)"
         );
     }
+    // Rebuild every output (constructor is submit-free; the swap drops the
+    // old renderer + scanout imports).
+    let mut rebuild_err: Option<anyhow::Error> = None;
+    for (id, ctx) in state.outputs.iter_mut() {
+        if ctx.gpu_id == gpu {
+            if let Err(e) = ctx.rebuild_render_state(device.clone()) {
+                rebuild_err = Some(e.context(format!("rebuild output {id}")));
+                break;
+            }
+        }
+    }
+    if let Some(e) = rebuild_err {
+        restore(state, device);
+        return Err(e);
+    }
 
-    // Registry swap FIRST: from here every stale materialization fails the
-    // R2 Arc-identity check and lazily rebuilds on the new device.
+    // ── Phase 3: close the old fd, then first submits ──────────────────
+    let old_refs = Arc::strong_count(&old);
+    drop(old);
+    if old_refs == 1 {
+        tracing::info!(
+            ?gpu,
+            "old device fully released — fd closed before any submit on the replacement"
+        );
+    } else {
+        // Not fatal (the remaining holders fade), but the fd stays open —
+        // if recovery still fails, this line says the experiment didn't
+        // actually test the fd-anchor hypothesis this round.
+        tracing::warn!(
+            ?gpu,
+            refs = old_refs - 1,
+            "old device still referenced; its fd stays open (in-flight capture? leak?)"
+        );
+    }
     state.gpus.insert(gpu, device.clone());
-
-    // The old copier waits its fence on drop — on a lost device the wait
-    // returns (error, ignored) rather than blocking.
     match prism_renderer::MirrorCopier::new(device.clone()) {
         Ok(c) => {
             state.mirror_copiers.insert(gpu, c);
@@ -150,28 +234,18 @@ fn recover_one(state: &mut PrismState, gpu: DrmDevId) -> Result<()> {
         Err(e) => {
             // Without a copier this GPU can't be a mirror home/target, but
             // native rendering still works — degrade like bringup does.
-            state.mirror_copiers.remove(&gpu);
             tracing::warn!(?gpu, "mirror copier rebuild failed: {e:#}");
         }
     }
-
+    // First submits on the replacement device: the per-output LUT upload.
+    // A rejection here means the new device is now lost too — fail the
+    // attempt so the retry runs the full cycle again.
     for (id, ctx) in state.outputs.iter_mut() {
         if ctx.gpu_id == gpu {
-            ctx.rebuild_render_state(device.clone())
-                .with_context(|| format!("rebuild output {id}"))?;
+            ctx.resynthesize_color_lut()
+                .with_context(|| format!("post-rebuild LUT upload on {id}"))?;
         }
     }
-
-    // Snapshot ghosts captured on the old device: close animations end,
-    // resize crossfades cancel (recapture would copy unrelated pixels).
-    let gpus = &state.gpus;
-    state
-        .layout
-        .purge_stale_snapshots(&|s| !gpus.values().any(|d| Arc::ptr_eq(d, s.device())));
-
-    // Memo hygiene: the hit-site identity check already rejects these,
-    // this just frees them now instead of at buffer destruction.
-    state.drop_native_import_memos(gpu);
     Ok(())
 }
 

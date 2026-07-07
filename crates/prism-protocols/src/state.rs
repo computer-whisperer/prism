@@ -489,6 +489,14 @@ pub struct PrismState {
     /// powers exactly these back on when their GPU comes back — user DPMS
     /// state is never touched. Keyed like `outputs`.
     pub lock_blanked_outputs: HashSet<OutputId>,
+    /// Every surface that has (or had) a `SurfaceTexSlot` texture, so
+    /// GPU-loss recovery can purge stale per-GPU materializations
+    /// EXHAUSTIVELY (the read-time lazy purge alone leaves quiet surfaces
+    /// pinning the dead device's fd — observed 07-07 keeping the poisoned
+    /// fd open through 18 failed recovery attempts). Registered in
+    /// `process_surface_buffer`; dead surfaces pruned during the sweep
+    /// ([`PrismState::purge_all_surface_textures`]).
+    pub tex_surfaces: HashMap<ObjectId, WlSurface>,
 
     // ── DRM stack — declaration order = drop order = outer to inner ────────
     /// Active outputs across all cards. Each `OutputContext` Drop calls
@@ -991,6 +999,7 @@ impl PrismState {
             gpu_recovery_pending: std::cell::Cell::new(false),
             gpu_recovery_attempts: HashMap::new(),
             lock_blanked_outputs: HashSet::new(),
+            tex_surfaces: HashMap::new(),
             keyboard_focus: KeyboardFocus::default(),
             on_demand_layer_focus: None,
             idle_notifier: None,
@@ -1128,6 +1137,31 @@ impl PrismState {
         for entry in self.dmabuf_sources.values() {
             entry.native_imports.lock().unwrap().remove(&gpu);
         }
+    }
+
+    /// Run the R2 staleness purge over EVERY registered textured surface
+    /// (not just those the render walk / commit path happen to touch).
+    /// GPU-loss recovery calls this after removing the lost device from
+    /// `gpus`, so all of the dead device's per-surface resources drop NOW
+    /// — quiet surfaces (idle windows on inactive workspaces) would
+    /// otherwise pin the dead device's fd indefinitely, which is the prime
+    /// suspect for the 07-07 all-new-devices-rejected failure mode. Prunes
+    /// dead surfaces from the registry as it goes.
+    pub fn purge_all_surface_textures(&mut self) {
+        let gpus = &self.gpus;
+        self.tex_surfaces.retain(|_, surface| {
+            if !surface.alive() {
+                return false;
+            }
+            with_states(surface, |states| {
+                if let Some(slot) = states.data_map.get::<SurfaceTexSlot>() {
+                    if let Some(tex) = slot.0.lock().unwrap().as_mut() {
+                        tex.purge_stale(gpus);
+                    }
+                }
+            });
+            true
+        });
     }
 
     /// Quarantine `gpu` if `err`'s chain bottoms out in
@@ -3994,6 +4028,13 @@ fn process_surface_buffer(state: &mut PrismState, surface: &WlSurface) {
     if state.gpus.is_empty() {
         return;
     }
+
+    // Register for the recovery sweep (see `tex_surfaces` field docs).
+    // Unconditional and idempotent; dead entries pruned during sweeps.
+    state
+        .tex_surfaces
+        .entry(surface.id())
+        .or_insert_with(|| surface.clone());
 
     // Set (or refresh) the surface's GPU-agnostic texture SOURCE under the
     // SurfaceData lock. No GPU work happens here — the per-GPU

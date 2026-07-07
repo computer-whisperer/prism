@@ -861,8 +861,7 @@ impl OutputContext {
             .with_context(|| format!("re-import scanout BO {i} on replacement device"))?;
             images.push(image);
         }
-        // Commit point — nothing below fails except the LUT upload, which
-        // degrades to identity like at bringup.
+        // Commit point — nothing below fails.
         self.renderer = renderer;
         for (buf, image) in self.buffers.iter_mut().zip(images) {
             buf.image = image;
@@ -870,16 +869,16 @@ impl OutputContext {
         self.damage_tracker = DamageTracker::new();
         self.damage_carry = [DamageCarry::Full, DamageCarry::Full];
         self.mark_for_resume();
-        if let Err(e) = self.resynthesize_color_lut() {
-            tracing::warn!(
-                connector = %self.connector_name,
-                "LUT re-synthesis after device rebuild failed: {e:#} (identity LUT)"
-            );
-        }
+        // Deliberately NO LUT re-synthesis here: `Renderer::new` is
+        // submit-free and this must stay that way end to end — the
+        // recovery orchestrator closes the old device's fd only after
+        // every output has swapped, and submits (LUT upload included)
+        // must come after that close (docs/device-loss-recovery.md). The
+        // orchestrator calls `resynthesize_color_lut` itself afterwards.
         tracing::info!(
             connector = %self.connector_name,
             gpu = ?self.gpu_id,
-            "output render state rebuilt on replacement device"
+            "output render state rebuilt on replacement device (submits deferred)"
         );
         Ok(())
     }
