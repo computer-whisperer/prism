@@ -92,6 +92,21 @@ pub fn recover_lost_gpus(state: &mut PrismState) {
                     attempt,
                     "GPU recovery failed: {e:#}; retry in {delay:?}"
                 );
+                // Diagnostic fork (observed 07-05/07-07: fresh devices in
+                // THIS process are rejected while a fresh process succeeds
+                // seconds later): a child process runs the same
+                // device-create + first-submit and logs its verdict to the
+                // journal next to ours. Child-OK + parent-failing proves
+                // the poison is anchored to this process / its open fds;
+                // child-failing means device-global. Attempts 1 and 5 (one
+                // early sample, one after ~30s persistence).
+                if attempt == 1 || attempt == 5 {
+                    prism_input::actions::spawn(vec![
+                        "prism".to_owned(),
+                        "gpu-probe".to_owned(),
+                        format!("{}:{}", gpu.major, gpu.minor),
+                    ]);
+                }
                 schedule_retry(state, delay);
             }
         }
@@ -157,6 +172,52 @@ fn recover_one(state: &mut PrismState, gpu: DrmDevId) -> Result<()> {
     // Memo hygiene: the hit-site identity check already rejects these,
     // this just frees them now instead of at buffer destruction.
     state.drop_native_import_memos(gpu);
+    Ok(())
+}
+
+/// `prism gpu-probe <major>:<minor>`: the child half of the recovery
+/// diagnostic fork. Creates a fresh VkInstance + Device on the given GPU
+/// (by DRM primary-node id) and performs the exact submit that keeps
+/// getting kernel-rejected in the parent — a 1×1 white shm-texture upload,
+/// byte-for-byte the first submit of `Renderer::new` — then reports
+/// loudly. stderr inherits the compositor's journald stream, so the
+/// verdict lands next to the recovery-failure lines it diagnoses.
+pub fn run_gpu_probe(arg: Option<&str>) -> Result<()> {
+    let arg = arg.context("usage: prism gpu-probe <major>:<minor>")?;
+    let (major, minor) = arg
+        .split_once(':')
+        .context("gpu-probe: expected <major>:<minor>")?;
+    let gpu = DrmDevId {
+        major: major.parse().context("gpu-probe: bad major")?,
+        minor: minor.parse().context("gpu-probe: bad minor")?,
+    };
+    tracing::info!(?gpu, pid = std::process::id(), "gpu-probe: starting");
+    let instance = prism_renderer::Instance::new().context("gpu-probe: Instance::new")?;
+    let device =
+        prism_renderer::Device::new(instance, Some(gpu)).context("gpu-probe: Device::new")?;
+    if device.physical.drm_primary != Some(gpu) {
+        anyhow::bail!(
+            "gpu-probe: selection landed on {:?}, not {:?}",
+            device.physical.drm_primary,
+            gpu
+        );
+    }
+    let mut tex = prism_renderer::ShmTexture::new(
+        device.clone(),
+        prism_renderer::vk::Extent2D {
+            width: 1,
+            height: 1,
+        },
+        prism_renderer::vk::Format::R8G8B8A8_UNORM,
+    )
+    .context("gpu-probe: ShmTexture::new")?;
+    tex.upload_bytes(&[255, 255, 255, 255], 4, &[])
+        .context("gpu-probe: upload submit REJECTED")?;
+    tracing::info!(
+        ?gpu,
+        pid = std::process::id(),
+        "gpu-probe: SUBMIT OK — fresh process can use this GPU"
+    );
     Ok(())
 }
 

@@ -55,8 +55,11 @@ fn main() -> Result<()> {
         Some("gradient") => run_gradient_scanout(output_name, parse_depth(depth_arg)?),
         Some("wayland") => run_wayland_server(),
         Some("run") => run_integrated(output_name, parse_depth(depth_arg)?, session),
+        // Recovery diagnostic fork (docs/device-loss-recovery.md): fresh
+        // process, fresh device, same first-submit as Renderer::new.
+        Some("gpu-probe") => recovery::run_gpu_probe(output_name),
         Some(other) => Err(anyhow!(
-            "unknown subcommand {other:?}; expected: (no args) | scanout [output] | gradient [output] [8|10] | wayland | run [output] [8|10] [--session]"
+            "unknown subcommand {other:?}; expected: (no args) | scanout [output] | gradient [output] [8|10] | wayland | run [output] [8|10] [--session] | gpu-probe <major>:<minor>"
         )),
     };
     if let Err(e) = &result {
