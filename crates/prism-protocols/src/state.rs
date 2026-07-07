@@ -4686,6 +4686,13 @@ fn consumer_gpus_for_surface(state: &PrismState, surface: &WlSurface) -> Vec<Drm
     state
         .outputs
         .get(&name)
+        // A powered-off (DPMS) output renders nothing and emits no frame
+        // callbacks; per-commit texture work for its surfaces would be
+        // pure waste — timer-driven clients keep committing while screens
+        // sleep (observed: ~30Hz for 8h). power_on queues redraws and the
+        // render-demand safety net materializes anything missing, so
+        // content repopulates on wake.
+        .filter(|o| !o.is_powered_off())
         .map(|o| o.gpu_id)
         // Quarantined GPUs take no new materializations/uploads; their
         // entries are rebuilt lazily after recovery.
@@ -4753,6 +4760,17 @@ fn ensure_surface_textures(state: &PrismState, surface: &WlSurface) {
                 tex.acquire_waited.clear();
             }
             TexSource::Shm { .. } => {
+                // No consumers right now (unplaced, or the output is
+                // powered off / its GPU quarantined): skip the upload AND
+                // leave `shm_upload_commit` untouched — advancing it
+                // without uploading would erase this commit's damage from
+                // the next real upload's `damage_since`, showing stale
+                // regions on wake. Left alone, the next upload covers the
+                // gap (damage_since falls back to the whole buffer once
+                // the tracker's history is exceeded).
+                if consumer_gpus.is_empty() {
+                    return;
+                }
                 // Upload only the regions the client damaged this commit
                 // (buffer coords map 1:1 onto the per-GPU image). damage_since
                 // returns the whole buffer when the commit is unknown/too old,
