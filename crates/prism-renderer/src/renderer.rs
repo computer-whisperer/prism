@@ -285,6 +285,20 @@ pub struct Renderer {
     /// Loader for VK_KHR_external_semaphore_fd — exports the per-slot
     /// `present_semaphore` as a Linux sync_file fd for KMS.
     semaphore_fd_loader: external_semaphore_fd::Device,
+    /// First-use uploads deferred out of `Renderer::new` (white texel +
+    /// identity LUT) so construction performs NO queue submits —
+    /// device-loss recovery constructs replacement renderers while the
+    /// poisoned old device's fd is still open and must not submit until
+    /// it closes (docs/device-loss-recovery.md). Flushed at the top of
+    /// `render_frame` / `encode_diagnose`; a real [`Self::upload_lut3d`]
+    /// supersedes the pending identity entries.
+    pending_init: PendingInit,
+}
+
+/// See [`Renderer::pending_init`].
+struct PendingInit {
+    white: bool,
+    lut_identity: Option<Vec<[f32; 3]>>,
 }
 
 impl Renderer {
@@ -372,8 +386,12 @@ impl Renderer {
         let semaphore_fd_loader =
             external_semaphore_fd::Device::new(device.instance_raw(), &device.raw);
 
-        // Solid-color element scratch — one 1×1 white texel, uploaded once.
-        let mut white_tex = ShmTexture::new(
+        // Solid-color element scratch — one 1×1 white texel. The upload is
+        // DEFERRED (see `PendingInit`): `Renderer::new` must perform no
+        // queue submits so device-loss recovery can construct replacement
+        // renderers before the poisoned old device's fd closes
+        // (docs/device-loss-recovery.md).
+        let white_tex = ShmTexture::new(
             device.clone(),
             vk::Extent2D {
                 width: 1,
@@ -381,8 +399,6 @@ impl Renderer {
             },
             vk::Format::R8G8B8A8_UNORM,
         )?;
-        // 1×1, uploaded once: pass &[] (new texture → full upload).
-        white_tex.upload_bytes(&[255, 255, 255, 255], 4, &[])?;
 
         // Per-output 3D LUT — only allocate when the configured encode
         // chain actually samples it. Default content at construction
@@ -393,8 +409,11 @@ impl Renderer {
         // output renders like a standard sRGB panel. Calibration data
         // (or a per-output reference-white re-synthesis) arrives later
         // via upload_lut3d.
-        let lut3d = if encode.uses_lut3d {
-            let mut tex = Lut3dTexture::new(device.clone(), DEFAULT_LUT_CUBE_EDGE)?;
+        // Upload deferred like white_tex above; a real `upload_lut3d`
+        // before the first frame (bringup calibration, recovery LUT
+        // re-synthesis) supersedes the identity entries entirely.
+        let (lut3d, pending_identity) = if encode.uses_lut3d {
+            let tex = Lut3dTexture::new(device.clone(), DEFAULT_LUT_CUBE_EDGE)?;
             let entries = match encode_config.lut_output_domain() {
                 crate::encode_synth::LutOutputDomain::Nits => identity_lut(DEFAULT_LUT_CUBE_EDGE),
                 crate::encode_synth::LutOutputDomain::Drive => crate::lut3d::drive_identity_lut(
@@ -402,10 +421,13 @@ impl Renderer {
                     crate::lut3d::DEFAULT_DRIVE_WHITE_NITS,
                 ),
             };
-            tex.upload(&entries)?;
-            Some(tex)
+            (Some(tex), Some(entries))
         } else {
-            None
+            (None, None)
+        };
+        let pending_init = PendingInit {
+            white: true,
+            lut_identity: pending_identity,
         };
 
         Ok(Self {
@@ -429,7 +451,25 @@ impl Renderer {
             profile_log: std::env::var_os("PRISM_PROFILE_LOG").is_some(),
             profile_ring: crate::profile::ProfileRing::new(),
             semaphore_fd_loader,
+            pending_init,
         })
+    }
+
+    /// Perform the uploads deferred out of [`Self::new`] (white texel +
+    /// identity LUT), once. Called at the top of every GPU entry point
+    /// that samples them; no-op after the first flush.
+    fn flush_pending_init(&mut self) -> Result<()> {
+        if self.pending_init.white {
+            // 1×1, uploaded once: pass &[] (new texture → full upload).
+            self.white_tex.upload_bytes(&[255, 255, 255, 255], 4, &[])?;
+            self.pending_init.white = false;
+        }
+        if let Some(entries) = self.pending_init.lut_identity.take() {
+            if let Some(lut) = self.lut3d.as_mut() {
+                lut.upload(&entries)?;
+            }
+        }
+        Ok(())
     }
 
     /// Run the encode pipeline against a 1×1 scratch with `input_nits`
@@ -446,6 +486,9 @@ impl Renderer {
         input_nits: [f64; 3],
         encode_push: &EncodePush,
     ) -> Result<DiagnosedNits> {
+        // The probe samples the LUT — make sure a deferred identity upload
+        // has landed (no-op in the steady state).
+        self.flush_pending_init()?;
         if self.diagnose.is_none() {
             self.diagnose = Some(EncodeDiagnoseProbe::new(
                 self.device.clone(),
@@ -575,6 +618,9 @@ impl Renderer {
     /// must be `cube_edge³` RGB triples in linear nits, X-fastest
     /// (see [`crate::lut3d::Lut3dTexture::upload`]).
     pub fn upload_lut3d(&mut self, entries: &[[f32; 3]]) -> Result<()> {
+        // Real calibration data supersedes a pending deferred identity
+        // upload — drop it so the first frame doesn't overwrite this.
+        self.pending_init.lut_identity = None;
         if let Some(lut) = self.lut3d.as_mut() {
             lut.upload(entries)?;
         }
@@ -731,6 +777,9 @@ impl Renderer {
         // GPU spans and pushes the finished record into the ring. `None` ⇒ off.
         frame_profile: Option<crate::profile::FrameProfile>,
     ) -> Result<RenderedFrame> {
+        // One-time deferred uploads (white texel / identity LUT) before
+        // anything samples them this frame.
+        self.flush_pending_init()?;
         let extent = scanout.extent();
         // `force_full`: the intermediate was just (re)allocated, so its contents
         // are undefined and the whole frame must be painted regardless of damage.
