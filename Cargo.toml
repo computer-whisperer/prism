@@ -62,18 +62,21 @@ tracing = { version = "0.1.44", features = ["max_level_trace", "release_max_leve
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # smithay: the computer-whisperer/smithay fork, branch
-# prism/dnd-no-data-device-cancel = upstream master (85f83ab6) + one carried
-# fix (a drop on a client with no wl_data_device must cancel the drag, not
-# report dnd_drop_performed — frozen Firefox tab tear-off over prism-bg; still
-# unfixed on master). Pointing the git dep straight at the fork instead of a
+# prism/dnd-no-data-device-cancel = upstream master (85f83ab6) + carried
+# fixes, both still unfixed on master: (1) a drop on a client with no
+# wl_data_device must cancel the drag, not report dnd_drop_performed —
+# frozen Firefox tab tear-off over prism-bg; (2) cursor_shape get_pointer
+# must init the device object even when the pointer capability is gone,
+# else wayland-backend aborts the compositor (hit live on VT switch).
+# Pointing the git dep straight at the fork instead of a
 # local `[patch]` path keeps the build reproducible off-machine. Repoint to
-# upstream/crates.io once the fix lands. Tracking master also means prism is
+# upstream/crates.io once the fixes land. Tracking master also means prism is
 # adapted for the Dispatch2/GlobalDispatch2 rework (0d14cd65, one
 # `delegate_dispatch2!`) and `PointerConstraintsHandler::remove_constraint`
 # (df73da71).
 [workspace.dependencies.smithay]
 git = "https://github.com/computer-whisperer/smithay.git"
-rev = "1cf70502"
+rev = "1500f439"
 default-features = false
 features = [
     "backend_drm",
@@ -87,7 +90,7 @@ features = [
 
 [workspace.dependencies.smithay-drm-extras]
 git = "https://github.com/computer-whisperer/smithay.git"
-rev = "1cf70502"
+rev = "1500f439"
 
 [profile.dev]
 opt-level = 1

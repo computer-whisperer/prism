@@ -236,6 +236,56 @@ Diagnostics/experiments landed in response:
   appears (retry at +2s lands inside the window), capturing the kernel's
   actual EINVAL reason. Install instructions in the unit file.
 
+## 5c. Runtime findings (2026-07-08): recovery never gets a fresh drm_file
+
+Episode with all diagnostics armed (wake trigger after only ~80 min off —
+not strictly long-idle). Readouts:
+
+- **gpu-probe child: SUBMIT OK.** Fresh process, fresh render-node fd,
+  same submit — works instantly while the parent's retries fail.
+- **Attempt 1 sweep left 237 of 510 old-device refs alive** ("fd stays
+  open"); attempts 2–4 reported "old device fully released — fd closed".
+  Both readouts are moot given the next point.
+- **drm.debug capture (the decisive one):** prism opened NO new DRM file
+  during any recovery attempt (zero `drm_open_helper` for its pid — the
+  only open is the probe child's). Every CS, original and retries, went
+  to the kernel on **the card1 primary node (`dev=0xe201`, `auth=1`)** —
+  the same `drm_file` prism has held since session start. Each "fresh
+  device" was only a fresh `AMDGPU_CTX` on that same file. GEM_CREATE /
+  GEM_VA / GEM_MMAP on the file all succeed; only `AMDGPU_CS` fails,
+  instantly (~150 µs), with **no driver debug output at 0xf** — a silent
+  -EINVAL validation path, i.e. per-drm_file state (most plausibly the
+  VM bound to the file).
+
+Interpretation: the poison is per-drm_file after all, and the fd-anchor
+experiment never actually replaced the file. `Device::new` reuses the
+existing `VkInstance`; RADV physical devices (fd + winsys +
+`amdgpu_device`) are created at instance enumeration and live as long as
+the instance. libdrm_amdgpu additionally dedups `amdgpu_device`
+process-wide per GPU (keyed by the primary node), so every in-process
+user — RADV and gbm/radeonsi alike — shares one `amdgpu_device` anchored
+to the FIRST fd initialized, evidently a primary-node fd (`auth=1`).
+"Process-scoped poison" was this: the poisoned file is immortal inside
+the process. (libdrm dedup mechanics asserted from memory — verify in
+mesa/libdrm source before building the cure on it; the kernel-side facts
+stand regardless.)
+
+Consequences:
+- **Cure direction:** recovery must drop every holder of the shared
+  `amdgpu_device` — all VkDevices, the VkInstance itself, and likely the
+  gbm device + master fd (re-taken via libseat) — before re-creating
+  anything. Instance teardown takes healthy GPUs down too ⇒ this becomes
+  a full in-process renderer restart. Design as its own increment.
+- **Root-cause instrumentation:** the watcher now ALSO arms an ftrace
+  `function_graph` capture rooted at `amdgpu_cs_ioctl` with
+  `funcgraph-retval`, pid-filtered to prism, streamed to
+  `/var/log/prism-cs-trace-<stamp>.log`. The innermost function returning
+  `0xffffffea` (-22) names the silent kernel path next episode.
+- Same episode, unrelated: the VT switch away crashed prism via a
+  smithay `cursor_shape` get_pointer early-return that skipped
+  `data_init` (wayland-backend aborts). Fixed on the smithay fork branch
+  (`1500f439`), rev bumped here — the VT-switch escape hatch works again.
+
 ## 6. Residual known risks (adversarial review, 2026-07-04 — accepted)
 
 - **Old-device Arc retention**: surfaces that neither commit nor render
