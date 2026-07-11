@@ -624,18 +624,31 @@ physically required serialization).
    the messages would have zero consumers — build them with the desktop
    hotplug feature, on this structure, when that lands.
 
-**C — Phase 1 remainder, on the new structure:** move the GTT→local mirror
-copy from the GFX cb to the ACE `transfer_queue` — now naturally a
-render-thread-side submit before the render (separate cb on the thread's
-transfer pool, `local_done` semaphore into the render's wait list; the
-scratch-overwrite gate re-points to ACE-copy-done per §1.4). Then
-double-buffer `target_local` (skip-copy must not flip the index, §1.8).
-Add a profile span for the copy. *Deliberately re-sequenced after B*: on
-the thread structure the ACE submit needs no cross-thread choreography.
-**Delete the interim path**: the `local_copies` parameter threaded through
-`render_frame`/`present` (added by the GFX-first sub-step e6d9a77) comes
-back out — the copy op list rides `LoweredFrame` into the thread's ACE
-submit instead. Don't leave both mechanisms alive.
+**C — Phase 1 remainder, on the new structure — DONE.** The GTT→local
+mirror copy runs on the ACE `transfer_queue`: `Renderer` owns an
+`AceCopier` (transfer-family cb + reuse fence + `local_done` binary
+semaphore + exportable `ace_done`), and `render_frame` submits the copy
+batch right before the graphics submit (waits = the home→GTT copy-done
+semaphores, moved off the render's wait list; the render waits
+`local_done` + the client acquire fences). The scratch-overwrite gate
+re-points to ACE-copy-done: the exported `ace_done` SYNC_FD rides the
+`SubmitReply` to main, which stores it in the target's `MirrorCopier`
+gate — sound because the ACE copy is now the scratch's ONLY reader, and
+replace semantics hold on the single transfer queue (A3). `target_local`
+is double-buffered (`[Arc<LocalImage>; 2]` + `local_write` on
+`GpuTex::Mirror`): the walk's views and the frame's copy ops agree on the
+index, which advances in `mirror_copies()` after lowering's last view
+read — a future skip-copy must NOT advance it (and must sample the other
+buffer). Deferred-destroy: transfer submits take no serial; coverage is
+transitive through the render's `local_done` wait, and every path that
+severs that chain (graphics-submit failure, export failure) fence-waits
+the copier + recreates the stale semaphores (`abort_unconsumed`). New CPU
+profile span `acecopy` (record+submit); the GPU-side copy duration is
+not yet timestamped (transfer queue is outside the graphics timestamp
+pool). Mechanism nuance vs. the plan: the ACE submit lives inside
+`render_frame` (the `local_copies` param stays as the carrier through
+`present`) rather than as a separate thread-loop step — same thread, same
+ordering, keeps the slot machinery encapsulated.
 
 **Do not start B until A is committed and the compositor has been
 daily-driven on A** — A carries all the refactor risk with none of the

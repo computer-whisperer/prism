@@ -63,9 +63,13 @@ pub struct FrameSubmission {
     pub frame: LoweredFrame,
     pub view_size: Size<f64, Logical>,
     pub encode_push: EncodePush,
-    /// Imported cross-GPU copy-done + dmabuf-acquire semaphores the render
-    /// submit waits on; retired via the deferred-destroy queue post-present.
-    pub render_waits: Vec<vk::Semaphore>,
+    /// Imported client-write-fence semaphores the render submit waits on
+    /// before sampling native dmabufs; retired via the deferred-destroy
+    /// queue post-outcome.
+    pub acquire_waits: Vec<vk::Semaphore>,
+    /// Imported home→GTT copy-done semaphores — waited by the ACE mirror
+    /// copy submit (§2.8 C); retired like `acquire_waits`.
+    pub mirror_waits: Vec<vk::Semaphore>,
     pub local_copies: Vec<prism_renderer::LocalMirrorCopy>,
     pub snapshot_copies: Vec<prism_renderer::SnapshotCopy>,
     pub force_full_decode: bool,
@@ -91,6 +95,12 @@ where
 pub struct SubmitReply {
     pub outcome: Result<PresentOutcome>,
     pub clock: FrameClockSnapshot,
+    /// ACE mirror-copy completion SYNC_FD, when this frame submitted
+    /// GTT→local copies. Main feeds it to the cross-GPU scratch-overwrite
+    /// gate (`note_mirror_render_done`) — the ACE copy is the scratch's
+    /// only reader, so its completion is all the next home→GTT copy needs
+    /// to wait for.
+    pub ace_copy_done: Option<std::os::fd::OwnedFd>,
 }
 
 /// One entry on the outcome channel: which output, and its reply.
@@ -274,11 +284,12 @@ fn render_thread_loop(
                 let mut sub = *sub;
                 let reply = match outputs.get_mut(&id) {
                     Some(ctx) => {
-                        let outcome = ctx.present(
+                        let result = ctx.present(
                             &sub.frame,
                             sub.view_size,
                             &sub.encode_push,
-                            &sub.render_waits,
+                            &sub.acquire_waits,
+                            &sub.mirror_waits,
                             &sub.local_copies,
                             &sub.snapshot_copies,
                             sub.force_full_decode,
@@ -293,7 +304,15 @@ fn render_thread_loop(
                             next_presentation_time: ctx.frame_clock.next_presentation_time(),
                             refresh_interval: ctx.frame_clock.refresh_interval(),
                         };
-                        SubmitReply { outcome, clock }
+                        let (outcome, ace_copy_done) = match result {
+                            Ok((outcome, ace)) => (Ok(outcome), ace),
+                            Err(e) => (Err(e), None),
+                        };
+                        SubmitReply {
+                            outcome,
+                            clock,
+                            ace_copy_done,
+                        }
                     }
                     None => SubmitReply {
                         outcome: Err(anyhow!("no output bound to id {id}")),
@@ -301,6 +320,7 @@ fn render_thread_loop(
                             next_presentation_time: Duration::ZERO,
                             refresh_interval: None,
                         },
+                        ace_copy_done: None,
                     },
                 };
                 // Main gone mid-teardown ⇒ nowhere to report; the state

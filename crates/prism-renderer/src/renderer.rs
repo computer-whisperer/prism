@@ -71,6 +71,11 @@ pub struct RenderedFrame {
     /// buffer-age sub-region). Lets the caller keep its per-BO damage carry
     /// exact: a full encode makes every *other* scanout BO fully stale.
     pub encoded_full: bool,
+    /// ACE mirror-copy completion as a SYNC_FD, when this frame submitted
+    /// GTT→local copies (`None` otherwise). Feeds the cross-GPU
+    /// scratch-overwrite gate: the next home→GTT copy waits it, which is
+    /// all the scratch needs now that the ACE copy is its only reader.
+    pub ace_copy_done: Option<OwnedFd>,
 }
 
 /// Device timestamp parameters for converting query ticks into the
@@ -290,6 +295,9 @@ pub struct Renderer {
     /// Loader for VK_KHR_external_semaphore_fd — exports the per-slot
     /// `present_semaphore` as a Linux sync_file fd for KMS.
     semaphore_fd_loader: external_semaphore_fd::Device,
+    /// Transfer-queue submitter for the cross-GPU mirror GTT→local copies
+    /// (rework increment C) — see [`crate::local_mirror::AceCopier`].
+    ace_copier: crate::local_mirror::AceCopier,
     /// First-use uploads deferred out of `Renderer::new` (white texel +
     /// identity LUT) so construction performs NO queue submits —
     /// device-loss recovery constructs replacement renderers while the
@@ -388,6 +396,7 @@ impl Renderer {
             .try_into()
             .map_err(|_| crate::error::RendererError::MissingFeature("FrameSlot collect"))?;
 
+        let ace_copier = crate::local_mirror::AceCopier::new(device.clone())?;
         let semaphore_fd_loader =
             external_semaphore_fd::Device::new(device.instance_raw(), &device.raw);
 
@@ -458,6 +467,7 @@ impl Renderer {
                 crate::profile::ProfileRing::new(),
             )),
             semaphore_fd_loader,
+            ace_copier,
             pending_init,
         })
     }
@@ -761,21 +771,25 @@ impl Renderer {
         // caller forcing a full repaint). `force_full*` also force full.
         encode_damage: &[Rectangle<i32, Physical>],
         encode_push: &EncodePush,
-        // Binary semaphores the render must wait on before sampling — used
-        // for cross-GPU mirror copies (a home GPU's copy into the shared
-        // scratch must complete before this GPU samples it). Empty for the
-        // common case (native textures, no mirror). Consumed by the wait;
-        // the caller hands them to `Device::retire` after this returns (the
-        // spec forbids destroying a semaphore before the batch waiting on
-        // it completes execution — the deferred-destroy queue holds them
-        // until this submission's slot fence proves that).
-        wait_semaphores: &[vk::Semaphore],
-        // Cross-GPU mirror GTT→local copies to record at the very start of the
-        // command buffer: each blits a LINEAR host-visible (GTT) mirror import
-        // into an OPTIMAL device-local image the decode/deband passes then
-        // sample, replacing two untiled PCIe scans with one streaming copy (see
-        // `docs/async-render-rework.md`). Gated by `wait_semaphores` (the
-        // home→GTT copy-done) at submit. Empty for the common case (no mirror).
+        // Client dmabuf write fences (imported as binary semaphores) the
+        // render must wait on before sampling native imports. Empty for the
+        // common case. Consumed by the wait; the caller hands them to
+        // `Device::retire` after this returns (the spec forbids destroying
+        // a semaphore before the batch waiting on it completes execution —
+        // the deferred-destroy queue holds them until this submission's
+        // slot fence proves that).
+        acquire_waits: &[vk::Semaphore],
+        // Cross-GPU mirror home→GTT copy-done semaphores. Waited by the ACE
+        // copy submit (not the render — the ACE copy is the scratch's only
+        // reader now). Retired by the caller exactly like `acquire_waits`;
+        // the render submit's wait on `local_done` transitively proves the
+        // ACE batch (these waits included) complete before the slot fence.
+        mirror_waits: &[vk::Semaphore],
+        // Cross-GPU mirror GTT→local copies, submitted on the transfer
+        // (ACE) queue so they overlap graphics: each blits a LINEAR
+        // host-visible (GTT) mirror import into the OPTIMAL device-local
+        // back buffer the decode/deband passes sample this frame (see
+        // `docs/async-render-rework.md` §2.8 C). Empty for the common case.
         local_copies: &[crate::local_mirror::LocalMirrorCopy],
         // Window-close snapshots to capture from the intermediate this frame,
         // recorded before the decode pass (which would otherwise repaint over
@@ -913,71 +927,6 @@ impl Renderer {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { self.device.raw.begin_command_buffer(cb, &begin_info) }
             .vk_ctx("begin_command_buffer (renderer)")?;
-
-        // ── Cross-GPU mirror: GTT→local copies ──────────────────────────────
-        // Recorded before everything else so the decode/deband passes sample a
-        // local OPTIMAL image instead of the LINEAR GTT import. The submit's
-        // `wait_semaphores` (home→GTT copy-done) gate the whole buffer, so the
-        // source is fully written before this reads it; the source stays in
-        // GENERAL (set once at import via `transition_to_general`). NOTE: this
-        // runs before the t0 timestamp, so its cost is not yet attributed to a
-        // profile span — only to total frame time (a dedicated span is a TODO).
-        let copy_range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
-        };
-        let copy_layers = vk::ImageSubresourceLayers::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .layer_count(1);
-        for c in local_copies {
-            let to_dst = [vk::ImageMemoryBarrier2::default()
-                .image(c.dst)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-                .src_access_mask(vk::AccessFlags2::empty())
-                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .subresource_range(copy_range)];
-            let region = [vk::ImageCopy::default()
-                .src_subresource(copy_layers)
-                .dst_subresource(copy_layers)
-                .extent(vk::Extent3D {
-                    width: c.extent.width,
-                    height: c.extent.height,
-                    depth: 1,
-                })];
-            let to_sample = [vk::ImageMemoryBarrier2::default()
-                .image(c.dst)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .subresource_range(copy_range)];
-            unsafe {
-                self.device.raw.cmd_pipeline_barrier2(
-                    cb,
-                    &vk::DependencyInfo::default().image_memory_barriers(&to_dst),
-                );
-                self.device.raw.cmd_copy_image(
-                    cb,
-                    c.src,
-                    vk::ImageLayout::GENERAL,
-                    c.dst,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &region,
-                );
-                self.device.raw.cmd_pipeline_barrier2(
-                    cb,
-                    &vk::DependencyInfo::default().image_memory_barriers(&to_sample),
-                );
-            }
-        }
 
         // GPU profiling: when this frame is being profiled, reset its timestamp
         // pool up front (must be outside any render pass). The five timestamps
@@ -1592,6 +1541,22 @@ impl Renderer {
 
         unsafe { self.device.raw.end_command_buffer(cb) }.vk_ctx("end_command_buffer")?;
 
+        // ── Cross-GPU mirror: GTT→local copies on the ACE queue ────────────
+        // Submitted here (after record, right before the graphics submit) so
+        // the only fallible step between the two submits is the graphics
+        // submit itself — one explicit error site keeps the local_done
+        // signal/wait pairing intact. The copy overlaps other graphics work;
+        // its data dependencies ride the semaphores (waits = home→GTT
+        // copy-done; signals = local_done for this render + the exported
+        // ace_done fd for the scratch-overwrite gate).
+        let t_ace = frame_profile.as_ref().map(|_| std::time::Instant::now());
+        let ace = if local_copies.is_empty() {
+            None
+        } else {
+            Some(self.ace_copier.submit(local_copies, mirror_waits)?)
+        };
+        let ace_span = t_ace.map(|t| t.elapsed());
+
         let cb_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         // Signal the slot's exportable binary semaphore alongside the
         // fence. The fence stays for our internal slot-reuse gate; the
@@ -1599,10 +1564,12 @@ impl Renderer {
         let signal_sem = [vk::SemaphoreSubmitInfo::default()
             .semaphore(slot_present_semaphore)
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-        // Wait on any cross-GPU mirror copies before the decode pass samples
-        // their scratch textures. Fragment-shader stage = where the decode
-        // pipeline samples.
-        let wait_sems: Vec<vk::SemaphoreSubmitInfo> = wait_semaphores
+        // Waits: client write fences for native dmabufs, plus the ACE
+        // copy's local_done when mirrors are in play. Fragment-shader stage
+        // = where the decode pipeline samples. Defensive: mirror_waits with
+        // no copies to ride (shouldn't happen — every drawn mirror emits
+        // copy ops) fold into the render's own waits so they stay sound.
+        let mut wait_sems: Vec<vk::SemaphoreSubmitInfo> = acquire_waits
             .iter()
             .map(|&s| {
                 vk::SemaphoreSubmitInfo::default()
@@ -1610,13 +1577,50 @@ impl Renderer {
                     .stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
             })
             .collect();
+        if let Some((local_done, _)) = ace.as_ref() {
+            wait_sems.push(
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(*local_done)
+                    .stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER),
+            );
+        } else {
+            for &s in mirror_waits {
+                wait_sems.push(
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(s)
+                        .stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER),
+                );
+            }
+        }
         let submit = [vk::SubmitInfo2::default()
             .command_buffer_infos(&cb_infos)
             .wait_semaphore_infos(&wait_sems)
             .signal_semaphore_infos(&signal_sem)];
         let serial =
-            self.device
-                .submit_graphics(&submit, slot_fence, "queue_submit2 (renderer)")?;
+            match self
+                .device
+                .submit_graphics(&submit, slot_fence, "queue_submit2 (renderer)")
+            {
+                Ok(serial) => {
+                    if ace.is_some() {
+                        // The render submit carries the local_done wait — the
+                        // signal will be consumed; normal semaphore reuse.
+                        self.ace_copier.note_consumed();
+                    }
+                    serial
+                }
+                Err(e) => {
+                    if ace.is_some() {
+                        // No render submit will consume local_done or extend
+                        // the deferred-destroy proof over the ACE batch — wait
+                        // it out (bounded: a small blit) so the caller can drop
+                        // the frame's references safely; the semaphore is
+                        // recreated on the copier's next use.
+                        self.ace_copier.abort_unconsumed();
+                    }
+                    return Err(e);
+                }
+            };
         self.slots[slot_idx].submit_serial = serial;
 
         // Buffer this frame's CPU profile in the slot it rendered into. The
@@ -1625,6 +1629,9 @@ impl Renderer {
         // ring — when this slot is next reused and its timestamps read back.
         if let (Some(mut prof), Some(t)) = (frame_profile, t_submit) {
             prof.set(crate::profile::Span::Submit, t.elapsed());
+            if let Some(d) = ace_span {
+                prof.set(crate::profile::Span::LocalCopy, d);
+            }
             self.slots[slot_idx].pending_profile = Some(prof);
         }
 
@@ -1651,6 +1658,7 @@ impl Renderer {
         Ok(RenderedFrame {
             present_sync: present_sync_fd,
             encoded_full: encode_full,
+            ace_copy_done: ace.map(|(_, fd)| fd),
         })
     }
 }

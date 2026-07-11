@@ -76,14 +76,11 @@ pub struct Device {
     /// submission order — the lock provides both).
     graphics_queue: vk::Queue,
     /// Async-compute (ACE) queue for transfer work that should overlap
-    /// graphics — the cross-GPU mirror copy (see `docs/async-render-rework.md`).
-    /// Equals `graphics_queue` when the GPU exposes no dedicated ACE family, so
-    /// callers never need a capability branch. Private, same as above. No
-    /// submitter yet — increment C (the ACE mirror copy) adds the locked
-    /// `submit_transfer` helper, which must also answer how transfer
-    /// submissions integrate with the deferred-destroy serial (single-queue
-    /// fence ordering doesn't extend across queues).
-    #[allow(dead_code)]
+    /// graphics — the cross-GPU mirror GTT→local copy (see
+    /// `docs/async-render-rework.md`). Equals `graphics_queue` when the GPU
+    /// exposes no dedicated ACE family, so callers never need a capability
+    /// branch. Private, same as above; all submission goes through
+    /// [`Self::submit_transfer`].
     transfer_queue: vk::Queue,
     /// Queue family `transfer_queue` belongs to (for command-pool creation).
     /// Equals `physical.graphics_queue_family` in the fallback case.
@@ -177,6 +174,44 @@ impl Device {
     pub fn wait_graphics_idle(&self, context: &'static str) -> Result<()> {
         let _guard = self.graphics_lock.lock().unwrap();
         unsafe { self.raw.queue_wait_idle(self.graphics_queue) }.vk_ctx(context)
+    }
+
+    /// Submit to the transfer (ACE) queue. On GPUs with no dedicated ACE
+    /// family this delegates to [`Self::submit_graphics`] (same queue), so
+    /// the A1 invariant — every graphics submit allocates a serial under
+    /// the queue lock — holds unconditionally.
+    ///
+    /// **Deferred-destroy coverage.** Transfer submissions take no serial
+    /// of their own: the retire proof (§7.2 single-queue ordering) is
+    /// anchored to the graphics queue. A transfer submission is covered
+    /// *transitively* — every ACE copy signals a semaphore that a
+    /// subsequent graphics submit waits on, so "graphics serial N complete"
+    /// proves the ACE batch (waits included) finished too. Callers that
+    /// break that chain (an error path that never issues the waiting
+    /// graphics submit) must prove completion themselves before letting
+    /// referenced objects retire — see [`Self::wait_transfer_idle`].
+    pub fn submit_transfer(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+        context: &'static str,
+    ) -> Result<()> {
+        let Some(lock) = self.transfer_lock.as_ref() else {
+            return self.submit_graphics(submits, fence, context).map(|_| ());
+        };
+        let _guard = lock.lock().unwrap();
+        unsafe { self.raw.queue_submit2(self.transfer_queue, submits, fence) }.vk_ctx(context)
+    }
+
+    /// `vkQueueWaitIdle` on the transfer queue, under its lock. Error-path
+    /// tool: proves outstanding ACE work finished when the transitive
+    /// graphics-side proof (see [`Self::submit_transfer`]) was severed.
+    pub fn wait_transfer_idle(&self, context: &'static str) -> Result<()> {
+        let Some(lock) = self.transfer_lock.as_ref() else {
+            return self.wait_graphics_idle(context);
+        };
+        let _guard = lock.lock().unwrap();
+        unsafe { self.raw.queue_wait_idle(self.transfer_queue) }.vk_ctx(context)
     }
 
     /// `vkDeviceWaitIdle`, holding **both** queue locks — the spec makes it

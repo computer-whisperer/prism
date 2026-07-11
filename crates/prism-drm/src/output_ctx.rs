@@ -667,12 +667,15 @@ impl OutputContext {
         // element geometry to physical for the damage diff.
         view_size: Size<f64, Logical>,
         encode_push: &EncodePush,
-        // Cross-GPU mirror copy-done semaphores the render must wait on
-        // before sampling. Empty for outputs with no mirrored surfaces.
-        wait_semaphores: &[vk::Semaphore],
-        // Cross-GPU mirror GTT→local copies to record at the start of the
-        // render command buffer (see `Renderer::render_frame`). Empty for the
-        // common case (no mirrored surfaces on this output).
+        // Client dmabuf write fences the render waits before sampling
+        // native imports. Empty for the common case.
+        acquire_waits: &[vk::Semaphore],
+        // Cross-GPU mirror home→GTT copy-done semaphores — waited by the
+        // ACE copy submit inside `render_frame` (§2.8 C). Empty for
+        // outputs with no mirrored surfaces.
+        mirror_waits: &[vk::Semaphore],
+        // Cross-GPU mirror GTT→local copies, submitted on the transfer
+        // (ACE) queue by `render_frame`. Empty for the common case.
         local_copies: &[prism_renderer::LocalMirrorCopy],
         // Window-close snapshots to capture from the intermediate this frame
         // (before the decode pass repaints over the region). Empty in the
@@ -689,9 +692,9 @@ impl OutputContext {
         // reuse later) merges the GPU spans and rings the record. `None` (or an
         // early-out before render) leaves it unrecorded.
         mut profile: Option<FrameProfile>,
-    ) -> Result<PresentOutcome> {
+    ) -> Result<(PresentOutcome, Option<std::os::fd::OwnedFd>)> {
         if self.frame_pending {
-            return Ok(PresentOutcome::FlipPending);
+            return Ok((PresentOutcome::FlipPending, None));
         }
 
         // Region damage for this frame. Logged for now (Stage 1b); Stage 2
@@ -730,7 +733,7 @@ impl OutputContext {
         // out of the intermediate rides this frame's command buffer.
         if damage.is_empty() && self.mode_set_done && !self.force_present && snapshots.is_empty() {
             tracing::debug!(target: "damage", output = %self.connector_name, "skip: no damage");
-            return Ok(PresentOutcome::SkippedNoDamage);
+            return Ok((PresentOutcome::SkippedNoDamage, None));
         }
 
         // Real render path: fill the profile's damage span + counters (the
@@ -786,13 +789,15 @@ impl OutputContext {
             &damage,
             &encode_rects,
             encode_push,
-            wait_semaphores,
+            acquire_waits,
+            mirror_waits,
             local_copies,
             snapshots,
             force_full_repaint,
             profile,
         )?;
         let present_sync = rendered.present_sync;
+        let ace_copy_done = rendered.ace_copy_done;
 
         // Debug-only (`PRISM_PROFILE_LOG`) throttled summary line. Off by default
         // — collection runs in the background and prism-tune reads it on demand;
@@ -857,10 +862,13 @@ impl OutputContext {
                 }
             ));
             if let Err(error) = res {
-                return Ok(PresentOutcome::FlipFailed {
-                    render_done: present_sync,
-                    error,
-                });
+                return Ok((
+                    PresentOutcome::FlipFailed {
+                        render_done: present_sync,
+                        error,
+                    },
+                    ace_copy_done,
+                ));
             }
             self.mode_set_done = true;
         } else {
@@ -882,10 +890,13 @@ impl OutputContext {
                 }
             ));
             if let Err(error) = res {
-                return Ok(PresentOutcome::FlipFailed {
-                    render_done: present_sync,
-                    error,
-                });
+                return Ok((
+                    PresentOutcome::FlipFailed {
+                        render_done: present_sync,
+                        error,
+                    },
+                    ace_copy_done,
+                ));
             }
         }
         self.frame_pending = true;
@@ -913,7 +924,7 @@ impl OutputContext {
         // present on a transient page-flip error (the `?`s above), with nothing
         // to retry it until the next independent damage.
         self.force_present = false;
-        Ok(PresentOutcome::Presented(present_sync))
+        Ok((PresentOutcome::Presented(present_sync), ace_copy_done))
     }
 }
 
