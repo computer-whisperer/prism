@@ -3728,11 +3728,15 @@ fn process_present_outcome(
         }
     };
 
-    // Service queued dmabuf screencopy captures for this output now — right
-    // after the frame's render submit, so each capture's GPU work is sequenced
-    // after this frame's encode (and before the next frame's decode rewrites the
-    // intermediate) on the shared queue. `copy_with_damage` captures naturally
-    // ride this damage-driven frame; immediate ones forced it.
+    // Service queued dmabuf screencopy captures for this output now. The
+    // ordering the captures need — after frame N's encode, before frame
+    // N+1's decode rewrites the intermediate — holds under the thread
+    // split (§2.8 B3): the capture's bridge closure lands on the render
+    // thread after N's present (we're processing N's outcome) and before
+    // N+1's SubmitFrame (main lowers N+1 later; command-channel FIFO),
+    // all on the output's single graphics queue. `copy_with_damage`
+    // captures naturally ride this damage-driven frame; immediate ones
+    // forced it.
     state.submit_pending_screencopy(output_id);
 
     // Extract pending `wp_presentation_feedback` from every surface mapped to

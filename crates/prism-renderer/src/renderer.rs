@@ -281,7 +281,12 @@ pub struct Renderer {
     /// debugging only (`PRISM_PROFILE_LOG`); off by default so logs stay quiet.
     profile_enabled: bool,
     profile_log: bool,
-    profile_ring: crate::profile::ProfileRing,
+    /// Behind `Arc<Mutex>` so the main thread's IPC profiling query can
+    /// read percentiles/timeline directly (via the `OutputShadow`'s clone)
+    /// while this renderer — on its GPU's render thread — pushes one
+    /// record per frame. Uncontended except while prism-tune's profiling
+    /// panel polls.
+    profile_ring: std::sync::Arc<std::sync::Mutex<crate::profile::ProfileRing>>,
     /// Loader for VK_KHR_external_semaphore_fd — exports the per-slot
     /// `present_semaphore` as a Linux sync_file fd for KMS.
     semaphore_fd_loader: external_semaphore_fd::Device,
@@ -449,7 +454,9 @@ impl Renderer {
             gpu_ts,
             profile_enabled: std::env::var_os("PRISM_NO_PROFILE").is_none(),
             profile_log: std::env::var_os("PRISM_PROFILE_LOG").is_some(),
-            profile_ring: crate::profile::ProfileRing::new(),
+            profile_ring: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::profile::ProfileRing::new(),
+            )),
             semaphore_fd_loader,
             pending_init,
         })
@@ -660,10 +667,21 @@ impl Renderer {
     /// plus the raw per-frame timeline — over the recent-frame ring, for the IPC
     /// path / prism-tune. `None` when profiling is off or the ring is empty.
     pub fn profile_readout(&self) -> Option<crate::profile::ProfileReadout> {
-        if !self.profile_enabled || self.profile_ring.is_empty() {
+        if !self.profile_enabled {
             return None;
         }
-        Some(self.profile_ring.readout())
+        let ring = self.profile_ring.lock().unwrap();
+        if ring.is_empty() {
+            return None;
+        }
+        Some(ring.readout())
+    }
+
+    /// Shared handle to the profile ring, for the main thread's
+    /// `OutputShadow` — lets the IPC profiling query read without a render-
+    /// thread round-trip (`docs/async-render-rework.md` §2.7).
+    pub fn profile_ring(&self) -> std::sync::Arc<std::sync::Mutex<crate::profile::ProfileRing>> {
+        self.profile_ring.clone()
     }
 
     /// Take the throttled (≤1 Hz) profiling summary for the *debug log only* —
@@ -673,7 +691,7 @@ impl Renderer {
         if !self.profile_enabled || !self.profile_log {
             return None;
         }
-        self.profile_ring.summary_due()
+        self.profile_ring.lock().unwrap().summary_due()
     }
 
     /// The renderer's device handle — lets the integrator allocate
@@ -876,7 +894,7 @@ impl Renderer {
             }
             // Ring it even if the GPU readback failed — the CPU spans are still
             // worth having; the GPU spans just stay 0 for that frame.
-            self.profile_ring.push(prof);
+            self.profile_ring.lock().unwrap().push(prof);
         }
 
         // CPU submit-span clock: from here (command record) through the queue

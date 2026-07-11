@@ -200,7 +200,14 @@ fn recover_one(state: &mut PrismState, gpu: DrmDevId) -> Result<()> {
     // completed. The fresh renderer-derived caches come back for the
     // shadows — their white-view/cube-edge point into the old renderer
     // until re-set.
-    let rebuilt: Result<Vec<(String, prism_renderer::vk::ImageView, u32, bool)>> = {
+    type RendererCaches = (
+        String,
+        prism_renderer::vk::ImageView,
+        u32,
+        bool,
+        std::sync::Arc<std::sync::Mutex<prism_renderer::ProfileRing>>,
+    );
+    let rebuilt: Result<Vec<RendererCaches>> = {
         let Some(thread) = state.render_threads.get(&gpu) else {
             restore(state, device);
             anyhow::bail!("no render thread for {gpu:?}");
@@ -218,6 +225,7 @@ fn recover_one(state: &mut PrismState, gpu: DrmDevId) -> Result<()> {
                             ctx.renderer.white_view(),
                             ctx.renderer.lut3d_cube_edge(),
                             ctx.renderer.profile_enabled(),
+                            ctx.renderer.profile_ring(),
                         ));
                     }
                 }
@@ -232,9 +240,9 @@ fn recover_one(state: &mut PrismState, gpu: DrmDevId) -> Result<()> {
             return Err(e);
         }
     };
-    for (id, white_view, cube_edge, profile_enabled) in caches {
+    for (id, white_view, cube_edge, profile_enabled, profile_ring) in caches {
         if let Some(shadow) = state.outputs.get_mut(&id) {
-            shadow.set_renderer_caches(white_view, cube_edge, profile_enabled);
+            shadow.set_renderer_caches(white_view, cube_edge, profile_enabled, profile_ring);
         }
     }
 

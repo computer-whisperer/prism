@@ -494,22 +494,27 @@ fn handle_lut3d(state: &mut PrismState, name: &str) -> (Reply, Option<OwnedFd>) 
 /// [`prism_ipc::ProfilingStats`]). Pull-based; prism-tune polls it while its
 /// profiling panel is open.
 fn handle_profiling_stats(state: &mut PrismState, name: &str) -> (Reply, Option<OwnedFd>) {
-    let Some(output_id) = state
+    let Some(shadow) = state
         .outputs
-        .iter()
-        .find(|(_id, shadow)| shadow.connector_name == name)
-        .map(|(id, _)| id.clone())
+        .values()
+        .find(|shadow| shadow.connector_name == name)
     else {
         return (Err(format!("profiling: output {name:?} not found")), None);
     };
-    // The profile ring lives with the renderer on the render thread;
-    // blocking bridge (prism-tune polls this at panel refresh rate, and
-    // the copy-out is a few hundred KB — B3 shares the ring behind an
-    // Arc<Mutex> instead if this ever shows up in latency).
-    let Some(readout) = state
-        .with_output_ctx(&output_id, |ctx| ctx.renderer.profile_readout())
-        .flatten()
-    else {
+    // Read straight from the shared profile ring (§2.7) — the render
+    // thread pushes a record per frame; no bridge round-trip, so
+    // prism-tune's polling never stalls the compositor.
+    let readout = if shadow.profile_enabled {
+        let ring = shadow.profile_ring.lock().unwrap();
+        if ring.is_empty() {
+            None
+        } else {
+            Some(ring.readout())
+        }
+    } else {
+        None
+    };
+    let Some(readout) = readout else {
         return (
             Err(format!(
                 "profiling: output {name:?} has no profile data yet \

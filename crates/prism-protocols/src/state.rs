@@ -4674,58 +4674,50 @@ fn hide_all_cursors(state: &mut PrismState) {
     apply_cursor_plane_state(state, desired);
 }
 
-/// Apply desired `(visible, position)` cursor-plane state on each output's
-/// render thread (one blocking bridge call per GPU), then queue redraws for
-/// the outputs whose plane actually changed. The change detection reads the
-/// plane's previous state, which lives with the plane on its thread; a
-/// changed plane also gets `force_next_present` there — a cursor move is a
-/// page-flip change with no element damage, so without it the zero-damage
-/// skip would freeze the cursor on screen.
+/// Apply desired `(visible, position)` cursor-plane state: diff against
+/// the main-side replica on each `OutputShadow` (exactly equivalent to
+/// diffing on the plane — its setters are plain field writes with no
+/// clamping), and for the outputs that actually changed, send a
+/// fire-and-forget closure to the owning render thread (set position/
+/// visibility + `force_next_present` — a cursor move is a page-flip change
+/// with no element damage, so without the force the zero-damage skip would
+/// freeze the cursor on screen) and queue a redraw. Pointer motion never
+/// blocks on a render thread (§2.3 `CursorUpdate`); command-channel FIFO
+/// lands the update before the frame the queued redraw produces.
 fn apply_cursor_plane_state(state: &mut PrismState, desired: Vec<CursorPlaneState>) {
-    for thread in state.render_threads.values() {
-        let batch: Vec<CursorPlaneState> = desired
-            .iter()
-            .filter(|(id, _, _)| {
-                state
-                    .outputs
-                    .get(id)
-                    .is_some_and(|shadow| shadow.gpu_id == thread.gpu)
-            })
-            .cloned()
-            .collect();
-        if batch.is_empty() {
+    for (id, visible, pos) in desired {
+        let Some(shadow) = state.outputs.get_mut(&id) else {
+            continue;
+        };
+        if !shadow.has_cursor_plane {
             continue;
         }
-        let changed = thread
-            .with_outputs(move |outputs| {
-                let mut changed = Vec::new();
-                for (id, visible, pos) in batch {
-                    let Some(ctx) = outputs.get_mut(&id) else {
-                        continue;
-                    };
-                    let Some(cursor) = ctx.cursor.as_mut() else {
-                        continue;
-                    };
-                    let was_visible = cursor.visible();
-                    let prev_pos = cursor.position();
-                    if let Some((x, y)) = pos {
-                        cursor.set_position(x, y);
-                    }
-                    cursor.set_visible(visible);
-                    if was_visible != cursor.visible() || prev_pos != cursor.position() {
-                        ctx.force_next_present();
-                        changed.push(id);
-                    }
-                }
-                changed
-            })
-            .unwrap_or_else(|e| {
-                tracing::error!(gpu = ?thread.gpu, "cursor plane update failed: {e:#}");
-                Vec::new()
-            });
-        for id in changed {
-            state.output_redraw.entry(id).or_default().queue_redraw();
+        // A hide never repositions; keep the replica's position so a
+        // subsequent show at the same spot still diffs correctly.
+        let new_pos = pos.unwrap_or(shadow.cursor_pos);
+        if shadow.cursor_visible == visible && shadow.cursor_pos == new_pos {
+            continue;
         }
+        shadow.cursor_visible = visible;
+        shadow.cursor_pos = new_pos;
+        let Some(thread) = state.render_threads.get(&shadow.gpu_id) else {
+            continue;
+        };
+        let cmd_id = id.clone();
+        if let Err(e) = thread.run(move |outputs| {
+            let Some(ctx) = outputs.get_mut(&cmd_id) else {
+                return;
+            };
+            if let Some(cursor) = ctx.cursor.as_mut() {
+                cursor.set_position(new_pos.0, new_pos.1);
+                cursor.set_visible(visible);
+            }
+            ctx.force_next_present();
+        }) {
+            tracing::error!(output = %id, "cursor plane update failed: {e:#}");
+            continue;
+        }
+        state.output_redraw.entry(id).or_default().queue_redraw();
     }
 }
 

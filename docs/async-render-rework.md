@@ -591,15 +591,21 @@ physically required serialization).
    `WaitingForVBlank`. Bonus: outcome-path present errors now retire the
    imported wait semaphores (the §2.8-A5-noted pre-existing leak) since
    they're parked main-side in `PendingSubmission`.
-3. **B3** cursor/screencopy/syncobj-release/feedback flows per 2.4;
-   profiling-ring sharing. Screencopy ordering note: `submit_pending_screencopy`
-   must stay sequenced *after* frame N's encode and *before* frame N+1's
-   decode on the target's graphics queue. Running it main-side in
-   `process_present_outcome(N)` preserves this under the split: it
-   happens-before lowering N+1 (main is serial), which happens-before
-   `SubmitFrame(N+1)` reaches the render thread (channel FIFO), which
-   happens-before the N+1 render submit — and A1's queue lock makes the
-   cross-thread submit itself safe. No move into the thread required.
+3. **B3** — **DONE**. Cursor moves are fire-and-forget closures diffed
+   against a main-side plane replica on `OutputShadow` (equivalent to
+   plane-side diffing — the setters are plain field writes); pointer
+   motion never blocks on a render thread. Sprite uploads stay a blocking
+   bridge (rare: sprite change / output crossing) to keep the
+   `cursor_dirty` retry semantics. Profiling ring shared per §2.7:
+   `Renderer::profile_ring` is `Arc<Mutex<ProfileRing>>`, the shadow
+   holds a clone (refreshed on recovery rebuild), and the IPC query reads
+   it directly. Screencopy: capture GPU work runs as a bridge closure
+   sent while processing frame N's outcome — after N's present, before
+   N+1's `SubmitFrame` (channel FIFO), on the output's single graphics
+   queue — which is the required after-N's-encode/before-N+1's-decode
+   ordering; the client `WlBuffer` stays main-side (D4).
+   Syncobj-release + presentation-feedback harvesting were already
+   main-side per §2.4 and needed no change.
 4. **B4** session pause/activate, hotplug, config `Reconfigure`, teardown
    ordering.
 

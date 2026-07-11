@@ -121,6 +121,26 @@ pub struct OutputShadow {
     /// Whether per-frame phase profiling is collected (static per renderer,
     /// from `PRISM_NO_PROFILE`).
     pub profile_enabled: bool,
+    /// Shared handle to the renderer's 256-frame profile ring (§2.7): the
+    /// render thread pushes a record per frame; the IPC profiling query
+    /// reads percentiles/timeline from here without a bridge round-trip.
+    /// Swapped on recovery rebuild (new renderer ⇒ new ring).
+    pub profile_ring: std::sync::Arc<std::sync::Mutex<prism_renderer::ProfileRing>>,
+
+    // ── Cursor-plane replica ───────────────────────────────────────────────
+    /// Whether the output claimed a hardware cursor plane at bringup.
+    /// Static for the output's lifetime (recovery rebuilds don't touch the
+    /// KMS side).
+    pub has_cursor_plane: bool,
+    /// Replica of the plane's `visible` flag. The plane's setters are
+    /// plain field writes with no clamping, so diffing desired state
+    /// against this replica is exactly equivalent to diffing on the plane
+    /// itself — which is what lets cursor updates be fire-and-forget
+    /// messages instead of a blocking round-trip per pointer motion.
+    pub cursor_visible: bool,
+    /// Replica of the plane's position (physical CRTC pixels, hotspot
+    /// already subtracted). Meaningless while `cursor_visible` is false.
+    pub cursor_pos: (i32, i32),
 
     // ── Frame-clock estimate replica ───────────────────────────────────────
     /// Last-known prediction of the next presentation time, mirrored from
@@ -160,6 +180,11 @@ impl OutputShadow {
             white_view: ctx.renderer.white_view(),
             lut3d_cube_edge: ctx.renderer.lut3d_cube_edge(),
             profile_enabled: ctx.renderer.profile_enabled(),
+            profile_ring: ctx.renderer.profile_ring(),
+            has_cursor_plane: ctx.cursor.is_some(),
+            // Matches CursorPlane's construction state ((0,0), hidden).
+            cursor_visible: false,
+            cursor_pos: (0, 0),
             next_present_estimate: ctx.frame_clock.next_presentation_time(),
             refresh_interval: ctx.frame_clock.refresh_interval(),
             powered_off: ctx.is_powered_off(),
@@ -181,10 +206,12 @@ impl OutputShadow {
         white_view: vk::ImageView,
         lut3d_cube_edge: u32,
         profile_enabled: bool,
+        profile_ring: std::sync::Arc<std::sync::Mutex<prism_renderer::ProfileRing>>,
     ) {
         self.white_view = white_view;
         self.lut3d_cube_edge = lut3d_cube_edge;
         self.profile_enabled = profile_enabled;
+        self.profile_ring = profile_ring;
     }
 
     /// DPMS replica — true while the output is powered off. Kept in sync by
