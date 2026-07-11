@@ -36,7 +36,7 @@
 //! construct + install a pointer (or touch) grab that drives
 //! enter/leave/motion/drop events to potential drop targets. While the
 //! grab is live, the render walk draws the icon surface at the cursor
-//! position on the output under the pointer (`render_output_now`), the
+//! position on the output under the pointer (the render pass), the
 //! commit handler accumulates the icon's `wl_surface.offset` deltas and
 //! queues repaints, and `send_frame_callbacks` keeps the icon's frame
 //! callbacks fed. When the grab ends, [`DndGrabHandler::dropped`]

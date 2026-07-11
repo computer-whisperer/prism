@@ -1595,10 +1595,27 @@ fn run_integrated(
     // Stash the LoopHandle on state before any client can connect:
     // drm_syncobj's pre-commit hook (registered from new_surface)
     // reads it to insert eventfd sources for acquire blockers, and
-    // render_output_now reads it to schedule release-point signals
+    // the render-outcome handler reads it to schedule release-point signals
     // on the per-submit sync_fd. Must happen before
     // `insert_wayland_sources` (which makes the socket reachable).
     state.set_loop_handle(event_loop.handle());
+    // Wake-on-outcome: render threads ping this source after queuing each
+    // present outcome; the callback drains. Outcomes are also drained at
+    // the top of the vblank handler and of every redraw pass (where the
+    // ordering matters — see drain_render_outcomes); the ping just bounds
+    // latency when nothing else wakes the loop.
+    {
+        let source = state
+            .render_events_ping_source
+            .take()
+            .expect("render-events ping source is taken exactly once");
+        event_loop
+            .handle()
+            .insert_source(source, |_, _, state| {
+                drain_render_outcomes(state);
+            })
+            .map_err(|e| anyhow!("insert render-events ping source: {e}"))?;
+    }
     // Bring up the wp_linux_drm_syncobj global now that cards are
     // attached. Skipped silently if kernel lacks `syncobj_eventfd`
     // or the primary GPU's card isn't registered.
@@ -2345,6 +2362,13 @@ fn on_vblank(
 ) {
     use prism_protocols::redraw::RedrawState;
 
+    // Drain queued present outcomes FIRST. An outcome is sent at submit
+    // time, strictly before its flip can retire, so after this drain the
+    // state machine has processed `Presented` (→ WaitingForVBlank + the
+    // feedback stash) for whatever frame this vblank belongs to — the
+    // ordering the pre-split synchronous code got for free.
+    drain_render_outcomes(state);
+
     // Resolve (card, crtc) → OutputId (small map; lookup is fine). CRTC
     // handles are per-device KMS object IDs and can alias across cards,
     // so the card must participate in the match.
@@ -2357,6 +2381,19 @@ fn on_vblank(
         breadcrumb(&format!("vblank for unknown crtc {crtc:?} on {card:?}"));
         return;
     };
+
+    // Defensive (should be unreachable given the drain above): a vblank
+    // for a frame whose outcome still hasn't arrived. Record it so the
+    // outcome handler fires feedback + transitions directly instead of
+    // waiting for a vblank that already happened.
+    if matches!(
+        state.output_redraw.get(&output_id).map(|s| &s.redraw),
+        Some(RedrawState::AwaitingOutcome { .. })
+    ) {
+        if let Some(pending) = state.pending_submissions.get_mut(&output_id) {
+            pending.missed_vblank = Some(presentation_time);
+        }
+    }
 
     prism_drm::flip_trace(&format!(
         "vblank {} crtc={:?} pres_us={}",
@@ -2388,38 +2425,15 @@ fn on_vblank(
 
     // Step 3: take + fire the stashed *presentation* feedback for the
     // just-presented frame (this is the one thing that genuinely belongs on the
-    // real vblank). Split take-from-fire so the fire can hold immutable borrows.
+    // real vblank).
     let pending = state
         .output_redraw
         .entry(output_id.clone())
         .or_default()
         .pending_feedback
         .take();
-
     if let Some(pending) = pending {
-        if let (Some(smithay_output), Some(ctx)) = (
-            state.wl_outputs.get(&output_id).cloned(),
-            state.outputs.get(&output_id),
-        ) {
-            let hz = ctx.mode.vrefresh().max(1);
-            let refresh = smithay::wayland::presentation::Refresh::fixed(Duration::from_nanos(
-                1_000_000_000 / hz as u64,
-            ));
-            use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
-            for fb in pending.presentation_cbs {
-                fb.presented(
-                    &smithay_output,
-                    presentation_time,
-                    refresh,
-                    // We don't track a real vblank sequence yet; the kernel
-                    // gives us metadata.sequence but plumbing it through is
-                    // a separate change. Monotonic-zero is sane for mpv's
-                    // glitch-detection.
-                    0,
-                    wp_presentation_feedback::Kind::Vsync,
-                );
-            }
-        }
+        fire_presentation_feedback(state, &output_id, pending, presentation_time);
     }
 
     // Step 4: transition the state machine. Damage-driven now —
@@ -2465,6 +2479,12 @@ fn on_vblank(
 /// timestamp. Called once per main-loop iteration, after `dispatch`.
 fn redraw_queued_outputs(state: &mut prism_protocols::PrismState) {
     use prism_protocols::redraw::RedrawState;
+
+    // §2.3 mirror-gate ordering: drain outcomes before lowering anything —
+    // frame N's `note_mirror_render_done` fd must be stored before frame
+    // N+1's `prepare_mirror_waits` runs, so a home→GTT copy can never
+    // overwrite scratch a still-in-flight render is reading.
+    drain_render_outcomes(state);
 
     // While the session is paused (we've VT-switched away) we hold no DRM
     // master, so any page-flip commit fails with EACCES. Suppress rendering
@@ -2555,7 +2575,168 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
         state.fail_pending_screencopy(output_id);
         return;
     }
-    match render_output_now(state, output_id) {
+    match lower_and_submit(state, output_id) {
+        Ok(true) => {
+            // Frame lowered and queued on the render thread; the outcome
+            // (Presented/Skipped/error) arrives on the outcome channel and
+            // is handled by `on_present_outcome`. Redraw requests landing
+            // in the meantime set `redraw_needed` and are folded into the
+            // outcome's transition.
+            state
+                .output_redraw
+                .entry(output_id.to_owned())
+                .or_default()
+                .redraw = RedrawState::AwaitingOutcome {
+                redraw_needed: false,
+            };
+        }
+        Ok(false) => {
+            // Output not in the layout yet (add_output vs first-vblank
+            // race); leave it Queued and retry next pass.
+        }
+        Err(e) => handle_render_error(state, output_id, &e),
+    }
+}
+
+/// Lower one queued output's frame and send it to its render thread.
+/// `Ok(true)` = sent, caller transitions to `AwaitingOutcome`; `Ok(false)`
+/// = output not in the layout yet (retry next pass).
+fn lower_and_submit(state: &mut prism_protocols::PrismState, output_id: &str) -> Result<bool> {
+    use prism_protocols::redraw::PendingSubmission;
+
+    let Some((submission, bookkeeping)) = lower_output_frame(state, output_id)? else {
+        return Ok(false);
+    };
+    // The submission moves to the thread; keep the imported wait-semaphore
+    // handles (plain vk handles) for the post-outcome retirement.
+    let render_waits = submission.render_waits.clone();
+    state
+        .render_thread_for_output(output_id)
+        .ok_or_else(|| anyhow!("no render thread for output {output_id}"))?
+        .submit_frame(output_id, submission)?;
+    let displaced = state.pending_submissions.insert(
+        output_id.to_owned(),
+        PendingSubmission {
+            render_waits,
+            bookkeeping,
+            missed_vblank: None,
+        },
+    );
+    // Single in-flight frame per output by state-machine construction —
+    // a displaced entry means the machine broke somewhere.
+    if displaced.is_some() {
+        tracing::error!(output = %output_id, "submitted a frame while one was already in flight");
+    }
+    Ok(true)
+}
+
+/// Shared failure path for a frame that never presented — a lowering
+/// error, a dead render thread, or a present error in the outcome.
+fn handle_render_error(
+    state: &mut prism_protocols::PrismState,
+    output_id: &str,
+    e: &anyhow::Error,
+) {
+    use prism_protocols::redraw::RedrawState;
+    // A device-lost render quarantines the output's GPU for
+    // recovery (docs/device-loss-recovery.md); the quarantine line
+    // is the loud one, so keep the per-render noise down.
+    let device_lost = state
+        .outputs
+        .get(output_id)
+        .is_some_and(|o| state.note_gpu_error(o.gpu_id, e));
+    if !device_lost {
+        tracing::warn!("render for {output_id} failed: {e:#}");
+    }
+    breadcrumb(&format!("render({output_id}) ERROR: {e:#}"));
+    // A failed render while the session is locking means this
+    // output may still be showing desktop content — abort the
+    // lock rather than confirm one the screen doesn't reflect
+    // (niri parity). No-op when not mid-lock. Device-lost is the
+    // exception: no render is coming until recovery, so blank the
+    // output and confirm instead of wedging the lock.
+    if state.is_locked() {
+        if device_lost {
+            blank_lost_output_for_lock(state, output_id);
+        } else {
+            state.note_lock_render(output_id, false);
+        }
+    }
+    if let Some(entry) = state.output_redraw.get_mut(output_id) {
+        entry.redraw = RedrawState::Idle;
+    }
+    // The render that would have serviced queued captures didn't
+    // happen, and Idle means none is coming until new damage — fail
+    // them now (matching the powered-off path) instead of leaving
+    // the client waiting on a frame that may never render.
+    state.fail_pending_screencopy(output_id);
+}
+
+/// Drain every present outcome the render threads have queued. Called from
+/// three places, which together make the ordering deterministic:
+/// - the outcome-channel ping source (bounds latency when nothing else
+///   wakes the loop);
+/// - the top of [`on_vblank`] — an outcome is sent at submit time, before
+///   its flip can retire, so draining here guarantees the state machine
+///   sees `Presented` before the matching vblank;
+/// - the top of [`redraw_queued_outputs`] — the §2.3 mirror-gate rule:
+///   `note_mirror_render_done` fds from frame N land before frame N+1's
+///   `prepare_mirror_waits` runs.
+fn drain_render_outcomes(state: &mut prism_protocols::PrismState) {
+    while let Ok((output_id, reply)) = state.render_events.try_recv() {
+        on_present_outcome(state, &output_id, reply);
+    }
+}
+
+/// Handle one present outcome from a render thread: run the main-side
+/// bookkeeping ([`process_present_outcome`]) and transition the redraw
+/// state machine out of `AwaitingOutcome` (`docs/async-render-rework.md`
+/// §2.5).
+fn on_present_outcome(
+    state: &mut prism_protocols::PrismState,
+    output_id: &str,
+    reply: prism_drm::SubmitReply,
+) {
+    use prism_protocols::redraw::{PendingSubmission, RedrawState};
+
+    // Fresh thread-side clock estimates for the estimated-vblank timer and
+    // the next lowering's target_time.
+    if let Some(shadow) = state.outputs.get_mut(output_id) {
+        shadow.note_clock(reply.clock);
+    }
+    let Some(pending) = state.pending_submissions.remove(output_id) else {
+        tracing::error!(output = %output_id, "present outcome with no pending submission");
+        return;
+    };
+    let PendingSubmission {
+        render_waits,
+        bookkeeping,
+        missed_vblank,
+    } = pending;
+    // A redraw queued while the frame was in flight survives the
+    // transition below.
+    let aw_redraw = matches!(
+        state.output_redraw.get(output_id).map(|s| &s.redraw),
+        Some(RedrawState::AwaitingOutcome {
+            redraw_needed: true
+        })
+    );
+
+    let outcome = match reply.outcome {
+        Ok(o) => o,
+        Err(e) => {
+            // The present never submitted, so nothing references the
+            // imported wait semaphores — retire them instead of leaking
+            // (the pre-split present-error path leaked these; the split
+            // makes the fix natural since they're parked main-side).
+            let gpu = bookkeeping.output_gpu_id;
+            prism_protocols::destroy_render_wait_semaphores(state, gpu, render_waits);
+            handle_render_error(state, output_id, &e);
+            return;
+        }
+    };
+
+    match process_present_outcome(state, output_id, outcome, render_waits, bookkeeping) {
         Ok(RenderOutcome::Presented {
             pending,
             redraw_again,
@@ -2568,21 +2749,47 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
                     state.gpu_recovery_attempts.remove(&gpu);
                 }
             }
-            let entry = state.output_redraw.entry(output_id.to_owned()).or_default();
-            entry.pending_feedback = Some(pending);
-            // A redraw requested during the render (demand-materialized
-            // textures) must survive this transition, or the surfaces that
-            // rendered blank this frame stay blank until unrelated damage.
-            entry.redraw = RedrawState::WaitingForVBlank {
-                redraw_needed: redraw_again,
-            };
+            let redraw_needed = redraw_again || aw_redraw;
+            if let Some(t) = missed_vblank {
+                // This frame's vblank was dispatched before its outcome
+                // (see PendingSubmission::missed_vblank — should be
+                // unreachable given the drain at the top of on_vblank).
+                // Waiting for it again would wedge the output; fire the
+                // feedback now with the real timestamp and take the
+                // vblank transition directly.
+                tracing::warn!(output = %output_id, "present outcome after its own vblank");
+                fire_presentation_feedback(state, output_id, pending, t);
+                let animations_ongoing = state
+                    .wl_outputs
+                    .get(output_id)
+                    .map(|o| state.layout.are_animations_ongoing(Some(o)))
+                    .unwrap_or(false);
+                state
+                    .output_redraw
+                    .entry(output_id.to_owned())
+                    .or_default()
+                    .redraw = if redraw_needed || animations_ongoing {
+                    RedrawState::Queued
+                } else {
+                    RedrawState::Idle
+                };
+            } else {
+                let entry = state.output_redraw.entry(output_id.to_owned()).or_default();
+                entry.pending_feedback = Some(pending);
+                // A redraw requested during the render (demand-materialized
+                // textures, commits since submit) must survive this
+                // transition, or the surfaces that rendered blank this
+                // frame stay blank until unrelated damage.
+                entry.redraw = RedrawState::WaitingForVBlank { redraw_needed };
+            }
         }
         Ok(RenderOutcome::SkippedNoDamage { redraw_again }) => {
             // Nothing changed, so no page-flip and thus no real vblank will
             // arrive to advance the frame-callback cycle or resume animations.
-            // Arm an estimated-vblank timer in its place.
+            // Arm an estimated-vblank timer in its place (fresh estimate:
+            // the clock snapshot above came with this very outcome).
             queue_estimated_vblank(state, output_id);
-            if redraw_again {
+            if redraw_again || aw_redraw {
                 // Upgrade the armed timer to ...AndQueued (or Queued/Idle
                 // fallbacks) so the demand-materialize repaint happens at the
                 // estimated vblank — paced, not respinning the dispatch loop.
@@ -2596,43 +2803,50 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
         Ok(RenderOutcome::FlipPending) => {
             // Flip still in flight. Shouldn't normally happen (we only enter
             // Queued after a vblank cleared frame_pending), but defensive:
-            // leave Queued so the next pass retries.
-            tracing::debug!(output = %output_id, "render_output_now: flip still pending, retry next pass");
+            // back to Queued so the next pass retries.
+            tracing::debug!(output = %output_id, "present outcome: flip still pending, retry next pass");
+            state
+                .output_redraw
+                .entry(output_id.to_owned())
+                .or_default()
+                .redraw = RedrawState::Queued;
         }
-        Err(e) => {
-            // A device-lost render quarantines the output's GPU for
-            // recovery (docs/device-loss-recovery.md); the quarantine line
-            // is the loud one, so keep the per-render noise down.
-            let device_lost = state
-                .outputs
-                .get(output_id)
-                .is_some_and(|o| state.note_gpu_error(o.gpu_id, &e));
-            if !device_lost {
-                tracing::warn!("render_output_now({output_id}) failed: {e:#}");
-            }
-            breadcrumb(&format!("render_output_now({output_id}) ERROR: {e:#}"));
-            // A failed render while the session is locking means this
-            // output may still be showing desktop content — abort the
-            // lock rather than confirm one the screen doesn't reflect
-            // (niri parity). No-op when not mid-lock. Device-lost is the
-            // exception: no render is coming until recovery, so blank the
-            // output and confirm instead of wedging the lock.
-            if state.is_locked() {
-                if device_lost {
-                    blank_lost_output_for_lock(state, output_id);
-                } else {
-                    state.note_lock_render(output_id, false);
-                }
-            }
-            if let Some(entry) = state.output_redraw.get_mut(output_id) {
-                entry.redraw = RedrawState::Idle;
-            }
-            // The render that would have serviced queued captures didn't
-            // happen, and Idle means none is coming until new damage — fail
-            // them now (matching the powered-off path) instead of leaving
-            // the client waiting on a frame that may never render.
-            state.fail_pending_screencopy(output_id);
-        }
+        Err(e) => handle_render_error(state, output_id, &e),
+    }
+}
+
+/// Fire a frame's `wp_presentation_feedback` with the kernel-reported
+/// presentation time. Shared by the vblank handler (the normal path) and
+/// the missed-vblank fallback in [`on_present_outcome`].
+fn fire_presentation_feedback(
+    state: &prism_protocols::PrismState,
+    output_id: &str,
+    pending: prism_protocols::PendingFeedback,
+    presentation_time: Duration,
+) {
+    let (Some(smithay_output), Some(shadow)) = (
+        state.wl_outputs.get(output_id),
+        state.outputs.get(output_id),
+    ) else {
+        return;
+    };
+    let hz = shadow.mode.vrefresh().max(1);
+    let refresh = smithay::wayland::presentation::Refresh::fixed(Duration::from_nanos(
+        1_000_000_000 / hz as u64,
+    ));
+    use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+    for fb in pending.presentation_cbs {
+        fb.presented(
+            smithay_output,
+            presentation_time,
+            refresh,
+            // We don't track a real vblank sequence yet; the kernel
+            // gives us metadata.sequence but plumbing it through is
+            // a separate change. Monotonic-zero is sane for mpv's
+            // glitch-detection.
+            0,
+            wp_presentation_feedback::Kind::Vsync,
+        );
     }
 }
 
@@ -2784,72 +2998,17 @@ fn on_estimated_vblank(state: &mut prism_protocols::PrismState, output_id: &str)
 
 /// The GPU-side half of a lowered frame is `prism_drm::FrameSubmission`
 /// (moved there for increment B1 — it crosses into the owning GPU's render
-/// thread, `docs/async-render-rework.md` §2.4).
+/// thread, `docs/async-render-rework.md` §2.4); the main-side half is
+/// [`prism_protocols::redraw::FrameBookkeeping`], parked in
+/// `pending_submissions` while the frame is in flight.
 use prism_drm::FrameSubmission;
+use prism_protocols::redraw::FrameBookkeeping;
 
-/// The main-thread half of a lowered frame: Wayland objects + state keys the
-/// post-present bookkeeping needs. Never crosses a thread (doc §2.4 — no
-/// Wayland object does).
-struct FrameBookkeeping {
-    output_gpu_id: prism_renderer::DrmDevId,
-    smithay_output: smithay::output::Output,
-    /// Surfaces whose texture on this output's GPU is a cross-GPU mirror —
-    /// their home→scratch copies were submitted during lowering; a confirmed
-    /// render's present fd re-arms the scratch overwrite gate.
-    mirror_surfaces: Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
-    /// Native-dmabuf surfaces whose client write fence was imported as a
-    /// render wait; marked waited only on a confirmed render submit.
-    acquire_surfaces: Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
-    /// Surfaces were demand-materialized (rendered blank this frame) ⇒ the
-    /// caller must schedule another redraw.
-    redraw_again: bool,
-    session_locked: bool,
-    /// Predicted presentation time, kept for the feedback stash.
-    target_time: Duration,
-}
-
-/// Render one output now and submit the page-flip. Returns a [`RenderOutcome`]:
-/// `Presented` carries the `PendingFeedback` to stash for the matching vblank;
-/// `SkippedNoDamage` if nothing changed (caller arms an estimated vblank);
-/// `FlipPending` if the output's previous flip is still in flight (caller
-/// retries).
-///
-/// Three stages — [`lower_output_frame`] (scene → `FrameSubmission`, all the
-/// `PrismState` reads), the present on the owning GPU's render thread
-/// (damage diff, record, submit, flip — `RenderThread::submit_frame`,
-/// blocking in B1; B2 makes it a message with the outcome delivered
-/// asynchronously), [`process_present_outcome`] (Wayland + mirror-gate
-/// bookkeeping keyed on the outcome, back on main).
-fn render_output_now(
-    state: &mut prism_protocols::PrismState,
-    output_id: &str,
-) -> Result<RenderOutcome> {
-    let Some((submission, bookkeeping)) = lower_output_frame(state, output_id)? else {
-        // Output not in the layout yet (add_output vs first-vblank race);
-        // leave it Queued and retry next pass.
-        return Ok(RenderOutcome::FlipPending);
-    };
-    // The submission moves to the thread; keep the imported wait-semaphore
-    // handles (plain vk handles) for the post-present retirement below.
-    let render_waits = submission.render_waits.clone();
-    let reply = state
-        .render_thread_for_output(output_id)
-        .ok_or_else(|| anyhow!("no render thread for output {output_id}"))?
-        .submit_frame(output_id, submission)?;
-    // Mirror the thread-owned FrameClock's fresh estimates into the shadow
-    // (feeds the estimated-vblank timer and the next frame's target_time).
-    if let Some(shadow) = state.outputs.get_mut(output_id) {
-        shadow.note_clock(reply.clock);
-    }
-    let outcome = reply.outcome?;
-    process_present_outcome(state, output_id, outcome, render_waits, bookkeeping)
-}
-
-/// Stage 1 of [`render_output_now`]: walk the layout + layer/lock/DnD
-/// surfaces into render elements, lower them to the draw stream, and gather
-/// everything the present submit needs (encode push, GPU-sync waits, mirror
-/// copies, snapshots). Returns `None` when the output isn't in the layout
-/// yet (caller treats it as flip-pending and retries).
+/// Stage 1 of a frame ([`lower_and_submit`]): walk the layout + layer/lock/
+/// DnD surfaces into render elements, lower them to the draw stream, and
+/// gather everything the present submit needs (encode push, GPU-sync waits,
+/// mirror copies, snapshots). Returns `None` when the output isn't in the
+/// layout yet (caller treats it as flip-pending and retries).
 fn lower_output_frame(
     state: &mut prism_protocols::PrismState,
     output_id: &str,
@@ -3505,7 +3664,8 @@ fn lower_output_frame(
     )))
 }
 
-/// Stage 3 of [`render_output_now`]: post-present bookkeeping — everything
+/// Stage 3 of a frame (called from [`on_present_outcome`]): post-present
+/// bookkeeping — everything
 /// keyed on the outcome that touches `PrismState` / Wayland objects: retire
 /// the imported wait semaphores, mark acquire-waits + re-arm the mirror
 /// render-done gate, service screencopy, harvest presentation feedback +
@@ -3694,7 +3854,7 @@ fn process_present_outcome(
     })
 }
 
-/// Outcome of [`render_output_now`] — mirrors `prism_drm::PresentOutcome` but
+/// Outcome of [`process_present_outcome`] — mirrors `prism_drm::PresentOutcome` but
 /// carries the harvested `PendingFeedback` on the presented path.
 enum RenderOutcome {
     /// Rendered + flipped; the stash to fire at the matching vblank.
@@ -3722,7 +3882,7 @@ enum RenderOutcome {
 /// buffer reached the screen", so it stays tied to the real vblank (see
 /// [`prism_protocols::PendingFeedback`]).
 ///
-/// Resolution mirrors `render_output_now`'s harvest exactly (toplevels mapped to
+/// Resolution mirrors `process_present_outcome`'s harvest exactly (toplevels mapped to
 /// this output + their popup trees + layer-shell surfaces) so the same surfaces
 /// get callbacks. `throttle = None` neutralises smithay's own time-based
 /// throttle in `send_frames_surface_tree`, leaving our per-surface sequence

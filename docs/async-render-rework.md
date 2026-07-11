@@ -568,11 +568,29 @@ physically required serialization).
    was already taken by the draw-list type it wraps.
 
 **B — the split:**
-1. **B1** `RenderThread` (spawn per GPU, mpsc loop, backchannel), move
-   `OutputContext` ownership in, `OutputShadow` on main, re-point
-   `state.outputs` readers. The flip to async happens here.
-2. **B2** state machine `AwaitingOutcome` + outcome-driven transitions;
-   vblank forwarding; estimated-vblank from `next_present_estimate`.
+1. **B1** — **DONE** (07896b0 = B1a OutputShadow pure refactor, 2a33da1 =
+   B1b thread move). `RenderThread` per GPU (mpsc loop), `OutputContext`
+   ownership moved in, `OutputShadow` on main (owns the color policy +
+   renderer-derived caches; `state.outputs` retyped so shadow readers
+   compiled unchanged). B1b kept every operation — the present included —
+   a *blocking* bridge closure, so semantics stayed serial; the async flip
+   landed at B2. Cold paths (IPC calibration, power, recovery, session
+   fixups, cursor sprite upload) remain blocking bridges by design.
+2. **B2** — **DONE**. `AwaitingOutcome { redraw_needed }` +
+   outcome-driven transitions; `SubmitFrame` is fire-and-forget; vblank
+   forwarding (no round-trip); estimated-vblank + lowering `target_time`
+   from the shadow's `next_present_estimate` replica (refreshed by every
+   outcome's `FrameClockSnapshot`). *Refinement over the design*: outcomes
+   ride a plain `std::sync::mpsc` + calloop `Ping` wake instead of a
+   calloop channel, so main DRAINS them at deterministic points — top of
+   `on_vblank` (outcome-before-vblank guaranteed, since outcomes are sent
+   at submit time) and top of `redraw_queued_outputs` (the §2.3
+   mirror-gate rule enforced by construction, not by loop shape). A
+   defensive `missed_vblank` stash covers the should-be-unreachable
+   outcome-after-vblank interleaving instead of wedging in
+   `WaitingForVBlank`. Bonus: outcome-path present errors now retire the
+   imported wait semaphores (the §2.8-A5-noted pre-existing leak) since
+   they're parked main-side in `PendingSubmission`.
 3. **B3** cursor/screencopy/syncobj-release/feedback flows per 2.4;
    profiling-ring sharing. Screencopy ordering note: `submit_pending_screencopy`
    must stay sequenced *after* frame N's encode and *before* frame N+1's

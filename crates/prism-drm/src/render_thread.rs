@@ -6,16 +6,21 @@
 //! [`crate::OutputShadow`]s and talks to the thread over an mpsc command
 //! channel.
 //!
-//! **Increment B1 shape — synchronous bridge.** Every operation, the
-//! per-frame present included, is a closure shipped to the thread with the
-//! caller blocking on a reply channel ([`RenderThread::with_outputs`]).
-//! That makes B1 semantically identical to the pre-split code (main is
-//! serialized against the render exactly as when it ran the code inline)
-//! while moving *ownership* wholesale — the whole point of the increment:
-//! all the refactor risk, none of the concurrency. Increment B2 replaces
-//! the hot path (submit + vblank + outcome) with fire-and-forget messages
-//! and a calloop backchannel, at which point the blocking bridge remains
-//! only for cold paths (IPC calibration, power, recovery, session fixups).
+//! **The hot path is asynchronous (increment B2).** A frame submit is a
+//! fire-and-forget [`RenderCmd::SubmitFrame`]; the thread presents and
+//! pushes the outcome (a [`SubmitReply`]) onto the shared outcome channel,
+//! waking main's event loop through a calloop [`Ping`]. Outputs on
+//! different GPUs render in true parallel; outputs on one GPU serialize in
+//! that thread's command queue (the physically required order). Main
+//! drains the outcome channel at deterministic points (its vblank handler
+//! and right before the redraw pass) — a plain `mpsc` + ping rather than a
+//! calloop channel source precisely so the drain can be *ordered* against
+//! the DRM vblank events by the consumer, not by source-dispatch luck.
+//!
+//! Everything else — IPC calibration ops, power, recovery, cursor plane
+//! updates, session fixups — is a closure shipped to the thread, blocking
+//! on a bounded reply ([`RenderThread::with_outputs`]) when a result is
+//! needed. Command-channel FIFO orders closures against frame submits.
 //!
 //! Rules inherited from the design (§2.3, §2.7):
 //! - No Wayland object ever crosses this channel (D4) — closures capture
@@ -25,6 +30,8 @@
 //! - Main may block on the thread only through the bounded
 //!   [`RenderThread::with_outputs`] bridge (`BRIDGE_TIMEOUT`); a timeout
 //!   surfaces as an error, never a deadlock.
+//! - At most one frame is in flight per output — enforced by the redraw
+//!   state machine (`Queued → AwaitingOutcome → …`), not by this module.
 
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -32,6 +39,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use prism_renderer::{vk, DrmDevId, EncodePush, FrameProfile, GpuKeepalive, LoweredFrame};
+use smithay::reexports::calloop::ping::Ping;
 use smithay::utils::{Logical, Size};
 
 use crate::breadcrumb::breadcrumb;
@@ -78,11 +86,15 @@ where
 /// Everything the main thread needs back from a present: the outcome plus
 /// a snapshot of the thread-owned `FrameClock`'s estimates, so main can
 /// arm estimated-vblank timers and stamp feedback target times without
-/// owning the clock (§2.3 `next_present_estimate`).
+/// owning the clock (§2.3 `next_present_estimate`). Delivered over the
+/// outcome channel as a [`RenderOutcomeEvent`].
 pub struct SubmitReply {
     pub outcome: Result<PresentOutcome>,
     pub clock: FrameClockSnapshot,
 }
+
+/// One entry on the outcome channel: which output, and its reply.
+pub type RenderOutcomeEvent = (String, SubmitReply);
 
 /// See [`SubmitReply`]. Mirrored into `OutputShadow` on every reply.
 #[derive(Clone, Copy)]
@@ -96,6 +108,12 @@ pub struct FrameClockSnapshot {
 pub type ThreadOutputs = HashMap<String, OutputContext>;
 
 enum RenderCmd {
+    /// Present one lowered frame; the outcome goes to the outcome channel
+    /// (fire-and-forget from main's perspective).
+    SubmitFrame {
+        id: String,
+        sub: Box<FrameSubmission>,
+    },
     /// Run a closure against the thread's outputs. The closure carries its
     /// own typed reply channel when the caller wants a result.
     Run(Box<dyn FnOnce(&mut ThreadOutputs) + Send>),
@@ -121,12 +139,18 @@ pub struct RenderThread {
 
 impl RenderThread {
     /// Spawn the render thread for `gpu`. Outputs are attached afterwards
-    /// via [`Self::attach_output`].
-    pub fn spawn(gpu: DrmDevId) -> Result<Self> {
+    /// via [`Self::attach_output`]. Frame outcomes go to `outcome_tx`
+    /// (shared by all render threads), each followed by a `ping` to wake
+    /// the main event loop.
+    pub fn spawn(
+        gpu: DrmDevId,
+        outcome_tx: mpsc::Sender<RenderOutcomeEvent>,
+        ping: Ping,
+    ) -> Result<Self> {
         let (cmd, rx) = mpsc::channel::<RenderCmd>();
         let join = std::thread::Builder::new()
             .name(format!("prism-render-{}:{}", gpu.major, gpu.minor))
-            .spawn(move || render_thread_loop(gpu, rx))
+            .spawn(move || render_thread_loop(gpu, rx, outcome_tx, ping))
             .map_err(|e| anyhow!("spawn render thread for {gpu:?}: {e}"))?;
         tracing::info!(?gpu, "render thread spawned");
         Ok(Self {
@@ -175,41 +199,18 @@ impl RenderThread {
         })
     }
 
-    /// Present one lowered frame on `output_id` and return the outcome +
-    /// clock snapshot. Blocking (B1); B2 turns this into a message with the
-    /// outcome delivered over the backchannel.
-    pub fn submit_frame(&self, output_id: &str, mut sub: FrameSubmission) -> Result<SubmitReply> {
-        let id = output_id.to_owned();
-        self.with_outputs(move |outputs| {
-            let Some(ctx) = outputs.get_mut(&id) else {
-                return SubmitReply {
-                    outcome: Err(anyhow!("no output bound to id {id}")),
-                    clock: FrameClockSnapshot {
-                        next_presentation_time: Duration::ZERO,
-                        refresh_interval: None,
-                    },
-                };
-            };
-            let outcome = ctx.present(
-                &sub.frame,
-                sub.view_size,
-                &sub.encode_push,
-                &sub.render_waits,
-                &sub.local_copies,
-                &sub.snapshot_copies,
-                sub.force_full_decode,
-                sub.profile.take(),
-            );
-            // Keepalives + imported wait semaphores die here, on the thread,
-            // after the submit that references them — exactly the lifetime
-            // the deferred-destroy serials account for. (`render_waits` are
-            // retired by the caller via destroy_render_wait_semaphores.)
-            let clock = FrameClockSnapshot {
-                next_presentation_time: ctx.frame_clock.next_presentation_time(),
-                refresh_interval: ctx.frame_clock.refresh_interval(),
-            };
-            SubmitReply { outcome, clock }
-        })
+    /// Queue one lowered frame for `output_id`. Fire-and-forget: the
+    /// present runs on the thread and its [`SubmitReply`] arrives on the
+    /// outcome channel (`Err` here only if the thread itself is gone). The
+    /// caller transitions the output to `AwaitingOutcome` and must not
+    /// submit again until the outcome comes back.
+    pub fn submit_frame(&self, output_id: &str, sub: FrameSubmission) -> Result<()> {
+        self.cmd
+            .send(RenderCmd::SubmitFrame {
+                id: output_id.to_owned(),
+                sub: Box::new(sub),
+            })
+            .map_err(|_| anyhow!("render thread {:?} is gone", self.gpu))
     }
 
     /// Forward a DRM vblank for `output_id` (§2.3: no round-trip — FIFO
@@ -260,10 +261,53 @@ impl Drop for RenderThread {
     }
 }
 
-fn render_thread_loop(gpu: DrmDevId, rx: mpsc::Receiver<RenderCmd>) {
+fn render_thread_loop(
+    gpu: DrmDevId,
+    rx: mpsc::Receiver<RenderCmd>,
+    outcome_tx: mpsc::Sender<RenderOutcomeEvent>,
+    ping: Ping,
+) {
     let mut outputs: ThreadOutputs = HashMap::new();
     while let Ok(cmd) = rx.recv() {
         match cmd {
+            RenderCmd::SubmitFrame { id, sub } => {
+                let mut sub = *sub;
+                let reply = match outputs.get_mut(&id) {
+                    Some(ctx) => {
+                        let outcome = ctx.present(
+                            &sub.frame,
+                            sub.view_size,
+                            &sub.encode_push,
+                            &sub.render_waits,
+                            &sub.local_copies,
+                            &sub.snapshot_copies,
+                            sub.force_full_decode,
+                            sub.profile.take(),
+                        );
+                        // Keepalives die here, after the submit that
+                        // references them — the lifetime the deferred-
+                        // destroy serials account for. (The imported wait
+                        // semaphores are retired main-side via
+                        // destroy_render_wait_semaphores on the outcome.)
+                        let clock = FrameClockSnapshot {
+                            next_presentation_time: ctx.frame_clock.next_presentation_time(),
+                            refresh_interval: ctx.frame_clock.refresh_interval(),
+                        };
+                        SubmitReply { outcome, clock }
+                    }
+                    None => SubmitReply {
+                        outcome: Err(anyhow!("no output bound to id {id}")),
+                        clock: FrameClockSnapshot {
+                            next_presentation_time: Duration::ZERO,
+                            refresh_interval: None,
+                        },
+                    },
+                };
+                // Main gone mid-teardown ⇒ nowhere to report; the state
+                // machine dies with it.
+                let _ = outcome_tx.send((id, reply));
+                ping.ping();
+            }
             RenderCmd::Run(f) => f(&mut outputs),
             RenderCmd::Shutdown => break,
         }

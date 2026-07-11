@@ -43,7 +43,8 @@ pub use modifiers::pick_scanout_modifiers;
 pub use output_ctx::{ColorOverride, OutputContext, PresentOutcome};
 pub use output_shadow::{LutSource, OutputShadow};
 pub use render_thread::{
-    FrameClockSnapshot, FrameSubmission, RenderThread, SubmitReply, ThreadOutputs,
+    FrameClockSnapshot, FrameSubmission, RenderOutcomeEvent, RenderThread, SubmitReply,
+    ThreadOutputs,
 };
 pub use scanout::{
     add_framebuffer_for_bo, connector_is_non_desktop, find_property, pick_all_connected,

@@ -53,6 +53,12 @@ pub enum RedrawState {
     /// A render is pending. The next `redraw_queued_outputs` pass
     /// will perform it.
     Queued,
+    /// A frame was lowered and sent to the output's render thread; its
+    /// present outcome hasn't come back yet (async-render rework §2.5).
+    /// `queue_redraw()` during this window sets `redraw_needed`, folded
+    /// into whichever state the outcome produces. At most one frame is in
+    /// flight per output — the redraw pass only submits from `Queued`.
+    AwaitingOutcome { redraw_needed: bool },
     /// A page-flip is in flight. When the vblank arrives:
     ///   - `redraw_needed: true`  ⇒ transition back to `Queued`
     ///     (e.g. continuous animation, or damage since submit).
@@ -66,6 +72,44 @@ pub enum RedrawState {
     /// As above, but a redraw was requested (commit / animation) while the
     /// estimated-vblank timer was pending. On fire we go straight to `Queued`.
     WaitingForEstimatedVBlankAndQueued(RegistrationToken),
+}
+
+/// The main-thread half of a lowered frame: Wayland objects + state keys
+/// the post-present bookkeeping needs. Never crosses a thread
+/// (`docs/async-render-rework.md` §2.4 — no Wayland object does); parked in
+/// [`PendingSubmission`] while the GPU half is on the render thread.
+pub struct FrameBookkeeping {
+    pub output_gpu_id: prism_renderer::DrmDevId,
+    pub smithay_output: smithay::output::Output,
+    /// Surfaces whose texture on this output's GPU is a cross-GPU mirror —
+    /// their home→scratch copies were submitted during lowering; a confirmed
+    /// render's present fd re-arms the scratch overwrite gate.
+    pub mirror_surfaces: Vec<WlSurface>,
+    /// Native-dmabuf surfaces whose client write fence was imported as a
+    /// render wait; marked waited only on a confirmed render submit.
+    pub acquire_surfaces: Vec<WlSurface>,
+    /// Surfaces were demand-materialized (rendered blank this frame) ⇒ the
+    /// caller must schedule another redraw.
+    pub redraw_again: bool,
+    pub session_locked: bool,
+    /// Predicted presentation time, kept for the feedback stash.
+    pub target_time: Duration,
+}
+
+/// Everything main parks for a frame that is in flight on a render thread
+/// (`RedrawState::AwaitingOutcome`), consumed when its outcome comes back.
+pub struct PendingSubmission {
+    /// Imported cross-GPU copy-done + dmabuf-acquire semaphores the render
+    /// submit waits on; retired via the deferred-destroy queue once the
+    /// outcome proves the submit happened (or never will).
+    pub render_waits: Vec<prism_renderer::vk::Semaphore>,
+    pub bookkeeping: FrameBookkeeping,
+    /// Set when this frame's DRM vblank was dispatched *before* its present
+    /// outcome was drained (the flip retired unusually fast, or main
+    /// stalled a full frame). The outcome handler then fires the
+    /// presentation feedback immediately with this timestamp and skips
+    /// `WaitingForVBlank` — the vblank it would wait on has already fired.
+    pub missed_vblank: Option<Duration>,
 }
 
 /// `wp_presentation_feedback` objects extracted from a frame's surfaces at
@@ -134,6 +178,9 @@ impl OutputRedrawState {
         self.redraw = match std::mem::take(&mut self.redraw) {
             RedrawState::Idle => RedrawState::Queued,
             RedrawState::WaitingForVBlank { .. } => RedrawState::WaitingForVBlank {
+                redraw_needed: true,
+            },
+            RedrawState::AwaitingOutcome { .. } => RedrawState::AwaitingOutcome {
                 redraw_needed: true,
             },
             RedrawState::Queued => RedrawState::Queued,

@@ -462,6 +462,21 @@ pub struct PrismState {
     /// timestamp. Keyed by `OutputId` to match `outputs` / `wl_outputs`.
     /// See [`crate::redraw`] for the state-machine shape.
     pub output_redraw: HashMap<OutputId, crate::redraw::OutputRedrawState>,
+    /// Main-side bookkeeping for frames in flight on the render threads
+    /// (`RedrawState::AwaitingOutcome`), keyed like `outputs`. Parked at
+    /// submit time; consumed when the outcome arrives on `render_events`.
+    pub pending_submissions: HashMap<OutputId, crate::redraw::PendingSubmission>,
+    /// Receiving end of the render threads' shared outcome channel. A
+    /// plain `mpsc` (not a calloop channel) so main can DRAIN it at
+    /// deterministic points — its vblank handler and right before the
+    /// redraw pass — instead of depending on source-dispatch order; the
+    /// paired ping below only wakes the loop.
+    pub render_events: std::sync::mpsc::Receiver<prism_drm::RenderOutcomeEvent>,
+    /// Calloop wake source paired with `render_events`: render threads
+    /// ping it after each outcome send. Created here; `run_integrated`
+    /// takes and inserts it (its callback just drains). `None` once taken,
+    /// and forever in headless builds (no threads, nothing to wake).
+    pub render_events_ping_source: Option<smithay::reexports::calloop::ping::PingSource>,
 
     // ── GPU loss quarantine (docs/device-loss-recovery.md) ─────────────────
     /// GPUs whose VkDevice is lost (`VK_ERROR_DEVICE_LOST`, sticky in
@@ -959,10 +974,18 @@ impl PrismState {
         // attached later via `attach_output`. A spawn failure leaves that
         // GPU's outputs unable to attach — degrade loudly rather than fail
         // construction. Headless / WLCS builds pass an empty `gpus` map and
-        // get no threads.
+        // get no threads. All threads share one outcome channel + wake
+        // ping (drained/dispatched by main — see the field docs).
+        let (render_outcome_tx, render_events) = std::sync::mpsc::channel();
+        let (render_ping, render_events_ping_source) =
+            smithay::reexports::calloop::ping::make_ping().expect("calloop make_ping");
         let mut render_threads = HashMap::new();
         for &gpu in gpus.keys() {
-            match prism_drm::RenderThread::spawn(gpu) {
+            match prism_drm::RenderThread::spawn(
+                gpu,
+                render_outcome_tx.clone(),
+                render_ping.clone(),
+            ) {
                 Ok(t) => {
                     render_threads.insert(gpu, t);
                 }
@@ -1022,6 +1045,9 @@ impl PrismState {
             wl_outputs: HashMap::new(),
             dmabuf_sources: HashMap::new(),
             output_redraw: HashMap::new(),
+            pending_submissions: HashMap::new(),
+            render_events,
+            render_events_ping_source: Some(render_events_ping_source),
             lost_gpus: std::cell::RefCell::new(HashSet::new()),
             gpu_recovery_pending: std::cell::Cell::new(false),
             gpu_recovery_attempts: HashMap::new(),
