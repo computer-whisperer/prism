@@ -602,7 +602,6 @@ fn tracer_render_gradient(device: Arc<prism_renderer::Device>) -> Result<()> {
         &[],
         &[],
         &[],
-        &[],
         false,
         None,
     )?;
@@ -2644,15 +2643,8 @@ fn lower_and_submit(state: &mut prism_protocols::PrismState, output_id: &str) ->
         return Ok(false);
     };
     // The submission moves to the thread; keep the imported wait-semaphore
-    // handles (plain vk handles) for the post-outcome retirement — both
-    // lists retire identically (deferred-destroy on the target device; the
-    // render's slot fence transitively covers the ACE batch's waits too).
-    let render_waits: Vec<vk::Semaphore> = submission
-        .mirror_waits
-        .iter()
-        .chain(submission.acquire_waits.iter())
-        .copied()
-        .collect();
+    // handles (plain vk handles) for the post-outcome retirement.
+    let render_waits = submission.render_waits.clone();
     state
         .render_thread_for_output(output_id)
         .ok_or_else(|| anyhow!("no render thread for output {output_id}"))?
@@ -2746,16 +2738,6 @@ fn on_present_outcome(
     // the next lowering's target_time.
     if let Some(shadow) = state.outputs.get_mut(output_id) {
         shadow.note_clock(reply.clock);
-    }
-    // Advance the cross-GPU scratch-overwrite gate: the ACE copy is the
-    // scratch's only reader now, so its completion fd is what the next
-    // home→GTT copy waits on (§2.8 C; replace semantics are sound — all of
-    // a target's copies ride its single transfer queue). Drained before the
-    // next redraw pass lowers anything, so the gate is always current.
-    if let Some(gpu) = state.outputs.get(output_id).map(|o| o.gpu_id) {
-        if let Some(fd) = reply.ace_copy_done.as_ref() {
-            prism_protocols::note_mirror_render_done(state, gpu, fd);
-        }
     }
     let Some(pending) = state.pending_submissions.remove(output_id) else {
         tracing::error!(output = %output_id, "present outcome with no pending submission");
@@ -3703,17 +3685,15 @@ fn lower_output_frame(
     // Both empty in the trivial single-GPU, all-shm case.
     let mirror_surfaces = mirror_surfaces.take();
     let acquire_surfaces = acquire_surfaces.take();
-    // Kept separate since increment C: the mirror copy-done semaphores are
-    // waited by the ACE copy submit, the client write fences by the render.
-    let mirror_waits =
+    let mut render_waits =
         prism_protocols::prepare_mirror_waits(state, &mirror_surfaces, output_gpu_id);
-    let acquire_waits =
-        prism_protocols::prepare_dmabuf_acquire_waits(state, &acquire_surfaces, output_gpu_id);
-    // GTT→local copies the render thread submits on the ACE queue, so
-    // decode/deband sample local tiled VRAM instead of scanning the LINEAR
-    // mirror imports over PCIe — and the copy overlaps other graphics work.
-    // Also advances each mirror's double-buffer index (must stay after the
-    // walk: every view() for this frame has been taken by now).
+    render_waits.extend(prism_protocols::prepare_dmabuf_acquire_waits(
+        state,
+        &acquire_surfaces,
+        output_gpu_id,
+    ));
+    // GTT→local copies the render records up front, so decode/deband sample
+    // local tiled VRAM instead of scanning the LINEAR mirror imports over PCIe.
     let local_copies = prism_protocols::mirror_local_copies(&mirror_surfaces, output_gpu_id);
 
     Ok(Some((
@@ -3722,8 +3702,7 @@ fn lower_output_frame(
             frame,
             view_size,
             encode_push,
-            acquire_waits,
-            mirror_waits,
+            render_waits,
             local_copies,
             snapshot_copies,
             force_full_decode,
@@ -3773,18 +3752,25 @@ fn process_present_outcome(
             // On FlipPending/Skipped below the waits went unused and the
             // retry re-exports (clearing at prepare time put the fa62fb9
             // blue-bleed race back on the flip-pending path).
-            // (The cross-GPU scratch-overwrite gate is advanced by the
-            // ACE-copy fd in `on_present_outcome` — renders no longer
-            // sample the scratch directly, §2.8 C.)
             prism_protocols::mark_dmabuf_acquire_waited(&bk.acquire_surfaces, output_gpu_id);
+            // If this render sampled mirror scratches, store its completion
+            // fence (a dup of the present SYNC_FD) so the next home→scratch
+            // copy waits it instead of overwriting mid-read.
+            if !bk.mirror_surfaces.is_empty() {
+                prism_protocols::note_mirror_render_done(state, output_gpu_id, &fd);
+            }
             fd
         }
         // Rendered but the flip failed: the render submit is in flight and
-        // really carried the acquire waits, so do the same GPU-side
-        // bookkeeping as `Presented`, then propagate the flip error.
+        // really carried the acquire waits / sampled the mirror scratches, so
+        // do the same GPU-side bookkeeping as `Presented` (skipping it would
+        // let the next copy overwrite a scratch this render is still reading),
+        // then propagate the flip error as before.
         prism_drm::PresentOutcome::FlipFailed { render_done, error } => {
             prism_protocols::mark_dmabuf_acquire_waited(&bk.acquire_surfaces, output_gpu_id);
-            drop(render_done);
+            if !bk.mirror_surfaces.is_empty() {
+                prism_protocols::note_mirror_render_done(state, output_gpu_id, &render_done);
+            }
             return Err(error);
         }
         // Flip still in flight — caller leaves the output Queued and retries.
@@ -4225,7 +4211,6 @@ fn run_gradient_scanout(output_name: Option<&str>, depth: prism_drm::ScanoutDept
         &[],
         &[],
         &encode_push,
-        &[],
         &[],
         &[],
         &[],

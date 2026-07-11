@@ -40,7 +40,7 @@ pub use encode_synth::{EncodeConfig, EncodeFragment, EncodePushSynth, LutOutputD
 pub use error::{RendererError, Result};
 pub use instance::Instance;
 pub use intermediate::{create_view, Intermediate, DEFAULT_INTERMEDIATE_FORMAT};
-pub use local_mirror::{AceCopier, LocalImage, LocalMirrorCopy};
+pub use local_mirror::{LocalImage, LocalMirrorCopy};
 pub use lut3d::{
     drive_identity_lut, identity_lut, load_lut3d_file, pq_eotf, save_lut3d_file,
     synthesize_lut_from_matrix_curve, LoadedLut, Lut3dTexture, LutFileHeader,

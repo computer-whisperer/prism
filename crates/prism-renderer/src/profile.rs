@@ -32,12 +32,12 @@ use std::time::{Duration, Instant};
 pub const RING_CAPACITY: usize = 256;
 
 /// Number of timed phases per frame ([`Span`] variants).
-pub const N_SPANS: usize = 10;
+pub const N_SPANS: usize = 9;
 
 /// Stable display names for the spans, indexed by [`Span`] `as usize`.
 pub const SPAN_NAMES: [&str; N_SPANS] = [
     // CPU phases (filled by the compositor as it builds the frame).
-    "walk", "damage", "lower", "encpush", "acecopy", "submit",
+    "walk", "damage", "lower", "encpush", "submit",
     // GPU phases (filled from the renderer's timestamp queries, one frame late).
     "snapshot", "decode", "deband", "encode",
 ];
@@ -55,11 +55,6 @@ pub enum Span {
     Lower,
     /// Building the per-output `EncodePush`.
     EncodePush,
-    /// CPU cost of recording + submitting the ACE-queue mirror copy batch
-    /// (zero for frames with no cross-GPU mirror). The GPU-side duration of
-    /// the copy is not yet timestamped (it runs on the transfer queue,
-    /// outside the graphics timestamp pool).
-    LocalCopy,
     /// CPU cost of recording + submitting the render command buffer.
     Submit,
     /// GPU: window-close snapshot capture (intermediate → snapshot copies).

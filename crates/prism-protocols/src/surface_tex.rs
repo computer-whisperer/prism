@@ -138,25 +138,12 @@ pub enum GpuTex {
         home_src_buffer: ObjectId,
         scratch: ExportableImage,
         target: Arc<ImportedImage>,
-        /// OPTIMAL device-local copies of `target`, in the consumer GPU's
-        /// own VRAM — sampled by the decode/deband passes instead of the
-        /// LINEAR `target`, so they read tiled local memory rather than
-        /// scanning the GTT import over PCIe twice. Double-buffered
-        /// (`docs/async-render-rework.md` §2.8 C): each frame's ACE-queue
-        /// copy fills `target_local[local_write]` while the previous
-        /// frame's render may still be sampling the other buffer — that is
-        /// what lets the next home→GTT copy start as soon as the previous
-        /// ACE copy (the scratch's only reader) finishes, instead of after
-        /// the whole render.
-        target_local: [Arc<LocalImage>; 2],
-        /// Index into `target_local` (and the chroma pair) that the frame
-        /// currently being lowered writes AND samples. Advanced by
-        /// [`GpuTex::mirror_copies`] after it emits the frame's copy ops —
-        /// the walk's `view()` reads run earlier in the same lowering, so
-        /// both see the same buffer. A future skip-copy optimization must
-        /// NOT advance this (and must sample `local_write ^ 1`, the last
-        /// buffer actually written).
-        local_write: usize,
+        /// OPTIMAL device-local copy of `target`, in the consumer GPU's own
+        /// VRAM. Filled once per render from `target` (a streaming GTT→VRAM
+        /// blit) and sampled by the decode/deband passes instead of the LINEAR
+        /// `target`, so they read tiled local memory rather than scanning the
+        /// GTT import over PCIe twice. See `docs/async-render-rework.md`.
+        target_local: Arc<LocalImage>,
         /// Chroma plane for a YUV mirror (NV12/P010): a second, half-res
         /// scratch+target carrying the interleaved chroma. `None` for an
         /// RGB mirror. When set, `scratch`/`target` hold the luma plane and
@@ -174,9 +161,8 @@ pub enum GpuTex {
 pub struct MirrorChroma {
     pub scratch: ExportableImage,
     pub target: Arc<ImportedImage>,
-    /// Local OPTIMAL copies of the chroma `target`, double-buffered in
-    /// lockstep with the luma pair (indexed by the parent's `local_write`).
-    pub target_local: [Arc<LocalImage>; 2],
+    /// Local OPTIMAL copy of the chroma `target` (see `GpuTex::Mirror`).
+    pub target_local: Arc<LocalImage>,
     pub kind: YuvKind,
 }
 
@@ -191,49 +177,38 @@ impl GpuTex {
     pub fn view(&self) -> vk::ImageView {
         match self {
             Self::Native(img) => img.view(),
-            // Sample the local OPTIMAL back buffer this frame's ACE copy
-            // fills, not the LINEAR GTT import.
-            Self::Mirror {
-                target_local,
-                local_write,
-                ..
-            } => target_local[*local_write].view(),
+            // Sample the local OPTIMAL copy, not the LINEAR GTT import — the
+            // per-frame GTT→local copy (recorded in render_frame) fills it.
+            Self::Mirror { target_local, .. } => target_local.view(),
             Self::Shm(t) => t.view(),
         }
     }
 
-    /// Cross-GPU mirror GTT→local copies this texture needs submitted (on
-    /// the ACE queue) before sampling: luma + optional chroma plane, into
-    /// the `local_write` back buffers. Advances `local_write` — every walk
-    /// `view()` for this frame has already been taken (lowering calls this
-    /// last), and the next frame writes + samples the other buffer. Empty
-    /// for non-mirror textures.
-    pub fn mirror_copies(&mut self) -> Vec<LocalMirrorCopy> {
+    /// Cross-GPU mirror GTT→local copies this texture needs recorded before
+    /// sampling (luma + optional chroma plane). Empty for non-mirror textures.
+    /// Handed to `render_frame` via the per-output present path.
+    pub fn mirror_copies(&self) -> Vec<LocalMirrorCopy> {
         let Self::Mirror {
             target,
             target_local,
-            local_write,
             chroma,
             ..
         } = self
         else {
             return Vec::new();
         };
-        let dst = &target_local[*local_write];
         let mut out = vec![LocalMirrorCopy {
             src: target.image(),
-            dst: dst.image(),
-            extent: dst.extent(),
+            dst: target_local.image(),
+            extent: target_local.extent(),
         }];
         if let Some(c) = chroma {
-            let cdst = &c.target_local[*local_write];
             out.push(LocalMirrorCopy {
                 src: c.target.image(),
-                dst: cdst.image(),
-                extent: cdst.extent(),
+                dst: c.target_local.image(),
+                extent: c.target_local.extent(),
             });
         }
-        *local_write ^= 1;
         out
     }
 
@@ -252,18 +227,13 @@ impl GpuTex {
                 chroma,
                 ..
             } => {
-                // `target` is the GTT import the frame's ACE copy reads;
-                // one `target_local` buffer is written + sampled this
-                // frame. Both buffers are kept (cheap) — the copy targets
-                // one, but the index has advanced by the time the frame is
-                // packaged, so picking would invite an off-by-one.
+                // `target` is the GTT import the frame's LocalMirrorCopy
+                // reads; `target_local` is what the draws sample.
                 out.push(target.clone());
-                out.push(target_local[0].clone());
-                out.push(target_local[1].clone());
+                out.push(target_local.clone());
                 if let Some(c) = chroma {
                     out.push(c.target.clone());
-                    out.push(c.target_local[0].clone());
-                    out.push(c.target_local[1].clone());
+                    out.push(c.target_local.clone());
                 }
             }
             Self::Shm(t) => out.push(t.image().clone()),
@@ -310,10 +280,8 @@ impl GpuTex {
                 None => (None, 0),
             },
             Self::Mirror {
-                chroma: Some(c),
-                local_write,
-                ..
-            } => (Some(c.target_local[*local_write].view()), code(c.kind)),
+                chroma: Some(c), ..
+            } => (Some(c.target_local.view()), code(c.kind)),
             _ => (None, 0),
         }
     }

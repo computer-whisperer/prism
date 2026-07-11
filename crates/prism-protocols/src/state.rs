@@ -5173,15 +5173,13 @@ pub fn prepare_mirror_waits(
     waits
 }
 
-/// Gather the GTT→local mirror copies the target render needs before
-/// sampling, for every mirrored surface drawn on `target_gpu` this frame
-/// (the luma plane plus an optional chroma plane each). Handed to
-/// `present()` → `render_frame`, which submits them on the transfer (ACE)
-/// queue gated by the home→GTT copy-done semaphores that
-/// [`prepare_mirror_waits`] returns (`docs/async-render-rework.md` §2.8 C).
-/// Advances each mirror's double-buffer write index — call after the walk
-/// (every `view()` for the frame taken), once per frame. Empty when no
-/// surface on this output is mirrored.
+/// Gather the GTT→local mirror copies the target render must record before
+/// sampling, for every mirrored surface drawn on `target_gpu` this frame (the
+/// luma plane plus an optional chroma plane each). Handed to `present()` →
+/// `render_frame`, which records them at the start of the command buffer; the
+/// copies' source reads are gated by the same home→GTT copy-done semaphores
+/// that [`prepare_mirror_waits`] returns. Empty when no surface on this output
+/// is mirrored.
 pub fn mirror_local_copies(
     surfaces: &[WlSurface],
     target_gpu: DrmDevId,
@@ -5192,12 +5190,9 @@ pub fn mirror_local_copies(
             let Some(slot) = states.data_map.get::<SurfaceTexSlot>() else {
                 return;
             };
-            let mut guard = slot.0.lock().unwrap();
-            let Some(tex) = guard.as_mut() else { return };
-            if let Some(gt) = tex.by_gpu.get_mut(&target_gpu) {
-                // Advances the mirror's write index — must run after every
-                // view() for this frame was taken (it does: lowering calls
-                // this after the walk).
+            let guard = slot.0.lock().unwrap();
+            let Some(tex) = guard.as_ref() else { return };
+            if let Some(gt) = tex.by_gpu.get(&target_gpu) {
                 out.extend(gt.mirror_copies());
             }
         });
@@ -5447,7 +5442,7 @@ fn materialize_dmabuf_for_gpu(
      -> Result<(
         prism_renderer::ExportableImage,
         Arc<prism_renderer::ImportedImage>,
-        [Arc<prism_renderer::LocalImage>; 2],
+        Arc<prism_renderer::LocalImage>,
     )> {
         if !gpu_supports_dmabuf(&device_g, vk_fmt, DRM_FORMAT_MOD_LINEAR) {
             anyhow::bail!("consumer GPU can't sample LINEAR for {vk_fmt:?}; no mirror");
@@ -5478,19 +5473,13 @@ fn materialize_dmabuf_for_gpu(
             .inspect_err(|e| {
                 state.note_gpu_error(g, e);
             })?;
-        // The local OPTIMAL copies the decode/deband passes actually
-        // sample — double-buffered so the ACE copy can fill one while the
-        // previous frame's render still samples the other (§2.8 C).
-        let make_local = |i: usize| -> Result<Arc<prism_renderer::LocalImage>> {
-            prism_renderer::LocalImage::new(device_g.clone(), plane_extent, vk_fmt)
-                .with_context(|| format!("LocalImage::new (mirror target_local {i})"))
-                .inspect_err(|e| {
-                    state.note_gpu_error(g, e);
-                })
-                .map(Arc::new)
-        };
-        let target_local = [make_local(0)?, make_local(1)?];
-        Ok((scratch, Arc::new(target), target_local))
+        // The local OPTIMAL copy the decode/deband passes actually sample.
+        let target_local = prism_renderer::LocalImage::new(device_g.clone(), plane_extent, vk_fmt)
+            .context("LocalImage::new (mirror target_local)")
+            .inspect_err(|e| {
+                state.note_gpu_error(g, e);
+            })?;
+        Ok((scratch, Arc::new(target), Arc::new(target_local)))
     };
 
     let yuv = yuv_kind_for(dmabuf.format);
@@ -5546,7 +5535,6 @@ fn materialize_dmabuf_for_gpu(
             scratch,
             target,
             target_local,
-            local_write: 0,
             chroma,
         },
     );
