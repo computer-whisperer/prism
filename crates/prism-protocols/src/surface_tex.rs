@@ -168,8 +168,10 @@ pub struct MirrorChroma {
 
 /// A type-erased strong ref to a GPU object a lowered frame's raw
 /// `vk::ImageView`s / copy ops point into — see [`GpuTex::keepalive`]. The
-/// frame only holds it (RAII); nothing downcasts it.
-pub type GpuKeepalive = Arc<dyn std::any::Any + Send + Sync>;
+/// frame only holds it (RAII); nothing downcasts it. Defined in
+/// `prism_renderer` so `prism_drm`'s `FrameSubmission` can name it too;
+/// re-exported here for the existing users.
+pub use prism_renderer::GpuKeepalive;
 
 impl GpuTex {
     pub fn view(&self) -> vk::ImageView {

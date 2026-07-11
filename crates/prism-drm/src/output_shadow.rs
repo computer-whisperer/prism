@@ -122,6 +122,19 @@ pub struct OutputShadow {
     /// from `PRISM_NO_PROFILE`).
     pub profile_enabled: bool,
 
+    // ── Frame-clock estimate replica ───────────────────────────────────────
+    /// Last-known prediction of the next presentation time, mirrored from
+    /// the thread-owned `FrameClock` via every [`crate::SubmitReply`]
+    /// (`docs/async-render-rework.md` §2.3 `next_present_estimate`).
+    /// Consumers: the estimated-vblank timer (armed right after a
+    /// `SkippedNoDamage` reply, so the value is fresh) and the feedback
+    /// stash's diagnostic `target_time` (stale-by-one between a vblank and
+    /// the next reply — acceptable, it's comparison-only).
+    pub next_present_estimate: std::time::Duration,
+    /// Refresh interval from the same snapshot (static per mode in
+    /// practice; `None` only if the clock was built without one).
+    pub refresh_interval: Option<std::time::Duration>,
+
     /// DPMS replica — see module docs.
     powered_off: bool,
 }
@@ -147,16 +160,31 @@ impl OutputShadow {
             white_view: ctx.renderer.white_view(),
             lut3d_cube_edge: ctx.renderer.lut3d_cube_edge(),
             profile_enabled: ctx.renderer.profile_enabled(),
+            next_present_estimate: ctx.frame_clock.next_presentation_time(),
+            refresh_interval: ctx.frame_clock.refresh_interval(),
             powered_off: ctx.is_powered_off(),
         }
     }
 
-    /// Re-capture the renderer-derived caches after device-loss recovery
-    /// swapped the context's `Renderer` (`rebuild_render_state`).
-    pub fn refresh_renderer_caches(&mut self, ctx: &OutputContext) {
-        self.white_view = ctx.renderer.white_view();
-        self.lut3d_cube_edge = ctx.renderer.lut3d_cube_edge();
-        self.profile_enabled = ctx.renderer.profile_enabled();
+    /// Mirror a fresh frame-clock snapshot from a render-thread reply.
+    pub fn note_clock(&mut self, snapshot: crate::FrameClockSnapshot) {
+        self.next_present_estimate = snapshot.next_presentation_time;
+        self.refresh_interval = snapshot.refresh_interval;
+    }
+
+    /// Re-set the renderer-derived caches after device-loss recovery
+    /// swapped the context's `Renderer` (`rebuild_render_state`). Raw
+    /// values because the rebuild runs on the render thread and only these
+    /// come back over the bridge.
+    pub fn set_renderer_caches(
+        &mut self,
+        white_view: vk::ImageView,
+        lut3d_cube_edge: u32,
+        profile_enabled: bool,
+    ) {
+        self.white_view = white_view;
+        self.lut3d_cube_edge = lut3d_cube_edge;
+        self.profile_enabled = profile_enabled;
     }
 
     /// DPMS replica — true while the output is powered off. Kept in sync by

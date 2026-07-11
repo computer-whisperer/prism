@@ -59,3 +59,13 @@ pub use upload::{ShmImage, ShmTexture};
 
 // Re-export ash::vk so binary / glue crates don't need a direct ash dep.
 pub use ash::vk;
+
+/// Type-erased strong reference keeping a GPU object alive for the
+/// lifetime of something that references it by raw handle — e.g. a lowered
+/// frame's `vk::ImageView`s pointing into surface textures. Destruction
+/// stays safe via the deferred-destroy queue ([`Device::retire`]); the
+/// keepalive only guarantees the retire can't be stamped before the
+/// referencing submit happens. Defined here (rather than in the consumer
+/// crates) so both the protocol layer's texture types and `prism-drm`'s
+/// frame-submission boundary type can name it.
+pub type GpuKeepalive = std::sync::Arc<dyn std::any::Any + Send + Sync>;

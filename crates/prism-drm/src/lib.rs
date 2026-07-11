@@ -27,6 +27,7 @@ pub mod hdr;
 pub mod modifiers;
 pub mod output_ctx;
 pub mod output_shadow;
+pub mod render_thread;
 pub mod scanout;
 pub mod session;
 
@@ -41,6 +42,9 @@ pub use hdr::{HdrEotf, HdrProps, HdrSignaling};
 pub use modifiers::pick_scanout_modifiers;
 pub use output_ctx::{ColorOverride, OutputContext, PresentOutcome};
 pub use output_shadow::{LutSource, OutputShadow};
+pub use render_thread::{
+    FrameClockSnapshot, FrameSubmission, RenderThread, SubmitReply, ThreadOutputs,
+};
 pub use scanout::{
     add_framebuffer_for_bo, connector_is_non_desktop, find_property, pick_all_connected,
     pick_all_connected_with_config, pick_by_name, pick_by_name_with_config, pick_first_connected,

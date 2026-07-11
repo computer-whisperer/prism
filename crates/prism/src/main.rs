@@ -1889,10 +1889,23 @@ fn run_integrated(
                         //    present re-modesets via commit (not a now-invalid
                         //    page-flip) and isn't wedged by a lost-vblank guard.
                         // The property writes go through each output's own
-                        // surface handle (same device fd as the card).
-                        for output in state.output_ctxs.values_mut() {
-                            output.reapply_color_signaling();
-                            output.mark_for_resume();
+                        // surface handle (same device fd as the card), so
+                        // the fixups run wholesale on each render thread.
+                        // Blocking: the re-queue + redraw below must not
+                        // race ahead of the resets. (B4 replaces this with
+                        // the designed SessionPause/Activate protocol.)
+                        for thread in state.render_threads.values() {
+                            if let Err(e) = thread.with_outputs(|outputs| {
+                                for output in outputs.values_mut() {
+                                    output.reapply_color_signaling();
+                                    output.mark_for_resume();
+                                }
+                            }) {
+                                tracing::error!(
+                                    gpu = ?thread.gpu,
+                                    "session-resume output fixups failed: {e:#}"
+                                );
+                            }
                         }
                         // Force a full redraw of every output: the reset above
                         // dropped scanout state, so each output must re-modeset.
@@ -2227,21 +2240,20 @@ fn run_integrated(
     ));
     let t_start = std::time::Instant::now();
 
-    // Take + drop the execution contexts one at a time so we can attribute
-    // hangs to a specific OutputContext (surface.clear, Renderer Drop,
-    // scanout buffer Drop with imported image + GBM BO). The shadows are
-    // plain data — dropping them with the rest of `state` is fine.
+    // Stop the render threads: each drops its OutputContexts on-thread,
+    // one at a time with per-output breadcrumbs (surface.clear, Renderer
+    // Drop, scanout buffer Drop), then exits and is joined — bounded, so a
+    // fence-wedged thread can't hang teardown (it's abandoned loudly
+    // instead). Must happen while DRM master is still held (event_loop's
+    // libseat notifier drops later). The shadows are plain data.
     drop(std::mem::take(&mut state.outputs));
-    let outputs = std::mem::take(&mut state.output_ctxs);
-    breadcrumb(&format!("shutdown: dropping {} outputs", outputs.len()));
-    for (id, output) in outputs {
-        let t = std::time::Instant::now();
-        let crtc = output.crtc;
-        drop(output);
-        breadcrumb(&format!(
-            "shutdown: dropped output {id} (crtc {crtc:?}) in {}ms",
-            t.elapsed().as_millis()
-        ));
+    let mut render_threads = std::mem::take(&mut state.render_threads);
+    breadcrumb(&format!(
+        "shutdown: stopping {} render thread(s)",
+        render_threads.len()
+    ));
+    for (_gpu, mut thread) in render_threads.drain() {
+        thread.shutdown_join(Duration::from_secs(10));
     }
 
     let t = std::time::Instant::now();
@@ -2354,9 +2366,14 @@ fn on_vblank(
     ));
 
     // Step 1: per-output DRM bookkeeping (frame_pending, back_buffer
-    // toggle, frame_clock update).
-    if let Some(ctx) = state.output_ctxs.get_mut(&output_id) {
-        ctx.mark_vblank(presentation_time);
+    // toggle, frame_clock update) — forwarded to the owning render thread
+    // (§2.3: fire-and-forget; command-channel FIFO orders it before any
+    // later frame submit, so the thread always clears `frame_pending`
+    // before the next present arrives).
+    if let Some(thread) = state.render_thread_for_output(&output_id) {
+        if let Err(e) = thread.vblank(&output_id, presentation_time) {
+            tracing::error!(output = %output_id, "vblank forward failed: {e:#}");
+        }
     }
 
     // Step 2: advance this output's refresh-cycle counter and deliver frame
@@ -2629,19 +2646,24 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
 /// here are recorded so recovery powers exactly them back on (user DPMS
 /// state is never touched).
 fn blank_lost_output_for_lock(state: &mut prism_protocols::PrismState, output_id: &str) {
-    let mut blanked = false;
-    if let Some(o) = state.output_ctxs.get_mut(output_id) {
-        if !o.is_powered_off() {
-            match o.power_off() {
-                Ok(()) => blanked = true,
-                Err(e) => {
-                    tracing::warn!("blanking lost-GPU output for lock failed: {e:#}");
-                    state.note_lock_render(output_id, false);
-                    return;
-                }
-            }
+    // CRTC clear runs on the output's render thread; blocking so the lock
+    // accounting below reflects what actually happened on screen.
+    let result: Option<Result<bool>> = state.with_output_ctx(output_id, |o| {
+        if o.is_powered_off() {
+            return Ok(false);
         }
-    }
+        o.power_off().map(|()| true)
+    });
+    let blanked = match result {
+        Some(Ok(blanked)) => blanked,
+        Some(Err(e)) => {
+            tracing::warn!("blanking lost-GPU output for lock failed: {e:#}");
+            state.note_lock_render(output_id, false);
+            return;
+        }
+        // Output/thread gone — nothing on screen to worry about.
+        None => false,
+    };
     if blanked {
         if let Some(shadow) = state.outputs.get_mut(output_id) {
             shadow.note_powered(false);
@@ -2671,12 +2693,14 @@ fn queue_estimated_vblank(state: &mut prism_protocols::PrismState, output_id: &s
         return;
     }
 
-    let Some((target, refresh)) = state.output_ctxs.get(output_id).map(|o| {
-        (
-            o.frame_clock.next_presentation_time(),
-            o.frame_clock.refresh_interval(),
-        )
-    }) else {
+    // Frame-clock estimates come from the shadow's replica, refreshed by
+    // every submit reply — and this timer is only armed right after a
+    // `SkippedNoDamage` reply, so the snapshot is fresh.
+    let Some((target, refresh)) = state
+        .outputs
+        .get(output_id)
+        .map(|o| (o.next_present_estimate, o.refresh_interval))
+    else {
         return;
     };
     // Fire at the predicted vblank. If that's already due (zero), wait one
@@ -2758,44 +2782,10 @@ fn on_estimated_vblank(state: &mut prism_protocols::PrismState, output_id: &str)
     };
 }
 
-/// Everything `OutputContext::present` consumes for one output's frame — the
-/// GPU-side half of a lowered frame, no Wayland objects. Kept `Send`
-/// (asserted below): increment B1 of the async-render rework sends it to the
-/// owning GPU's render thread (`docs/async-render-rework.md` §2.4). Named
-/// `FrameSubmission` because `prism_renderer::LoweredFrame` is the draw-list
-/// type it wraps.
-///
-/// Lifetime-bearing: `_keepalive` owns strong refs to every GPU object the
-/// frame's raw `vk::ImageView`s / mirror copy ops point into — the drawn
-/// surfaces' textures (collected per-surface in the walk) and the layout's
-/// snapshot ghosts (`Layout::snapshot_keepalives`) — so a surface dying or
-/// an animation ending while the frame is in flight can't stamp the
-/// texture's deferred-destroy retirement before the frame's submit.
-struct FrameSubmission {
-    /// RAII only — never read. See above.
-    _keepalive: Vec<prism_protocols::GpuKeepalive>,
-    frame: prism_renderer::LoweredFrame,
-    view_size: smithay::utils::Size<f64, smithay::utils::Logical>,
-    encode_push: prism_renderer::EncodePush,
-    /// Imported cross-GPU copy-done + dmabuf-acquire semaphores the render
-    /// submit waits on; retired via the deferred-destroy queue post-present.
-    render_waits: Vec<vk::Semaphore>,
-    local_copies: Vec<prism_renderer::LocalMirrorCopy>,
-    snapshot_copies: Vec<prism_renderer::SnapshotCopy>,
-    force_full_decode: bool,
-    /// Per-frame phase profile with the lowering-side CPU spans already
-    /// filled; `present` fills damage/submit and rings the record.
-    profile: Option<prism_renderer::FrameProfile>,
-}
-
-// Compile-time assertion: `FrameSubmission` crosses a thread boundary at B1,
-// so it must stay `Send`. (A trivially-false concrete `where` bound is a
-// compile error, which is exactly the check we want.)
-fn _assert_frame_submission_send()
-where
-    FrameSubmission: Send,
-{
-}
+/// The GPU-side half of a lowered frame is `prism_drm::FrameSubmission`
+/// (moved there for increment B1 — it crosses into the owning GPU's render
+/// thread, `docs/async-render-rework.md` §2.4).
+use prism_drm::FrameSubmission;
 
 /// The main-thread half of a lowered frame: Wayland objects + state keys the
 /// post-present bookkeeping needs. Never crosses a thread (doc §2.4 — no
@@ -2825,54 +2815,34 @@ struct FrameBookkeeping {
 /// retries).
 ///
 /// Three stages — [`lower_output_frame`] (scene → `FrameSubmission`, all the
-/// `PrismState` reads), [`execute_frame`] (the present: damage diff, record,
-/// submit, flip), [`process_present_outcome`] (Wayland + mirror-gate
-/// bookkeeping keyed on the outcome). Split so increment B1 of the
-/// async-render rework can move `execute` onto the per-GPU render threads
-/// while lower/process stay on main (`docs/async-render-rework.md` §2.8 A2).
+/// `PrismState` reads), the present on the owning GPU's render thread
+/// (damage diff, record, submit, flip — `RenderThread::submit_frame`,
+/// blocking in B1; B2 makes it a message with the outcome delivered
+/// asynchronously), [`process_present_outcome`] (Wayland + mirror-gate
+/// bookkeeping keyed on the outcome, back on main).
 fn render_output_now(
     state: &mut prism_protocols::PrismState,
     output_id: &str,
 ) -> Result<RenderOutcome> {
-    let Some((mut submission, bookkeeping)) = lower_output_frame(state, output_id)? else {
+    let Some((submission, bookkeeping)) = lower_output_frame(state, output_id)? else {
         // Output not in the layout yet (add_output vs first-vblank race);
         // leave it Queued and retry next pass.
         return Ok(RenderOutcome::FlipPending);
     };
-    let outcome = {
-        let output = state
-            .output_ctxs
-            .get_mut(output_id)
-            .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
-        execute_frame(output, &mut submission)?
-    };
-    process_present_outcome(
-        state,
-        output_id,
-        outcome,
-        submission.render_waits,
-        bookkeeping,
-    )
-}
-
-/// Stage 2 of [`render_output_now`]: the present itself — damage diff,
-/// command-buffer record, queue submit, atomic page-flip. Touches only the
-/// `OutputContext` and the submission (no `PrismState`, no Wayland objects);
-/// B1 moves exactly this call onto the owning GPU's render thread.
-fn execute_frame(
-    output: &mut prism_drm::OutputContext,
-    sub: &mut FrameSubmission,
-) -> Result<prism_drm::PresentOutcome> {
-    output.present(
-        &sub.frame,
-        sub.view_size,
-        &sub.encode_push,
-        &sub.render_waits,
-        &sub.local_copies,
-        &sub.snapshot_copies,
-        sub.force_full_decode,
-        sub.profile.take(),
-    )
+    // The submission moves to the thread; keep the imported wait-semaphore
+    // handles (plain vk handles) for the post-present retirement below.
+    let render_waits = submission.render_waits.clone();
+    let reply = state
+        .render_thread_for_output(output_id)
+        .ok_or_else(|| anyhow!("no render thread for output {output_id}"))?
+        .submit_frame(output_id, submission)?;
+    // Mirror the thread-owned FrameClock's fresh estimates into the shadow
+    // (feeds the estimated-vblank timer and the next frame's target_time).
+    if let Some(shadow) = state.outputs.get_mut(output_id) {
+        shadow.note_clock(reply.clock);
+    }
+    let outcome = reply.outcome?;
+    process_present_outcome(state, output_id, outcome, render_waits, bookkeeping)
 }
 
 /// Stage 1 of [`render_output_now`]: walk the layout + layer/lock/DnD
@@ -2889,13 +2859,14 @@ fn lower_output_frame(
 
     // Snapshot identity bits without holding any borrow into the output
     // maps. The "effective" reads pick runtime IPC overrides ahead of the
-    // persisted KDL values, so calibration tools can iterate live. All
-    // policy comes from the shadow; the frame-clock estimate is the one
-    // execution-side read left (it moves behind the render-thread split's
-    // outcome messages at B1b).
+    // persisted KDL values, so calibration tools can iterate live. All of
+    // it comes from the shadow — including `target_time`, the frame-clock
+    // estimate replica (stale by at most one vblank; it's the diagnostic
+    // comparison value in the feedback stash, not a scheduling input).
     let (
         output_gpu_id,
         white_view,
+        target_time,
         output_sdr_reference_nits,
         output_decode_clamp_bt2020_rgb,
         profile_enabled,
@@ -2907,17 +2878,12 @@ fn lower_output_frame(
         (
             shadow.gpu_id,
             shadow.white_view,
+            shadow.next_present_estimate,
             shadow.effective_sdr_reference_nits(),
             shadow.effective_decode_clamp_bt2020_rgb(),
             shadow.profile_enabled,
         )
     };
-    let target_time = state
-        .output_ctxs
-        .get(output_id)
-        .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?
-        .frame_clock
-        .next_presentation_time();
 
     // Per-frame phase profile, accumulated as we build the frame. `None` (the
     // default) means profiling is off and we skip taking the per-phase timings

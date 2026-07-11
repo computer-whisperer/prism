@@ -416,13 +416,17 @@ fn handle_capture_frame(state: &mut PrismState, name: &str) -> (Reply, Option<Ow
         );
     };
 
-    let Some(output_ctx) = state.output_ctxs.get(&output_id) else {
+    // The intermediate lives with the renderer on the output's render
+    // thread; blocking bridge (one-shot inspector op).
+    let Some(captured) =
+        state.with_output_ctx(&output_id, |ctx| ctx.renderer.capture_intermediate())
+    else {
         return (
-            Err(format!("capture-frame: output {name:?} not found")),
+            Err(format!("capture-frame: output {name:?} unreachable")),
             None,
         );
     };
-    match output_ctx.renderer.capture_intermediate() {
+    match captured {
         Ok(frame) => {
             let meta = prism_ipc::FrameMeta {
                 width: frame.width,
@@ -490,14 +494,22 @@ fn handle_lut3d(state: &mut PrismState, name: &str) -> (Reply, Option<OwnedFd>) 
 /// [`prism_ipc::ProfilingStats`]). Pull-based; prism-tune polls it while its
 /// profiling panel is open.
 fn handle_profiling_stats(state: &mut PrismState, name: &str) -> (Reply, Option<OwnedFd>) {
-    let Some(ctx) = state
-        .output_ctxs
-        .values()
-        .find(|ctx| ctx.connector_name == name)
+    let Some(output_id) = state
+        .outputs
+        .iter()
+        .find(|(_id, shadow)| shadow.connector_name == name)
+        .map(|(id, _)| id.clone())
     else {
         return (Err(format!("profiling: output {name:?} not found")), None);
     };
-    let Some(readout) = ctx.renderer.profile_readout() else {
+    // The profile ring lives with the renderer on the render thread;
+    // blocking bridge (prism-tune polls this at panel refresh rate, and
+    // the copy-out is a few hundred KB — B3 shares the ring behind an
+    // Arc<Mutex> instead if this ever shows up in latency).
+    let Some(readout) = state
+        .with_output_ctx(&output_id, |ctx| ctx.renderer.profile_readout())
+        .flatten()
+    else {
         return (
             Err(format!(
                 "profiling: output {name:?} has no profile data yet \
@@ -709,17 +721,11 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
         ));
     };
 
-    // Color policy lives on the shadow (main-owned); the renderer / HDR
-    // infoframe ops need the execution context. Split-borrow both maps so
-    // the match arms can touch each side.
-    let PrismState {
-        outputs,
-        output_ctxs,
-        ..
-    } = &mut *state;
-    let (Some(shadow), Some(output_ctx)) =
-        (outputs.get_mut(&output_id), output_ctxs.get_mut(&output_id))
-    else {
+    // Color policy lives on the shadow (main-owned) — the match arms
+    // mutate it here. Renderer / HDR-infoframe work runs on the output's
+    // render thread AFTER the match (collected via the flags below), so no
+    // execution borrow is held while policy changes.
+    let Some(shadow) = state.outputs.get_mut(&output_id) else {
         return Ok(Response::OutputConfigChanged(
             OutputConfigChanged::OutputWasMissing,
         ));
@@ -736,6 +742,12 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
     // push — triggers a rebuild + re-advertise of the output's preferred
     // image description after the match.
     let mut readvertise = false;
+    // Set when the KMS HDR infoframe must be re-pushed on the render
+    // thread; carries the per-action warning context.
+    let mut rebuild_infoframe: Option<&'static str> = None;
+    // Set by EncodeDiagnose: the probe input + the push mirroring the live
+    // encode config, run on the render thread after the match.
+    let mut diagnose: Option<([f64; 3], prism_renderer::EncodePushSynth)> = None;
     match action {
         OutputAction::SdrReferenceNits { nits } => {
             let v = (nits.clamp(1.0, 10_000.0)) as f32;
@@ -788,12 +800,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             // after the runtime color state changes. The infoframe uses
             // the KDL HDR signaling values, not measured subpixel peaks.
             // No-op for SDR outputs.
-            if let Err(e) = output_ctx.rebuild_hdr_infoframe() {
-                tracing::warn!(
-                    connector = %name,
-                    "panel-peak-nits applied but HDR infoframe rebuild failed: {e:#}"
-                );
-            }
+            rebuild_infoframe = Some("panel-peak-nits applied but HDR infoframe rebuild failed");
         }
         OutputAction::AdvertisedPeakNits { nits } => {
             let v = (nits.round().clamp(1.0, 10_000.0)) as u32;
@@ -930,42 +937,16 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             if let Some(m) = shadow.effective_ctm() {
                 p.set_ctm(m);
             }
-            let result = output_ctx
-                .renderer
-                .encode_diagnose([r, g, b], &p)
-                .map_err(|e| {
-                    // Mirror to tracing as well as the IPC reply so the
-                    // error is recoverable from prism.log alone when the
-                    // client's stderr wasn't captured (which is the
-                    // common case for interactive prism-tune runs).
-                    tracing::warn!(
-                        connector = %name,
-                        input = ?[r, g, b],
-                        "ipc: encode_diagnose failed: {e:#}"
-                    );
-                    format!("encode_diagnose failed: {e:#}")
-                })?;
-            tracing::info!(
-                connector = %name,
-                input = ?[r, g, b],
-                scanout = ?result,
-                "ipc: encode_diagnose"
-            );
-            return Ok(Response::EncodeDiagnose(prism_ipc::EncodeDiagnoseResult {
-                scanout_nits: result,
-            }));
+            // The GPU probe itself runs on the render thread, after the
+            // shadow borrow ends (below the match).
+            diagnose = Some(([r, g, b], p));
         }
         OutputAction::ResetColor => {
             shadow.color_override = prism_drm::ColorOverride::default();
             tracing::info!(connector = %name, "ipc: cleared color overrides");
             // The cleared panel-peak-nits reverts to the bringup KDL
             // value — push the corresponding infoframe.
-            if let Err(e) = output_ctx.rebuild_hdr_infoframe() {
-                tracing::warn!(
-                    connector = %name,
-                    "color reset applied but HDR infoframe rebuild failed: {e:#}"
-                );
-            }
+            rebuild_infoframe = Some("color reset applied but HDR infoframe rebuild failed");
             lut_dirty = true;
             // Clearing the override reverts the advertised peak to the
             // KDL value — re-advertise so clients pick that back up.
@@ -979,22 +960,70 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
     }
 
     // CTM / response-curve / reset all change what the LUT should hold;
-    // re-synthesize from the new effective values. Failure is logged but
-    // doesn't bubble — keeping the previous LUT is the least-surprising
-    // fallback (calibration just doesn't update this round).
-    if lut_dirty {
-        if let Some((entries, source)) = shadow.effective_lut3d_entries() {
-            if let Err(e) = output_ctx
-                .renderer
-                .upload_lut3d(&entries)
-                .context(source.upload_context())
-            {
+    // resolve the new effective entries while the shadow borrow is live.
+    // The GPU upload happens on the render thread below.
+    let lut_entries = if lut_dirty {
+        shadow.effective_lut3d_entries()
+    } else {
+        None
+    };
+
+    // EncodeDiagnose is a pure probe — run it on the render thread and
+    // reply without touching the redraw machinery.
+    if let Some((input, p)) = diagnose {
+        let result = state
+            .with_output_ctx(&output_id, move |ctx| {
+                ctx.renderer.encode_diagnose(input, &p)
+            })
+            .ok_or_else(|| format!("encode_diagnose: output {name:?} unreachable"))?
+            .map_err(|e| {
+                // Mirror to tracing as well as the IPC reply so the
+                // error is recoverable from prism.log alone when the
+                // client's stderr wasn't captured (which is the
+                // common case for interactive prism-tune runs).
                 tracing::warn!(
                     connector = %name,
-                    "color LUT re-synthesis failed: {e:#} (LUT keeps previous content)"
+                    input = ?input,
+                    "ipc: encode_diagnose failed: {e:#}"
                 );
+                format!("encode_diagnose failed: {e:#}")
+            })?;
+        tracing::info!(
+            connector = %name,
+            input = ?input,
+            scanout = ?result,
+            "ipc: encode_diagnose"
+        );
+        return Ok(Response::EncodeDiagnose(prism_ipc::EncodeDiagnoseResult {
+            scanout_nits: result,
+        }));
+    }
+
+    // Execution-side follow-ups on the render thread: the HDR infoframe
+    // re-push and/or the LUT upload. Failures are logged but don't bubble —
+    // keeping the previous LUT is the least-surprising fallback
+    // (calibration just doesn't update this round).
+    if rebuild_infoframe.is_some() || lut_entries.is_some() {
+        let name = name.to_owned();
+        state.with_output_ctx(&output_id, move |ctx| {
+            if let Some(warn_ctx) = rebuild_infoframe {
+                if let Err(e) = ctx.rebuild_hdr_infoframe() {
+                    tracing::warn!(connector = %name, "{warn_ctx}: {e:#}");
+                }
             }
-        }
+            if let Some((entries, source)) = lut_entries {
+                if let Err(e) = ctx
+                    .renderer
+                    .upload_lut3d(&entries)
+                    .context(source.upload_context())
+                {
+                    tracing::warn!(
+                        connector = %name,
+                        "color LUT re-synthesis failed: {e:#} (LUT keeps previous content)"
+                    );
+                }
+            }
+        });
     }
 
     // Rebuild + re-advertise the output's preferred image description
@@ -1008,9 +1037,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
     // The recolor changes the encode output without moving any element, so the
     // damage tracker sees nothing — force the next present past the zero-damage
     // skip, or the change wouldn't reach the screen until something moved.
-    if let Some(output_ctx) = state.output_ctxs.get_mut(&output_id) {
-        output_ctx.force_next_present();
-    }
+    state.force_next_present(&output_id);
     // Override won't be observable until the next frame — kick a
     // redraw so users see the change immediately even on otherwise-
     // idle outputs.

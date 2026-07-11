@@ -502,15 +502,18 @@ pub struct PrismState {
     /// Main-thread shadow of every active output — identity, geometry,
     /// config, and the color policy (`docs/async-render-rework.md` §2.2).
     /// Everything main-side code reads per-frame or per-request lives
-    /// here; the execution state is in [`Self::output_ctxs`].
+    /// here; the execution state lives on the per-GPU render threads
+    /// ([`Self::render_threads`]).
     pub outputs: HashMap<OutputId, prism_drm::OutputShadow>,
-    /// Per-output execution state (DrmSurface, scanout BOs, `Renderer`,
-    /// damage tracking, cursor plane), keyed like `outputs`. Interim home
-    /// for increment B1a of the async-render rework — B1b moves these onto
-    /// per-GPU render threads. Each `OutputContext` Drop calls
-    /// `surface.clear()`, which needs DRM master. Must drop before
-    /// `session` releases libseat (else EACCES on clear).
-    pub output_ctxs: HashMap<OutputId, prism_drm::OutputContext>,
+    /// Per-GPU render threads — each owns the `OutputContext`s (DrmSurface,
+    /// scanout BOs, `Renderer`, damage tracking, cursor plane) of its GPU's
+    /// outputs (`docs/async-render-rework.md` §2.1 D1). Main talks to them
+    /// through [`Self::with_output_ctx`] / the `RenderThread` helpers; no
+    /// execution state lives on this thread anymore. Dropping a
+    /// `RenderThread` joins it after its contexts drop *on the thread* —
+    /// `OutputContext::Drop` calls `surface.clear()`, which needs DRM
+    /// master, so these must still drop before `session` releases libseat.
+    pub render_threads: HashMap<DrmDevId, prism_drm::RenderThread>,
     /// Per-card DRM lease state (`wp_drm_lease_device_v1`): VR headset
     /// connectors reserved at bringup + the leases handed out. Keyed
     /// like `cards`. Declared before `cards` so active leases revoke
@@ -952,6 +955,21 @@ impl PrismState {
         // element's `alpha` fade. Global kept alive by the display.
         let _alpha_modifier = AlphaModifierState::new::<PrismState>(&dh);
 
+        // One render thread per GPU (async-render rework B1). Outputs are
+        // attached later via `attach_output`. A spawn failure leaves that
+        // GPU's outputs unable to attach — degrade loudly rather than fail
+        // construction. Headless / WLCS builds pass an empty `gpus` map and
+        // get no threads.
+        let mut render_threads = HashMap::new();
+        for &gpu in gpus.keys() {
+            match prism_drm::RenderThread::spawn(gpu) {
+                Ok(t) => {
+                    render_threads.insert(gpu, t);
+                }
+                Err(e) => tracing::error!(?gpu, "render thread spawn failed: {e:#}"),
+            }
+        }
+
         Self {
             config,
             config_load_request: None,
@@ -1000,7 +1018,7 @@ impl PrismState {
             mirror_copiers: build_mirror_copiers(&gpus),
             gpus,
             outputs: HashMap::new(),
-            output_ctxs: HashMap::new(),
+            render_threads,
             wl_outputs: HashMap::new(),
             dmabuf_sources: HashMap::new(),
             output_redraw: HashMap::new(),
@@ -1279,16 +1297,29 @@ impl PrismState {
     /// unknown output. Used by the output-power protocol and the
     /// `PowerOffMonitors` / `PowerOnMonitors` actions.
     pub fn set_monitor_powered(&mut self, output_id: &OutputId, on: bool) {
-        let Some(ctx) = self.output_ctxs.get_mut(output_id) else {
+        // Power transitions run on the output's render thread (the CRTC
+        // clear in `power_off` needs the surface); blocking so the failure
+        // path and the shadow replica stay exact.
+        let Some(result) = self.with_output_ctx(output_id, move |ctx| {
+            if on {
+                ctx.power_on();
+                Ok(())
+            } else {
+                ctx.power_off()
+            }
+        }) else {
             return;
         };
         if on {
-            ctx.power_on();
+            if let Err(e) = result {
+                tracing::warn!(connector = %output_id, "DPMS power_on failed: {e:#}");
+                return;
+            }
             if let Some(shadow) = self.outputs.get_mut(output_id) {
                 shadow.note_powered(true);
             }
         } else {
-            if let Err(e) = ctx.power_off() {
+            if let Err(e) = result {
                 tracing::warn!(connector = %output_id, "DPMS power_off failed: {e:#}");
                 return;
             }
@@ -1366,11 +1397,53 @@ impl PrismState {
     /// wayland-side `wp_linux_dmabuf_v1.get_surface_feedback` path can
     /// advertise direct-scanout-friendly formats to clients whose
     /// surfaces land on this output.
+    /// Locate the render thread owning `output_id`'s execution context.
+    pub fn render_thread_for_output(&self, output_id: &str) -> Option<&prism_drm::RenderThread> {
+        let gpu = self.outputs.get(output_id)?.gpu_id;
+        self.render_threads.get(&gpu)
+    }
+
+    /// Run a closure against one output's execution context on its render
+    /// thread, blocking for the result (bounded). `None` when the output or
+    /// its thread is gone, or the bridge fails (logged) — callers treat all
+    /// three like the old "output not in the map" case.
+    pub fn with_output_ctx<R, F>(&self, output_id: &str, f: F) -> Option<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut prism_drm::OutputContext) -> R + Send + 'static,
+    {
+        let thread = self.render_thread_for_output(output_id)?;
+        let id = output_id.to_owned();
+        match thread.with_outputs(move |outputs| outputs.get_mut(&id).map(f)) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(output = %output_id, "render-thread bridge failed: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Fire-and-forget `force_next_present` on an output's render thread —
+    /// pushes the next present past the zero-damage skip (cursor moves,
+    /// recolors, forced captures). Command-channel FIFO orders it before
+    /// any later frame submit.
+    pub fn force_next_present(&self, output_id: &str) {
+        let Some(thread) = self.render_thread_for_output(output_id) else {
+            return;
+        };
+        let id = output_id.to_owned();
+        let _ = thread.run(move |outputs| {
+            if let Some(ctx) = outputs.get_mut(&id) {
+                ctx.force_next_present();
+            }
+        });
+    }
+
     pub fn attach_output(
         &mut self,
         output: prism_drm::OutputContext,
         shadow: prism_drm::OutputShadow,
-    ) -> Option<prism_drm::OutputContext> {
+    ) {
         let id: OutputId = output.connector_name.clone();
         // The cursor plane is created hidden; `update_output_cursors`
         // uploads the correct, scale-matched sprite before it makes the
@@ -1402,8 +1475,20 @@ impl PrismState {
         );
         self.color_management
             .set_output_preferred(id.clone(), preferred);
+        let gpu_id = output.gpu_id;
         self.outputs.insert(id.clone(), shadow);
-        self.output_ctxs.insert(id, output)
+        // The execution context moves onto its GPU's render thread.
+        let Some(thread) = self.render_threads.get(&gpu_id) else {
+            tracing::error!(
+                connector = %id,
+                ?gpu_id,
+                "no render thread for this output's GPU — it will never render"
+            );
+            return;
+        };
+        if let Err(e) = thread.attach_output(id.clone(), output) {
+            tracing::error!(connector = %id, "attach_output to render thread failed: {e:#}");
+        }
     }
 
     /// Build a smithay `Output` mirroring the given `OutputContext` and
@@ -4497,37 +4582,38 @@ pub fn update_output_cursors(state: &mut PrismState) {
             return;
         };
         state.cursor_hotspot = sprite.hotspot;
-        if let Some(plane) = state
-            .output_ctxs
-            .get_mut(&owner_id)
-            .and_then(|o| o.cursor.as_mut())
-        {
-            match plane.upload_sprite(&sprite.pixels_rgba, sprite.width, sprite.height) {
-                Ok(()) => {
-                    state.cursor_uploaded_to = Some(owner_id.clone());
-                    state.cursor_dirty = false;
-                }
-                // Leave dirty set so the next pass retries (e.g. a client
-                // cursor larger than the BO, or no plane yet).
-                Err(e) => tracing::warn!(connector = %owner_id, "cursor upload failed: {e:#}"),
+        // Ship the pixels to the owning render thread (the plane's BO lives
+        // there). Blocking, but rare — only on sprite change or output
+        // crossing — and the result drives the exact same retry semantics
+        // as before: failure (or a missing plane) leaves `cursor_dirty` set
+        // so the next pass retries.
+        let uploaded = state.with_output_ctx(&owner_id, move |ctx| {
+            ctx.cursor
+                .as_mut()
+                .map(|plane| plane.upload_sprite(&sprite.pixels_rgba, sprite.width, sprite.height))
+        });
+        match uploaded.flatten() {
+            Some(Ok(())) => {
+                state.cursor_uploaded_to = Some(owner_id.clone());
+                state.cursor_dirty = false;
             }
+            // Leave dirty set so the next pass retries (e.g. a client
+            // cursor larger than the BO, or no plane yet).
+            Some(Err(e)) => tracing::warn!(connector = %owner_id, "cursor upload failed: {e:#}"),
+            None => {}
         }
     }
 
+    // Desired plane state per output, computed main-side (wl_output
+    // geometry/scale are main data): position + visible for the owner,
+    // hidden for everyone else (and for outputs with no wl_output).
     let hotspot = state.cursor_hotspot;
     let pointer_pos = state.pointer_pos;
-    for (id, output_ctx) in state.output_ctxs.iter_mut() {
-        let Some(cursor) = output_ctx.cursor.as_mut() else {
-            continue;
-        };
-        let Some(wl_output) = state.wl_outputs.get(id) else {
-            cursor.set_visible(false);
-            continue;
-        };
-        let was_visible = cursor.visible();
-        let prev_pos = cursor.position();
-
-        if *id == owner_id {
+    let mut desired: Vec<CursorPlaneState> = Vec::new();
+    for id in state.outputs.keys() {
+        let visible = *id == owner_id && state.wl_outputs.contains_key(id);
+        let pos = if visible {
+            let wl_output = state.wl_outputs.get(id).expect("checked above");
             // pointer_pos and origin are logical; the DRM cursor plane wants
             // physical CRTC pixels, so scale the in-output offset by the
             // output's fractional scale. The hotspot is already in sprite
@@ -4536,51 +4622,83 @@ pub fn update_output_cursors(state: &mut PrismState) {
             let scale = wl_output.current_scale().fractional_scale().max(0.01);
             let lx = pointer_pos.x - origin.x as f64;
             let ly = pointer_pos.y - origin.y as f64;
-            let x = (lx * scale).round() as i32 - hotspot.0;
-            let y = (ly * scale).round() as i32 - hotspot.1;
-            cursor.set_position(x, y);
-            cursor.set_visible(true);
+            Some((
+                (lx * scale).round() as i32 - hotspot.0,
+                (ly * scale).round() as i32 - hotspot.1,
+            ))
         } else {
-            cursor.set_visible(false);
-        }
-
-        let changed = was_visible != cursor.visible() || prev_pos != cursor.position();
-        if changed {
-            // The cursor is a hardware plane committed in `present`'s page-flip,
-            // not a render element — so a move / visibility change produces no
-            // element damage. Force the present past the zero-damage skip, or the
-            // cursor would freeze on screen until something else damaged. (`cursor`
-            // is no longer borrowed here, so the &mut self call is fine.)
-            output_ctx.force_next_present();
-            state
-                .output_redraw
-                .entry(id.clone())
-                .or_default()
-                .queue_redraw();
-        }
+            None
+        };
+        desired.push((id.clone(), visible, pos));
     }
+    apply_cursor_plane_state(state, desired);
 }
 
+/// Desired hardware-cursor plane state for one output:
+/// `(output, visible, position)`. Position is `None` when only visibility
+/// changes (hide paths never reposition).
+type CursorPlaneState = (OutputId, bool, Option<(i32, i32)>);
+
 fn hide_all_cursors(state: &mut PrismState) {
-    for (id, output_ctx) in state.output_ctxs.iter_mut() {
-        // Hide the plane if it was visible; `changed` ends the cursor borrow
-        // before the `force_next_present`/`queue_redraw` calls below.
-        let changed = match output_ctx.cursor.as_mut() {
-            Some(c) if c.visible() => {
-                c.set_visible(false);
-                true
-            }
-            _ => false,
-        };
-        if changed {
-            // Hiding the cursor plane is a page-flip change with no element
-            // damage — force the present so the hide actually reaches the screen.
-            output_ctx.force_next_present();
-            state
-                .output_redraw
-                .entry(id.clone())
-                .or_default()
-                .queue_redraw();
+    let desired: Vec<CursorPlaneState> = state
+        .outputs
+        .keys()
+        .map(|id| (id.clone(), false, None))
+        .collect();
+    apply_cursor_plane_state(state, desired);
+}
+
+/// Apply desired `(visible, position)` cursor-plane state on each output's
+/// render thread (one blocking bridge call per GPU), then queue redraws for
+/// the outputs whose plane actually changed. The change detection reads the
+/// plane's previous state, which lives with the plane on its thread; a
+/// changed plane also gets `force_next_present` there — a cursor move is a
+/// page-flip change with no element damage, so without it the zero-damage
+/// skip would freeze the cursor on screen.
+fn apply_cursor_plane_state(state: &mut PrismState, desired: Vec<CursorPlaneState>) {
+    for thread in state.render_threads.values() {
+        let batch: Vec<CursorPlaneState> = desired
+            .iter()
+            .filter(|(id, _, _)| {
+                state
+                    .outputs
+                    .get(id)
+                    .is_some_and(|shadow| shadow.gpu_id == thread.gpu)
+            })
+            .cloned()
+            .collect();
+        if batch.is_empty() {
+            continue;
+        }
+        let changed = thread
+            .with_outputs(move |outputs| {
+                let mut changed = Vec::new();
+                for (id, visible, pos) in batch {
+                    let Some(ctx) = outputs.get_mut(&id) else {
+                        continue;
+                    };
+                    let Some(cursor) = ctx.cursor.as_mut() else {
+                        continue;
+                    };
+                    let was_visible = cursor.visible();
+                    let prev_pos = cursor.position();
+                    if let Some((x, y)) = pos {
+                        cursor.set_position(x, y);
+                    }
+                    cursor.set_visible(visible);
+                    if was_visible != cursor.visible() || prev_pos != cursor.position() {
+                        ctx.force_next_present();
+                        changed.push(id);
+                    }
+                }
+                changed
+            })
+            .unwrap_or_else(|e| {
+                tracing::error!(gpu = ?thread.gpu, "cursor plane update failed: {e:#}");
+                Vec::new()
+            });
+        for id in changed {
+            state.output_redraw.entry(id).or_default().queue_redraw();
         }
     }
 }

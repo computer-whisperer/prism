@@ -62,10 +62,9 @@ pub fn recover_lost_gpus(state: &mut PrismState) {
                     // exactly those — while still locked the next render
                     // shows the lock surface, not desktop content. User
                     // DPMS state (not in this set) is untouched.
-                    if state.lock_blanked_outputs.remove(id) {
-                        if let Some(ctx) = state.output_ctxs.get_mut(id) {
-                            ctx.power_on();
-                        }
+                    if state.lock_blanked_outputs.remove(id)
+                        && state.with_output_ctx(id, |ctx| ctx.power_on()).is_some()
+                    {
                         if let Some(shadow) = state.outputs.get_mut(id) {
                             shadow.note_powered(true);
                         }
@@ -195,25 +194,48 @@ fn recover_one(state: &mut PrismState, gpu: DrmDevId) -> Result<()> {
             "replacement device landed on {landed:?}, not the lost GPU {gpu:?} (unplugged?)"
         );
     }
-    // Rebuild every output (constructor is submit-free; the swap drops the
-    // old renderer + scanout imports). The shadow's renderer-derived caches
-    // (white view, LUT cube edge) point into the replaced renderer —
-    // refresh them alongside.
-    let mut rebuild_err: Option<anyhow::Error> = None;
-    for (id, ctx) in state.output_ctxs.iter_mut() {
-        if ctx.gpu_id == gpu {
-            if let Err(e) = ctx.rebuild_render_state(device.clone()) {
-                rebuild_err = Some(e.context(format!("rebuild output {id}")));
-                break;
-            }
-            if let Some(shadow) = state.outputs.get_mut(id) {
-                shadow.refresh_renderer_caches(ctx);
-            }
+    // Rebuild every output on the GPU's render thread (constructor is
+    // submit-free; the swap drops the old renderer + scanout imports).
+    // Blocking bridge: phase 3 (fd close) must not run until every swap
+    // completed. The fresh renderer-derived caches come back for the
+    // shadows — their white-view/cube-edge point into the old renderer
+    // until re-set.
+    let rebuilt: Result<Vec<(String, prism_renderer::vk::ImageView, u32, bool)>> = {
+        let Some(thread) = state.render_threads.get(&gpu) else {
+            restore(state, device);
+            anyhow::bail!("no render thread for {gpu:?}");
+        };
+        let device_for_rebuild = device.clone();
+        thread
+            .with_outputs(move |outputs| {
+                let mut caches = Vec::new();
+                for (id, ctx) in outputs.iter_mut() {
+                    if ctx.gpu_id == gpu {
+                        ctx.rebuild_render_state(device_for_rebuild.clone())
+                            .with_context(|| format!("rebuild output {id}"))?;
+                        caches.push((
+                            id.clone(),
+                            ctx.renderer.white_view(),
+                            ctx.renderer.lut3d_cube_edge(),
+                            ctx.renderer.profile_enabled(),
+                        ));
+                    }
+                }
+                Ok(caches)
+            })
+            .unwrap_or_else(Err)
+    };
+    let caches = match rebuilt {
+        Ok(c) => c,
+        Err(e) => {
+            restore(state, device);
+            return Err(e);
         }
-    }
-    if let Some(e) = rebuild_err {
-        restore(state, device);
-        return Err(e);
+    };
+    for (id, white_view, cube_edge, profile_enabled) in caches {
+        if let Some(shadow) = state.outputs.get_mut(&id) {
+            shadow.set_renderer_caches(white_view, cube_edge, profile_enabled);
+        }
     }
 
     // ── Phase 3: close the old fd, then first submits ──────────────────
@@ -245,22 +267,37 @@ fn recover_one(state: &mut PrismState, gpu: DrmDevId) -> Result<()> {
             tracing::warn!(?gpu, "mirror copier rebuild failed: {e:#}");
         }
     }
-    // First submits on the replacement device: the per-output LUT upload
-    // (entries resolved from the shadow's color policy). A rejection here
-    // means the new device is now lost too — fail the attempt so the retry
-    // runs the full cycle again.
-    for (id, ctx) in state.output_ctxs.iter_mut() {
-        if ctx.gpu_id == gpu {
-            let Some(shadow) = state.outputs.get(id) else {
-                continue;
-            };
-            if let Some((entries, source)) = shadow.effective_lut3d_entries() {
-                ctx.renderer
-                    .upload_lut3d(&entries)
-                    .context(source.upload_context())
-                    .with_context(|| format!("post-rebuild LUT upload on {id}"))?;
-            }
-        }
+    // First submits on the replacement device: the per-output LUT uploads
+    // (entries resolved from the shadows' color policy, uploaded on the
+    // render thread). A rejection here means the new device is now lost
+    // too — fail the attempt so the retry runs the full cycle again.
+    let uploads: Vec<(String, Vec<[f32; 3]>, &'static str)> = state
+        .outputs
+        .iter()
+        .filter(|(_, s)| s.gpu_id == gpu)
+        .filter_map(|(id, s)| {
+            s.effective_lut3d_entries()
+                .map(|(entries, source)| (id.clone(), entries, source.upload_context()))
+        })
+        .collect();
+    if !uploads.is_empty() {
+        let thread = state
+            .render_threads
+            .get(&gpu)
+            .with_context(|| format!("no render thread for {gpu:?}"))?;
+        thread
+            .with_outputs(move |outputs| -> Result<()> {
+                for (id, entries, what) in uploads {
+                    if let Some(ctx) = outputs.get_mut(&id) {
+                        ctx.renderer
+                            .upload_lut3d(&entries)
+                            .context(what)
+                            .with_context(|| format!("post-rebuild LUT upload on {id}"))?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap_or_else(Err)?;
     }
     Ok(())
 }

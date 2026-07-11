@@ -369,9 +369,7 @@ impl PrismState {
             kind,
         });
         if !with_damage {
-            if let Some(ctx) = self.output_ctxs.get_mut(output_id) {
-                ctx.force_next_present();
-            }
+            self.force_next_present(output_id);
             self.output_redraw
                 .entry(output_id.clone())
                 .or_default()
@@ -565,25 +563,30 @@ impl PrismState {
         output_id: &str,
         kind: PendingKind,
     ) -> Result<(OwnedFd, InflightKind), ()> {
-        // Color policy + geometry from the shadow; the GPU work below goes
-        // through the execution context.
+        // Color policy + geometry from the shadow; the capture's GPU work
+        // runs on the output's render thread (blocking bridge — the whole
+        // point of running right after the present is the queue ordering,
+        // which the command channel's FIFO preserves). Only GPU objects
+        // cross the bridge; the client's WlBuffer (SHM case) stays here.
         let Some(shadow) = self.outputs.get(output_id) else {
             return Err(());
         };
         let white = shadow.effective_sdr_reference_nits();
         let src_width = shadow.extent.width;
-        let Some(ctx) = self.output_ctxs.get_mut(output_id) else {
-            return Err(());
-        };
         match kind {
             PendingKind::Dmabuf {
                 imported,
                 region_wh,
             } => {
-                let fd = ctx
-                    .renderer
-                    .capture_into_dmabuf(&imported, white)
+                let fd = self
+                    .with_output_ctx(output_id, move |ctx| {
+                        ctx.renderer
+                            .capture_into_dmabuf(&imported, white)
+                            .map(|fd| (fd, imported))
+                    })
+                    .ok_or(())?
                     .map_err(|e| trace!("screencopy: capture_into_dmabuf failed: {e}"))?;
+                let (fd, imported) = fd;
                 Ok((
                     fd,
                     InflightKind::Dmabuf {
@@ -593,9 +596,11 @@ impl PrismState {
                 ))
             }
             PendingKind::Shm { buffer, region } => {
-                let (fd, readback) = ctx
-                    .renderer
-                    .capture_to_host(CAPTURE_VK_FORMAT, white)
+                let (fd, readback) = self
+                    .with_output_ctx(output_id, move |ctx| {
+                        ctx.renderer.capture_to_host(CAPTURE_VK_FORMAT, white)
+                    })
+                    .ok_or(())?
                     .map_err(|e| trace!("screencopy: capture_to_host failed: {e}"))?;
                 Ok((
                     fd,
