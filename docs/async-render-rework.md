@@ -606,8 +606,23 @@ physically required serialization).
    ordering; the client `WlBuffer` stays main-side (D4).
    Syncobj-release + presentation-feedback harvesting were already
    main-side per §2.4 and needed no change.
-4. **B4** session pause/activate, hotplug, config `Reconfigure`, teardown
-   ordering.
+4. **B4** — **DONE** (for the surface that exists). Session pause:
+   bounded no-op barrier per render thread + outcome drain BEFORE
+   `card.drm.pause()` — the §2.6 PauseAck semantics via the existing
+   bridge; an in-flight flip can no longer race the master release.
+   Resume: per-thread fixups (color signaling via the surface's own fd +
+   `mark_for_resume`), then a hard main-side reset of every output's
+   redraw state to `Queued` (stale WaitingForVBlank flips died with
+   master; dropped feedback delivers `discarded`), then re-render.
+   `on_present_outcome` transitions only from `AwaitingOutcome`
+   (bookkeeping always runs; a reset state is left alone). Teardown
+   ordering landed with B1b (Shutdown → per-output instrumented drops on
+   the thread → bounded join → cards/session). `CreateOutput` /
+   `DestroyOutput` / `Reconfigure` messages are deliberately NOT built:
+   desktop outputs are fixed at bringup (config `output` sections are
+   restart-only; DRM-lease hotplug never touches an `OutputContext`), so
+   the messages would have zero consumers — build them with the desktop
+   hotplug feature, on this structure, when that lands.
 
 **C — Phase 1 remainder, on the new structure:** move the GTT→local mirror
 copy from the GFX cb to the ACE `transfer_queue` — now naturally a

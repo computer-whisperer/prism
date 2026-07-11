@@ -1854,6 +1854,26 @@ fn run_integrated(
                         tracing::info!("libseat session paused (VT switch away)");
                         state.session_active = false;
                         libinput.suspend();
+                        // Quiesce the render threads BEFORE releasing DRM
+                        // master (§2.6 SessionPause/PauseAck): a bounded
+                        // no-op barrier per thread drains its command
+                        // queue, so any in-flight present (atomic commit
+                        // included) completes while we still hold master —
+                        // no EACCES mid-flip. No new submits can follow:
+                        // session_active is already false and this handler
+                        // runs inside dispatch, before any redraw pass.
+                        for thread in state.render_threads.values() {
+                            if let Err(e) = thread.with_outputs(|_| ()) {
+                                tracing::error!(
+                                    gpu = ?thread.gpu,
+                                    "session-pause render barrier failed: {e:#}"
+                                );
+                            }
+                        }
+                        // Process the outcomes those presents produced now,
+                        // with a coherent state machine, rather than after
+                        // master is gone.
+                        drain_render_outcomes(state);
                         // Release DRM master on every card so we stop trying
                         // to commit page-flips (which would EACCES) and the
                         // incoming VT can take over cleanly.
@@ -1909,8 +1929,7 @@ fn run_integrated(
                         // surface handle (same device fd as the card), so
                         // the fixups run wholesale on each render thread.
                         // Blocking: the re-queue + redraw below must not
-                        // race ahead of the resets. (B4 replaces this with
-                        // the designed SessionPause/Activate protocol.)
+                        // race ahead of the resets.
                         for thread in state.render_threads.values() {
                             if let Err(e) = thread.with_outputs(|outputs| {
                                 for output in outputs.values_mut() {
@@ -1924,13 +1943,29 @@ fn run_integrated(
                                 );
                             }
                         }
-                        // Force a full redraw of every output: the reset above
-                        // dropped scanout state, so each output must re-modeset.
-                        // This also restarts the vblank cadence (the resumed
-                        // flip's completion drives the next on_vblank).
+                        // Reset every output's redraw state to a hard
+                        // Queued — the main-side mirror of mark_for_resume.
+                        // A state left over from before the pause would
+                        // wait on things that no longer exist: a
+                        // WaitingForVBlank's flip event was lost with
+                        // master, a stale timer's guard no-ops (it
+                        // self-reaps). Dropped pending feedback delivers
+                        // `discarded`, which is exactly what happened to
+                        // those frames. The pause barrier guarantees no
+                        // submission is still in flight (log if the
+                        // machine says otherwise).
                         let ids: Vec<_> = state.outputs.keys().cloned().collect();
                         for id in ids {
-                            state.output_redraw.entry(id).or_default().queue_redraw();
+                            if state.pending_submissions.remove(&id).is_some() {
+                                tracing::error!(
+                                    output = %id,
+                                    "session-resume found an in-flight submission; \
+                                     the pause barrier should have drained it"
+                                );
+                            }
+                            let entry = state.output_redraw.entry(id).or_default();
+                            drop(entry.pending_feedback.take());
+                            entry.redraw = prism_protocols::redraw::RedrawState::Queued;
                         }
                         prism_protocols::state::update_output_cursors(state);
                         redraw_queued_outputs(state);
@@ -2714,13 +2749,22 @@ fn on_present_outcome(
         missed_vblank,
     } = pending;
     // A redraw queued while the frame was in flight survives the
-    // transition below.
-    let aw_redraw = matches!(
-        state.output_redraw.get(output_id).map(|s| &s.redraw),
-        Some(RedrawState::AwaitingOutcome {
-            redraw_needed: true
-        })
-    );
+    // transition below. `in_awaiting` guards the transitions themselves:
+    // if something reset this output's state while its frame was in
+    // flight (defensive — the session pause barrier and the redraw-pass
+    // gates shouldn't let it happen), the bookkeeping still runs but the
+    // state machine is left alone.
+    let (in_awaiting, aw_redraw) = match state.output_redraw.get(output_id).map(|s| &s.redraw) {
+        Some(RedrawState::AwaitingOutcome { redraw_needed }) => (true, *redraw_needed),
+        _ => (false, false),
+    };
+    if !in_awaiting {
+        tracing::warn!(
+            output = %output_id,
+            "present outcome arrived with the output not in AwaitingOutcome; \
+             running bookkeeping only"
+        );
+    }
 
     let outcome = match reply.outcome {
         Ok(o) => o,
@@ -2750,6 +2794,12 @@ fn on_present_outcome(
                 }
             }
             let redraw_needed = redraw_again || aw_redraw;
+            if !in_awaiting {
+                // Bookkeeping done; the frame presented but whoever reset
+                // the state owns it now. Dropping the feedback delivers
+                // `discarded`.
+                return;
+            }
             if let Some(t) = missed_vblank {
                 // This frame's vblank was dispatched before its outcome
                 // (see PendingSubmission::missed_vblank — should be
@@ -2784,6 +2834,9 @@ fn on_present_outcome(
             }
         }
         Ok(RenderOutcome::SkippedNoDamage { redraw_again }) => {
+            if !in_awaiting {
+                return;
+            }
             // Nothing changed, so no page-flip and thus no real vblank will
             // arrive to advance the frame-callback cycle or resume animations.
             // Arm an estimated-vblank timer in its place (fresh estimate:
@@ -2801,6 +2854,9 @@ fn on_present_outcome(
             }
         }
         Ok(RenderOutcome::FlipPending) => {
+            if !in_awaiting {
+                return;
+            }
             // Flip still in flight. Shouldn't normally happen (we only enter
             // Queued after a vblank cleared frame_pending), but defensive:
             // back to Queued so the next pass retries.
