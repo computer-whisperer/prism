@@ -603,12 +603,13 @@ impl OutputContext {
         self.damage_tracker = DamageTracker::new();
         self.damage_carry = [DamageCarry::Full, DamageCarry::Full];
         self.mark_for_resume();
-        // Deliberately NO LUT re-synthesis here: `Renderer::new` is
+        // Deliberately NO LUT re-upload here: `Renderer::new` is
         // submit-free and this must stay that way end to end — the
         // recovery orchestrator closes the old device's fd only after
         // every output has swapped, and submits (LUT upload included)
         // must come after that close (docs/device-loss-recovery.md). The
-        // orchestrator calls `resynthesize_color_lut` itself afterwards.
+        // orchestrator uploads the LUT entries (resolved from each
+        // output's shadow color policy) itself afterwards.
         tracing::info!(
             connector = %self.connector_name,
             gpu = ?self.gpu_id,

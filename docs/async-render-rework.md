@@ -1,6 +1,18 @@
 # Async render rework — cross-GPU mirror + per-GPU concurrency
 
-Status: **design / not started.** Phase 1 detailed below; Phase 2 sketched.
+Status: **Phase 2 (B series) IMPLEMENTED, runtime-unverified
+(2026-07-11); increment C attempted, REVERTED same day.** Phase 1
+(mirror locality) is live in its GFX-first shape (e6d9a77). Phase 2
+landed as increments A (b86140e…2d662b8, 2026-07-01) and
+B1a/B1b/B2/B3/B4 (07896b0, 2a33da1, cd497b8, ba22453, 994ff44 —
+2026-07-11), plus a post-review fix set (see §2.8 review notes).
+Increment C (ACE-queue copy + double-buffered target_local, 17fb7aa)
+was reverted (b0825df) after adversarial review found two
+high-severity defects in its synchronization design — the findings and
+redesign constraints are recorded at §2.8 C. Every landed increment is
+build/clippy/test-clean; NONE of the B series has run on hardware yet —
+the compositor was in daily use throughout, and the first restart onto
+this code should walk §2.9's validation checklist.
 
 ## Motivation
 
@@ -624,18 +636,73 @@ physically required serialization).
    the messages would have zero consumers — build them with the desktop
    hotplug feature, on this structure, when that lands.
 
-**C — Phase 1 remainder, on the new structure:** move the GTT→local mirror
-copy from the GFX cb to the ACE `transfer_queue` — now naturally a
-render-thread-side submit before the render (separate cb on the thread's
-transfer pool, `local_done` semaphore into the render's wait list; the
-scratch-overwrite gate re-points to ACE-copy-done per §1.4). Then
-double-buffer `target_local` (skip-copy must not flip the index, §1.8).
-Add a profile span for the copy. *Deliberately re-sequenced after B*: on
-the thread structure the ACE submit needs no cross-thread choreography.
-**Delete the interim path**: the `local_copies` parameter threaded through
-`render_frame`/`present` (added by the GFX-first sub-step e6d9a77) comes
-back out — the copy op list rides `LoweredFrame` into the thread's ACE
-submit instead. Don't leave both mechanisms alive.
+**Post-review fix set (same day, after a 3-lens adversarial review of the
+B series):** (i) presentation-feedback + syncobj-release harvesting and
+the acquire-wait marking moved to LOWERING time / made buffer-identity
+checked — under async submission, outcome-time bookkeeping raced commits
+landing in the submit→outcome gap (wrong-buffer acquire marking = the
+fa62fb9 class reopened; a gap commit's release tracker harvested in place
+of the sampled buffer's). §2.4 required this all along. Skipped /
+never-presented frames now deliver `discarded` for their harvested
+feedback instead of leaving it queued (protocol-honest; mpv-class clients
+always damage, so they never hit it). (ii) `note_lock_render` is gated on
+the frame's lowering-time lock state matching the current one — an
+in-flight desktop frame's outcome arriving during `Locking` no longer
+spuriously aborts the lock (pre-split this race was structurally
+impossible). (iii) Recovery drains the outcome channel before and inside
+`recover_one`, so stale device-lost outcomes retire semaphores against
+the old device (not the replacement copier) and re-quarantines are no-ops;
+renderer caches re-seed shadows per-output even on a partially failed
+rebuild; a lock-blanked output stays in its re-power set if the bridge
+fails. (iv) Imported wait semaphores are retired on the two paths that
+previously leaked them (submit-send failure, resume-with-wedged-thread).
+
+**C — Phase 1 remainder: ATTEMPTED 2026-07-11 (17fb7aa), REVERTED
+(b0825df) after adversarial review.** The attempt: per-Renderer
+`AceCopier` (transfer-queue cb + fence + `local_done` binary semaphore
+into the render's wait list + exportable `ace_done` SYNC_FD re-pointing
+the scratch gate), `target_local` double-buffered as ONE pair per
+(surface, GPU) with a `local_write` index advanced at lowering. Review
+findings that killed it — these are the CONSTRAINTS for the redesign:
+
+1. **A single binary `local_done` re-signalled across in-flight frames is
+   spec-UB** (VUID-vkQueueSubmit2-semaphore-03868): the copier's fence
+   proves ACE-batch completion, NOT that the graphics wait consumed the
+   previous signal. Benign on RADV's syncobj mechanics, but a validation
+   failure and portability hazard. Redesign: per-render-slot `local_done`
+   semaphores (the slot fence then proves the prior wait executed) or a
+   timeline semaphore.
+2. **A shared per-(surface,GPU) buffer pair with a lowering-time index is
+   unsound.** Three breakers: (a) two outputs on one GPU drawing the same
+   mirror (the daily multi-Vega case) interleave index advances so one
+   output's ACE copy overwrites the buffer the other output's in-flight
+   render samples; (b) a zero-damage skip advances the index without a
+   copy (the skip decision is made thread-side, after lowering), shifting
+   parity so the next render's copy targets the still-in-flight buffer;
+   (c) FlipPending retries ditto. §1.8's "skip must not flip the index"
+   applies to TODAY's present-level skip, not only a future skip-copy
+   optimization. Redesign: per-OUTPUT local pairs, or advance the index
+   only when the copy is actually submitted (thread-side), with the walk's
+   view selection made consistent with that.
+3. Error paths: a fence reset with fallible work before the submit wedges
+   the copier forever on non-device-lost failures (reset immediately
+   before `queue_submit2`); a present-fd export failure after both
+   submits dropped the `ace_done` fd, leaving the scratch gate stale with
+   a live reader.
+4. The scratch-gate currency argument must not assume outcomes have
+   arrived: under B2, a same-GPU output's `ace_done` may still be in
+   flight when another output lowers (only reachable once a surface can
+   draw on two outputs of one GPU — see the §2.3 note below).
+
+What survives on main: the GFX-recorded copy (e6d9a77 shape) with the
+present-fd scratch gate — single-queue ordering gives the (a)/(b)/(c)
+hazards no room by construction. `Device::transfer_queue` +
+`transfer_queue_family` remain (created at A/1.1) with no submitter;
+`LocalImage` stays CONCURRENT-shared so the redesign needs no ownership
+transfers. Estimated remaining win (copy off the GFX critical path +
+home-copy pipelining) is real but bounded — the big Phase-1 win
+(decode/deband sampling local tiled memory) is already in the GFX-first
+shape.
 
 **Do not start B until A is committed and the compositor has been
 daily-driven on A** — A carries all the refactor risk with none of the

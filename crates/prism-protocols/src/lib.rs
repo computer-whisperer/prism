@@ -33,9 +33,10 @@ pub use redraw::{OutputRedrawState, PendingFeedback, RedrawState};
 pub use rlimit::raise_nofile_to_max;
 pub use server::insert_wayland_sources;
 pub use state::{
-    destroy_render_wait_semaphores, mark_dmabuf_acquire_waited, materialize_surface_on_gpu,
-    mirror_local_copies, new_display, note_mirror_render_done, prepare_dmabuf_acquire_waits,
-    prepare_mirror_waits, PrismState,
+    destroy_render_wait_semaphores, mark_dmabuf_acquire_waited,
+    mark_dmabuf_acquire_waited_if_current, materialize_surface_on_gpu, mirror_local_copies,
+    new_display, note_mirror_render_done, prepare_dmabuf_acquire_waits, prepare_mirror_waits,
+    PrismState,
 };
 pub use surface_tex::{
     GpuKeepalive, GpuTex, SurfacePlacement, SurfacePlacementSlot, SurfaceTexSlot, SurfaceTexture,

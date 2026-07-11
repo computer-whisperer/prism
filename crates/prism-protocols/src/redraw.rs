@@ -85,9 +85,24 @@ pub struct FrameBookkeeping {
     /// their home→scratch copies were submitted during lowering; a confirmed
     /// render's present fd re-arms the scratch overwrite gate.
     pub mirror_surfaces: Vec<WlSurface>,
-    /// Native-dmabuf surfaces whose client write fence was imported as a
-    /// render wait; marked waited only on a confirmed render submit.
-    pub acquire_surfaces: Vec<WlSurface>,
+    /// Native-dmabuf `(surface, buffer)` pairs whose client write fence was
+    /// imported as a render wait; marked waited on a confirmed render
+    /// submit only if the surface's buffer is still the fenced one
+    /// (`mark_dmabuf_acquire_waited_if_current`).
+    pub acquire_buffers: Vec<crate::state::AcquiredBuffer>,
+    /// `wp_presentation_feedback` callbacks harvested from this frame's
+    /// surfaces AT LOWERING TIME (§2.4: the harvest must observe the state
+    /// the frame renders, not the state at outcome time — a commit in the
+    /// submit→outcome gap must not have its feedback attributed to this
+    /// frame). Fired at the frame's vblank; dropped (→ `discarded`) if the
+    /// frame never presents.
+    pub presentation_cbs: Vec<PresentationFeedbackCallback>,
+    /// `wp_linux_drm_syncobj` release trackers for the surfaces this frame
+    /// samples, harvested at lowering for the same reason: harvesting at
+    /// outcome time would grab a gap-commit's tracker and leave the buffer
+    /// this frame actually reads with no clone gating its release. Clones
+    /// (the slot keeps its own ref), so dropping them is always safe.
+    pub release_trackers: Vec<Arc<CommitReleaseTracker>>,
     /// Surfaces were demand-materialized (rendered blank this frame) ⇒ the
     /// caller must schedule another redraw.
     pub redraw_again: bool,

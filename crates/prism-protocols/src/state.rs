@@ -5253,37 +5253,50 @@ pub fn prepare_dmabuf_acquire_waits(
     state: &PrismState,
     surfaces: &[WlSurface],
     target_gpu: DrmDevId,
-) -> Vec<vk::Semaphore> {
+) -> (Vec<vk::Semaphore>, Vec<AcquiredBuffer>) {
     use std::os::fd::AsFd;
 
     if surfaces.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let Some(copier) = state.mirror_copiers.get(&target_gpu) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
 
     let mut waits = Vec::new();
+    let mut acquired = Vec::new();
     for surface in surfaces {
         // Export the producer write fence under the surface lock (we need the
         // dmabuf plane fd); import it as a semaphore after releasing the lock.
         // Deliberately does NOT mark the wait as done here: `present()` can
         // still bail (FlipPending / no damage) without queueing any GPU work,
         // and the retry must re-export. The caller marks via
-        // `mark_dmabuf_acquire_waited` once the render submit is confirmed.
-        let fence_fd = with_states(surface, |states| {
+        // `mark_dmabuf_acquire_waited_if_current` once the render submit is
+        // confirmed — passing back the buffer identity captured HERE, under
+        // the same lock as the fence export, so a commit landing while the
+        // frame is in flight on its render thread can never get its (new,
+        // unwaited) buffer stamped as waited.
+        let exported = with_states(surface, |states| {
             let slot = states.data_map.get::<SurfaceTexSlot>()?;
             let mut guard = slot.0.lock().unwrap();
             let tex = guard.as_mut()?;
-            let TexSource::Dmabuf { dmabuf, .. } = &tex.source else {
+            let TexSource::Dmabuf { dmabuf, buffer, .. } = &tex.source else {
                 return None;
             };
+            let buffer_id = buffer.id();
             let plane = dmabuf.planes.first()?;
-            crate::dmabuf_sync::export_read_fence(plane.fd.as_fd()).ok()
+            crate::dmabuf_sync::export_read_fence(plane.fd.as_fd())
+                .ok()
+                .map(|fd| (fd, buffer_id))
         });
-        let Some(fence_fd) = fence_fd else { continue };
+        let Some((fence_fd, buffer_id)) = exported else {
+            continue;
+        };
         match copier.import_wait_semaphore(fence_fd) {
-            Ok(sem) => waits.push(sem),
+            Ok(sem) => {
+                waits.push(sem);
+                acquired.push((surface.clone(), buffer_id));
+            }
             Err(e) => {
                 if e.is_device_lost() {
                     state.note_gpu_lost(target_gpu);
@@ -5304,7 +5317,39 @@ pub fn prepare_dmabuf_acquire_waits(
             "dmabuf acquire: some surfaces had no exportable write fence"
         );
     }
-    waits
+    (waits, acquired)
+}
+
+/// A surface whose producer write fence a lowered frame waits, paired with
+/// the identity of the buffer the fence belongs to (captured at fence-export
+/// time). The outcome-time marking checks the identity so a commit landing
+/// while the frame was in flight can't get its new buffer falsely marked.
+pub type AcquiredBuffer = (WlSurface, ObjectId);
+
+/// Outcome-time half of the acquire-wait accounting: for each `(surface,
+/// buffer)` whose fence a *confirmed* render submit carried, mark the wait
+/// done — but only if the surface's committed buffer is still the one the
+/// fence belonged to. A commit in the submit→outcome gap cleared
+/// `acquire_waited` for its new buffer; marking then would let the next
+/// frame sample that new buffer with no producer-fence wait (the fa62fb9
+/// blue-bleed class, reopened asynchronously). Skipped surfaces just
+/// re-export next frame.
+pub fn mark_dmabuf_acquire_waited_if_current(acquired: &[AcquiredBuffer], target_gpu: DrmDevId) {
+    for (surface, buffer_id) in acquired {
+        with_states(surface, |states| {
+            if let Some(slot) = states.data_map.get::<SurfaceTexSlot>() {
+                if let Some(tex) = slot.0.lock().unwrap().as_mut() {
+                    let current = matches!(
+                        &tex.source,
+                        TexSource::Dmabuf { buffer, .. } if buffer.id() == *buffer_id
+                    );
+                    if current {
+                        tex.acquire_waited.insert(target_gpu);
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// Record that a GPU submit on `target_gpu` carrying the acquire waits for

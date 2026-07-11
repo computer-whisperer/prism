@@ -19,12 +19,15 @@
 //!   values. The `OutputContext` no longer holds any of it.
 //! - **Renderer-derived caches** (`white_view`, `lut3d_cube_edge`,
 //!   `profile_enabled`): stable for the life of a `Renderer`; captured at
-//!   construction and refreshed via [`Self::refresh_renderer_caches`] when
+//!   construction and refreshed via [`Self::set_renderer_caches`] when
 //!   device-loss recovery rebuilds the renderer.
 //! - **`powered_off`**: a replica of execution state, updated by the
 //!   main-side power paths that drive it (DPMS actions, the session-lock
-//!   blank path, recovery re-power). The context's flag remains the truth
-//!   the render path acts on; the replica serves main-side gates.
+//!   blank path, recovery re-power). NOTE: this replica is the ONLY render
+//!   gate — `OutputContext::present` has no powered-off check of its own
+//!   (the context's flag only makes power_on/power_off idempotent), so any
+//!   future submit path that bypasses `render_one_queued`'s shadow gate
+//!   would re-modeset and wake a sleeping panel.
 
 use prism_renderer::{synthesize_lut_from_matrix_curve, vk, DrmDevId};
 use smithay::reexports::drm::control::{connector, crtc, Mode};

@@ -34,6 +34,13 @@ use prism_renderer::DrmDevId;
 /// between passes (no state borrows outstanding, no frame mid-lowering)
 /// whenever `gpu_recovery_pending` was set.
 pub fn recover_lost_gpus(state: &mut PrismState) {
+    // Drain queued present outcomes first: stale device-lost outcomes from
+    // other outputs of the dying GPU are processed against the OLD device
+    // state (their imported semaphore handles retire on the old copier /
+    // no-op once it's gone) instead of after the swap, where
+    // destroy_render_wait_semaphores would hand old-device handles to the
+    // NEW device's deferred-destroy queue.
+    crate::drain_render_outcomes(state);
     let lost: Vec<DrmDevId> = state.lost_gpus.borrow().iter().copied().collect();
     for gpu in lost {
         let attempt = state.gpu_recovery_attempts.get(&gpu).copied().unwrap_or(0) + 1;
@@ -62,11 +69,19 @@ pub fn recover_lost_gpus(state: &mut PrismState) {
                     // exactly those — while still locked the next render
                     // shows the lock surface, not desktop content. User
                     // DPMS state (not in this set) is untouched.
-                    if state.lock_blanked_outputs.remove(id)
-                        && state.with_output_ctx(id, |ctx| ctx.power_on()).is_some()
-                    {
-                        if let Some(shadow) = state.outputs.get_mut(id) {
-                            shadow.note_powered(true);
+                    if state.lock_blanked_outputs.contains(id) {
+                        if state.with_output_ctx(id, |ctx| ctx.power_on()).is_some() {
+                            state.lock_blanked_outputs.remove(id);
+                            if let Some(shadow) = state.outputs.get_mut(id) {
+                                shadow.note_powered(true);
+                            }
+                        } else {
+                            // Bridge failed — keep the output in the set so
+                            // a recovery retry can still re-power it.
+                            tracing::warn!(
+                                output = %id,
+                                "lock-blanked output re-power unreachable; will retry"
+                            );
                         }
                     }
                     state
@@ -207,35 +222,42 @@ fn recover_one(state: &mut PrismState, gpu: DrmDevId) -> Result<()> {
         bool,
         std::sync::Arc<std::sync::Mutex<prism_renderer::ProfileRing>>,
     );
-    let rebuilt: Result<Vec<RendererCaches>> = {
+    let rebuilt: Result<(Vec<RendererCaches>, Result<()>)> = {
         let Some(thread) = state.render_threads.get(&gpu) else {
             restore(state, device);
             anyhow::bail!("no render thread for {gpu:?}");
         };
         let device_for_rebuild = device.clone();
-        thread
-            .with_outputs(move |outputs| {
-                let mut caches = Vec::new();
-                for (id, ctx) in outputs.iter_mut() {
-                    if ctx.gpu_id == gpu {
-                        ctx.rebuild_render_state(device_for_rebuild.clone())
-                            .with_context(|| format!("rebuild output {id}"))?;
-                        caches.push((
-                            id.clone(),
-                            ctx.renderer.white_view(),
-                            ctx.renderer.lut3d_cube_edge(),
-                            ctx.renderer.profile_enabled(),
-                            ctx.renderer.profile_ring(),
-                        ));
+        thread.with_outputs(move |outputs| {
+            let mut caches = Vec::new();
+            for (id, ctx) in outputs.iter_mut() {
+                if ctx.gpu_id == gpu {
+                    if let Err(e) = ctx
+                        .rebuild_render_state(device_for_rebuild.clone())
+                        .with_context(|| format!("rebuild output {id}"))
+                    {
+                        // Return the caches of the outputs that DID swap —
+                        // their shadows must be re-seeded even on a failed
+                        // attempt, or main would keep raw handles into the
+                        // renderers this pass just destroyed.
+                        return (caches, Err(e));
                     }
+                    caches.push((
+                        id.clone(),
+                        ctx.renderer.white_view(),
+                        ctx.renderer.lut3d_cube_edge(),
+                        ctx.renderer.profile_enabled(),
+                        ctx.renderer.profile_ring(),
+                    ));
                 }
-                Ok(caches)
-            })
-            .unwrap_or_else(Err)
+            }
+            (caches, Ok(()))
+        })
     };
-    let caches = match rebuilt {
-        Ok(c) => c,
+    let (caches, rebuild_result) = match rebuilt {
+        Ok(v) => v,
         Err(e) => {
+            // Bridge failure: nothing provably swapped; keep the old state.
             restore(state, device);
             return Err(e);
         }
@@ -245,8 +267,20 @@ fn recover_one(state: &mut PrismState, gpu: DrmDevId) -> Result<()> {
             shadow.set_renderer_caches(white_view, cube_edge, profile_enabled, profile_ring);
         }
     }
+    if let Err(e) = rebuild_result {
+        restore(state, device);
+        return Err(e);
+    }
 
     // ── Phase 3: close the old fd, then first submits ──────────────────
+    // Outcomes queued while the rebuild bridge waited behind still-failing
+    // presents (channel FIFO) are drained now, while `mirror_copiers` has
+    // no entry for this GPU: their semaphore retirement no-ops (the handles
+    // belong to the dying device — leaking them there is fine) instead of
+    // landing on the replacement copier installed below, and their
+    // re-quarantine of a still-quarantined GPU is a no-op.
+    crate::drain_render_outcomes(state);
+
     let old_refs = Arc::strong_count(&old);
     drop(old);
     if old_refs == 1 {

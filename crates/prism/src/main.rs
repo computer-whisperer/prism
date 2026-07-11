@@ -1956,11 +1956,17 @@ fn run_integrated(
                         // machine says otherwise).
                         let ids: Vec<_> = state.outputs.keys().cloned().collect();
                         for id in ids {
-                            if state.pending_submissions.remove(&id).is_some() {
+                            if let Some(pending) = state.pending_submissions.remove(&id) {
                                 tracing::error!(
                                     output = %id,
                                     "session-resume found an in-flight submission; \
                                      the pause barrier should have drained it"
+                                );
+                                let gpu = pending.bookkeeping.output_gpu_id;
+                                prism_protocols::destroy_render_wait_semaphores(
+                                    state,
+                                    gpu,
+                                    pending.render_waits,
                                 );
                             }
                             let entry = state.output_redraw.entry(id).or_default();
@@ -2629,7 +2635,7 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
             // Output not in the layout yet (add_output vs first-vblank
             // race); leave it Queued and retry next pass.
         }
-        Err(e) => handle_render_error(state, output_id, &e),
+        Err(e) => handle_render_error(state, output_id, &e, None),
     }
 }
 
@@ -2645,10 +2651,17 @@ fn lower_and_submit(state: &mut prism_protocols::PrismState, output_id: &str) ->
     // The submission moves to the thread; keep the imported wait-semaphore
     // handles (plain vk handles) for the post-outcome retirement.
     let render_waits = submission.render_waits.clone();
-    state
+    let gpu = bookkeeping.output_gpu_id;
+    let sent = state
         .render_thread_for_output(output_id)
-        .ok_or_else(|| anyhow!("no render thread for output {output_id}"))?
-        .submit_frame(output_id, submission)?;
+        .ok_or_else(|| anyhow!("no render thread for output {output_id}"))
+        .and_then(|thread| thread.submit_frame(output_id, submission));
+    if let Err(e) = sent {
+        // The frame never reached a thread — nothing will ever wait the
+        // imported semaphores; retire them instead of leaking.
+        prism_protocols::destroy_render_wait_semaphores(state, gpu, render_waits);
+        return Err(e);
+    }
     let displaced = state.pending_submissions.insert(
         output_id.to_owned(),
         PendingSubmission {
@@ -2667,10 +2680,17 @@ fn lower_and_submit(state: &mut prism_protocols::PrismState, output_id: &str) ->
 
 /// Shared failure path for a frame that never presented — a lowering
 /// error, a dead render thread, or a present error in the outcome.
+///
+/// `lowered_while_locked`: the session-lock state captured when the failed
+/// frame was LOWERED (`None` for synchronous failures, where lowering time
+/// is now). A frame lowered before a lock transition must not abort the
+/// lock its failure races with — see the lock-epoch note in
+/// [`process_present_outcome`].
 fn handle_render_error(
     state: &mut prism_protocols::PrismState,
     output_id: &str,
     e: &anyhow::Error,
+    lowered_while_locked: Option<bool>,
 ) {
     use prism_protocols::redraw::RedrawState;
     // A device-lost render quarantines the output's GPU for
@@ -2689,11 +2709,15 @@ fn handle_render_error(
     // lock rather than confirm one the screen doesn't reflect
     // (niri parity). No-op when not mid-lock. Device-lost is the
     // exception: no render is coming until recovery, so blank the
-    // output and confirm instead of wedging the lock.
+    // output and confirm instead of wedging the lock. A frame from
+    // BEFORE the lock transition (async outcome racing the lock) says
+    // nothing about the locked frame — the lock keeps waiting for the
+    // real locked render, which the transition already queued.
+    let same_lock_epoch = lowered_while_locked.is_none_or(|l| l == state.is_locked());
     if state.is_locked() {
         if device_lost {
             blank_lost_output_for_lock(state, output_id);
-        } else {
+        } else if same_lock_epoch {
             state.note_lock_render(output_id, false);
         }
     }
@@ -2775,11 +2799,12 @@ fn on_present_outcome(
             // makes the fix natural since they're parked main-side).
             let gpu = bookkeeping.output_gpu_id;
             prism_protocols::destroy_render_wait_semaphores(state, gpu, render_waits);
-            handle_render_error(state, output_id, &e);
+            handle_render_error(state, output_id, &e, Some(bookkeeping.session_locked));
             return;
         }
     };
 
+    let lowered_while_locked = bookkeeping.session_locked;
     match process_present_outcome(state, output_id, outcome, render_waits, bookkeeping) {
         Ok(RenderOutcome::Presented {
             pending,
@@ -2867,7 +2892,7 @@ fn on_present_outcome(
                 .or_default()
                 .redraw = RedrawState::Queued;
         }
-        Err(e) => handle_render_error(state, output_id, &e),
+        Err(e) => handle_render_error(state, output_id, &e, Some(lowered_while_locked)),
     }
 }
 
@@ -3687,14 +3712,82 @@ fn lower_output_frame(
     let acquire_surfaces = acquire_surfaces.take();
     let mut render_waits =
         prism_protocols::prepare_mirror_waits(state, &mirror_surfaces, output_gpu_id);
-    render_waits.extend(prism_protocols::prepare_dmabuf_acquire_waits(
-        state,
-        &acquire_surfaces,
-        output_gpu_id,
-    ));
+    let (acquire_wait_sems, acquire_buffers) =
+        prism_protocols::prepare_dmabuf_acquire_waits(state, &acquire_surfaces, output_gpu_id);
+    render_waits.extend(acquire_wait_sems);
     // GTT→local copies the render records up front, so decode/deband sample
     // local tiled VRAM instead of scanning the LINEAR mirror imports over PCIe.
     let local_copies = prism_protocols::mirror_local_copies(&mirror_surfaces, output_gpu_id);
+
+    // Harvest `wp_presentation_feedback` + `wp_linux_drm_syncobj` release
+    // trackers NOW, at lowering (§2.4) — this is the state the frame
+    // renders. The frame is executed asynchronously on its render thread,
+    // and a client commit can land in the submit→outcome gap; harvesting at
+    // outcome time would attribute the gap commit's feedback to this frame
+    // and, worse, grab the NEW buffer's release tracker while leaving the
+    // buffer this frame actually samples with no clone gating its release
+    // (explicit-sync clients could then reuse it mid-read). Frame callbacks
+    // are NOT harvested here (`None`) — `send_frame_callbacks` delivers
+    // them at vblank, throttled per refresh cycle. The subsurface walk +
+    // deadlock-safe reads live in `redraw::harvest_surface_feedback` so the
+    // WLCS harness reuses the traversal.
+    let mut presentation_cbs = Vec::new();
+    let mut release_trackers = Vec::new();
+    {
+        let surfaces: Vec<_> = state
+            .xdg_shell
+            .toplevel_surfaces()
+            .iter()
+            .map(|t| t.wl_surface().clone())
+            .collect();
+        for surface in &surfaces {
+            let belongs_here = state
+                .layout
+                .find_window_and_output(surface)
+                .and_then(|(_, out)| out)
+                .map(|out| out == &smithay_output)
+                .unwrap_or(false);
+            if !belongs_here {
+                continue;
+            }
+            prism_protocols::redraw::harvest_surface_feedback(
+                surface,
+                None,
+                &mut presentation_cbs,
+                &mut release_trackers,
+            );
+            // Popups are separate surface trees parented to this toplevel,
+            // not part of its subsurface tree, so the walk above doesn't
+            // reach them.
+            for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(surface) {
+                prism_protocols::redraw::harvest_surface_feedback(
+                    popup.wl_surface(),
+                    None,
+                    &mut presentation_cbs,
+                    &mut release_trackers,
+                );
+            }
+        }
+        // Same harvest for every layer-shell surface this frame renders
+        // (all four layers composite), plus each root's popup trees.
+        let map = smithay::desktop::layer_map_for_output(&smithay_output);
+        for ls in map.layers() {
+            prism_protocols::redraw::harvest_surface_feedback(
+                ls.wl_surface(),
+                None,
+                &mut presentation_cbs,
+                &mut release_trackers,
+            );
+            for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(ls.wl_surface()) {
+                prism_protocols::redraw::harvest_surface_feedback(
+                    popup.wl_surface(),
+                    None,
+                    &mut presentation_cbs,
+                    &mut release_trackers,
+                );
+            }
+        }
+    }
 
     Ok(Some((
         FrameSubmission {
@@ -3712,7 +3805,9 @@ fn lower_output_frame(
             output_gpu_id,
             smithay_output,
             mirror_surfaces,
-            acquire_surfaces,
+            acquire_buffers,
+            presentation_cbs,
+            release_trackers,
             redraw_again: !missing.is_empty(),
             session_locked,
             target_time,
@@ -3748,11 +3843,16 @@ fn process_present_outcome(
     let present_sync_fd = match outcome {
         prism_drm::PresentOutcome::Presented(fd) => {
             // The render submit really carried the acquire waits — only now
-            // may these surfaces skip the producer-fence wait on this GPU.
-            // On FlipPending/Skipped below the waits went unused and the
-            // retry re-exports (clearing at prepare time put the fa62fb9
+            // may these surfaces skip the producer-fence wait on this GPU
+            // (and only for the buffers the fences belonged to — a commit
+            // in the submit→outcome gap must re-export next frame). On
+            // FlipPending/Skipped below the waits went unused and the retry
+            // re-exports (clearing at prepare time put the fa62fb9
             // blue-bleed race back on the flip-pending path).
-            prism_protocols::mark_dmabuf_acquire_waited(&bk.acquire_surfaces, output_gpu_id);
+            prism_protocols::mark_dmabuf_acquire_waited_if_current(
+                &bk.acquire_buffers,
+                output_gpu_id,
+            );
             // If this render sampled mirror scratches, store its completion
             // fence (a dup of the present SYNC_FD) so the next home→scratch
             // copy waits it instead of overwriting mid-read.
@@ -3765,18 +3865,41 @@ fn process_present_outcome(
         // really carried the acquire waits / sampled the mirror scratches, so
         // do the same GPU-side bookkeeping as `Presented` (skipping it would
         // let the next copy overwrite a scratch this render is still reading),
-        // then propagate the flip error as before.
+        // then propagate the flip error as before. The harvested release
+        // trackers gate on the render-done fd — the submit really samples
+        // those buffers even though no flip carried them to the screen.
         prism_drm::PresentOutcome::FlipFailed { render_done, error } => {
-            prism_protocols::mark_dmabuf_acquire_waited(&bk.acquire_surfaces, output_gpu_id);
+            prism_protocols::mark_dmabuf_acquire_waited_if_current(
+                &bk.acquire_buffers,
+                output_gpu_id,
+            );
             if !bk.mirror_surfaces.is_empty() {
                 prism_protocols::note_mirror_render_done(state, output_gpu_id, &render_done);
             }
+            if let Some(loop_handle) = state.loop_handle.as_ref() {
+                prism_protocols::drm_syncobj::register_release_after_submit(
+                    loop_handle,
+                    render_done,
+                    bk.release_trackers,
+                );
+            }
+            // bk.presentation_cbs drop → `discarded` (nothing reached the
+            // screen).
             return Err(error);
         }
         // Flip still in flight — caller leaves the output Queued and retries.
+        // The harvested feedback/trackers drop: the retry re-lowers and
+        // re-harvests; the tracker clones are non-destructive (the surface
+        // slot keeps its own ref) and the callbacks... were consumed by this
+        // lowering, so the retry can't re-take them — deliver `discarded`
+        // rather than silently losing them (drop does exactly that).
         prism_drm::PresentOutcome::FlipPending => return Ok(RenderOutcome::FlipPending),
-        // Nothing changed — caller arms an estimated vblank instead of waiting
-        // for a real one. No harvest (no scanout, so no presentation feedback).
+        // Nothing changed — caller arms an estimated vblank instead of
+        // waiting for a real one. No scanout ⇒ the harvested presentation
+        // feedback drops → `discarded` (the previous, already-accounted
+        // frame is still showing; this commit produced no new presentation).
+        // Tracker clones drop harmlessly — the render never sampled, and
+        // the surface slot still holds its own ref for future frames.
         prism_drm::PresentOutcome::SkippedNoDamage => {
             return Ok(RenderOutcome::SkippedNoDamage {
                 redraw_again: bk.redraw_again,
@@ -3795,105 +3918,28 @@ fn process_present_outcome(
     // forced it.
     state.submit_pending_screencopy(output_id);
 
-    // Extract pending `wp_presentation_feedback` from every surface mapped to
-    // this output so we can fire it at the next vblank with the kernel-reported
-    // presentation time. Firing it now (at submit, before scanout) would lie to
-    // clients about when the buffer hit the screen and cause over-production /
-    // stalls — see the redraw module's docs. (Frame callbacks are delivered
-    // separately by `send_frame_callbacks`, throttled per refresh cycle.)
-    //
-    // Same walk also harvests `wp_linux_drm_syncobj` release trackers
-    // for surfaces that opted into explicit sync: every surface we
-    // just rendered contributes one Arc clone, and we hand the whole
-    // batch + the present sync_fd to drm_syncobj's release wiring.
-    // When the fd signals (Vulkan submit done), the Arcs drop; the
-    // last drop across all outputs that sampled the surface signals
-    // the client's release point.
-    let surfaces: Vec<_> = state
-        .xdg_shell
-        .toplevel_surfaces()
-        .iter()
-        .map(|t| t.wl_surface().clone())
-        .collect();
-
-    let mut presentation_cbs = Vec::new();
-    let mut release_trackers = Vec::new();
-
-    // Harvest presentation feedback + drm_syncobj release trackers from each
-    // surface we rendered. Frame callbacks are NOT harvested here (we pass
-    // `None`): they're delivered by `send_frame_callbacks` at vblank, throttled
-    // per refresh cycle — draining them now would steal them before that runs.
-    // The subsurface-descending walk and deadlock-safe direct reads live in
-    // `redraw::harvest_surface_feedback` so the WLCS harness reuses the traversal.
-    for surface in &surfaces {
-        let belongs_here = state
-            .layout
-            .find_window_and_output(surface)
-            .and_then(|(_, out)| out)
-            .map(|out| out == &bk.smithay_output)
-            .unwrap_or(false);
-        if !belongs_here {
-            continue;
-        }
-        prism_protocols::redraw::harvest_surface_feedback(
-            surface,
-            None,
-            &mut presentation_cbs,
-            &mut release_trackers,
-        );
-        // Popups are separate surface trees parented to this toplevel, not
-        // part of its subsurface tree, so the walk above doesn't reach them.
-        for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(surface) {
-            prism_protocols::redraw::harvest_surface_feedback(
-                popup.wl_surface(),
-                None,
-                &mut presentation_cbs,
-                &mut release_trackers,
-            );
-        }
-    }
-    // Same harvest for every layer-shell surface we just rendered (all four
-    // layers now composite). harvest_surface_feedback descends each surface's
-    // subsurface tree itself, so the layer roots are all we pass in — plus
-    // each root's popup trees, which (as above) are not subsurfaces.
-    {
-        let map = smithay::desktop::layer_map_for_output(&bk.smithay_output);
-        for ls in map.layers() {
-            prism_protocols::redraw::harvest_surface_feedback(
-                ls.wl_surface(),
-                None,
-                &mut presentation_cbs,
-                &mut release_trackers,
-            );
-            for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(ls.wl_surface()) {
-                prism_protocols::redraw::harvest_surface_feedback(
-                    popup.wl_surface(),
-                    None,
-                    &mut presentation_cbs,
-                    &mut release_trackers,
-                );
-            }
-        }
-    }
-
+    // Wire the lowering-harvested `wp_linux_drm_syncobj` release trackers
+    // to the present fd: when it signals (Vulkan submit done), the Arcs
+    // drop; the last drop across all outputs that sampled a surface
+    // signals the client's release point.
     if let Some(loop_handle) = state.loop_handle.as_ref() {
         prism_protocols::drm_syncobj::register_release_after_submit(
             loop_handle,
             present_sync_fd,
-            release_trackers,
+            bk.release_trackers,
         );
     } else {
         // No LoopHandle stashed — drop the trackers (signals release
         // immediately, racy with in-flight GPU). Only reachable if
         // main forgot to call state.set_loop_handle before dispatch;
         // log loudly.
-        if !release_trackers.is_empty() {
+        if !bk.release_trackers.is_empty() {
             tracing::error!(
                 "drm_syncobj: state.loop_handle is None during render — \
                  release points will fire before GPU completes"
             );
         }
-        drop(release_trackers);
+        drop(bk.release_trackers);
         drop(present_sync_fd);
     }
 
@@ -3907,7 +3953,7 @@ fn process_present_outcome(
 
     Ok(RenderOutcome::Presented {
         pending: PendingFeedback {
-            presentation_cbs,
+            presentation_cbs: bk.presentation_cbs,
             target_time: bk.target_time,
         },
         redraw_again: bk.redraw_again,
