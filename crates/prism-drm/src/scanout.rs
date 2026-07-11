@@ -612,8 +612,13 @@ where
 
 /// Find a named property on a resource by walking its property list.
 /// Returns `None` if no such property exists on this object.
-pub fn find_property<H: ResourceHandle>(
-    drm: &DrmDevice,
+///
+/// Generic over [`ControlDevice`] so callers can go through whichever
+/// handle to the DRM fd they own — the card's `DrmDevice` at bringup, or
+/// an output's `DrmSurface` from the render thread (both resolve to the
+/// same underlying device fd).
+pub fn find_property<D: ControlDevice, H: ResourceHandle>(
+    drm: &D,
     handle: H,
     name: &str,
 ) -> Result<Option<property::Handle>> {
@@ -638,8 +643,8 @@ pub fn find_property<H: ResourceHandle>(
 /// (some drivers omit it for HDMI/DP variants); the caller can treat
 /// that as "use whatever depth the link defaulted to". Returns `Ok(true)`
 /// on a successful set.
-pub fn set_connector_max_bpc(
-    drm: &DrmDevice,
+pub fn set_connector_max_bpc<D: ControlDevice>(
+    drm: &D,
     connector: connector::Handle,
     value: u64,
 ) -> Result<bool> {

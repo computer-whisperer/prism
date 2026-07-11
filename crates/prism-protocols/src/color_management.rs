@@ -588,7 +588,7 @@ impl ColorManagementState {
 /// pass-through render path (Step 4) instead of going through
 /// transfer-function conversion.
 pub fn build_output_preferred(
-    ctx: &prism_drm::OutputContext,
+    ctx: &prism_drm::OutputShadow,
     cm: &ColorManagementState,
 ) -> Arc<ImageDescription> {
     let identity = cm.next_identity();
@@ -606,7 +606,7 @@ pub fn build_output_preferred(
             .effective_advertised_peak_nits()
             .unwrap_or(hdr.max_luminance as u32);
         // Prefer the measured panel floor (calibrate-lut3d writes it
-        // to the .lut header, OutputContext exposes it via
+        // to the .lut header, OutputShadow exposes it via
         // effective_black_point_xyz) over the KDL-configured min
         // luminance. The measurement is what the colorimeter
         // actually read at (R=G=B=0); the KDL value is a guess or

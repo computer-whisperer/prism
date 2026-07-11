@@ -1192,7 +1192,7 @@ fn run_integrated(
     // bring up only that one. Otherwise pick_all_connected on each card.
     // Non-desktop connectors (VR headsets) found by the scan are collected
     // per card and advertised for DRM leasing once PrismState is up.
-    let mut outputs: Vec<prism_drm::OutputContext> = Vec::new();
+    let mut outputs: Vec<(prism_drm::OutputContext, prism_drm::OutputShadow)> = Vec::new();
     let mut non_desktop_by_card: std::collections::HashMap<
         prism_renderer::DrmDevId,
         Vec<prism_drm::NonDesktopConnector>,
@@ -1403,8 +1403,12 @@ fn run_integrated(
             breadcrumb(&format!("bringup loop: building OutputContext for {name}"));
             match prism_drm::OutputContext::new(card, device.clone(), pick, &output_config) {
                 Ok(mut output) => {
+                    // Main-thread shadow: identity/geometry/config copies
+                    // plus the color policy, which the shadow *owns* (the
+                    // context no longer carries it — see output_shadow.rs).
+                    let mut shadow = prism_drm::OutputShadow::new(&output);
                     // KDL `color.lut3d "file"` — load the binary LUT now
-                    // so resynthesize_color_lut sees it as the fallback
+                    // so effective_lut3d_entries sees it as the fallback
                     // when no IPC override is active. Re-look up the
                     // per-connector config block; the earlier `cfg` is
                     // scoped to the `if let` above. Use the OutputContext's
@@ -1419,7 +1423,7 @@ fn run_integrated(
                         match prism_renderer::load_lut3d_file(std::path::Path::new(&lut3d_cfg.path))
                         {
                             Ok(loaded) => {
-                                let renderer_edge = output.renderer.lut3d_cube_edge();
+                                let renderer_edge = shadow.lut3d_cube_edge;
                                 let want_domain = output.config.encode_config.lut_output_domain();
                                 if loaded.cube_edge != renderer_edge {
                                     tracing::warn!(
@@ -1455,14 +1459,14 @@ fn run_integrated(
                                         black_point_xyz = ?bp,
                                         "loaded color LUT from file"
                                     );
-                                    output.kdl_lut3d_entries = Some(loaded.entries);
+                                    shadow.kdl_lut3d_entries = Some(loaded.entries);
                                     // All-zero ⇒ unmeasured (pre-v2 measurement
                                     // or calibrate skipped the floor). Leave
                                     // unset so effective_black_point_xyz returns
                                     // None and downstream consumers can fall
                                     // back to "no min-luminance signal."
                                     if bp[0] != 0.0 || bp[1] != 0.0 || bp[2] != 0.0 {
-                                        output.kdl_black_point_xyz = Some(bp);
+                                        shadow.kdl_black_point_xyz = Some(bp);
                                     }
                                 }
                             }
@@ -1483,7 +1487,7 @@ fn run_integrated(
                             .and_then(|c| c.color.as_ref())
                             .and_then(|c| c.gamut.as_ref())
                     {
-                        output.kdl_gamut_path = Some(std::path::PathBuf::from(&gamut_cfg.path));
+                        shadow.kdl_gamut_path = Some(std::path::PathBuf::from(&gamut_cfg.path));
                     }
                     // Bake whichever color representation is current
                     // (loaded LUT or synthesis from CTM + curve) into the
@@ -1492,18 +1496,24 @@ fn run_integrated(
                     // device, etc.) — log and continue with whatever the
                     // identity LUT renders rather than fail the whole
                     // output, since the bringup just succeeded.
-                    if let Err(e) = output.resynthesize_color_lut() {
-                        tracing::warn!(
-                            connector = %output.connector_name,
-                            "initial color LUT synthesis failed: {e:#} \
-                             (output stays on identity LUT)"
-                        );
+                    if let Some((entries, source)) = shadow.effective_lut3d_entries() {
+                        if let Err(e) = output
+                            .renderer
+                            .upload_lut3d(&entries)
+                            .context(source.upload_context())
+                        {
+                            tracing::warn!(
+                                connector = %output.connector_name,
+                                "initial color LUT synthesis failed: {e:#} \
+                                 (output stays on identity LUT)"
+                            );
+                        }
                     }
                     breadcrumb(&format!(
                         "output bringup ok: {} {}x{} on {}",
                         name, output.extent.width, output.extent.height, card.path
                     ));
-                    outputs.push(output);
+                    outputs.push((output, shadow));
                 }
                 Err(e) => {
                     breadcrumb(&format!("output bringup FAILED for {name}: {e:#}"));
@@ -1562,11 +1572,11 @@ fn run_integrated(
     for card in cards {
         state.attach_card(card);
     }
-    for output in outputs {
-        // Advertise BEFORE moving the OutputContext into state — we only
-        // need a borrow for the wl_output mode/extent/connector_name.
-        state.advertise_output(&output);
-        state.attach_output(output);
+    for (output, shadow) in outputs {
+        // Advertise BEFORE moving the pair into state — we only need a
+        // borrow of the shadow for the wl_output mode/extent/connector_name.
+        state.advertise_output(&shadow);
+        state.attach_output(output, shadow);
     }
     // Now that every output is advertised, assign logical positions
     // (horizontal stack by sorted connector name). Sends wl_output.done
@@ -1878,13 +1888,10 @@ fn run_integrated(
                         //    bookkeeping from the pre-pause flip, so the next
                         //    present re-modesets via commit (not a now-invalid
                         //    page-flip) and isn't wedged by a lost-vblank guard.
-                        // `output.gpu_id` keys the card it scans out on (bringup
-                        // builds each output on its own card's GPU).
-                        let cards = &state.cards;
-                        for output in state.outputs.values_mut() {
-                            if let Some(card) = cards.get(&output.gpu_id) {
-                                output.reapply_color_signaling(&card.drm);
-                            }
+                        // The property writes go through each output's own
+                        // surface handle (same device fd as the card).
+                        for output in state.output_ctxs.values_mut() {
+                            output.reapply_color_signaling();
                             output.mark_for_resume();
                         }
                         // Force a full redraw of every output: the reset above
@@ -2220,10 +2227,12 @@ fn run_integrated(
     ));
     let t_start = std::time::Instant::now();
 
-    // Take + drop outputs one at a time so we can attribute hangs to a
-    // specific OutputContext (surface.clear, Renderer Drop, scanout buffer
-    // Drop with imported image + GBM BO).
-    let outputs = std::mem::take(&mut state.outputs);
+    // Take + drop the execution contexts one at a time so we can attribute
+    // hangs to a specific OutputContext (surface.clear, Renderer Drop,
+    // scanout buffer Drop with imported image + GBM BO). The shadows are
+    // plain data — dropping them with the rest of `state` is fine.
+    drop(std::mem::take(&mut state.outputs));
+    let outputs = std::mem::take(&mut state.output_ctxs);
     breadcrumb(&format!("shutdown: dropping {} outputs", outputs.len()));
     for (id, output) in outputs {
         let t = std::time::Instant::now();
@@ -2346,7 +2355,7 @@ fn on_vblank(
 
     // Step 1: per-output DRM bookkeeping (frame_pending, back_buffer
     // toggle, frame_clock update).
-    if let Some(ctx) = state.outputs.get_mut(&output_id) {
+    if let Some(ctx) = state.output_ctxs.get_mut(&output_id) {
         ctx.mark_vblank(presentation_time);
     }
 
@@ -2621,7 +2630,7 @@ fn render_one_queued(state: &mut prism_protocols::PrismState, output_id: &str) {
 /// state is never touched).
 fn blank_lost_output_for_lock(state: &mut prism_protocols::PrismState, output_id: &str) {
     let mut blanked = false;
-    if let Some(o) = state.outputs.get_mut(output_id) {
+    if let Some(o) = state.output_ctxs.get_mut(output_id) {
         if !o.is_powered_off() {
             match o.power_off() {
                 Ok(()) => blanked = true,
@@ -2634,6 +2643,9 @@ fn blank_lost_output_for_lock(state: &mut prism_protocols::PrismState, output_id
         }
     }
     if blanked {
+        if let Some(shadow) = state.outputs.get_mut(output_id) {
+            shadow.note_powered(false);
+        }
         state.lock_blanked_outputs.insert(output_id.to_owned());
     }
     state.note_lock_render(output_id, true);
@@ -2659,7 +2671,7 @@ fn queue_estimated_vblank(state: &mut prism_protocols::PrismState, output_id: &s
         return;
     }
 
-    let Some((target, refresh)) = state.outputs.get(output_id).map(|o| {
+    let Some((target, refresh)) = state.output_ctxs.get(output_id).map(|o| {
         (
             o.frame_clock.next_presentation_time(),
             o.frame_clock.refresh_interval(),
@@ -2829,7 +2841,7 @@ fn render_output_now(
     };
     let outcome = {
         let output = state
-            .outputs
+            .output_ctxs
             .get_mut(output_id)
             .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
         execute_frame(output, &mut submission)?
@@ -2875,31 +2887,37 @@ fn lower_output_frame(
     use prism_layout::layout::RenderCtx;
     use prism_renderer::{vk, EncodePush, RenderEl};
 
-    // Snapshot identity bits without holding any borrow into
-    // state.outputs (we'll re-borrow mutably at present() time below).
-    // The "effective" reads here pick runtime IPC overrides ahead of
-    // the persisted KDL values, so calibration tools can iterate live.
+    // Snapshot identity bits without holding any borrow into the output
+    // maps. The "effective" reads pick runtime IPC overrides ahead of the
+    // persisted KDL values, so calibration tools can iterate live. All
+    // policy comes from the shadow; the frame-clock estimate is the one
+    // execution-side read left (it moves behind the render-thread split's
+    // outcome messages at B1b).
     let (
         output_gpu_id,
         white_view,
-        target_time,
         output_sdr_reference_nits,
         output_decode_clamp_bt2020_rgb,
         profile_enabled,
     ) = {
-        let output = state
+        let shadow = state
             .outputs
             .get(output_id)
             .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
         (
-            output.gpu_id,
-            output.renderer.white_view(),
-            output.frame_clock.next_presentation_time(),
-            output.effective_sdr_reference_nits(),
-            output.effective_decode_clamp_bt2020_rgb(),
-            output.renderer.profile_enabled(),
+            shadow.gpu_id,
+            shadow.white_view,
+            shadow.effective_sdr_reference_nits(),
+            shadow.effective_decode_clamp_bt2020_rgb(),
+            shadow.profile_enabled,
         )
     };
+    let target_time = state
+        .output_ctxs
+        .get(output_id)
+        .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?
+        .frame_clock
+        .next_presentation_time();
 
     // Per-frame phase profile, accumulated as we build the frame. `None` (the
     // default) means profiling is off and we skip taking the per-phase timings
@@ -2949,7 +2967,16 @@ fn lower_output_frame(
                 .outputs
                 .get(output_id)
                 .ok_or_else(|| anyhow!("no output bound to id {output_id}"))?;
-            (output.renderer.device(), output.extent)
+            // Snapshot textures allocate on the output's device — same
+            // `Arc` the renderer was built from (recovery swaps both
+            // together), so the registry lookup is equivalent to the old
+            // `renderer.device()` read.
+            let device = state
+                .gpus
+                .get(&output.gpu_id)
+                .ok_or_else(|| anyhow!("no device registered for {:?}", output.gpu_id))?
+                .clone();
+            (device, output.extent)
         };
         let sx = out_extent.width as f64 / view_size.w.max(1.0);
         let sy = out_extent.height as f64 / view_size.h.max(1.0);

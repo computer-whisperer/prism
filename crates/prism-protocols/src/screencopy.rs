@@ -369,7 +369,7 @@ impl PrismState {
             kind,
         });
         if !with_damage {
-            if let Some(ctx) = self.outputs.get_mut(output_id) {
+            if let Some(ctx) = self.output_ctxs.get_mut(output_id) {
                 ctx.force_next_present();
             }
             self.output_redraw
@@ -415,14 +415,21 @@ impl PrismState {
 
         // Import the client dmabuf as a COLOR_ATTACHMENT render target (cheap;
         // same call the scanout uses). The actual render is deferred to the
-        // render loop.
+        // render loop. The import is a device-level operation (no queue), so
+        // it stays main-side; the device comes from the registry — same
+        // `Arc` the output's renderer was built from (recovery swaps both
+        // together).
         let imported = {
-            let Some(ctx) = self.outputs.get_mut(output_id) else {
+            let Some(device) = self
+                .outputs
+                .get(output_id)
+                .and_then(|shadow| self.gpus.get(&shadow.gpu_id))
+                .cloned()
+            else {
                 trace!("screencopy: output {output_id} gone before dmabuf copy");
                 frame.failed();
                 return;
             };
-            let device = ctx.renderer.device();
             let prism_dmabuf = match prism_frame::Dmabuf::from_smithay(dmabuf) {
                 Ok(d) => d,
                 Err(e) => {
@@ -558,11 +565,16 @@ impl PrismState {
         output_id: &str,
         kind: PendingKind,
     ) -> Result<(OwnedFd, InflightKind), ()> {
-        let Some(ctx) = self.outputs.get_mut(output_id) else {
+        // Color policy + geometry from the shadow; the GPU work below goes
+        // through the execution context.
+        let Some(shadow) = self.outputs.get(output_id) else {
             return Err(());
         };
-        let white = ctx.effective_sdr_reference_nits();
-        let src_width = ctx.extent.width;
+        let white = shadow.effective_sdr_reference_nits();
+        let src_width = shadow.extent.width;
+        let Some(ctx) = self.output_ctxs.get_mut(output_id) else {
+            return Err(());
+        };
         match kind {
             PendingKind::Dmabuf {
                 imported,

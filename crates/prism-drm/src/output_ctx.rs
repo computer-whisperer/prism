@@ -26,26 +26,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use drm_fourcc::DrmModifier;
 use prism_renderer::{
-    synthesize_lut_from_matrix_curve, vk, DamageTracker, Device, DrmDevId, EncodePush,
-    FrameProfile, ImportedImage, LoweredFrame, Renderer, SnapshotCopy, Span,
+    vk, DamageTracker, Device, DrmDevId, EncodePush, FrameProfile, ImportedImage, LoweredFrame,
+    Renderer, SnapshotCopy, Span,
 };
-use smithay::backend::drm::{DrmDevice, DrmSurface, PlaneConfig, PlaneState};
+use smithay::backend::drm::{DrmSurface, PlaneConfig, PlaneState};
 use smithay::reexports::drm::control::{connector, crtc, framebuffer, Mode};
 
 use crate::frame_clock::FrameClock;
 use smithay::utils::{Logical, Physical, Rectangle, Scale, Size, Transform};
-
-/// Headroom multiplier on the derived per-channel BT.2020 decode clamp.
-/// The clamp's purpose is to keep the BT.2020 fp16 intermediate honest
-/// — bound to "panel-realizable as BT.2020 content" — not to be the
-/// final tone-map. Going slightly above the panel's physical limit is
-/// fine: the encoder's response inverse + PQ OETF clamp soft-clip the
-/// excess at the panel ceiling. With margin, the buffer absorbs minor
-/// color-management drift (e.g. fp roundoff pushing a 100%-channel value
-/// to 1.0001 × sdr_white) without hard-clipping content authored in good
-/// faith. 1.5× chosen as a conservative default; the precision of the
-/// underlying panel-peak fit doesn't need to be tight at this margin.
-const BT2020_DECODE_CAP_MARGIN: f32 = 1.5;
 
 use crate::{
     add_framebuffer_for_bo,
@@ -106,32 +94,13 @@ pub struct OutputContext {
     /// from. The render path uses this to look up the correct per-GPU
     /// texture import (or per-GPU shm upload) when sampling client surfaces.
     pub gpu_id: DrmDevId,
-    /// The static config used at construction. Held so HDR / calibration
-    /// reconfig later can read what we currently have.
+    /// The static config used at construction. Held for the execution
+    /// side's needs (scanout formats, encode chain, device-loss rebuild).
+    /// Color *policy* — runtime overrides, KDL LUT entries, the
+    /// `effective_*` resolution — lives on the main thread's
+    /// [`crate::OutputShadow`], which owns the authoritative copy of
+    /// `config` for those reads.
     pub config: OutputConfig,
-    /// Runtime color overrides set via IPC (calibration tooling, etc.).
-    /// Sticky across config-file reloads — only `OutputAction::ResetColor`
-    /// or a compositor restart clears them. When set, the render path
-    /// uses these values in preference to the equivalents in `config`.
-    pub color_override: ColorOverride,
-    /// LUT entries loaded from KDL `color.lut3d` at bringup, if any.
-    /// Used by [`Self::resynthesize_color_lut`] as the fallback when no
-    /// IPC color override is active — bypasses the synthesis path and
-    /// pushes the file content directly. `None` ⇒ no file configured,
-    /// synthesis takes over.
-    pub kdl_lut3d_entries: Option<Vec<[f32; 3]>>,
-    /// Panel black-point measurement (X, Y, Z in cd/m²) parsed out of
-    /// the KDL-loaded LUT file's v2 header at bringup. `None` ⇒ no
-    /// KDL LUT, or the file's `black_point_xyz` was all zeros (the
-    /// "unknown" sentinel — calibrate-lut3d always writes a real
-    /// measurement). Read via [`Self::effective_black_point_xyz`],
-    /// which prefers the IPC override.
-    pub kdl_black_point_xyz: Option<[f32; 3]>,
-    /// Path to the measured gamut-surface sidecar from KDL `color.gamut
-    /// "file"`, if configured. Not used by the render pipeline — held so
-    /// the `GamutMesh` IPC can load + serve it on demand for the
-    /// gamut-cloud inspector. `None` ⇒ no gamut file configured.
-    pub kdl_gamut_path: Option<std::path::PathBuf>,
     /// Set on first present to switch from `commit` (mode-set) to `page_flip`
     /// (just-swap-fb) for subsequent frames.
     mode_set_done: bool,
@@ -384,10 +353,6 @@ impl OutputContext {
             crtc: pick.crtc,
             gpu_id,
             config: config.clone(),
-            color_override: ColorOverride::default(),
-            kdl_lut3d_entries: None,
-            kdl_black_point_xyz: None,
-            kdl_gamut_path: None,
             mode_set_done: false,
             force_present: false,
             frame_pending: false,
@@ -398,225 +363,6 @@ impl OutputContext {
             hdr_props,
             scanout_formats,
         })
-    }
-
-    /// Effective SDR reference luminance for this output, taking any
-    /// runtime IPC override into account before falling back to the
-    /// KDL-config value.
-    pub fn effective_sdr_reference_nits(&self) -> f32 {
-        self.color_override
-            .sdr_reference_nits
-            .unwrap_or(self.config.sdr_reference_nits)
-    }
-
-    /// Effective response curve, override-then-config.
-    pub fn effective_response_curve(&self) -> Option<([f32; 3], [f32; 3])> {
-        self.color_override
-            .response_curve
-            .or(self.config.response_curve)
-    }
-
-    /// Effective 3×3 calibration matrix, override-then-config. `None`
-    /// = identity (no gamut correction in the encode shader).
-    pub fn effective_ctm(&self) -> Option<[[f32; 3]; 3]> {
-        self.color_override.ctm.or(self.config.ctm)
-    }
-
-    /// Effective measured panel black-point in CIE XYZ (cd/m²) —
-    /// what the colorimeter reads at (R=G=B=0). Precedence:
-    /// IPC override > KDL-loaded LUT header > `None` (unmeasured).
-    ///
-    /// Consumers:
-    /// - `wp_color_management_v1` feedback `min_luminance` event,
-    ///   which standardizes on the Y component (the only one HDR
-    ///   metadata transports treat as load-bearing).
-    /// - Future tone mapping: PQ-encoded content authored at "0 nits"
-    ///   should map to the panel's actual floor rather than absolute
-    ///   zero, so the toe doesn't crush.
-    /// - Cross-display matching (future): lifting the OLED's floor
-    ///   to match the brightest LCD's would let same-grey patches
-    ///   read consistently across the 6-monitor setup.
-    ///
-    /// Returns `None` when no calibration has measured it. Callers
-    /// MUST handle that — there's no sensible default (EDID min-lum
-    /// is essentially fictional on consumer panels).
-    pub fn effective_black_point_xyz(&self) -> Option<[f32; 3]> {
-        self.color_override
-            .black_point_xyz
-            .or(self.kdl_black_point_xyz)
-    }
-
-    /// Rebuild this output's 3D LUT from the legacy `(CTM, response curve)`
-    /// representation. Called at bringup and whenever an IPC handler
-    /// mutates `color_override`'s CTM / response-curve / panel-peak
-    /// fields. The shader chain reads only the LUT, so this is what
-    /// makes calibration actually visible.
-    ///
-    /// No-op when the renderer's encode chain doesn't include
-    /// `EncodeFragment::Lut3d` (e.g. legacy chains kept for tests) —
-    /// detected via `lut3d_cube_edge() == 0`.
-    ///
-    /// **Per-mode curve handling.** SDR outputs skip the per-channel
-    /// response curve when baking the LUT, mirroring the legacy
-    /// `[CalibrationMatrix, OutputTransferSrgb]` shader chain that never
-    /// included `PerChannelResponseGainGamma`. Applying it would push
-    /// commanded values past `sdr_reference_nits` whenever the panel's
-    /// peak emission is below sdr_white — the inverse-gamma blows up
-    /// commanded to several × the cap, then `OutputTransferSrgb` clamps
-    /// the entire range to byte 0xff and the panel renders pinned-peak
-    /// garbage. The calibrate tool today still writes SDR response
-    /// curves to KDL but those values are derived from a feedback loop
-    /// that didn't actually apply them, so they're not trustworthy; we
-    /// honor the previous shader's "ignore" semantics until the SDR
-    /// calibration path is rebuilt. HDR outputs use the full
-    /// `(CTM, curve)` pair as before — that path is what the LUT
-    /// pipeline was designed around.
-    pub fn resynthesize_color_lut(&mut self) -> Result<()> {
-        let Some((entries, source)) = self.effective_lut3d_entries() else {
-            return Ok(());
-        };
-        let what = match source {
-            LutSource::IpcOverride => "upload IPC-pushed color LUT",
-            LutSource::KdlFile => "upload KDL-loaded color LUT",
-            LutSource::Synthesized => "upload synthesized color LUT",
-        };
-        self.renderer.upload_lut3d(&entries).context(what)
-    }
-
-    /// The 3D LUT entries the encode pass should be running right now,
-    /// plus which precedence level produced them. This is the single
-    /// source of truth [`Self::resynthesize_color_lut`] uploads from; the
-    /// IPC `Lut3d` inspector request reads it directly so clients see
-    /// exactly what the GPU sees (which may never have existed on disk).
-    ///
-    /// Returns `None` when the renderer's encode chain has no LUT slot
-    /// (`lut3d_cube_edge() == 0`). Always returns owned entries — the
-    /// stored-override branches clone (~0.4 MB at cube_edge 33, dwarfed
-    /// by the GPU upload that typically follows).
-    ///
-    /// Precedence (highest to lowest):
-    ///   1. IPC LUT override (LoadLut3dFromFile) — measurement-derived
-    ///      data pushed live by a calibration tool.
-    ///   2. IPC override on CTM or response-curve → synthesize from
-    ///      effective values (override-wins).
-    ///   3. KDL-loaded LUT file (`color.lut3d "…"`).
-    ///   4. KDL CTM + response-curve synthesis.
-    pub fn effective_lut3d_entries(&self) -> Option<(Vec<[f32; 3]>, LutSource)> {
-        let cube_edge = self.renderer.lut3d_cube_edge();
-        if cube_edge == 0 {
-            return None;
-        }
-        if let Some(entries) = self.color_override.lut3d_entries.as_ref() {
-            if entries.len() == (cube_edge as usize).pow(3) {
-                return Some((entries.clone(), LutSource::IpcOverride));
-            }
-            tracing::warn!(
-                connector = %self.connector_name,
-                "IPC LUT entry count {} doesn't match renderer cube_edge {}; \
-                 falling back to next precedence level",
-                entries.len(),
-                cube_edge,
-            );
-        }
-        let ipc_curve_override_active =
-            self.color_override.ctm.is_some() || self.color_override.response_curve.is_some();
-        if !ipc_curve_override_active {
-            if let Some(entries) = self.kdl_lut3d_entries.as_ref() {
-                if entries.len() == (cube_edge as usize).pow(3) {
-                    return Some((entries.clone(), LutSource::KdlFile));
-                }
-                tracing::warn!(
-                    connector = %self.connector_name,
-                    "KDL-loaded LUT entry count {} doesn't match renderer cube_edge {}; \
-                     falling back to synthesis",
-                    entries.len(),
-                    cube_edge,
-                );
-            }
-        }
-        let response_curve = if self.config.hdr.is_some() {
-            self.effective_response_curve()
-        } else {
-            None
-        };
-        // Drive-domain chains (sRGB) bake the nits → drive normalization
-        // into the synthesized fallback, anchored at the output's
-        // effective reference white *at synthesis time*. This is the only
-        // place `sdr-reference-nits` touches the encode side, and only
-        // for uncalibrated outputs — a measured `.lut` (precedence 1/3
-        // above) carries its own absolute drive mapping that no runtime
-        // policy knob can re-scale.
-        let drive_white = match self.config.encode_config.lut_output_domain() {
-            prism_renderer::LutOutputDomain::Drive => Some(self.effective_sdr_reference_nits()),
-            prism_renderer::LutOutputDomain::Nits => None,
-        };
-        let entries = synthesize_lut_from_matrix_curve(
-            cube_edge,
-            self.effective_ctm(),
-            response_curve,
-            drive_white,
-        );
-        Some((entries, LutSource::Synthesized))
-    }
-
-    /// Effective per-channel panel-NATIVE peak nits (i.e. the peak
-    /// emission of each physical primary on the panel itself).
-    /// Resolution order:
-    ///   1. Runtime IPC override (set by calibration tools)
-    ///   2. KDL config `panel-peak-nits-r/-g/-b` (from prior calibration)
-    ///   3. Broadcast of HDR `max_luminance` (HDR-mode outputs) or
-    ///      effective `sdr_reference_nits` (SDR-mode outputs)
-    ///
-    /// **Do not feed this directly to the decoder clamp.** The decoder
-    /// clamps in the BT.2020 domain; use [`Self::effective_decode_clamp_bt2020_rgb`]
-    /// instead, which translates panel-native peaks through the CTM.
-    /// This getter is for tooling (telemetry, calibrate's curve fit)
-    /// and for the BT.2020 derivation itself.
-    pub fn effective_panel_peak_nits_rgb(&self) -> [f32; 3] {
-        if let Some(rgb) = self.color_override.panel_peak_nits_rgb {
-            return rgb;
-        }
-        // Cached config value is already the per-channel value (KDL
-        // override or bringup-time broadcast — main.rs::bringup
-        // resolves both before we get here).
-        self.config.panel_peak_nits_rgb
-    }
-
-    /// Resolve the peak luminance (cd/m²) to advertise to
-    /// color-management clients as the display's mastering ceiling.
-    /// Resolution order:
-    ///   1. Runtime IPC override (`ColorOverride::advertised_peak_nits`)
-    ///   2. KDL config `advertised-peak-nits`
-    ///   3. KDL `hdr { max-luminance … }`
-    ///
-    /// Returns `None` for SDR outputs (no `hdr` block ⇒ no mastering
-    /// metadata is advertised).
-    ///
-    /// Distinct from [`Self::effective_panel_peak_nits_rgb`] and the
-    /// panel-facing `max-luminance`: this only changes what we *tell*
-    /// clients the display reaches, not the HDR_OUTPUT_METADATA
-    /// infoframe or the encode clamp.
-    pub fn effective_advertised_peak_nits(&self) -> Option<u32> {
-        let hdr = self.config.hdr?;
-        Some(
-            self.color_override
-                .advertised_peak_nits
-                .or(self.config.advertised_peak_nits)
-                .unwrap_or(hdr.max_luminance as u32),
-        )
-    }
-
-    /// Per-channel BT.2020-domain clamp the decoder applies to the fp16
-    /// intermediate. The job here is only to prevent fp32 garbage from
-    /// reaching the encode stage on adversarial content — gamut / range
-    /// mapping happens inside the LUT (or the CTM-derived legacy clamp
-    /// when no LUT is in play). See [`derive_bt2020_decode_clamp`].
-    pub fn effective_decode_clamp_bt2020_rgb(&self) -> [f32; 3] {
-        derive_bt2020_decode_clamp(
-            self.effective_panel_peak_nits_rgb(),
-            self.effective_ctm(),
-            BT2020_DECODE_CAP_MARGIN,
-        )
     }
 
     /// Re-push the bringup `HDR_OUTPUT_METADATA` infoframe to the
@@ -663,19 +409,7 @@ impl OutputContext {
     }
 }
 
-/// Which precedence level of [`OutputContext::effective_lut3d_entries`]
-/// produced the effective LUT.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LutSource {
-    /// IPC-pushed override (`LoadLut3dFromFile` / `IdentityLut3d`).
-    IpcOverride,
-    /// KDL-configured `color.lut3d` file.
-    KdlFile,
-    /// Synthesized from the effective CTM + response curve.
-    Synthesized,
-}
-
-/// Runtime color overrides — see [`OutputContext::color_override`].
+/// Runtime color overrides — see [`crate::OutputShadow::color_override`].
 /// Each field is `None` until an IPC request sets it; setting any field
 /// shadows the matching `OutputConfig` value in the render path.
 #[derive(Debug, Default, Clone)]
@@ -889,14 +623,23 @@ impl OutputContext {
     /// reset drops them back to defaults — without this the panel returns from
     /// a VT switch in SDR instead of the HDR mode it had before. Shares the
     /// exact bringup routine. Pairs with [`Self::mark_for_resume`].
-    pub fn reapply_color_signaling(&mut self, drm: &DrmDevice) {
-        apply_color_signaling(
-            drm,
-            &self.connector_name,
-            self.connector,
-            &mut self.hdr_props,
-            &self.config,
-        );
+    ///
+    /// Self-contained: the property writes go through `self.surface`'s own
+    /// handle to the device fd (same underlying device as the card's
+    /// `DrmDevice`), so this is callable from the output's render thread
+    /// without borrowing the main-owned card context.
+    pub fn reapply_color_signaling(&mut self) {
+        // Split borrows: `apply_color_signaling` needs `&self.surface`
+        // alongside `&mut self.hdr_props`.
+        let Self {
+            surface,
+            connector_name,
+            connector,
+            hdr_props,
+            config,
+            ..
+        } = self;
+        apply_color_signaling(surface, connector_name, *connector, hdr_props, config);
     }
 
     /// Render the supplied frame (with the supplied encode parameters) into the
@@ -1184,8 +927,11 @@ impl OutputContext {
 /// All failures are best-effort (logged, not fatal): a connector with no HDR
 /// props no-ops, and a missing max-bpc prop just leaves link depth to the
 /// driver.
-fn apply_color_signaling(
-    drm: &DrmDevice,
+///
+/// Generic over [`ControlDevice`]: bringup passes the card's `DrmDevice`,
+/// session resume passes the output's own `DrmSurface` (same device fd).
+fn apply_color_signaling<D: smithay::reexports::drm::control::Device>(
+    drm: &D,
     connector_name: &str,
     connector: connector::Handle,
     hdr_props: &mut Option<crate::HdrProps>,

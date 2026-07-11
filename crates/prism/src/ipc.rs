@@ -416,7 +416,12 @@ fn handle_capture_frame(state: &mut PrismState, name: &str) -> (Reply, Option<Ow
         );
     };
 
-    let output_ctx = state.outputs.get(&output_id).expect("just found above");
+    let Some(output_ctx) = state.output_ctxs.get(&output_id) else {
+        return (
+            Err(format!("capture-frame: output {name:?} not found")),
+            None,
+        );
+    };
     match output_ctx.renderer.capture_intermediate() {
         Ok(frame) => {
             let meta = prism_ipc::FrameMeta {
@@ -464,7 +469,7 @@ fn handle_lut3d(state: &mut PrismState, name: &str) -> (Reply, Option<OwnedFd>) 
         Err(e) => return (Err(format!("lut3d: memfd: {e}")), None),
     };
     let meta = prism_ipc::Lut3dMeta {
-        cube_edge: ctx.renderer.lut3d_cube_edge(),
+        cube_edge: ctx.lut3d_cube_edge,
         byte_len: bytes.len() as u64,
         out_space: match ctx.config.encode_config.lut_output_domain() {
             prism_renderer::LutOutputDomain::Nits => prism_ipc::Lut3dDomain::Nits,
@@ -486,7 +491,7 @@ fn handle_lut3d(state: &mut PrismState, name: &str) -> (Reply, Option<OwnedFd>) 
 /// profiling panel is open.
 fn handle_profiling_stats(state: &mut PrismState, name: &str) -> (Reply, Option<OwnedFd>) {
     let Some(ctx) = state
-        .outputs
+        .output_ctxs
         .values()
         .find(|ctx| ctx.connector_name == name)
     else {
@@ -704,7 +709,21 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
         ));
     };
 
-    let output_ctx = state.outputs.get_mut(&output_id).expect("just found above");
+    // Color policy lives on the shadow (main-owned); the renderer / HDR
+    // infoframe ops need the execution context. Split-borrow both maps so
+    // the match arms can touch each side.
+    let PrismState {
+        outputs,
+        output_ctxs,
+        ..
+    } = &mut *state;
+    let (Some(shadow), Some(output_ctx)) =
+        (outputs.get_mut(&output_id), output_ctxs.get_mut(&output_id))
+    else {
+        return Ok(Response::OutputConfigChanged(
+            OutputConfigChanged::OutputWasMissing,
+        ));
+    };
     // Track whether this mutation changed something the per-output 3D LUT
     // depends on. CTM and response-curve obviously do, and so does
     // SdrReferenceNits on drive-domain (SDR) outputs — the synthesized
@@ -720,7 +739,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
     match action {
         OutputAction::SdrReferenceNits { nits } => {
             let v = (nits.clamp(1.0, 10_000.0)) as f32;
-            output_ctx.color_override.sdr_reference_nits = Some(v);
+            shadow.color_override.sdr_reference_nits = Some(v);
             tracing::info!(connector = %name, sdr_reference_nits = v, "ipc: set sdr-reference-nits override");
             // Decode-side policy, plus the anchor of the *synthesized*
             // fallback LUT on drive-domain outputs. Measured LUTs
@@ -742,7 +761,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             let y_r = (gamma_r as f32).clamp(0.1, 10.0);
             let y_g = (gamma_g as f32).clamp(0.1, 10.0);
             let y_b = (gamma_b as f32).clamp(0.1, 10.0);
-            output_ctx.color_override.response_curve = Some(([g_r, g_g, g_b], [y_r, y_g, y_b]));
+            shadow.color_override.response_curve = Some(([g_r, g_g, g_b], [y_r, y_g, y_b]));
             tracing::info!(
                 connector = %name,
                 gain = ?[g_r, g_g, g_b],
@@ -759,7 +778,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             let r = (nits_r as f32).clamp(1.0, 10_000.0);
             let g = (nits_g as f32).clamp(1.0, 10_000.0);
             let b = (nits_b as f32).clamp(1.0, 10_000.0);
-            output_ctx.color_override.panel_peak_nits_rgb = Some([r, g, b]);
+            shadow.color_override.panel_peak_nits_rgb = Some([r, g, b]);
             tracing::info!(
                 connector = %name,
                 panel_peak_nits_rgb = ?[r, g, b],
@@ -778,7 +797,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
         }
         OutputAction::AdvertisedPeakNits { nits } => {
             let v = (nits.round().clamp(1.0, 10_000.0)) as u32;
-            output_ctx.color_override.advertised_peak_nits = Some(v);
+            shadow.color_override.advertised_peak_nits = Some(v);
             tracing::info!(
                 connector = %name,
                 advertised_peak_nits = v,
@@ -804,7 +823,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                 [gr as f32, gg as f32, gb as f32],
                 [br as f32, bg as f32, bb as f32],
             ];
-            output_ctx.color_override.ctm = Some(m);
+            shadow.color_override.ctm = Some(m);
             tracing::info!(
                 connector = %name,
                 ctm = ?m,
@@ -819,7 +838,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
                     return Err(format!("load_lut3d_file({path}) failed: {e:#}"));
                 }
             };
-            let renderer_edge = output_ctx.renderer.lut3d_cube_edge();
+            let renderer_edge = shadow.lut3d_cube_edge;
             if loaded.cube_edge != renderer_edge {
                 return Err(format!(
                     "LUT file cube_edge={} doesn't match renderer cube_edge={}",
@@ -831,7 +850,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             // for sRGB). A mismatched file would render garbage — most
             // insidiously, a pre-v5 nits-space file on an SDR output
             // would re-create the silent dimming this reform removed.
-            let want = output_ctx.config.encode_config.lut_output_domain();
+            let want = shadow.config.encode_config.lut_output_domain();
             if loaded.out_space != want {
                 return Err(format!(
                     "LUT file out_space={:?} doesn't match the output's encode chain ({want:?}); \
@@ -841,7 +860,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             }
             let cube_edge = loaded.cube_edge;
             let bp = loaded.black_point_xyz;
-            output_ctx.color_override.lut3d_entries = Some(loaded.entries);
+            shadow.color_override.lut3d_entries = Some(loaded.entries);
             // Carry the measured black-point alongside — the v2+ file
             // format pairs them and the compositor uses the floor for
             // tone-map decisions + wp_color_management feedback. All-
@@ -849,7 +868,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             // unset" so the KDL-loaded value (if any) still shows
             // through via effective_black_point_xyz.
             if bp[0] != 0.0 || bp[1] != 0.0 || bp[2] != 0.0 {
-                output_ctx.color_override.black_point_xyz = Some(bp);
+                shadow.color_override.black_point_xyz = Some(bp);
             }
             tracing::info!(
                 connector = %name,
@@ -861,7 +880,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             lut_dirty = true;
         }
         OutputAction::IdentityLut3d => {
-            let cube_edge = output_ctx.renderer.lut3d_cube_edge();
+            let cube_edge = shadow.lut3d_cube_edge;
             if cube_edge == 0 {
                 return Err(
                     "IdentityLut3d: encode chain has no LUT slot (legacy CTM+curve path)"
@@ -873,14 +892,14 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             // nits → drive mapping anchored at the effective reference
             // white, so a calibration sweep's patch code values round-
             // trip to the wire unchanged.
-            let entries = match output_ctx.config.encode_config.lut_output_domain() {
+            let entries = match shadow.config.encode_config.lut_output_domain() {
                 prism_renderer::LutOutputDomain::Nits => prism_renderer::identity_lut(cube_edge),
                 prism_renderer::LutOutputDomain::Drive => prism_renderer::drive_identity_lut(
                     cube_edge,
-                    output_ctx.effective_sdr_reference_nits(),
+                    shadow.effective_sdr_reference_nits(),
                 ),
             };
-            output_ctx.color_override.lut3d_entries = Some(entries);
+            shadow.color_override.lut3d_entries = Some(entries);
             tracing::info!(
                 connector = %name,
                 cube_edge,
@@ -894,7 +913,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             // OutputTransfer stage, so the diagnose must mirror it or
             // it'd test a different shader configuration than what the
             // panel sees. (The sRGB transfer is parameter-free.)
-            let mut p = match output_ctx.config.hdr {
+            let mut p = match shadow.config.hdr {
                 Some(hdr) => {
                     let mut p = prism_renderer::EncodePushSynth::pq_identity();
                     p.target_peak_nits = hdr.max_luminance as f32;
@@ -905,10 +924,10 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             // CTM + per-channel curve are no longer read by the
             // Lut3d-only encode chain, but mirror them anyway so any
             // legacy-chain output stays equivalent.
-            if let Some((gain, gamma)) = output_ctx.effective_response_curve() {
+            if let Some((gain, gamma)) = shadow.effective_response_curve() {
                 p.set_response_gain_gamma(gain, gamma);
             }
-            if let Some(m) = output_ctx.effective_ctm() {
+            if let Some(m) = shadow.effective_ctm() {
                 p.set_ctm(m);
             }
             let result = output_ctx
@@ -937,7 +956,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
             }));
         }
         OutputAction::ResetColor => {
-            output_ctx.color_override = prism_drm::ColorOverride::default();
+            shadow.color_override = prism_drm::ColorOverride::default();
             tracing::info!(connector = %name, "ipc: cleared color overrides");
             // The cleared panel-peak-nits reverts to the bringup KDL
             // value — push the corresponding infoframe.
@@ -964,11 +983,17 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
     // doesn't bubble — keeping the previous LUT is the least-surprising
     // fallback (calibration just doesn't update this round).
     if lut_dirty {
-        if let Err(e) = output_ctx.resynthesize_color_lut() {
-            tracing::warn!(
-                connector = %name,
-                "color LUT re-synthesis failed: {e:#} (LUT keeps previous content)"
-            );
+        if let Some((entries, source)) = shadow.effective_lut3d_entries() {
+            if let Err(e) = output_ctx
+                .renderer
+                .upload_lut3d(&entries)
+                .context(source.upload_context())
+            {
+                tracing::warn!(
+                    connector = %name,
+                    "color LUT re-synthesis failed: {e:#} (LUT keeps previous content)"
+                );
+            }
         }
     }
 
@@ -983,7 +1008,7 @@ fn handle_output_action(state: &mut PrismState, name: &str, action: OutputAction
     // The recolor changes the encode output without moving any element, so the
     // damage tracker sees nothing — force the next present past the zero-damage
     // skip, or the change wouldn't reach the screen until something moved.
-    if let Some(output_ctx) = state.outputs.get_mut(&output_id) {
+    if let Some(output_ctx) = state.output_ctxs.get_mut(&output_id) {
         output_ctx.force_next_present();
     }
     // Override won't be observable until the next frame — kick a

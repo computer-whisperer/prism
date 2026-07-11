@@ -7,6 +7,11 @@
 //!   - [`OutputContext`] — one per active connector. DrmSurface + scanout
 //!     BOs + per-output Renderer.
 //!
+//! Each output additionally has a main-thread [`OutputShadow`] — identity,
+//! geometry, and the color policy — so the async-render split can move the
+//! `OutputContext` onto a per-GPU render thread while main keeps everything
+//! it reads per-frame (`docs/async-render-rework.md` §2.2).
+//!
 //! Static per-output configuration (depth, formats, encode-shader chain,
 //! and — future — color description, calibration, tone-map) lives in
 //! [`OutputConfig`].
@@ -21,6 +26,7 @@ pub mod gbm_dev;
 pub mod hdr;
 pub mod modifiers;
 pub mod output_ctx;
+pub mod output_shadow;
 pub mod scanout;
 pub mod session;
 
@@ -33,7 +39,8 @@ pub use frame_clock::FrameClock;
 pub use gbm_dev::GbmDevice;
 pub use hdr::{HdrEotf, HdrProps, HdrSignaling};
 pub use modifiers::pick_scanout_modifiers;
-pub use output_ctx::{ColorOverride, LutSource, OutputContext, PresentOutcome};
+pub use output_ctx::{ColorOverride, OutputContext, PresentOutcome};
+pub use output_shadow::{LutSource, OutputShadow};
 pub use scanout::{
     add_framebuffer_for_bo, connector_is_non_desktop, find_property, pick_all_connected,
     pick_all_connected_with_config, pick_by_name, pick_by_name_with_config, pick_first_connected,

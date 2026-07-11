@@ -499,10 +499,18 @@ pub struct PrismState {
     pub tex_surfaces: HashMap<ObjectId, WlSurface>,
 
     // ── DRM stack — declaration order = drop order = outer to inner ────────
-    /// Active outputs across all cards. Each `OutputContext` Drop calls
+    /// Main-thread shadow of every active output — identity, geometry,
+    /// config, and the color policy (`docs/async-render-rework.md` §2.2).
+    /// Everything main-side code reads per-frame or per-request lives
+    /// here; the execution state is in [`Self::output_ctxs`].
+    pub outputs: HashMap<OutputId, prism_drm::OutputShadow>,
+    /// Per-output execution state (DrmSurface, scanout BOs, `Renderer`,
+    /// damage tracking, cursor plane), keyed like `outputs`. Interim home
+    /// for increment B1a of the async-render rework — B1b moves these onto
+    /// per-GPU render threads. Each `OutputContext` Drop calls
     /// `surface.clear()`, which needs DRM master. Must drop before
     /// `session` releases libseat (else EACCES on clear).
-    pub outputs: HashMap<OutputId, prism_drm::OutputContext>,
+    pub output_ctxs: HashMap<OutputId, prism_drm::OutputContext>,
     /// Per-card DRM lease state (`wp_drm_lease_device_v1`): VR headset
     /// connectors reserved at bringup + the leases handed out. Keyed
     /// like `cards`. Declared before `cards` so active leases revoke
@@ -992,6 +1000,7 @@ impl PrismState {
             mirror_copiers: build_mirror_copiers(&gpus),
             gpus,
             outputs: HashMap::new(),
+            output_ctxs: HashMap::new(),
             wl_outputs: HashMap::new(),
             dmabuf_sources: HashMap::new(),
             output_redraw: HashMap::new(),
@@ -1270,15 +1279,21 @@ impl PrismState {
     /// unknown output. Used by the output-power protocol and the
     /// `PowerOffMonitors` / `PowerOnMonitors` actions.
     pub fn set_monitor_powered(&mut self, output_id: &OutputId, on: bool) {
-        let Some(ctx) = self.outputs.get_mut(output_id) else {
+        let Some(ctx) = self.output_ctxs.get_mut(output_id) else {
             return;
         };
         if on {
             ctx.power_on();
+            if let Some(shadow) = self.outputs.get_mut(output_id) {
+                shadow.note_powered(true);
+            }
         } else {
             if let Err(e) = ctx.power_off() {
                 tracing::warn!(connector = %output_id, "DPMS power_off failed: {e:#}");
                 return;
+            }
+            if let Some(shadow) = self.outputs.get_mut(output_id) {
+                shadow.note_powered(false);
             }
             // A zero-damage skip may have left an estimated-vblank timer armed.
             // Drop the redraw state to Idle so its now-stale fire is a no-op
@@ -1354,18 +1369,21 @@ impl PrismState {
     pub fn attach_output(
         &mut self,
         output: prism_drm::OutputContext,
+        shadow: prism_drm::OutputShadow,
     ) -> Option<prism_drm::OutputContext> {
         let id: OutputId = output.connector_name.clone();
         // The cursor plane is created hidden; `update_output_cursors`
         // uploads the correct, scale-matched sprite before it makes the
         // plane visible, so no seed upload is needed here.
-        // Build the per-output dmabuf feedback before moving `output`.
+        // Build the per-output dmabuf feedback from the shadow (the
+        // caller has already filled its color-policy fields, so the
+        // preferred description below sees the KDL LUT's black point).
         // Skipped (and logged) if the output's GPU isn't registered
         // (shouldn't happen — `gpus` is populated before bringup) or
         // if feedback build fails (e.g. shm shortage). Either way the
         // client gets the global default feedback as a fallback.
         if let Some(feedback) =
-            build_output_feedback(&output, &self.gpus, &self.dmabuf_main_formats)
+            build_output_feedback(&shadow, &self.gpus, &self.dmabuf_main_formats)
         {
             self.output_feedback.insert(id.clone(), feedback);
         }
@@ -1375,7 +1393,7 @@ impl PrismState {
         // know "this surface, on this output, should be PQ BT.2020
         // mastered to X nits" (HDR) or sRGB+gamma22 (SDR).
         let preferred =
-            crate::color_management::build_output_preferred(&output, &self.color_management);
+            crate::color_management::build_output_preferred(&shadow, &self.color_management);
         tracing::info!(
             connector = %output.connector_name,
             identity = preferred.identity,
@@ -1384,16 +1402,8 @@ impl PrismState {
         );
         self.color_management
             .set_output_preferred(id.clone(), preferred);
-        self.outputs.insert(id, output)
-    }
-
-    /// Locate the output bound to a particular CRTC (e.g. for routing a
-    /// vblank event from `DrmDeviceNotifier`).
-    pub fn output_for_crtc(
-        &mut self,
-        crtc: smithay::reexports::drm::control::crtc::Handle,
-    ) -> Option<&mut prism_drm::OutputContext> {
-        self.outputs.values_mut().find(|o| o.crtc == crtc)
+        self.outputs.insert(id.clone(), shadow);
+        self.output_ctxs.insert(id, output)
     }
 
     /// Build a smithay `Output` mirroring the given `OutputContext` and
@@ -1419,7 +1429,7 @@ impl PrismState {
     /// serial"; physical mm size lets DPI-aware clients pick correct
     /// font sizes. Fields the panel didn't advertise fall back to the
     /// strings smithay treats as "unknown" ("Unknown" / empty / 0×0).
-    pub fn advertise_output(&mut self, ctx: &prism_drm::OutputContext) -> &Output {
+    pub fn advertise_output(&mut self, ctx: &prism_drm::OutputShadow) -> &Output {
         let mode = OutputMode {
             size: (ctx.extent.width as i32, ctx.extent.height as i32).into(),
             // smithay::output::Mode::refresh is in milli-Hz.
@@ -3780,7 +3790,7 @@ impl XdgDialogHandler for PrismState {}
 /// Both are unexpected in steady state but we don't want them to
 /// hard-fail output bringup.
 fn build_output_feedback(
-    ctx: &prism_drm::OutputContext,
+    ctx: &prism_drm::OutputShadow,
     gpus: &HashMap<DrmDevId, Arc<prism_renderer::Device>>,
     main_formats: &[DrmFormat],
 ) -> Option<DmabufFeedback> {
@@ -4488,7 +4498,7 @@ pub fn update_output_cursors(state: &mut PrismState) {
         };
         state.cursor_hotspot = sprite.hotspot;
         if let Some(plane) = state
-            .outputs
+            .output_ctxs
             .get_mut(&owner_id)
             .and_then(|o| o.cursor.as_mut())
         {
@@ -4506,7 +4516,7 @@ pub fn update_output_cursors(state: &mut PrismState) {
 
     let hotspot = state.cursor_hotspot;
     let pointer_pos = state.pointer_pos;
-    for (id, output_ctx) in state.outputs.iter_mut() {
+    for (id, output_ctx) in state.output_ctxs.iter_mut() {
         let Some(cursor) = output_ctx.cursor.as_mut() else {
             continue;
         };
@@ -4552,7 +4562,7 @@ pub fn update_output_cursors(state: &mut PrismState) {
 }
 
 fn hide_all_cursors(state: &mut PrismState) {
-    for (id, output_ctx) in state.outputs.iter_mut() {
+    for (id, output_ctx) in state.output_ctxs.iter_mut() {
         // Hide the plane if it was visible; `changed` ends the cursor borrow
         // before the `force_next_present`/`queue_redraw` calls below.
         let changed = match output_ctx.cursor.as_mut() {

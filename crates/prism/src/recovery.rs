@@ -63,8 +63,11 @@ pub fn recover_lost_gpus(state: &mut PrismState) {
                     // shows the lock surface, not desktop content. User
                     // DPMS state (not in this set) is untouched.
                     if state.lock_blanked_outputs.remove(id) {
-                        if let Some(ctx) = state.outputs.get_mut(id) {
+                        if let Some(ctx) = state.output_ctxs.get_mut(id) {
                             ctx.power_on();
+                        }
+                        if let Some(shadow) = state.outputs.get_mut(id) {
+                            shadow.note_powered(true);
                         }
                     }
                     state
@@ -193,13 +196,18 @@ fn recover_one(state: &mut PrismState, gpu: DrmDevId) -> Result<()> {
         );
     }
     // Rebuild every output (constructor is submit-free; the swap drops the
-    // old renderer + scanout imports).
+    // old renderer + scanout imports). The shadow's renderer-derived caches
+    // (white view, LUT cube edge) point into the replaced renderer —
+    // refresh them alongside.
     let mut rebuild_err: Option<anyhow::Error> = None;
-    for (id, ctx) in state.outputs.iter_mut() {
+    for (id, ctx) in state.output_ctxs.iter_mut() {
         if ctx.gpu_id == gpu {
             if let Err(e) = ctx.rebuild_render_state(device.clone()) {
                 rebuild_err = Some(e.context(format!("rebuild output {id}")));
                 break;
+            }
+            if let Some(shadow) = state.outputs.get_mut(id) {
+                shadow.refresh_renderer_caches(ctx);
             }
         }
     }
@@ -237,13 +245,21 @@ fn recover_one(state: &mut PrismState, gpu: DrmDevId) -> Result<()> {
             tracing::warn!(?gpu, "mirror copier rebuild failed: {e:#}");
         }
     }
-    // First submits on the replacement device: the per-output LUT upload.
-    // A rejection here means the new device is now lost too — fail the
-    // attempt so the retry runs the full cycle again.
-    for (id, ctx) in state.outputs.iter_mut() {
+    // First submits on the replacement device: the per-output LUT upload
+    // (entries resolved from the shadow's color policy). A rejection here
+    // means the new device is now lost too — fail the attempt so the retry
+    // runs the full cycle again.
+    for (id, ctx) in state.output_ctxs.iter_mut() {
         if ctx.gpu_id == gpu {
-            ctx.resynthesize_color_lut()
-                .with_context(|| format!("post-rebuild LUT upload on {id}"))?;
+            let Some(shadow) = state.outputs.get(id) else {
+                continue;
+            };
+            if let Some((entries, source)) = shadow.effective_lut3d_entries() {
+                ctx.renderer
+                    .upload_lut3d(&entries)
+                    .context(source.upload_context())
+                    .with_context(|| format!("post-rebuild LUT upload on {id}"))?;
+            }
         }
     }
     Ok(())
