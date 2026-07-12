@@ -17,8 +17,14 @@
 //! calloop channel source precisely so the drain can be *ordered* against
 //! the DRM vblank events by the consumer, not by source-dispatch luck.
 //!
-//! Everything else — IPC calibration ops, power, recovery, cursor plane
-//! updates, session fixups — is a closure shipped to the thread, blocking
+//! Cursor moves are their own fire-and-forget message
+//! ([`RenderCmd::CursorUpdate`]): the context pushes them out as
+//! cursor-plane-only atomic commits, with EBUSY deferrals retried by the
+//! loop on vblank or a short timeout — pointer motion never renders and
+//! never blocks.
+//!
+//! Everything else — IPC calibration ops, power, recovery, cursor sprite
+//! uploads, session fixups — is a closure shipped to the thread, blocking
 //! on a bounded reply ([`RenderThread::with_outputs`]) when a result is
 //! needed. Command-channel FIFO orders closures against frame submits.
 //!
@@ -114,6 +120,15 @@ enum RenderCmd {
         id: String,
         sub: Box<FrameSubmission>,
     },
+    /// Cursor plane position/visibility change (§2.3 `CursorUpdate`).
+    /// Fire-and-forget: the context attempts a cursor-plane-only atomic
+    /// commit — no render, no buffer swap; EBUSY deferrals are retried by
+    /// the loop (on vblank, or on [`CURSOR_RETRY`] timeout).
+    CursorUpdate {
+        id: String,
+        pos: (i32, i32),
+        visible: bool,
+    },
     /// Run a closure against the thread's outputs. The closure carries its
     /// own typed reply channel when the caller wants a result.
     Run(Box<dyn FnOnce(&mut ThreadOutputs) + Send>),
@@ -128,6 +143,12 @@ enum RenderCmd {
 /// without device-loss) — the caller gets an error and the compositor
 /// stays alive.
 const BRIDGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Retry cadence for cursor-only commits deferred on EBUSY (a commit is
+/// still latching at scanout) or on an in-flight flip whose vblank hasn't
+/// arrived. Only armed while some output has a pending cursor commit — an
+/// idle thread still blocks indefinitely in `recv`.
+const CURSOR_RETRY: Duration = Duration::from_millis(2);
 
 /// Handle to one GPU's render thread. Owned by `PrismState`; dropped (and
 /// joined) at teardown after an explicit [`Self::shutdown_join`].
@@ -224,6 +245,19 @@ impl RenderThread {
         })
     }
 
+    /// Fire-and-forget cursor plane update for `output_id`: position +
+    /// visibility land in a cursor-only atomic commit on the thread — no
+    /// render, no redraw-state involvement (§2.3 `CursorUpdate`).
+    pub fn cursor_update(&self, output_id: &str, pos: (i32, i32), visible: bool) -> Result<()> {
+        self.cmd
+            .send(RenderCmd::CursorUpdate {
+                id: output_id.to_owned(),
+                pos,
+                visible,
+            })
+            .map_err(|_| anyhow!("render thread {:?} is gone", self.gpu))
+    }
+
     /// Shut the thread down: drop every output (instrumented), then join.
     /// Bounded — a wedged thread is abandoned (detached) with a loud log
     /// rather than hanging teardown.
@@ -268,9 +302,32 @@ fn render_thread_loop(
     ping: Ping,
 ) {
     let mut outputs: ThreadOutputs = HashMap::new();
-    while let Ok(cmd) = rx.recv() {
+    loop {
+        // Block indefinitely when idle; poll on a short timeout while any
+        // output has a deferred cursor-only commit that a command won't
+        // flush on its own (EBUSY latch window / flip-idle recency gate), so
+        // a wiggle-and-stop never leaves the cursor one event stale. A
+        // deferral behind `frame_pending` is excluded: its vblank arrives as
+        // a `Run` command and wakes `recv` anyway — polling would only burn
+        // wakeups (and would spin at 500Hz on a wedged output whose vblank
+        // never comes).
+        let cmd = if outputs
+            .values()
+            .any(|c| c.cursor_commit_pending() && !c.is_frame_pending())
+        {
+            match rx.recv_timeout(CURSOR_RETRY) {
+                Ok(cmd) => Some(cmd),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(cmd) => Some(cmd),
+                Err(_) => break,
+            }
+        };
         match cmd {
-            RenderCmd::SubmitFrame { id, sub } => {
+            Some(RenderCmd::SubmitFrame { id, sub }) => {
                 let mut sub = *sub;
                 let reply = match outputs.get_mut(&id) {
                     Some(ctx) => {
@@ -308,8 +365,21 @@ fn render_thread_loop(
                 let _ = outcome_tx.send((id, reply));
                 ping.ping();
             }
-            RenderCmd::Run(f) => f(&mut outputs),
-            RenderCmd::Shutdown => break,
+            Some(RenderCmd::CursorUpdate { id, pos, visible }) => {
+                if let Some(ctx) = outputs.get_mut(&id) {
+                    ctx.cursor_update(pos, visible);
+                }
+            }
+            Some(RenderCmd::Run(f)) => f(&mut outputs),
+            Some(RenderCmd::Shutdown) => break,
+            // Retry-timeout tick — fall through to the cursor sweep.
+            None => {}
+        }
+        // Cursor flush: a vblank (a `Run` closure calling `mark_vblank`)
+        // just cleared `frame_pending`, or the retry timeout elapsed on an
+        // EBUSY'd commit. No-op for outputs with nothing pending.
+        for ctx in outputs.values_mut() {
+            ctx.try_cursor_commit();
         }
     }
     // Shutdown (or every sender dropped): release scanout one output at a

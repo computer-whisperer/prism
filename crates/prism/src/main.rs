@@ -2892,6 +2892,23 @@ fn on_present_outcome(
                 .or_default()
                 .redraw = RedrawState::Queued;
         }
+        Ok(RenderOutcome::FlipBusyRetry) => {
+            if !in_awaiting {
+                return;
+            }
+            // The flip lost to a cursor-only commit's latch window. Pace the
+            // retry at the estimated vblank (immediate re-queue would spin
+            // full renders into the same EBUSY for the rest of the interval)
+            // and queue the redraw so the retry actually re-renders. No real
+            // vblank is coming — the failed flip requested no event.
+            tracing::debug!(output = %output_id, "flip EBUSY (cursor commit latching); retrying at estimated vblank");
+            queue_estimated_vblank(state, output_id);
+            state
+                .output_redraw
+                .entry(output_id.to_owned())
+                .or_default()
+                .queue_redraw();
+        }
         Err(e) => handle_render_error(state, output_id, &e, Some(lowered_while_locked)),
     }
 }
@@ -3884,7 +3901,20 @@ fn process_present_outcome(
                 );
             }
             // bk.presentation_cbs drop → `discarded` (nothing reached the
-            // screen).
+            // screen; the retry below re-lowers and takes fresh callbacks).
+            //
+            // EBUSY is retryable, not a render error: a cursor-plane-only
+            // commit's flip_done window was still open when this flip
+            // landed (possible on the first frame after a flip-idle spell —
+            // standalone cursor commits are gated off while frames flow).
+            // The damage baseline didn't advance and force_present wasn't
+            // cleared, so a re-render + re-flip is fully coherent. Routing
+            // it through handle_render_error instead would park the output
+            // Idle with no timer and — worse — abort a mid-`Locking`
+            // session lock and fail queued screencopies.
+            if flip_error_is_busy(&error) {
+                return Ok(RenderOutcome::FlipBusyRetry);
+            }
             return Err(error);
         }
         // Flip still in flight — caller leaves the output Queued and retries.
@@ -3986,6 +4016,23 @@ enum RenderOutcome {
     SkippedNoDamage { redraw_again: bool },
     /// A previous flip is still in flight; caller retries next pass.
     FlipPending,
+    /// The render ran but the flip was rejected with EBUSY (a cursor-only
+    /// commit was still latching). Caller re-queues at an estimated vblank;
+    /// by then the latch window has closed. The damage baseline did not
+    /// advance, so the retry re-renders the same content.
+    FlipBusyRetry,
+}
+
+/// True when a failed atomic commit was rejected with EBUSY: another
+/// NONBLOCK commit on the CRTC — in prism, only a cursor-plane-only commit
+/// — hadn't signaled `flip_done` yet. Retryable, unlike every other flip
+/// failure. Walks the anyhow chain to the smithay error.
+fn flip_error_is_busy(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<smithay::backend::drm::DrmError>(),
+        Some(smithay::backend::drm::DrmError::Access(a))
+            if a.source.kind() == std::io::ErrorKind::ResourceBusy
+    )
 }
 
 /// Deliver `wl_callback.frame` callbacks to every surface mapped to `output_id`,

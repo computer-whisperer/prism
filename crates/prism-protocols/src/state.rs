@@ -1450,9 +1450,9 @@ impl PrismState {
     }
 
     /// Fire-and-forget `force_next_present` on an output's render thread —
-    /// pushes the next present past the zero-damage skip (cursor moves,
-    /// recolors, forced captures). Command-channel FIFO orders it before
-    /// any later frame submit.
+    /// pushes the next present past the zero-damage skip (recolors, forced
+    /// captures, power-on re-presents). Command-channel FIFO orders it
+    /// before any later frame submit.
     pub fn force_next_present(&self, output_id: &str) {
         let Some(thread) = self.render_thread_for_output(output_id) else {
             return;
@@ -4565,8 +4565,9 @@ fn read_shm_cursor_sprite(
 ///
 /// Theme cursors are loaded at the owning output's integer scale, so the
 /// cursor is correctly sized on HiDPI monitors. Only one output shows the
-/// cursor at a time. Cursor-only commits at sub-vblank cadence are still a
-/// future refinement (today it rides the next redraw).
+/// cursor at a time. Position/visibility changes go out as cursor-plane-only
+/// atomic commits on the render thread — no render pass, no redraw (see
+/// [`apply_cursor_plane_state`]).
 pub fn update_output_cursors(state: &mut PrismState) {
     state.cursor_manager.check_cursor_image_surface_alive();
 
@@ -4678,12 +4679,16 @@ fn hide_all_cursors(state: &mut PrismState) {
 /// the main-side replica on each `OutputShadow` (exactly equivalent to
 /// diffing on the plane — its setters are plain field writes with no
 /// clamping), and for the outputs that actually changed, send a
-/// fire-and-forget closure to the owning render thread (set position/
-/// visibility + `force_next_present` — a cursor move is a page-flip change
-/// with no element damage, so without the force the zero-damage skip would
-/// freeze the cursor on screen) and queue a redraw. Pointer motion never
-/// blocks on a render thread (§2.3 `CursorUpdate`); command-channel FIFO
-/// lands the update before the frame the queued redraw produces.
+/// fire-and-forget `CursorUpdate` to the owning render thread (§2.3). The
+/// thread pushes it out as a cursor-plane-only atomic commit — no render,
+/// no redraw, no full-frame encode (`OutputContext::try_cursor_commit`);
+/// a frame already in flight carries the freshest state anyway, since
+/// every present merges `to_plane_state`. Pointer motion never blocks on
+/// a render thread and never enters the redraw state machine.
+///
+/// Powered-off outputs still get the update (the thread-side plane fields
+/// must stay current for the eventual power-on present); the commit
+/// itself is gated off thread-side while the CRTC is down.
 fn apply_cursor_plane_state(state: &mut PrismState, desired: Vec<CursorPlaneState>) {
     for (id, visible, pos) in desired {
         let Some(shadow) = state.outputs.get_mut(&id) else {
@@ -4703,21 +4708,9 @@ fn apply_cursor_plane_state(state: &mut PrismState, desired: Vec<CursorPlaneStat
         let Some(thread) = state.render_threads.get(&shadow.gpu_id) else {
             continue;
         };
-        let cmd_id = id.clone();
-        if let Err(e) = thread.run(move |outputs| {
-            let Some(ctx) = outputs.get_mut(&cmd_id) else {
-                return;
-            };
-            if let Some(cursor) = ctx.cursor.as_mut() {
-                cursor.set_position(new_pos.0, new_pos.1);
-                cursor.set_visible(visible);
-            }
-            ctx.force_next_present();
-        }) {
+        if let Err(e) = thread.cursor_update(&id, new_pos, visible) {
             tracing::error!(output = %id, "cursor plane update failed: {e:#}");
-            continue;
         }
-        state.output_redraw.entry(id).or_default().queue_redraw();
     }
 }
 

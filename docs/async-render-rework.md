@@ -751,5 +751,26 @@ Perf acceptance:
 - Whether the 4 ACE queues should later host compute-shader decode/encode
   for intra-GPU multi-output overlap (post-Phase-2; the D1 thread already
   owns the ACE queues to build on).
-- Cursor-only atomic commits (reposition without a full render pass) —
-  cheap on the render thread once B lands; latency win for idle scenes.
+- ~~Cursor-only atomic commits (reposition without a full render pass)~~
+  **DONE** (post-B, 2026-07-12): `RenderCmd::CursorUpdate` →
+  `OutputContext::cursor_update` / `try_cursor_commit` — a NONBLOCK
+  `page_flip` touching only the cursor plane, no event, no render, no
+  redraw-state involvement. Standalone commits are gated to FLIP-IDLE
+  outputs (no flip/vblank within ~1.5 refresh intervals — the §2.3
+  ride-along rule: while frames flow the cursor rides every flip at the
+  same latch latency, and a standalone commit's own flip_done window
+  could EBUSY the next real flip). Deferrals (EBUSY latch window, idle
+  gate) retried by the thread loop (post-command sweep + 2ms recv
+  timeout, ~1s EBUSY fuse); every full present still merges
+  `to_plane_state` and clears the pending flag. Main-side safety net for
+  the residual idle→active race: an EBUSY `FlipFailed` is
+  `RenderOutcome::FlipBusyRetry` (estimated-vblank-paced re-render), NOT
+  handle_render_error — a busy flip must not park the output Idle, abort
+  a mid-Locking session lock, or fail screencopy. Input-side fallout:
+  FFM + click activation queue their own (edge-triggered) redraws now
+  that motion doesn't. Kills the prior cost: cursor moves rode
+  `force_next_present`, whose `content_full` forced a FULL-OUTPUT ENCODE
+  per moved frame. Runtime validation: cursor smoothness on an idle VRR
+  output (if amdgpu latches plane-only commits at min refresh instead of
+  kicking a cycle, the fallback is the legacy `drmModeMoveCursor`
+  fastpath, mutter-proven).

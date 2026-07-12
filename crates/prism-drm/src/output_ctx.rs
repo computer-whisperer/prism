@@ -116,6 +116,24 @@ pub struct OutputContext {
     /// Submitting another flip while one is pending causes the kernel to
     /// reject with ENOMEM. Don't re-enter present() until `mark_vblank()`.
     frame_pending: bool,
+    /// A cursor plane change hasn't reached the kernel yet. Set by
+    /// [`Self::cursor_update`]; cleared when any commit carries the plane
+    /// state out — a cursor-only commit ([`Self::try_cursor_commit`]) or a
+    /// full present (every flip merges `to_plane_state`). The render-thread
+    /// loop polls this to arm its EBUSY-retry timeout.
+    cursor_commit_pending: bool,
+    /// When this output last ATTEMPTED a flip (success or not) or received
+    /// its vblank. Standalone cursor commits are gated to flip-IDLE outputs
+    /// (see [`Self::try_cursor_commit`]); while frames are flowing — or
+    /// retrying an EBUSY'd flip — the cursor rides them instead. Stamped at
+    /// attempt time so a flip that LOSES to a cursor commit's latch window
+    /// still closes the gate (else motion-rate standalone commits starve
+    /// the retry). Deliberately NOT stamped by cursor-only commits — they
+    /// must not throttle each other through this.
+    last_flip_activity: Option<std::time::Instant>,
+    /// Consecutive EBUSY rejections of the pending cursor commit. Fuse
+    /// only — normal contention resolves within one refresh interval.
+    cursor_commit_busy: u32,
     /// DPMS power state. `true` after [`Self::power_off`] (CRTC cleared,
     /// panel asleep) until [`Self::power_on`]. The render path skips
     /// powered-off outputs so a stray commit-/animation-driven redraw can't
@@ -130,9 +148,10 @@ pub struct OutputContext {
     pub frame_clock: FrameClock,
     /// Hardware cursor plane for this output, if the driver exposed
     /// one and we could claim it. `None` ⇒ no cursor on this output
-    /// until software cursor lands. The position/visibility/sprite are
-    /// driven by `prism_protocols::update_output_cursors`; we just
-    /// include its `to_plane_state()` in the page-flip below.
+    /// until software cursor lands. Position/visibility/sprite are
+    /// driven by `prism_protocols::update_output_cursors`; changes go
+    /// out as cursor-only commits ([`Self::try_cursor_commit`]) and its
+    /// `to_plane_state()` is merged into every full page-flip.
     pub cursor: Option<CursorPlane>,
     /// Parsed EDID — make / model / serial / physical mm size / HDR
     /// capabilities / default primaries. Always populated; fields
@@ -356,6 +375,9 @@ impl OutputContext {
             mode_set_done: false,
             force_present: false,
             frame_pending: false,
+            cursor_commit_pending: false,
+            last_flip_activity: None,
+            cursor_commit_busy: 0,
             powered_off: false,
             frame_clock,
             cursor,
@@ -481,6 +503,7 @@ impl OutputContext {
     /// render into.
     pub fn mark_vblank(&mut self, presentation_time: Duration) {
         self.frame_pending = false;
+        self.last_flip_activity = Some(std::time::Instant::now());
         // The buffer we just flipped TO is now front. Toggle so back_index
         // points at the *other* one (the new back).
         self.back_index = 1 - self.back_index;
@@ -543,6 +566,129 @@ impl OutputContext {
     /// zero-damage skip. One-shot: cleared by the next render.
     pub fn force_next_present(&mut self) {
         self.force_present = true;
+    }
+
+    /// Apply a cursor position/visibility change and try to push it to the
+    /// kernel immediately with a cursor-only commit — no render, no buffer
+    /// swap, no redraw-state involvement (§2.3 `CursorUpdate`). Runs on the
+    /// render thread. Outputs without a cursor plane no-op.
+    pub fn cursor_update(&mut self, pos: (i32, i32), visible: bool) {
+        let Some(cursor) = self.cursor.as_mut() else {
+            return;
+        };
+        cursor.set_position(pos.0, pos.1);
+        cursor.set_visible(visible);
+        self.cursor_commit_pending = true;
+        self.try_cursor_commit();
+    }
+
+    /// True while a cursor change still needs a commit. The render-thread
+    /// loop polls this to arm a short retry timeout instead of blocking
+    /// indefinitely on its command channel.
+    pub fn cursor_commit_pending(&self) -> bool {
+        self.cursor_commit_pending
+    }
+
+    /// Flush a pending cursor update with an atomic commit touching ONLY the
+    /// cursor plane: `page_flip` with `event = false` ⇒ NONBLOCK, no vblank
+    /// event — so no frame-clock, redraw-state, or vblank-accounting
+    /// interaction. Latches at the next scanout.
+    ///
+    /// **Standalone commits are for flip-idle outputs only** (§2.3: while
+    /// frames are flowing, the cursor rides every flip anyway — same latch
+    /// latency — and a standalone commit buys nothing while its own
+    /// `flip_done` window can EBUSY the next real frame's flip, which main
+    /// would see as a render failure). Hence the recency gate below; the
+    /// residual idle→active race (a real frame arriving right after a
+    /// standalone commit) is handled main-side by retrying EBUSY flips.
+    ///
+    /// Gating and error policy:
+    /// - Powered off / before the first mode-set: drop the pending flag —
+    ///   the (forced, full) present that brings the output back rewrites the
+    ///   whole cursor plane state anyway (both paths reset `mode_set_done`,
+    ///   so the plane rides that `commit`).
+    /// - Flip in flight, or a flip/vblank within ~1.5 refresh intervals:
+    ///   keep pending — the next present carries it (clearing the flag), or
+    ///   the thread loop's retry timeout flushes it once the output goes
+    ///   idle.
+    /// - EBUSY (a previous cursor commit is still latching): keep pending;
+    ///   the thread loop retries on its timeout. We always commit the
+    ///   plane's *current* state, so dropped intermediate positions are
+    ///   harmless. A fuse drops the flag if EBUSY persists implausibly long
+    ///   (~1s of retries) so a wedged CRTC can't poll forever.
+    /// - Inactive session / EACCES: drop pending silently — both mean the
+    ///   session is (or is becoming) paused; libseat can revoke DRM master
+    ///   before `PauseSession` reaches `drm.pause()`, so EACCES here is the
+    ///   pause window, not a real fault. The resume re-present carries the
+    ///   state.
+    /// - Anything else: drop pending with a warning; the state still rides
+    ///   every future present via `to_plane_state`.
+    pub fn try_cursor_commit(&mut self) {
+        if !self.cursor_commit_pending {
+            return;
+        }
+        if self.powered_off || !self.mode_set_done {
+            self.cursor_commit_pending = false;
+            self.cursor_commit_busy = 0;
+            return;
+        }
+        if self.frame_pending {
+            return;
+        }
+        // Flip-idle gate: recent flip activity ⇒ frames are (or were just)
+        // flowing; hold the standalone commit and let a frame carry it, or
+        // flush via the retry timeout once the output stays quiet.
+        let idle_after = self
+            .frame_clock
+            .refresh_interval()
+            .map_or(Duration::from_millis(25), |r| r * 3 / 2);
+        if self
+            .last_flip_activity
+            .is_some_and(|t| t.elapsed() < idle_after)
+        {
+            return;
+        }
+        let Some(cursor) = self.cursor.as_ref() else {
+            self.cursor_commit_pending = false;
+            self.cursor_commit_busy = 0;
+            return;
+        };
+        use smithay::backend::drm::DrmError;
+        match self
+            .surface
+            .page_flip(std::iter::once(cursor.to_plane_state()), false)
+        {
+            Ok(()) => {
+                self.cursor_commit_pending = false;
+                self.cursor_commit_busy = 0;
+            }
+            Err(DrmError::Access(a)) if a.source.kind() == std::io::ErrorKind::ResourceBusy => {
+                self.cursor_commit_busy += 1;
+                // ~1s of 2ms retries with zero successes: something is
+                // wedged; stop polling. The next present re-syncs the plane.
+                if self.cursor_commit_busy > 512 {
+                    tracing::warn!(
+                        connector = %self.connector_name,
+                        "cursor-only commits EBUSY for >1s; deferring to the next present"
+                    );
+                    self.cursor_commit_pending = false;
+                    self.cursor_commit_busy = 0;
+                }
+            }
+            Err(DrmError::DeviceInactive) => {
+                self.cursor_commit_pending = false;
+                self.cursor_commit_busy = 0;
+            }
+            Err(DrmError::Access(a)) if a.source.kind() == std::io::ErrorKind::PermissionDenied => {
+                self.cursor_commit_pending = false;
+                self.cursor_commit_busy = 0;
+            }
+            Err(e) => {
+                tracing::warn!(connector = %self.connector_name, "cursor-only commit failed: {e}");
+                self.cursor_commit_pending = false;
+                self.cursor_commit_busy = 0;
+            }
+        }
     }
 
     /// Prepare this output for a session resume (VT switch back). On pause the
@@ -839,6 +985,16 @@ impl OutputContext {
             plane_state.push(cursor.to_plane_state());
         }
 
+        // Stamp flip activity at ATTEMPT time, not on success: an EBUSY'd
+        // flip (lost to a standalone cursor commit's latch window) must
+        // close the cursor recency gate, or sustained pointer motion keeps
+        // issuing standalone commits whose fresh latch windows EBUSY every
+        // estimated-vblank retry of this frame — a livelock that starves
+        // the queued frame for as long as the mouse moves. Stamped here,
+        // the first failed attempt shuts the gate and the retry flip one
+        // interval later carries the pending cursor state itself.
+        self.last_flip_activity = Some(std::time::Instant::now());
+
         if !self.mode_set_done {
             flip_trace(&format!(
                 "submit modeset {} crtc={:?} back={}",
@@ -890,6 +1046,11 @@ impl OutputContext {
             }
         }
         self.frame_pending = true;
+        // This flip carried the cursor plane's current state (serialized into
+        // `plane_state` above, same thread — nothing can have changed since),
+        // so any pending cursor-only commit is satisfied by it.
+        self.cursor_commit_pending = false;
+        self.cursor_commit_busy = 0;
         // The flip is submitted — this frame's damage has reached the scanout,
         // so advance the tracker's baseline. (On the `?` early-returns above the
         // commit is skipped, so a failed flip re-damages next frame.)

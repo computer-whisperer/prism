@@ -15,10 +15,11 @@
 //!   - Current position in CRTC pixels, hotspot offset, visibility
 //!
 //! The hot path is `set_position` — pure field write, no syscalls.
-//! Position only takes effect on the next page-flip via
-//! [`CursorPlane::to_plane_state`]. Latency: up to one refresh
-//! interval. Sub-frame cursor updates (legacy `drmModeMoveCursor` or a
-//! cursor-only atomic commit) are a later phase.
+//! Position reaches the kernel through a cursor-plane-only atomic
+//! commit (`OutputContext::try_cursor_commit` — the usual path: no
+//! render, latches at the next scanout) or by riding the next full
+//! present, which merges [`CursorPlane::to_plane_state`] into every
+//! page-flip.
 //!
 //! Sprite uploads happen lazily on cursor-icon changes via
 //! [`CursorPlane::upload_sprite`] — copies RGBA8888 → ARGB8888 into

@@ -168,7 +168,8 @@ pub fn on_pointer_motion<I: PrismInputBackend>(
     maybe_trigger_hot_corner(state, was_inside_hot_corner);
     maybe_dnd_update(state, &pointer);
     // Walk the cursor plane on every output: show on the output the
-    // pointer is in, hide on the rest, queue redraws on changes.
+    // pointer is in, hide on the rest. Changes go out as cursor-plane-only
+    // commits on the render threads — no redraws from here.
     prism_protocols::state::update_output_cursors(state);
     // A constraint may want to activate now that focus settled here.
     state.maybe_activate_pointer_constraint();
@@ -1312,6 +1313,11 @@ fn maybe_focus_follows_mouse(state: &mut PrismState) {
         if let Some(out) = target_output.as_ref() {
             if state.layout.active_output() != Some(out) {
                 state.layout.focus_output(out);
+                // Active-state visuals (focus ring, border colors) span the
+                // old and new outputs, and nothing else repaints on a pure
+                // hover monitor switch — cursor moves are plane-only commits
+                // now, so motion itself no longer queues redraws.
+                crate::move_grab::queue_redraw_all(state);
             }
         }
     }
@@ -1355,7 +1361,18 @@ fn maybe_focus_follows_mouse(state: &mut PrismState) {
                 }
             }
             state.on_demand_layer_focus = None;
+            // Queue redraws only on a real focus change (activation runs on
+            // every motion event inside a window and is idempotent —
+            // queueing unconditionally would resurrect the per-motion
+            // redraws the cursor-only commit path removed). The repaint
+            // covers the focus ring / border flip on both windows, and it
+            // starts the frame cycle when activation kicks off a view-scroll
+            // animation — client focus-in repaints are not guaranteed.
+            let was_focused = state.layout.focus().map(|m| &m.window) == Some(&window);
             state.layout.activate_window_without_raising(&window);
+            if !was_focused {
+                crate::move_grab::queue_redraw_all(state);
+            }
         }
     }
 }
@@ -1401,6 +1418,15 @@ fn focus_surface(state: &mut PrismState, surface: &WlSurface, raise: bool) {
         } else {
             state.layout.activate_window_without_raising(&w);
         }
+        // The compositor-side visuals of an activation (focus ring flip,
+        // floating-stack raise, activation view-scroll) don't necessarily
+        // come with a client commit — a raise of an already-focused
+        // floating window changes nothing client-side at all. Queue the
+        // repaint here; pointer motion no longer queues redraws (cursor
+        // moves are plane-only commits), so clicks can't ride incidental
+        // per-motion repaints anymore. Click-rate, so unconditional is
+        // cheap (a no-change click renders once into a zero-damage skip).
+        crate::move_grab::queue_redraw_all(state);
     }
 }
 
