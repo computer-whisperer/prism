@@ -3949,7 +3949,17 @@ fn process_present_outcome(
     // locked frame. The zero-damage skip path deliberately does NOT
     // call this — a skip means the previous (already accounted) frame
     // is still showing.
-    state.note_lock_render(output_id, bk.session_locked);
+    //
+    // Epoch gate (same rule as `handle_render_error`): only report frames
+    // lowered under the current lock state. A desktop frame lowered just
+    // before the lock transition can have its outcome arrive mid-`Locking`;
+    // reporting it as an unlocked render would spuriously abort the lock.
+    // The locked render for this output was already queued by the
+    // transition, so the state machine still converges. (Locked frames
+    // during `Locking` pass: `is_locked()` covers `Locking | Locked`.)
+    if bk.session_locked == state.is_locked() {
+        state.note_lock_render(output_id, bk.session_locked);
+    }
 
     Ok(RenderOutcome::Presented {
         pending: PendingFeedback {
