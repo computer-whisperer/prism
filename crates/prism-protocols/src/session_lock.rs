@@ -162,6 +162,13 @@ impl PrismState {
 
         tracing::info!("locking session");
 
+        // Start the lock epoch with a clean render ledger: entries from a
+        // previous lock session (a `Locked` written moments before an
+        // unlock→relock) must not count toward this session's all-locked
+        // confirmation — especially now that the outcome epoch gate skips
+        // recording `Unlocked` for frames lowered in the previous epoch.
+        self.lock_render_state.clear();
+
         if self.outputs.is_empty() {
             // Nothing to blank; lock immediately.
             let lock = confirmation.ext_session_lock().clone();
